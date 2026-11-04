@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Lumen — a Notion-style workspace written entirely in Rust with egui (native + WebAssembly)"
 license = "MIT"
@@ -27,7 +27,7 @@ env_logger = "0.11"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "Element"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "Element", "HtmlElement", "HtmlAnchorElement", "Node", "Blob", "BlobPropertyBag", "Url"] }
 
 [profile.release]
 opt-level = 3

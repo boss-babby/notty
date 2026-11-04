@@ -3,12 +3,19 @@
 
 mod app;
 mod auth;
+mod database;
+mod dates;
 mod editor;
 mod icons;
+mod io;
 mod lock;
 mod model;
+mod platform;
 mod theme;
 mod widgets;
+
+#[cfg(test)]
+mod tests;
 
 pub use app::LumenApp;
 

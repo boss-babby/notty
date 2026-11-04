@@ -10,11 +10,13 @@ use egui::{
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, now_ms, Credential};
-use crate::editor::{self, EditorState};
+use crate::editor::{self, EditorState, Req};
+use crate::io as nio;
+use crate::platform;
 use crate::icons::{self, Icon};
 use crate::lock::{LockEvent, LockScreen};
-use crate::model::{Page, PageKind, Workspace};
-use crate::theme::{self, bold, body, lerp_color, Palette};
+use crate::model::{Page, PageKind, Workspace, TEMPLATES};
+use crate::theme::{self, bold, body, lerp_color, Palette, ACCENTS};
 use crate::widgets::{
     appear, field, icon_button, menu_item, popup_area, primary_button, reset_appear, section_label, with_alpha,
 };
@@ -48,7 +50,15 @@ enum Ev {
 enum PalAct {
     Open(u64),
     NewPage,
-    NewBoard,
+    NewDb,
+    Journal,
+    Templates,
+    Import,
+    ExportMd,
+    ExportCsv,
+    Backup,
+    Focus,
+    Help,
     Theme,
     Lock,
     Sidebar,
@@ -59,6 +69,14 @@ struct PaletteState {
     query: String,
     sel: usize,
     focused: bool,
+    /// When set, the palette is picking a page to link into this block.
+    pick: Option<u64>,
+}
+
+#[derive(Default)]
+struct ImportDialog {
+    name: String,
+    text: String,
 }
 
 #[derive(Default)]
@@ -94,6 +112,12 @@ pub struct LumenApp {
     last_active: f64,
     shown_page: Option<u64>,
     focus_title: Option<u64>,
+    import: Option<ImportDialog>,
+    templates_open: bool,
+    help_open: bool,
+    page_menu: Option<Pos2>,
+    focus_mode: bool,
+    last_accent: usize,
 }
 
 impl LumenApp {
@@ -104,6 +128,11 @@ impl LumenApp {
             Some(s) => (s.ws, s.cred, s.skipped),
             None => (Workspace::seed(), None, false),
         };
+        let mut ws = ws;
+        ws.migrate();
+        if ws.current.map_or(true, |c| ws.page(c).is_none()) {
+            ws.current = ws.pages.iter().find(|p| !p.trashed && !p.row).map(|p| p.id);
+        }
         let locked = cred.is_some() || !skipped;
         Self {
             ws,
@@ -124,6 +153,12 @@ impl LumenApp {
             last_active: now_ms() / 1000.0,
             shown_page: None,
             focus_title: None,
+            import: None,
+            templates_open: false,
+            help_open: false,
+            page_menu: None,
+            focus_mode: false,
+            last_accent: usize::MAX,
         }
     }
 
@@ -134,6 +169,80 @@ impl LumenApp {
     fn new_page(&mut self, parent: Option<u64>, kind: PageKind) {
         let id = self.ws.add_page(parent, kind);
         self.focus_title = Some(id);
+    }
+
+    fn link_block(&mut self, page: u64, bid: u64, target: u64) {
+        if let Some(b) = self.ws.page_mut(page).and_then(|p| p.blocks.iter_mut().find(|b| b.id == bid)) {
+            b.link = Some(target);
+        }
+    }
+
+    fn handle_req(&mut self, req: Req, cur: u64) {
+        match req {
+            Req::NewPage(bid) => {
+                let id = self.ws.add_page(Some(cur), PageKind::Doc);
+                self.ws.current = Some(cur);
+                self.link_block(cur, bid, id);
+                self.toast("Sub-page created — click the link to open it", None);
+            }
+            Req::NewDb(bid, vk) => {
+                let id = self.ws.add_database(Some(cur), vk);
+                self.ws.current = Some(cur);
+                self.link_block(cur, bid, id);
+                self.toast("Database created — click the link to open it", None);
+            }
+            Req::PickLink(bid) => {
+                self.palette = Some(PaletteState { query: String::new(), sel: 0, focused: false, pick: Some(bid) });
+            }
+        }
+    }
+
+    fn export_md(&mut self) {
+        let Some(cur) = self.ws.current else { return };
+        let md = nio::page_markdown(&self.ws, cur);
+        let name = format!("{}.md", nio::file_safe(&self.ws.display_title(cur)));
+        let msg = platform::save_download(&name, md.as_bytes(), "text/markdown");
+        self.toast(msg, None);
+    }
+
+    fn export_csv(&mut self) {
+        let Some(cur) = self.ws.current else { return };
+        if self.ws.db(cur).is_none() {
+            self.toast("Open a database to export it as CSV", None);
+            return;
+        }
+        let csv = nio::db_csv(&self.ws, cur);
+        let name = format!("{}.csv", nio::file_safe(&self.ws.display_title(cur)));
+        let msg = platform::save_download(&name, csv.as_bytes(), "text/csv");
+        self.toast(msg, None);
+    }
+
+    fn backup(&mut self) {
+        match serde_json::to_vec_pretty(&self.ws) {
+            Ok(b) => {
+                let msg = platform::save_download("lumen-backup.json", &b, "application/json");
+                self.toast(msg, None);
+            }
+            Err(_) => self.toast("Could not create backup", None),
+        }
+    }
+
+    fn import_text(&mut self, name: &str, text: &str, csv: bool) {
+        let name = name.trim();
+        let name = if name.is_empty() { "Imported" } else { name };
+        if csv {
+            match nio::import_csv(&mut self.ws, name, text, None) {
+                Some(id) => {
+                    self.ws.current = Some(id);
+                    self.toast("Imported as a database", None);
+                }
+                None => self.toast("That doesn't look like CSV (need a header and at least one row)", None),
+            }
+        } else {
+            let id = nio::import_markdown(&mut self.ws, name, text, None);
+            self.ws.current = Some(id);
+            self.toast("Imported as a page", None);
+        }
     }
 
     fn lock_now(&mut self) {
@@ -152,7 +261,20 @@ impl LumenApp {
         match a {
             PalAct::Open(id) => self.ws.current = Some(id),
             PalAct::NewPage => self.new_page(None, PageKind::Doc),
-            PalAct::NewBoard => self.new_page(None, PageKind::Board),
+            PalAct::NewDb => self.new_page(None, PageKind::Database),
+            PalAct::Journal => self.ws.open_today(),
+            PalAct::Templates => self.templates_open = true,
+            PalAct::Import => self.import = Some(ImportDialog::default()),
+            PalAct::ExportMd => self.export_md(),
+            PalAct::ExportCsv => self.export_csv(),
+            PalAct::Backup => self.backup(),
+            PalAct::Help => self.help_open = true,
+            PalAct::Focus => {
+                self.focus_mode = !self.focus_mode;
+                if self.focus_mode {
+                    self.toast("Focus mode — press Ctrl+. to exit", None);
+                }
+            }
             PalAct::Theme => self.ws.dark = !self.ws.dark,
             PalAct::Lock => {
                 if self.cred.is_some() {
@@ -208,13 +330,19 @@ impl LumenApp {
 
         // quick actions
         if simple_row(ui, pal, "sr_search", w, Icon::Search, "Search", Some("Ctrl K")) {
-            self.palette = Some(PaletteState { query: String::new(), sel: 0, focused: false });
+            self.palette = Some(PaletteState { query: String::new(), sel: 0, focused: false, pick: None });
         }
         if simple_row(ui, pal, "sr_new", w, Icon::Plus, "New page", None) {
             self.new_page(None, PageKind::Doc);
         }
-        if simple_row(ui, pal, "sr_board", w, Icon::Board, "New board", None) {
-            self.new_page(None, PageKind::Board);
+        if simple_row(ui, pal, "sr_board", w, Icon::Board, "New database", None) {
+            self.new_page(None, PageKind::Database);
+        }
+        if simple_row(ui, pal, "sr_journal", w, Icon::Page, "Today's journal", Some("Ctrl J")) {
+            self.run(PalAct::Journal);
+        }
+        if simple_row(ui, pal, "sr_tpl", w, Icon::Duplicate, "Templates", None) {
+            self.templates_open = true;
         }
         ui.add_space(8.0);
 
@@ -331,6 +459,11 @@ impl LumenApp {
         let (updated, fav) = self.ws.page(cur).map(|p| (p.updated, p.favorite)).unwrap_or((0.0, false));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(10.0);
+            let r = icon_button(ui, pal, Icon::Dots, 16.0, "Page options");
+            if r.clicked() {
+                self.page_menu = Some(r.rect.left_bottom() + vec2(-220.0, 6.0));
+                self.fresh = true;
+            }
             let (lock_icon, tip) = if self.cred.is_some() { (Icon::Lock, "Lock workspace  (Ctrl+L)") } else { (Icon::Shield, "Set a password") };
             if icon_button(ui, pal, lock_icon, 16.0, tip).clicked() {
                 self.run(PalAct::Lock);
@@ -340,7 +473,7 @@ impl LumenApp {
                 self.ws.dark = !self.ws.dark;
             }
             if icon_button(ui, pal, Icon::Search, 16.0, "Search  (Ctrl+K)").clicked() {
-                self.palette = Some(PaletteState { query: String::new(), sel: 0, focused: false });
+                self.palette = Some(PaletteState { query: String::new(), sel: 0, focused: false, pick: None });
             }
             let (si, st) = if fav { (Icon::StarFilled, "Remove from favorites") } else { (Icon::Star, "Add to favorites") };
             let r = icon_button(ui, pal, si, 16.0, st);
@@ -404,13 +537,21 @@ impl LumenApp {
             scored.sort_by_key(|s| s.0);
             out.extend(scored.into_iter().take(8).map(|(_, a, i, t, s)| (a, i, t, s)));
         }
-        let actions: [(PalAct, &str, &str, &str); 6] = [
-            (PalAct::NewPage, "＋", "New page", "Create a blank page"),
-            (PalAct::NewBoard, "▥", "New board", "Create a kanban board"),
+        let actions: [(PalAct, &str, &str, &str); 14] = [
+            (PalAct::NewPage, "+", "New page", "Create a blank page"),
+            (PalAct::NewDb, "▥", "New database", "Table, board, list, gallery or calendar"),
+            (PalAct::Journal, "📖", "Today's journal", "Open or create today's entry  (Ctrl+J)"),
+            (PalAct::Templates, "▦", "Browse templates", "Meeting notes, trackers, wiki…"),
+            (PalAct::Import, "⇩", "Import…", "Markdown, CSV or a workspace backup"),
+            (PalAct::ExportMd, "⇧", "Export page as Markdown", "Download the current page"),
+            (PalAct::ExportCsv, "⇧", "Export database as CSV", "Download the current database"),
+            (PalAct::Backup, "📦", "Back up workspace", "Download everything as JSON"),
+            (PalAct::Focus, "◎", "Toggle focus mode", "Hide sidebar and top bar  (Ctrl+.)"),
             (PalAct::Theme, "◐", "Toggle theme", "Switch between light and dark"),
             (PalAct::Lock, "🔒", "Lock workspace", "Require your password again"),
             (PalAct::Sidebar, "◧", "Toggle sidebar", "Show or hide the sidebar"),
             (PalAct::Trash, "🗑", "Open trash", "Restore deleted pages"),
+            (PalAct::Help, "⌨", "Keyboard shortcuts", "Everything you can do without the mouse  (Ctrl+/)"),
         ];
         for (a, i, t, s) in actions {
             if q.is_empty() || t.to_lowercase().contains(&q) {
@@ -422,12 +563,16 @@ impl LumenApp {
 
     fn palette_ui(&mut self, ctx: &Context, pal: &Palette) {
         let Some(mut st) = self.palette.take() else { return };
-        let items = self.palette_items(&st.query);
+        let mut items = self.palette_items(&st.query);
+        if st.pick.is_some() {
+            items.retain(|i| matches!(i.0, PalAct::Open(_)));
+        }
         let len = items.len();
         if len > 0 {
             st.sel = st.sel.min(len - 1);
         }
         let mut exec: Option<PalAct> = None;
+        let st_pick = st.pick;
         if len > 0 {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
                 st.sel = (st.sel + 1) % len;
@@ -458,7 +603,7 @@ impl LumenApp {
                         .font(body(18.0))
                         .desired_width(520.0)
                         .margin(Margin::symmetric(4, 10))
-                        .hint_text(RichText::new("Search pages or run a command…").color(with_alpha(pal.muted, 0.8))),
+                        .hint_text(RichText::new(if st.pick.is_some() { "Link to which page?" } else { "Search pages or run a command…" }).color(with_alpha(pal.muted, 0.8))),
                 );
                 if before != st.query {
                     st.sel = 0;
@@ -494,7 +639,15 @@ impl LumenApp {
         } else {
             reset_appear(ctx, Id::new("palette").with("a"));
             if let Some(a) = exec {
-                self.run(a);
+                match (st_pick, a) {
+                    (Some(bid), PalAct::Open(t)) => {
+                        if let Some(cur) = self.ws.current {
+                            self.link_block(cur, bid, t);
+                        }
+                    }
+                    (Some(_), _) => {}
+                    (None, a) => self.run(a),
+                }
             }
         }
     }
@@ -511,10 +664,10 @@ impl LumenApp {
             if menu_item(ui, pal, if fav { "☆" } else { "★" }, if fav { "Remove from favorites" } else { "Add to favorites" }, None, false, false).clicked() {
                 act = Some(0);
             }
-            if menu_item(ui, pal, "⧉", "Duplicate", None, false, false).clicked() {
+            if menu_item(ui, pal, "⎘", "Duplicate", None, false, false).clicked() {
                 act = Some(1);
             }
-            if menu_item(ui, pal, "＋", "Add sub-page", None, false, false).clicked() {
+            if menu_item(ui, pal, "+", "Add sub-page", None, false, false).clicked() {
                 act = Some(2);
             }
             ui.add_space(3.0);
@@ -550,8 +703,10 @@ impl LumenApp {
         let mut act: Option<u8> = None;
         let has_pw = self.cred.is_some();
         let dark = self.ws.dark;
+        let accent = self.ws.accent;
+        let mut acc_pick: Option<usize> = None;
         let name = &mut self.ws.name;
-        let open = popup_area(ctx, Id::new("ws_menu"), pos, pal, &mut self.fresh, 252.0, |ui| {
+        let open = popup_area(ctx, Id::new("ws_menu"), pos, pal, &mut self.fresh, 286.0, |ui| {
             section_label(ui, pal, "WORKSPACE");
             ui.horizontal(|ui| {
                 ui.add_space(6.0);
@@ -569,10 +724,43 @@ impl LumenApp {
             if menu_item(ui, pal, "🔑", if has_pw { "Change or remove password…" } else { "Set a password…" }, None, false, false).clicked() {
                 act = Some(2);
             }
-            if menu_item(ui, pal, "⧉", "Copy workspace as JSON", None, false, false).clicked() {
+            if menu_item(ui, pal, "▦", "Templates…", None, false, false).clicked() {
+                act = Some(4);
+            }
+            if menu_item(ui, pal, "⇩", "Import Markdown / CSV / backup…", None, false, false).clicked() {
+                act = Some(5);
+            }
+            if menu_item(ui, pal, "📦", "Back up workspace (download JSON)", None, false, false).clicked() {
+                act = Some(6);
+            }
+            if menu_item(ui, pal, "⎘", "Copy workspace as JSON", None, false, false).clicked() {
                 act = Some(3);
             }
+            if menu_item(ui, pal, "⌨", "Keyboard shortcuts", None, false, false).clicked() {
+                act = Some(7);
+            }
+            ui.add_space(3.0);
+            ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
+            ui.add_space(4.0);
+            section_label(ui, pal, "ACCENT COLOUR");
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                for (i, (nm, (r, g, b))) in ACCENTS.iter().enumerate() {
+                    let (rc, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+                    let col = Color32::from_rgb(*r, *g, *b);
+                    ui.painter().circle_filled(rc.center(), 9.0 + if resp.hovered() { 1.5 } else { 0.0 }, col);
+                    if accent == i {
+                        ui.painter().circle_stroke(rc.center(), 12.0, Stroke::new(1.6_f32, pal.text));
+                    }
+                    if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(*nm).clicked() {
+                        acc_pick = Some(i);
+                    }
+                }
+            });
         });
+        if let Some(i) = acc_pick {
+            self.ws.accent = i;
+        }
         if !open || act.is_some() {
             self.ws_menu = None;
         }
@@ -586,6 +774,10 @@ impl LumenApp {
                     self.toast("Workspace JSON copied to clipboard", None);
                 }
             }
+            Some(4) => self.templates_open = true,
+            Some(5) => self.import = Some(ImportDialog::default()),
+            Some(6) => self.backup(),
+            Some(7) => self.help_open = true,
             _ => {}
         }
     }
@@ -598,7 +790,7 @@ impl LumenApp {
             .ws
             .pages
             .iter()
-            .filter(|p| p.trashed)
+            .filter(|p| p.trashed && !p.parent.and_then(|pp| self.ws.page(pp)).map_or(false, |pp| pp.trashed))
             .map(|p| (p.id, if p.title.is_empty() { "Untitled".into() } else { p.title.clone() }, p.icon.clone()))
             .collect();
         let mut restore: Option<u64> = None;
@@ -666,6 +858,284 @@ impl LumenApp {
         if !open {
             self.trash_open = false;
             reset_appear(ctx, Id::new("trash").with("a"));
+        }
+    }
+
+    fn page_menu_ui(&mut self, ctx: &Context, pal: &Palette) {
+        let Some(pos) = self.page_menu else { return };
+        let Some(cur) = self.ws.current else {
+            self.page_menu = None;
+            return;
+        };
+        let Some(page) = self.ws.page(cur) else {
+            self.page_menu = None;
+            return;
+        };
+        let (small, full, is_db) = (page.small_text, page.full_width, page.db.is_some());
+        let (words, chars) = (nio::word_count(page), nio::char_count(page));
+        let mut act: Option<u8> = None;
+        let open = popup_area(ctx, Id::new("page_menu"), pos, pal, &mut self.fresh, 262.0, |ui| {
+            section_label(ui, pal, "PAGE STYLE");
+            if menu_item(ui, pal, "Aa", if small { "Normal text size" } else { "Small text" }, None, false, false).clicked() {
+                act = Some(0);
+            }
+            if menu_item(ui, pal, "↔", if full { "Standard page width" } else { "Full width" }, None, false, false).clicked() {
+                act = Some(1);
+            }
+            ui.add_space(3.0);
+            ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
+            ui.add_space(4.0);
+            if menu_item(ui, pal, "⎘", "Duplicate", None, false, false).clicked() {
+                act = Some(2);
+            }
+            if menu_item(ui, pal, "⇧", "Export as Markdown", Some("Downloads a .md file"), false, false).clicked() {
+                act = Some(3);
+            }
+            if menu_item(ui, pal, "⎘", "Copy as Markdown", None, false, false).clicked() {
+                act = Some(4);
+            }
+            if is_db && menu_item(ui, pal, "⇧", "Export as CSV", Some("Downloads a .csv file"), false, false).clicked() {
+                act = Some(5);
+            }
+            ui.add_space(3.0);
+            ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
+            ui.add_space(4.0);
+            if !is_db {
+                let mins = ((words as f32) / 220.0).ceil().max(1.0) as usize;
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(format!("{words} words · {chars} characters · ~{mins} min read")).font(body(12.0)).color(pal.muted));
+                });
+                ui.add_space(4.0);
+            }
+            if menu_item(ui, pal, "🗑", "Move to trash", None, false, true).clicked() {
+                act = Some(6);
+            }
+        });
+        if !open || act.is_some() {
+            self.page_menu = None;
+        }
+        match act {
+            Some(0) => {
+                if let Some(p) = self.ws.page_mut(cur) {
+                    p.small_text = !p.small_text;
+                }
+            }
+            Some(1) => {
+                if let Some(p) = self.ws.page_mut(cur) {
+                    p.full_width = !p.full_width;
+                }
+            }
+            Some(2) => {
+                self.ws.duplicate(cur);
+            }
+            Some(3) => self.export_md(),
+            Some(4) => {
+                ctx.copy_text(nio::page_markdown(&self.ws, cur));
+                self.toast("Markdown copied to clipboard", None);
+            }
+            Some(5) => self.export_csv(),
+            Some(6) => {
+                self.ws.set_trashed(cur, true);
+                self.toast("Moved to trash", Some(cur));
+            }
+            _ => {}
+        }
+    }
+
+    fn templates_ui(&mut self, ctx: &Context, pal: &Palette) {
+        if !self.templates_open {
+            return;
+        }
+        let mut pick: Option<usize> = None;
+        let open = modal(ctx, Id::new("templates"), pal, 640.0, 90.0, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.label(RichText::new("Templates").font(bold(20.0)));
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.label(RichText::new("Start from a ready-made page or database. Everything is editable.").font(body(13.5)).color(pal.muted));
+            });
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
+                for (i, (name, icon, desc)) in TEMPLATES.iter().enumerate() {
+                    let (r, resp) = ui.allocate_exact_size(vec2(296.0, 74.0), Sense::click());
+                    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+                    ui.painter().rect_filled(r, 10.0, with_alpha(pal.hover, 0.5 + 0.5 * t));
+                    ui.painter().rect_stroke(r, 10.0, Stroke::new(1.2_f32, lerp_color(pal.border, pal.accent, t)), egui::StrokeKind::Inside);
+                    ui.painter().text(pos2(r.left() + 30.0, r.center().y), Align2::CENTER_CENTER, *icon, body(28.0), pal.text);
+                    ui.painter().text(pos2(r.left() + 62.0, r.center().y - 11.0), Align2::LEFT_CENTER, *name, bold(14.5), pal.text);
+                    ui.painter().with_clip_rect(r.shrink(6.0)).text(pos2(r.left() + 62.0, r.center().y + 10.0), Align2::LEFT_CENTER, *desc, body(12.0), pal.muted);
+                    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                        pick = Some(i);
+                    }
+                }
+            });
+            ui.add_space(8.0);
+        });
+        if let Some(i) = pick {
+            let id = self.ws.add_template(i, None);
+            self.focus_title = Some(id);
+            self.templates_open = false;
+            reset_appear(ctx, Id::new("templates").with("a"));
+        } else if !open {
+            self.templates_open = false;
+            reset_appear(ctx, Id::new("templates").with("a"));
+        }
+    }
+
+    fn import_ui(&mut self, ctx: &Context, pal: &Palette) {
+        let Some(mut dlg) = self.import.take() else { return };
+        let mut action: Option<u8> = None;
+        let open = modal(ctx, Id::new("import"), pal, 620.0, 80.0, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.label(RichText::new("Import").font(bold(20.0)));
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.label(RichText::new("Paste Markdown, CSV or a Lumen backup — or just drop a file onto the window.").font(body(13.5)).color(pal.muted));
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                field(ui, pal, pal.bg, &mut dlg.name, "Name of the new page or database", false, 580.0, Id::new("imp_name"));
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                Frame::new().fill(pal.bg).stroke(Stroke::new(1.0_f32, pal.border)).corner_radius(CornerRadius::same(9)).inner_margin(Margin::same(10)).show(ui, |ui| {
+                    ScrollArea::vertical().max_height(230.0).show(ui, |ui| {
+                        ui.add(TextEdit::multiline(&mut dlg.text).desired_width(556.0).desired_rows(11).frame(false).font(egui::FontId::monospace(13.0)).hint_text("# My notes\n\n- paste your content here"));
+                    });
+                });
+            });
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                if primary_button(ui, pal, "Markdown → page", 190.0).clicked() {
+                    action = Some(0);
+                }
+                if primary_button(ui, pal, "CSV → database", 170.0).clicked() {
+                    action = Some(1);
+                }
+                if crate::widgets::ghost_button(ui, pal, "Restore backup (replaces all)").clicked() {
+                    action = Some(2);
+                }
+            });
+            ui.add_space(8.0);
+        });
+        let mut keep = open;
+        match action {
+            Some(0) | Some(1) if dlg.text.trim().is_empty() => self.toast("Paste some content first", None),
+            Some(0) => {
+                self.import_text(&dlg.name, &dlg.text, false);
+                keep = false;
+            }
+            Some(1) => {
+                self.import_text(&dlg.name, &dlg.text, true);
+                keep = false;
+            }
+            Some(2) => match serde_json::from_str::<Workspace>(&dlg.text) {
+                Ok(mut w) => {
+                    w.migrate();
+                    self.ws = w;
+                    self.toast("Workspace restored from backup", None);
+                    keep = false;
+                }
+                Err(_) => self.toast("That isn't a valid Lumen backup", None),
+            },
+            _ => {}
+        }
+        if keep {
+            self.import = Some(dlg);
+        } else {
+            reset_appear(ctx, Id::new("import").with("a"));
+        }
+    }
+
+    fn help_ui(&mut self, ctx: &Context, pal: &Palette) {
+        if !self.help_open {
+            return;
+        }
+        let groups: [(&str, &[(&str, &str)]); 3] = [
+            (
+                "GENERAL",
+                &[
+                    ("Ctrl K  /  Ctrl P", "Search & command palette"),
+                    ("Ctrl N", "New page"),
+                    ("Ctrl J", "Today's journal"),
+                    ("Ctrl \\", "Toggle sidebar"),
+                    ("Ctrl .", "Focus mode"),
+                    ("Ctrl L", "Lock workspace"),
+                    ("Ctrl Shift L", "Light / dark theme"),
+                    ("Ctrl Shift E", "Export page as Markdown"),
+                    ("Ctrl /", "This help"),
+                ],
+            ),
+            (
+                "EDITING",
+                &[
+                    ("/", "Insert any block or database"),
+                    ("Enter  /  Shift Enter", "New block  /  line break"),
+                    ("Tab  /  Shift Tab", "Nest  /  un-nest a block"),
+                    ("Backspace at start", "Reset or merge block"),
+                    ("Ctrl B  /  Ctrl I", "Bold  /  italic"),
+                    ("Ctrl E", "Inline code"),
+                    ("Ctrl Shift S", "Strikethrough"),
+                    ("↑ ↓ at block edge", "Move between blocks"),
+                ],
+            ),
+            (
+                "MARKDOWN",
+                &[
+                    ("# , ## , ###", "Headings"),
+                    ("- , * ", "Bulleted list"),
+                    ("1. ", "Numbered list"),
+                    ("[] ", "To-do"),
+                    ("> ", "Toggle"),
+                    ("\" ", "Quote"),
+                    ("| ", "Callout"),
+                    ("```", "Code block"),
+                    ("---", "Divider"),
+                ],
+            ),
+        ];
+        let open = modal(ctx, Id::new("help"), pal, 760.0, 80.0, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                ui.label(RichText::new("Keyboard shortcuts").font(bold(20.0)));
+            });
+            ui.add_space(8.0);
+            ui.horizontal_top(|ui| {
+                for (title, rows) in groups.iter() {
+                    ui.vertical(|ui| {
+                        ui.set_width(238.0);
+                        section_label(ui, pal, title);
+                        for (k, d) in rows.iter() {
+                            ui.horizontal(|ui| {
+                                ui.add_space(6.0);
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 0.0;
+                                    ui.label(RichText::new(*k).font(bold(12.5)).color(pal.accent));
+                                    ui.label(RichText::new(*d).font(body(13.0)).color(pal.text));
+                                    ui.add_space(5.0);
+                                });
+                            });
+                        }
+                    });
+                }
+            });
+            ui.add_space(8.0);
+        });
+        if !open {
+            self.help_open = false;
+            reset_appear(ctx, Id::new("help").with("a"));
         }
     }
 
@@ -831,10 +1301,11 @@ impl eframe::App for LumenApp {
         // theme (animated)
         let target = if self.locked || self.ws.dark { 1.0 } else { 0.0 };
         let t = ctx.animate_value_with_time(Id::new("theme_t"), target, 0.35);
-        let pal = Palette::mix(t);
-        if !self.theme_applied || (t - self.last_theme_t).abs() > 1e-4 {
+        let pal = theme::with_accent(Palette::mix(t), self.ws.accent, t);
+        if !self.theme_applied || (t - self.last_theme_t).abs() > 1e-4 || self.last_accent != self.ws.accent {
             theme::apply(ctx, &pal, t > 0.5);
             self.last_theme_t = t;
+            self.last_accent = self.ws.accent;
             self.theme_applied = true;
         }
 
@@ -881,7 +1352,7 @@ impl eframe::App for LumenApp {
             self.ws.dark = !self.ws.dark;
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
-            self.palette = if self.palette.is_some() { None } else { Some(PaletteState { query: String::new(), sel: 0, focused: false }) };
+            self.palette = if self.palette.is_some() { None } else { Some(PaletteState { query: String::new(), sel: 0, focused: false, pick: None }) };
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::N)) {
             self.new_page(None, PageKind::Doc);
@@ -892,9 +1363,41 @@ impl eframe::App for LumenApp {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::L)) {
             self.run(PalAct::Lock);
         }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::J)) {
+            self.run(PalAct::Journal);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Slash)) {
+            self.help_open = !self.help_open;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Period)) {
+            self.run(PalAct::Focus);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::E)) {
+            self.export_md();
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::P)) {
+            self.palette = Some(PaletteState { query: String::new(), sel: 0, focused: false, pick: None });
+        }
+
+        // files dropped onto the window
+        let dropped: Vec<egui::DroppedFile> = ctx.input(|i| i.raw.dropped_files.clone());
+        for f in dropped {
+            let name = platform::file_name(&f);
+            let lower = name.to_lowercase();
+            let Some(bytes) = platform::dropped_bytes(&f) else { continue };
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            let stem = name.rsplit_once('.').map(|x| x.0.to_owned()).unwrap_or(name.clone());
+            if lower.ends_with(".csv") || lower.ends_with(".tsv") {
+                self.import_text(&stem, &text, true);
+            } else if lower.ends_with(".json") {
+                self.import = Some(ImportDialog { name: stem, text });
+            } else {
+                self.import_text(&stem, &text, false);
+            }
+        }
 
         // sidebar
-        let st = ctx.animate_bool_with_time_and_easing(Id::new("sidebar_t"), self.ws.sidebar_open, 0.28, egui::emath::easing::cubic_out);
+        let st = ctx.animate_bool_with_time_and_easing(Id::new("sidebar_t"), self.ws.sidebar_open && !self.focus_mode, 0.28, egui::emath::easing::cubic_out);
         if st > 0.003 {
             egui::SidePanel::left("sidebar")
                 .resizable(false)
@@ -910,12 +1413,14 @@ impl eframe::App for LumenApp {
                 });
         }
 
-        egui::TopBottomPanel::top("topbar")
-            .exact_height(46.0)
-            .frame(Frame::new().fill(pal.bg))
-            .show(ctx, |ui| {
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| self.topbar(ui, &pal));
-            });
+        if !self.focus_mode {
+            egui::TopBottomPanel::top("topbar")
+                .exact_height(46.0)
+                .frame(Frame::new().fill(pal.bg))
+                .show(ctx, |ui| {
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| self.topbar(ui, &pal));
+                });
+        }
 
         egui::CentralPanel::default().frame(Frame::new().fill(pal.bg)).show(ctx, |ui| {
             let Some(cur) = self.ws.current.filter(|id| self.ws.page(*id).map_or(false, |p| !p.trashed)) else {
@@ -950,16 +1455,27 @@ impl eframe::App for LumenApp {
             let ed = &mut self.ed;
             let mut changed = false;
             ScrollArea::vertical().id_salt(("page_scroll", cur)).auto_shrink([false, false]).show(ui, |ui| {
-                if let Some(page) = ws.pages.iter_mut().find(|p| p.id == cur) {
-                    changed = editor::show_page(ui, page, &mut ws.next_id, ed, &pal);
-                }
+                changed = editor::show_page(ui, ws, cur, ed, &pal);
             });
             if changed {
                 ws.touch(cur);
             }
         });
 
+        if let Some(id) = self.ed.nav.take() {
+            if self.ws.page(id).map_or(false, |p| !p.trashed) {
+                self.ws.current = Some(id);
+            }
+        }
+        if let (Some(req), Some(cur)) = (self.ed.req.take(), self.ws.current) {
+            self.handle_req(req, cur);
+        }
+
         self.row_menu_ui(ctx, &pal);
+        self.page_menu_ui(ctx, &pal);
+        self.templates_ui(ctx, &pal);
+        self.import_ui(ctx, &pal);
+        self.help_ui(ctx, &pal);
         self.ws_menu_ui(ctx, &pal);
         self.palette_ui(ctx, &pal);
         self.trash_ui(ctx, &pal);
@@ -1078,7 +1594,7 @@ fn page_row(ui: &mut Ui, pal: &Palette, key: Id, w: f32, depth: usize, page: &Pa
     // icon & title
     let ic = pos2(x0 + 32.0, rect.center().y);
     if page.icon.is_empty() {
-        icons::paint(p, ic, 15.0, if page.kind == PageKind::Board { Icon::Board } else { Icon::Page }, pal.muted);
+        icons::paint(p, ic, 15.0, if page.kind == PageKind::Database { Icon::Board } else { Icon::Page }, pal.muted);
     } else {
         p.text(ic, Align2::CENTER_CENTER, &page.icon, body(15.0), pal.text);
     }

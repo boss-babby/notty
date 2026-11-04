@@ -96,10 +96,38 @@ impl Palette {
 }
 
 /// Notion-style label colors used for board columns and tags.
-pub const TAG_NAMES: [&str; 6] = ["Gray", "Blue", "Green", "Orange", "Purple", "Red"];
+pub const TAG_NAMES: [&str; 9] = ["Gray", "Blue", "Green", "Orange", "Purple", "Red", "Yellow", "Pink", "Brown"];
 
 pub fn tag_color(i: usize) -> Color32 {
-    [c(155, 154, 151), c(51, 126, 169), c(68, 131, 97), c(217, 115, 13), c(144, 101, 176), c(212, 76, 71)][i % 6]
+    [
+        c(155, 154, 151),
+        c(51, 126, 169),
+        c(68, 131, 97),
+        c(217, 115, 13),
+        c(144, 101, 176),
+        c(212, 76, 71),
+        c(203, 145, 47),
+        c(193, 76, 138),
+        c(159, 107, 83),
+    ][i % 9]
+}
+
+/// Accent colour choices for the workspace.
+pub const ACCENTS: [(&str, (u8, u8, u8)); 6] = [
+    ("Blue", (35, 131, 226)),
+    ("Purple", (144, 101, 176)),
+    ("Green", (46, 160, 110)),
+    ("Orange", (217, 115, 13)),
+    ("Red", (212, 76, 71)),
+    ("Pink", (193, 76, 138)),
+];
+
+pub fn with_accent(mut p: Palette, idx: usize, t: f32) -> Palette {
+    let (_, (r, g, b)) = ACCENTS[idx % ACCENTS.len()];
+    let base = c(r, g, b);
+    p.accent = lerp_color(base, lerp_color(base, Color32::WHITE, 0.12), t);
+    p.accent_soft = lerp_color(p.bg, p.accent, 0.14);
+    p
 }
 
 pub const COVERS: [((u8, u8, u8), (u8, u8, u8)); 8] = [
