@@ -109,6 +109,24 @@ pub(crate) enum A {
     Reschedule,
 }
 
+/// True when `row` (transitively) depends on `target` through the dependency property `dp`. Iterative and cycle-safe.
+fn depends_on(ws: &Workspace, dp: u64, row: u64, target: u64) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![row];
+    while let Some(r) = stack.pop() {
+        if r == target {
+            return true;
+        }
+        if !seen.insert(r) {
+            continue;
+        }
+        if let Some(Val::Multi(preds)) = ws.page(r).and_then(|p| p.props.get(&dp)) {
+            stack.extend(preds.iter().copied());
+        }
+    }
+    false
+}
+
 fn col_w(k: PropKind) -> f32 {
     match k {
         PropKind::Text => 190.0,
@@ -129,6 +147,19 @@ fn col_w(k: PropKind) -> f32 {
 fn chip_paint(p: &Painter, left_center: Pos2, text: &str, color: usize, pal: &Palette) -> f32 {
     let col = tag_color(color);
     let g = p.layout_no_wrap(text.to_owned(), body(12.5), lerp_color(col, pal.text, 0.25));
+    let w = g.size().x + 14.0;
+    let r = Rect::from_min_size(pos2(left_center.x, left_center.y - 10.0), vec2(w, 20.0));
+    p.rect_filled(r, 10.0, col.gamma_multiply(0.2));
+    p.galley(pos2(r.left() + 7.0, r.center().y - g.size().y / 2.0), g, Color32::WHITE);
+    w
+}
+
+/// Like `chip_paint`, but the label is cut with an ellipsis so the chip never grows wider than `max_w`.
+fn chip_paint_fit(p: &Painter, left_center: Pos2, text: &str, color: usize, pal: &Palette, max_w: f32) -> f32 {
+    let col = tag_color(color);
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), body(12.5), lerp_color(col, pal.text, 0.25));
+    job.wrap = egui::text::TextWrapping::truncate_at_width((max_w - 14.0).max(8.0));
+    let g = p.layout_job(job);
     let w = g.size().x + 14.0;
     let r = Rect::from_min_size(pos2(left_center.x, left_center.y - 10.0), vec2(w, 20.0));
     p.rect_filled(r, 10.0, col.gamma_multiply(0.2));
@@ -409,10 +440,10 @@ fn cell(ui: &mut Ui, db: &Database, row: &Page, prop: &Prop, rect: Rect, pal: &P
             };
             for oid in ids {
                 if let Some(o) = db.opt(prop.id, oid) {
-                    if x > rect.right() - 20.0 {
+                    if x > rect.right() - 30.0 {
                         break;
                     }
-                    x += chip_paint(&clip, pos2(x, rect.center().y), &o.name, o.color, pal) + 5.0;
+                    x += chip_paint_fit(&clip, pos2(x, rect.center().y), &o.name, o.color, pal, rect.right() - 8.0 - x) + 5.0;
                 }
             }
             if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
@@ -443,9 +474,9 @@ fn cell(ui: &mut Ui, db: &Database, row: &Page, prop: &Prop, rect: Rect, pal: &P
             if let Some(b) = chk {
                 check_box(ui, pal, pos2(rect.left() + 18.0, cy), b);
             } else if right {
-                clip.text(pos2(rect.right() - 10.0, cy), Align2::RIGHT_CENTER, txt, body(14.0), pal.text);
+                crate::widgets::text_fit(&clip, pos2(rect.right() - 10.0, cy), Align2::RIGHT_CENTER, &txt, body(14.0), pal.text, rect.width() - 20.0);
             } else {
-                clip.text(pos2(rect.left() + 10.0, cy), Align2::LEFT_CENTER, txt, body(14.0), if err { pal.danger } else { pal.text });
+                crate::widgets::text_fit(&clip, pos2(rect.left() + 10.0, cy), Align2::LEFT_CENTER, &txt, body(14.0), if err { pal.danger } else { pal.text }, rect.width() - 20.0);
             }
             let tip = if prop.kind == PropKind::Formula { format!("Formula: {}", prop.cfg.formula) } else { format!("Rollup · {}", prop.cfg.rollup_fn.label()) };
             resp.on_hover_text(tip);
@@ -460,11 +491,11 @@ fn cell(ui: &mut Ui, db: &Database, row: &Page, prop: &Prop, rect: Rect, pal: &P
             let mut any = false;
             for rid in ids {
                 if let Some(t) = rel_title(rid) {
-                    if x > rect.right() - 20.0 {
+                    if x > rect.right() - 30.0 {
                         break;
                     }
                     any = true;
-                    x += chip_paint(&clip, pos2(x, rect.center().y), &t, 7, pal) + 5.0;
+                    x += chip_paint_fit(&clip, pos2(x, rect.center().y), &t, 7, pal, rect.right() - 8.0 - x) + 5.0;
                 }
             }
             if !any && resp.hovered() {
@@ -485,7 +516,7 @@ fn cell(ui: &mut Ui, db: &Database, row: &Page, prop: &Prop, rect: Rect, pal: &P
                     clip.text(pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, "Pick a date", body(13.5), with_alpha(pal.muted, 0.7));
                 }
             } else {
-                clip.text(pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, txt, body(14.0), pal.text);
+                crate::widgets::text_fit(&clip, pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, &txt, body(14.0), pal.text, rect.width() - 20.0);
             }
             if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                 let (y, m, _) = match val {
@@ -503,7 +534,11 @@ fn cell(ui: &mut Ui, db: &Database, row: &Page, prop: &Prop, rect: Rect, pal: &P
 
 #[allow(clippy::too_many_arguments)]
 fn table(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], st: &mut DbState, pal: &Palette, w: f32, acts: &mut Vec<A>) {
-    let total: f32 = TITLE_W + db.props.iter().map(|p| col_w(p.kind)).sum::<f32>() + 44.0;
+    // Phones: a narrower name column, the hover buttons shrink to "OPEN" only — nothing overlaps the title text.
+    let compact = w < 560.0;
+    let title_w: f32 = if compact { (w * 0.5).clamp(150.0, 230.0) } else { TITLE_W };
+    let btn_w: f32 = if compact { 62.0 } else { 92.0 };
+    let total: f32 = title_w + db.props.iter().map(|p| col_w(p.kind)).sum::<f32>() + 44.0;
     ScrollArea::horizontal().id_salt("table_scroll").auto_shrink([false, true]).show(ui, |ui| {
         ui.set_min_width(w.max(total.min(w)));
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
@@ -511,14 +546,14 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], st: &mut DbSt
         let (hr, _) = ui.allocate_exact_size(vec2(total, 32.0), Sense::hover());
         let mut x = hr.left();
         ui.painter().text(pos2(x + 8.0, hr.center().y), Align2::LEFT_CENTER, "Aa  Name", body(13.0), pal.muted);
-        x += TITLE_W;
+        x += title_w;
         for p in &db.props {
             let cw = col_w(p.kind);
             let r = Rect::from_min_size(pos2(x, hr.top()), vec2(cw, 32.0));
             let resp = ui.interact(r, Id::new(("th", p.id)), Sense::click());
             let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
             ui.painter().rect_filled(r, 0.0, with_alpha(pal.hover, t));
-            ui.painter().with_clip_rect(r).text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, format!("{}  {}", p.kind.glyph(), p.name), body(13.0), lerp_color(pal.muted, pal.text, t));
+            crate::widgets::text_fit(&ui.painter().with_clip_rect(r), pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, &format!("{}  {}", p.kind.glyph(), p.name), body(13.0), lerp_color(pal.muted, pal.text, t), cw - 16.0);
             if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                 open_popup_at(st, Popup::PropMenu { prop: p.id, pos: r.left_bottom() + vec2(0.0, 4.0) });
             }
@@ -542,14 +577,15 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], st: &mut DbSt
             ui.painter().rect_filled(rr, 0.0, with_alpha(pal.hover, t * 0.6));
             ui.painter().hline(rr.x_range(), rr.bottom(), Stroke::new(1.0_f32, pal.border));
             // title
-            let tr = Rect::from_min_size(rr.min, vec2(TITLE_W, ROW_H));
+            let t = if compact { 1.0 } else { t }; // touch screens have no hover: keep the OPEN button visible
+            let tr = Rect::from_min_size(rr.min, vec2(title_w, ROW_H));
             let tid = Id::new(("rt", row.id));
             if st.focus_row == Some(row.id) {
                 ui.ctx().memory_mut(|m| m.request_focus(tid));
                 st.focus_row = None;
             }
             let mut title = row.title.clone();
-            let ir = Rect::from_center_size(pos2(tr.left() + 8.0 + (TITLE_W - 92.0) / 2.0, tr.center().y), vec2(TITLE_W - 92.0, 24.0));
+            let ir = Rect::from_center_size(pos2(tr.left() + 8.0 + (title_w - btn_w - 8.0) / 2.0, tr.center().y), vec2(title_w - btn_w - 8.0, 24.0));
             let r = ui.put(
                 ir,
                 TextEdit::singleline(&mut title)
@@ -570,7 +606,7 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], st: &mut DbSt
                 acts.push(A::SetTitle(row.id, title));
             }
             if t > 0.05 {
-                let open = Rect::from_min_size(pos2(tr.right() - 74.0, tr.center().y - 11.0), vec2(46.0, 22.0));
+                let open = Rect::from_min_size(pos2(tr.right() - if compact { 52.0 } else { 74.0 }, tr.center().y - 11.0), vec2(46.0, 22.0));
                 let resp = ui.interact(open, Id::new(("ro", row.id)), Sense::click());
                 let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
                 ui.painter().rect_filled(open, 5.0, with_alpha(lerp_color(pal.active, pal.border, h), t));
@@ -578,16 +614,18 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], st: &mut DbSt
                 if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                     acts.push(A::Open(row.id));
                 }
-                let del = Rect::from_min_size(pos2(tr.right() - 26.0, tr.center().y - 11.0), vec2(22.0, 22.0));
-                let resp = ui.interact(del, Id::new(("rd", row.id)), Sense::click());
+                let del = Rect::from_min_size(pos2(tr.right() - 26.0, tr.center().y - 11.0), vec2(if compact { 0.0 } else { 22.0 }, 22.0));
+                let resp = ui.interact(del, Id::new(("rd", row.id)), if compact { Sense::hover() } else { Sense::click() });
                 let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-                icons::paint(ui.painter(), del.center(), 13.0, Icon::Trash, with_alpha(lerp_color(pal.muted, pal.danger, h), t));
+                if !compact {
+                    icons::paint(ui.painter(), del.center(), 13.0, Icon::Trash, with_alpha(lerp_color(pal.muted, pal.danger, h), t));
+                }
                 if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Delete row").clicked() {
                     acts.push(A::DelRow(row.id));
                 }
             }
             // props
-            let mut x = rr.left() + TITLE_W;
+            let mut x = rr.left() + title_w;
             for p in &db.props {
                 let cw = col_w(p.kind);
                 let cr = Rect::from_min_size(pos2(x, rr.top()), vec2(cw, ROW_H));
@@ -1796,6 +1834,11 @@ fn apply(ws: &mut Workspace, db_id: u64, a: A, ed: &mut EditorState) {
         }
         A::AddDep(succ, pred) => {
             let Some(dp) = ws.db(db_id).and_then(|d| d.views.get(d.active).and_then(|v| d.dep_prop(v, db_id))) else { return };
+            // a row can neither depend on itself nor (indirectly) on something that already depends on it
+            let exists = matches!(ws.page(succ).and_then(|p| p.props.get(&dp)), Some(Val::Multi(m)) if m.contains(&pred));
+            if !exists && (succ == pred || depends_on(ws, dp, pred, succ)) {
+                return;
+            }
             if let Some(r) = ws.page_mut(succ) {
                 let mut m = match r.props.get(&dp) {
                     Some(Val::Multi(m)) => m.clone(),

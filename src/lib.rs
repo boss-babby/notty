@@ -19,6 +19,7 @@ mod media;
 mod mediablocks;
 mod multisel;
 mod pdf;
+mod pdfnotes;
 mod pickers;
 mod rich;
 mod clip;

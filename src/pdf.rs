@@ -11,11 +11,17 @@
 //!   (almost) on screen, at the exact on-screen resolution. A small low-resolution preview per page and the tiles of the previous
 //!   zoom level are shown while sharp tiles are being produced. At most a few milliseconds of rendering are spent per frame so
 //!   the UI never freezes, and the texture cache is capped (LRU).
-//! * Closing the reader drops the parsed document, hayro's caches and every texture.
+//! * Closing the reader drops the parsed document, hayro's caches and every texture (and asks for one more frame so the GPU
+//!   copies are really released). While idle the tile cache shrinks to what is on screen.
+//! * **Crisp at every zoom**: each page is snapped to whole physical pixels and tiles are rendered at the *exact* on-screen
+//!   scale (1/4096 resolution) so one texel maps to one pixel — no resampling blur, also below 100 %.
+//! * **Annotations** (`pdfnotes.rs`): highlight, underline, strike-through, sticky notes with comments, freehand pen, eraser;
+//!   stored in the workspace per document and exportable as Markdown.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use egui::load::{BytesPoll, Bytes};
 use egui::{
@@ -34,6 +40,8 @@ use hayro::RenderSettings;
 use crate::auth::now_ms;
 use crate::icons;
 use crate::lucide as l;
+use crate::model::PdfAnnot;
+use crate::pdfnotes::{self, Notes, Tool};
 use crate::theme::{bold, body, Palette};
 use crate::widgets::with_alpha;
 
@@ -51,10 +59,15 @@ const TOOLBAR_H: f32 = 52.0;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 6.0;
 const THUMB_W: u32 = 240;
+/// Render scale resolution: tiles are rendered at `qs / SCALE_Q` pixels per point (error < 0.01 % → no visible resampling).
+const SCALE_Q: f32 = 4096.0;
+/// Texture memory budget of the tile cache (bytes).
 #[cfg(target_arch = "wasm32")]
-const MAX_TILES: usize = 72;
+const MAX_TILE_BYTES: usize = 40 << 20;
 #[cfg(not(target_arch = "wasm32"))]
-const MAX_TILES: usize = 140;
+const MAX_TILE_BYTES: usize = 96 << 20;
+/// After this long without input the cache is trimmed to the tiles that are on screen.
+const IDLE_TRIM_MS: f64 = 2500.0;
 const MAX_THUMBS: usize = 64;
 /// Rendering budget per frame (milliseconds); at least one tile is always rendered.
 const FRAME_BUDGET_MS: f64 = 12.0;
@@ -115,7 +128,7 @@ enum OpenErr {
 struct Engine {
     cache: hayro::RenderCache<'static>,
     pdf: Box<Pdf>,
-    dims: Vec<(f32, f32)>,
+    dims: Arc<[(f32, f32)]>,
 }
 
 impl Engine {
@@ -126,7 +139,8 @@ impl Engine {
             Err(LoadPdfError::Decryption(_)) => return Err(OpenErr::Locked),
             Err(_) => return Err(OpenErr::Invalid("This file is not a valid PDF (or is damaged).".into())),
         };
-        let dims: Vec<(f32, f32)> = guarded(|| pdf.pages().iter().map(|p| p.render_dimensions()).map(|(w, h)| (w.max(1.0), h.max(1.0))).collect())
+        let dims: Arc<[(f32, f32)]> = guarded(|| pdf.pages().iter().map(|p| p.render_dimensions()).map(|(w, h)| (w.max(1.0), h.max(1.0))).collect::<Vec<_>>())
+            .map(Arc::from)
             .ok_or_else(|| OpenErr::Invalid("The page tree of this PDF is damaged.".into()))?;
         if dims.is_empty() {
             return Err(OpenErr::Invalid("This PDF has no pages.".into()));
@@ -172,6 +186,8 @@ impl Engine {
 
 enum Load {
     Fetch(String),
+    /// Bytes are in memory, parsing starts on the next frame so the reader appears instantly.
+    Opening(Arc<[u8]>),
     Locked { data: Arc<[u8]>, input: String, wrong: bool },
     Failed(String),
     Ready,
@@ -208,6 +224,12 @@ struct Reader {
     goto: String,
     page: usize,
     first_frame: bool,
+    notes: Notes,
+    /// Milliseconds it took to parse the document (shown in the title bar).
+    open_ms: f64,
+    /// Time of the last user input / render activity (for the idle trim).
+    active_at: f64,
+    trim_armed: bool,
 }
 
 thread_local! {
@@ -222,13 +244,13 @@ fn bytes_to_arc(b: Bytes) -> Arc<[u8]> {
 }
 
 impl Reader {
-    fn new(req: &mut Request) -> Reader {
+    fn new(req: &mut Request, annots: Vec<PdfAnnot>) -> Reader {
         let (load, remote) = match req.source.take() {
             Some(Source::Remote(url)) => (Load::Fetch(url.clone()), Some(url)),
-            Some(Source::Local(data)) => (Load::Locked { data, input: String::new(), wrong: false }, None),
+            Some(Source::Local(data)) => (Load::Opening(data), None),
             None => (Load::Failed("Nothing to show".into()), None),
         };
-        let mut r = Reader {
+        let r = Reader {
             key: req.key,
             title: req.title.clone(),
             remote,
@@ -249,18 +271,19 @@ impl Reader {
             goto: String::new(),
             page: 0,
             first_frame: true,
+            notes: Notes::new(annots),
+            open_ms: 0.0,
+            active_at: now_ms(),
+            trim_armed: false,
         };
-        // local documents are opened right away (no password first)
-        if let Load::Locked { data, .. } = &r.load {
-            let data = data.clone();
-            r.try_open(data, "");
-        }
         r
     }
 
     fn try_open(&mut self, data: Arc<[u8]>, pw: &str) {
+        let t0 = now_ms();
         match Engine::new(data.clone(), pw) {
             Ok(e) => {
+                self.open_ms = now_ms() - t0;
                 self.engine = Some(e);
                 self.load = Load::Ready;
             }
@@ -307,7 +330,8 @@ fn page_at(lay: &Lay, y: f32) -> usize {
 // ───────────────────────────── UI ─────────────────────────────
 
 /// Draws the reader when a request is pending. Returns true while it is open (callers should hide web iframes etc.).
-pub fn reader_ui(ctx: &Context, req: &mut Option<Request>, pal: &Palette) -> bool {
+/// `annots` is the workspace's annotation store; changes made in the reader are written back immediately.
+pub fn reader_ui(ctx: &Context, req: &mut Option<Request>, annots: &mut BTreeMap<u64, Vec<PdfAnnot>>, pal: &Palette) -> bool {
     let Some(r) = req.as_mut() else {
         close_reader(ctx);
         return false;
@@ -316,14 +340,21 @@ pub fn reader_ui(ctx: &Context, req: &mut Option<Request>, pal: &Palette) -> boo
         let mut g = cell.borrow_mut();
         if g.as_ref().map_or(true, |x| x.key != r.key) {
             if let Some(old) = g.take() {
-                if let Some(u) = old.remote {
-                    ctx.forget_image(&u);
-                }
+                release(ctx, old);
             }
-            *g = Some(Reader::new(r));
+            *g = Some(Reader::new(r, annots.get(&r.key).cloned().unwrap_or_default()));
         }
         let rd = g.as_mut().expect("reader");
-        draw(rd, ctx, pal)
+        let keep = draw(rd, ctx, pal);
+        if rd.notes.dirty {
+            rd.notes.dirty = false;
+            if rd.notes.list.is_empty() {
+                annots.remove(&rd.key);
+            } else {
+                annots.insert(rd.key, rd.notes.list.clone());
+            }
+        }
+        keep
     });
     if !keep {
         *req = None;
@@ -333,15 +364,22 @@ pub fn reader_ui(ctx: &Context, req: &mut Option<Request>, pal: &Palette) -> boo
     true
 }
 
+/// Drops a reader: document, hayro caches, tile + preview textures and the remote download.
+fn release(ctx: &Context, old: Reader) {
+    if let Some(u) = &old.remote {
+        ctx.forget_image(u);
+    }
+    drop(old);
+    // textures are freed on the GPU when the next frame is finished
+    ctx.request_repaint();
+}
+
 /// Releases the document, caches and textures.
 pub fn close_reader(ctx: &Context) {
-    READER.with(|cell| {
-        if let Some(old) = cell.borrow_mut().take() {
-            if let Some(u) = &old.remote {
-                ctx.forget_image(u);
-            }
-        }
-    });
+    let old = READER.with(|cell| cell.borrow_mut().take());
+    if let Some(old) = old {
+        release(ctx, old);
+    }
 }
 
 fn tb_button(ui: &mut Ui, pal: &Palette, rect: Rect, id: &str, glyph: &str, tip: &str, enabled: bool, active: bool) -> bool {
@@ -362,12 +400,25 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
     rd.frame += 1;
     let screen = ctx.screen_rect();
     let narrow = screen.width() < 640.0;
+    let tiny = screen.width() < 470.0;
     let mut keep = true;
     let mut zoom_req: Option<(f32, egui::Pos2)> = None;
     let mut goto_req: Option<usize> = None;
     let mut fit: Option<bool> = None;
     let mut scroll_by: Option<f32> = None;
     let editing = ctx.memory(|m| m.focused()).is_some();
+    if ctx.input(|i| !i.events.is_empty() || i.pointer.velocity().length() > 0.0 || i.smooth_scroll_delta != Vec2::ZERO) {
+        rd.active_at = now_ms();
+        rd.trim_armed = false;
+    }
+
+    if let Load::Opening(d) = &rd.load {
+        if rd.frame >= 2 {
+            let d = d.clone();
+            rd.try_open(d, "");
+        }
+        ctx.request_repaint();
+    }
 
     if matches!(rd.load, Load::Fetch(_)) {
         if let Load::Fetch(uri) = &rd.load {
@@ -407,6 +458,15 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
         if !narrow && ready && tb_button(ui, pal, put(&mut x, bsz.x), "thumbs", l::PANEL_LEFT, "Page thumbnails", true, rd.thumbs) {
             rd.thumbs = !rd.thumbs;
         }
+        if ready && tb_button(ui, pal, put(&mut x, bsz.x), "annot", l::HIGHLIGHTER, "Annotate: highlight, underline, notes, pen", true, rd.notes.bar) {
+            rd.notes.bar = !rd.notes.bar;
+            if rd.notes.bar {
+                rd.notes.panel = !narrow && !rd.notes.list.is_empty();
+            } else {
+                rd.notes.tool = Tool::Hand;
+                rd.notes.panel = false;
+            }
+        }
         // right-hand side first (so the title can use the remaining space)
         let mut rx = bar.right() - 8.0;
         let mut put_r = |rx: &mut f32, w: f32| -> Rect {
@@ -416,7 +476,7 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
             r
         };
         if ready {
-            if tb_button(ui, pal, put_r(&mut rx, bsz.x), "night", if rd.night { l::SUN } else { l::MOON }, "Night mode", true, rd.night) {
+            if !tiny && tb_button(ui, pal, put_r(&mut rx, bsz.x), "night", if rd.night { l::SUN } else { l::MOON }, "Night mode", true, rd.night) {
                 rd.night = !rd.night;
                 rd.tiles.clear();
                 rd.thumb_tex.clear();
@@ -431,7 +491,7 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
                 }
             }
             let anchor = pos2(body_rect.center().x, body_rect.top() + body_rect.height() * 0.4);
-            if tb_button(ui, pal, put_r(&mut rx, bsz.x), "zin", l::ZOOM_IN, "Zoom in  (Ctrl +)", rd.zoom < MAX_ZOOM - 0.01, false) {
+            if !tiny && tb_button(ui, pal, put_r(&mut rx, bsz.x), "zin", l::ZOOM_IN, "Zoom in  (Ctrl +)", rd.zoom < MAX_ZOOM - 0.01, false) {
                 zoom_req = Some((rd.zoom * 1.25, anchor));
             }
             let lr = put_r(&mut rx, 54.0);
@@ -439,7 +499,7 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
             if ui.interact(lr, Id::new("pdf_zoom_lbl"), Sense::click()).on_hover_text("Click to reset to 100 %").clicked() {
                 fit = Some(true);
             }
-            if tb_button(ui, pal, put_r(&mut rx, bsz.x), "zout", l::ZOOM_OUT, "Zoom out  (Ctrl −)", rd.zoom > MIN_ZOOM + 0.01, false) {
+            if !tiny && tb_button(ui, pal, put_r(&mut rx, bsz.x), "zout", l::ZOOM_OUT, "Zoom out  (Ctrl −)", rd.zoom > MIN_ZOOM + 0.01, false) {
                 zoom_req = Some((rd.zoom / 1.25, anchor));
             }
             // page controls
@@ -467,7 +527,13 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
         if !narrow {
             let avail = (rx - x - 12.0).max(40.0);
             let mem = rd.mem_bytes();
-            let title = if mem > 0 { format!("{}   ·   {:.0} MB cache", rd.title, mem as f64 / 1_048_576.0) } else { rd.title.clone() };
+            let mut title = rd.title.clone();
+            if rd.engine.is_some() {
+                title.push_str(&format!("   ·   opened in {:.0} ms", rd.open_ms));
+            }
+            if mem > 0 {
+                title.push_str(&format!("   ·   {:.0} MB cache", mem as f64 / 1_048_576.0));
+            }
             crate::widgets::text_fit(ui.painter(), pos2(x + 8.0, bar.center().y), Align2::LEFT_CENTER, &title, bold(14.0), pal.text, avail);
         }
 
@@ -476,6 +542,9 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
             Load::Fetch(_) => {
                 ui.painter().text(body_rect.center(), Align2::CENTER_CENTER, "Loading PDF…", body(16.0), Color32::from_gray(220));
                 ctx.request_repaint();
+            }
+            Load::Opening(_) => {
+                ui.painter().text(body_rect.center(), Align2::CENTER_CENTER, "Opening…", body(16.0), Color32::from_gray(220));
             }
             Load::Failed(m) => {
                 ui.painter().text(body_rect.center() - vec2(0.0, 12.0), Align2::CENTER_CENTER, "⚠  Could not open this PDF", bold(18.0), Color32::from_gray(235));
@@ -503,12 +572,27 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
                 }
             }
             Load::Ready => {
-                let side = if rd.thumbs && !narrow { 132.0 } else { 0.0 };
-                let view = Rect::from_min_max(pos2(body_rect.left() + side, body_rect.top()), body_rect.max);
-                if side > 0.0 {
-                    thumbs_panel(ui, rd, ctx, pal, Rect::from_min_max(body_rect.min, pos2(body_rect.left() + side, body_rect.bottom())), &mut goto_req);
+                let bar_h = if rd.notes.bar { pdfnotes::bar_height(narrow) } else { 0.0 };
+                if rd.notes.bar {
+                    pdfnotes::bar(ui, pal, Rect::from_min_size(body_rect.min, vec2(body_rect.width(), bar_h)), &mut rd.notes, narrow);
                 }
-                reading_view(ui, rd, ctx, view, editing, &mut zoom_req, &mut goto_req, &mut fit, &mut scroll_by, &mut keep);
+                let area = Rect::from_min_max(pos2(body_rect.left(), body_rect.top() + bar_h), body_rect.max);
+                let side = if rd.thumbs && !narrow { 132.0 } else { 0.0 };
+                let panel_w = if rd.notes.panel && rd.notes.bar { if narrow { area.width() } else { 320.0f32.min(area.width() * 0.45) } } else { 0.0 };
+                let view = Rect::from_min_max(pos2(area.left() + side, area.top()), pos2(if narrow { area.right() } else { area.right() - panel_w }, area.bottom()));
+                if side > 0.0 {
+                    thumbs_panel(ui, rd, ctx, pal, Rect::from_min_max(area.min, pos2(area.left() + side, area.bottom())), &mut goto_req);
+                }
+                // on phones the notes list replaces the page while it is open
+                let list_only = narrow && panel_w > 0.0;
+                if !list_only {
+                    reading_view(ui, rd, ctx, view, editing, pal, &mut zoom_req, &mut goto_req, &mut fit, &mut scroll_by, &mut keep);
+                }
+                if panel_w > 0.0 {
+                    let pr = Rect::from_min_max(pos2(area.right() - panel_w, area.top()), area.max);
+                    let title = rd.title.clone();
+                    pdfnotes::panel(ui, ctx, pal, pr, &mut rd.notes, &title, &mut goto_req);
+                }
             }
         }
     });
@@ -636,6 +720,7 @@ fn reading_view(
     ctx: &Context,
     view: Rect,
     editing: bool,
+    pal: &Palette,
     zoom_req: &mut Option<(f32, egui::Pos2)>,
     goto_req: &mut Option<usize>,
     fit: &mut Option<bool>,
@@ -672,7 +757,8 @@ fn reading_view(
                 i.modifiers.shift,
             )
         });
-        if esc {
+        let esc_used = rd.notes.keys(ctx, editing);
+        if esc && !esc_used {
             *keep = false;
         }
         if pgdn || (space && !shift) {
@@ -709,7 +795,7 @@ fn reading_view(
     let now = now_ms();
     let debounce = now - rd.zoom_changed < 160.0;
 
-    let mut sa = ScrollArea::both().id_salt("pdf_scroll").auto_shrink([false, false]).drag_to_scroll(true);
+    let mut sa = ScrollArea::both().id_salt("pdf_scroll").auto_shrink([false, false]).drag_to_scroll(!rd.notes.capturing());
     if let Some(o) = rd.pending_off.take() {
         sa = sa.scroll_offset(o);
     }
@@ -722,8 +808,9 @@ fn reading_view(
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(view).layout(egui::Layout::top_down(egui::Align::Min)));
     child.set_clip_rect(view.intersect(ui.clip_rect()));
     let out = sa.show_viewport(&mut child, |ui, viewport| {
-        let (content, resp) = ui.allocate_exact_size(vec2(lay.content_w, lay.content_h), Sense::click());
-        if resp.double_clicked() {
+        let capturing = rd.notes.capturing();
+        let (content, resp) = ui.allocate_exact_size(vec2(lay.content_w, lay.content_h), if capturing { Sense::click_and_drag() } else { Sense::click() });
+        if !capturing && resp.double_clicked() {
             *zoom_req = Some((if rd.zoom < 1.6 { 2.0 } else { 1.0 }, resp.interact_pointer_pos().unwrap_or(view.center())));
         }
         let p = ui.painter().clone();
@@ -734,15 +821,22 @@ fn reading_view(
         let cur = page_at(&lay, center_y);
         rd.page = cur;
         let rs = (lay.s * ppp).clamp(0.05, 12.0);
-        let rs_q = (rs * 64.0).round() / 64.0;
-        let qs = (rs_q * 64.0) as u32;
+        let qs = ((rs * SCALE_Q).round() as u32).max(1);
+        let rs_q = qs as f32 / SCALE_Q;
         let view_center = viewport.center();
+        let snap = |v: f32| (v * ppp).round() / ppp;
+        let accent = pal.accent;
+        let mut shown: Vec<(usize, Rect)> = vec![];
         for i in first..dims.len() {
             if lay.ys[i] > vp_bot {
                 break;
             }
+            // The page is snapped to whole physical pixels and has exactly `wp × hp` of them, so every texel of a tile lands on
+            // one screen pixel (no bilinear resampling = no blur, at any zoom level).
+            let (wp, hp) = (((dims[i].0 * rs_q).round() as u32).max(1), ((dims[i].1 * rs_q).round() as u32).max(1));
             let x = (content.width() - lay.ws[i]) / 2.0;
-            let prect = Rect::from_min_size(content.min + vec2(x, lay.ys[i]), vec2(lay.ws[i], lay.hs[i]));
+            let origin = pos2(snap(content.min.x + x), snap(content.min.y + lay.ys[i]));
+            let prect = Rect::from_min_size(origin, vec2(wp as f32 / ppp, hp as f32 / ppp));
             p.rect_filled(prect.translate(vec2(0.0, 2.0)).expand(1.0), 2.0, Color32::from_black_alpha(70));
             p.rect_filled(prect, 0.0, if night { Color32::from_gray(30) } else { Color32::WHITE });
             let page_vp = Rect::from_min_max(content.min + vec2(0.0, vp_top), content.min + vec2(content.width(), vp_bot));
@@ -750,6 +844,7 @@ fn reading_view(
             if vis.width() <= 0.0 || vis.height() <= 0.0 {
                 continue;
             }
+            shown.push((i, prect));
             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
             // 1. low-res preview
             if let Some(t) = rd.thumb_tex.get_mut(&i) {
@@ -761,22 +856,21 @@ fn reading_view(
             // 2. tiles of the previously completed zoom level (stretched) while sharp ones render
             let best = rd.best.get(&i).copied();
             if let Some(bq) = best.filter(|b| *b != qs) {
-                let brs = bq as f32 / 64.0;
+                let brs = bq as f32 / SCALE_Q;
+                let f = rs_q / brs / ppp; // screen points per old pixel
                 for (k, t) in rd.tiles.iter_mut().filter(|(k, _)| k.0 == i && k.1 == bq && k.4 == night) {
                     t.used = frame;
-                    let (x0, y0) = (k.2 as f32 * TILE as f32 / brs * lay.s, k.3 as f32 * TILE as f32 / brs * lay.s);
+                    let (x0, y0) = (k.2 as f32 * TILE as f32 * f, k.3 as f32 * TILE as f32 * f);
                     let [tw, th] = t.tex.size();
-                    let r = Rect::from_min_size(prect.min + vec2(x0, y0), vec2(tw as f32 / brs * lay.s, th as f32 / brs * lay.s));
+                    let r = Rect::from_min_size(prect.min + vec2(x0, y0), vec2(tw as f32 * f, th as f32 * f));
                     p.image(t.tex.id(), r, uv, Color32::WHITE);
                 }
             }
             // 3. tiles at the current scale
-            let (wp, hp) = ((dims[i].0 * rs_q).ceil() as u32, (dims[i].1 * rs_q).ceil() as u32);
-            let to_px = |pt: f32| pt / lay.s * rs_q;
-            let rx0 = to_px(vis.min.x - prect.min.x).max(0.0);
-            let rx1 = to_px(vis.max.x - prect.min.x).min(wp as f32);
-            let ry0 = to_px(vis.min.y - prect.min.y).max(0.0);
-            let ry1 = to_px(vis.max.y - prect.min.y).min(hp as f32);
+            let rx0 = ((vis.min.x - prect.min.x) * ppp).max(0.0);
+            let rx1 = ((vis.max.x - prect.min.x) * ppp).min(wp as f32);
+            let ry0 = ((vis.min.y - prect.min.y) * ppp).max(0.0);
+            let ry1 = ((vis.max.y - prect.min.y) * ppp).min(hp as f32);
             if rx1 <= rx0 || ry1 <= ry0 {
                 continue;
             }
@@ -786,18 +880,18 @@ fn reading_view(
             let mut have = 0;
             for ty in ty0..=ty1 {
                 for tx in tx0..=tx1 {
+                    let (px, py) = (tx * TILE, ty * TILE);
+                    if px >= wp || py >= hp {
+                        continue;
+                    }
                     total += 1;
                     let key: TileKey = (i, qs, tx as u16, ty as u16, night);
-                    let (px, py) = (tx * TILE, ty * TILE);
                     let (tw, th) = (TILE.min(wp - px), TILE.min(hp - py));
-                    let r = Rect::from_min_size(prect.min + vec2(px as f32 / rs_q * lay.s, py as f32 / rs_q * lay.s), vec2(tw as f32 / rs_q * lay.s, th as f32 / rs_q * lay.s));
+                    let r = Rect::from_min_size(prect.min + vec2(px as f32 / ppp, py as f32 / ppp), vec2(tw as f32 / ppp, th as f32 / ppp));
                     if let Some(t) = rd.tiles.get_mut(&key) {
                         t.used = frame;
                         have += 1;
-                        // snap to physical pixels to avoid seams between tiles
-                        let snap = |v: f32| (v * ppp).round() / ppp;
-                        let sr = Rect::from_min_max(pos2(snap(r.min.x), snap(r.min.y)), pos2(snap(r.max.x), snap(r.max.y)));
-                        p.image(t.tex.id(), sr, uv, Color32::WHITE);
+                        p.image(t.tex.id(), r, uv, Color32::WHITE);
                     } else if !rd.failed.contains(&(i, qs)) && (!debounce || best.is_none()) {
                         let d = (r.center() - view_center).length();
                         want.push((d, key, i, rs_q, px, py, tw, th));
@@ -810,6 +904,11 @@ fn reading_view(
             if rd.failed.contains(&(i, qs)) {
                 p.text(prect.center(), Align2::CENTER_CENTER, "This page could not be rendered", body(14.0), Color32::GRAY);
             }
+            // 4. annotations on top of the page
+            rd.notes.paint_page(&p, prect, i, night, accent);
+        }
+        if capturing || rd.notes.bar || !rd.notes.list.is_empty() {
+            rd.notes.input(ctx, &resp, &shown);
         }
     });
     rd.off = out.state.offset;
@@ -828,6 +927,10 @@ fn reading_view(
     want.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let t0 = now_ms();
     let mut left = want.len();
+    if !want.is_empty() {
+        rd.active_at = now_ms();
+        rd.trim_armed = false;
+    }
     for (_, key, i, rs_q, px, py, tw, th) in want {
         if let Some(e) = rd.engine.as_ref() {
             match e.render(i, rs_q, px, py, tw, th, night) {
@@ -856,14 +959,34 @@ fn reading_view(
         ctx.request_repaint();
     }
 
-    // LRU eviction (never touches what was drawn this frame)
-    if rd.tiles.len() > MAX_TILES {
-        let mut v: Vec<(TileKey, u64)> = rd.tiles.iter().filter(|(_, t)| t.used + 1 < frame).map(|(k, t)| (*k, t.used)).collect();
+    // LRU eviction by memory budget (never touches what was drawn this frame)
+    let mut mem: usize = rd.tiles.values().map(|t| t.bytes).sum();
+    if mem > MAX_TILE_BYTES {
+        let mut v: Vec<(TileKey, u64, usize)> = rd.tiles.iter().filter(|(_, t)| t.used + 1 < frame).map(|(k, t)| (*k, t.used, t.bytes)).collect();
         v.sort_by_key(|x| x.1);
-        let over = rd.tiles.len() - MAX_TILES;
-        for (k, _) in v.into_iter().take(over) {
+        for (k, _, b) in v {
+            if mem <= MAX_TILE_BYTES {
+                break;
+            }
             rd.tiles.remove(&k);
+            mem = mem.saturating_sub(b);
         }
+    }
+    // idle trim: a few seconds after the last input only what is on screen stays in memory
+    let idle = now_ms() - rd.active_at;
+    if idle >= IDLE_TRIM_MS && left == 0 {
+        let before = rd.tiles.len() + rd.thumb_tex.len();
+        rd.tiles.retain(|_, t| t.used + 1 >= frame);
+        rd.thumb_tex.retain(|_, t| t.used + 1 >= frame || rd.thumbs);
+        if rd.tiles.len() + rd.thumb_tex.len() != before {
+            let tiles = &rd.tiles;
+            rd.best.retain(|i, q| tiles.keys().any(|k| k.0 == *i && k.1 == *q));
+            rd.failed.clear();
+        }
+        rd.trim_armed = true;
+    } else if !rd.trim_armed && left == 0 {
+        ctx.request_repaint_after(Duration::from_millis(IDLE_TRIM_MS as u64 + 250));
+        rd.trim_armed = true;
     }
     // pages far away lose their previews / sharp tiles (keeps memory flat in long documents)
     if frame % 30 == 0 {
@@ -949,5 +1072,83 @@ mod tests {
         assert_eq!(page_at(&a, a.ys[7] + 5.0), 7);
         assert_eq!(page_at(&a, 0.0), 0);
         assert_eq!(page_at(&a, 1e9), 29);
+    }
+
+    fn run(ctx: &Context, req: &mut Option<Request>, annots: &mut BTreeMap<u64, Vec<PdfAnnot>>, t: &mut f64, size: Vec2, evs: Vec<egui::Event>) {
+        *t += 0.05;
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), size));
+        input.time = Some(*t);
+        input.events = evs;
+        let pal = crate::theme::Palette::light();
+        let _ = ctx.run(input, |ctx| {
+            reader_ui(ctx, req, annots, &pal);
+        });
+    }
+
+    #[test]
+    fn reader_is_pixel_exact_annotates_and_cleans_up() {
+        let ctx = Context::default();
+        crate::theme::setup_fonts(&ctx);
+        let mut req = Some(Request { key: 7, title: "t.pdf".into(), source: Some(Source::Local(tiny_pdf().into())) });
+        let mut annots = BTreeMap::new();
+        let mut t = 0.0;
+        for size in [vec2(1280.0, 800.0), vec2(360.0, 640.0)] {
+            for zoom in [0.25_f32, 0.5, 0.8, 1.0, 3.0] {
+                READER.with(|c| {
+                    if let Some(r) = c.borrow_mut().as_mut() {
+                        r.zoom = zoom;
+                        r.zoom_changed = 0.0;
+                    }
+                });
+                for _ in 0..8 {
+                    run(&ctx, &mut req, &mut annots, &mut t, size, vec![]);
+                }
+                READER.with(|c| {
+                    let g = c.borrow();
+                    let r = g.as_ref().expect("reader is open");
+                    assert!(r.engine.is_some(), "the document opened");
+                    assert!(!r.tiles.is_empty(), "tiles rendered at {zoom} on {size:?}");
+                    for (k, tile) in r.tiles.iter().filter(|(k, _)| k.2 == 0 && k.3 == 0) {
+                        let rs = k.1 as f32 / SCALE_Q;
+                        let (wp, hp) = (((200.0 * rs).round() as usize).max(1), ((100.0 * rs).round() as usize).max(1));
+                        assert_eq!(tile.tex.size(), [wp.min(TILE as usize), hp.min(TILE as usize)], "tile is exactly the page's pixel size");
+                    }
+                });
+            }
+        }
+        // annotate: arm the highlighter and drag across the page
+        READER.with(|c| {
+            let mut g = c.borrow_mut();
+            let r = g.as_mut().unwrap();
+            r.zoom = 1.0;
+            r.notes.bar = true;
+            r.notes.tool = Tool::Highlight;
+        });
+        let size = vec2(1280.0, 800.0);
+        for _ in 0..4 {
+            run(&ctx, &mut req, &mut annots, &mut t, size, vec![]);
+        }
+        let (a, b) = (pos2(500.0, 330.0), pos2(780.0, 335.0));
+        let btn = |p, pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        run(&ctx, &mut req, &mut annots, &mut t, size, vec![egui::Event::PointerMoved(a)]);
+        run(&ctx, &mut req, &mut annots, &mut t, size, vec![btn(a, true)]);
+        run(&ctx, &mut req, &mut annots, &mut t, size, vec![egui::Event::PointerMoved(pos2(600.0, 332.0))]);
+        run(&ctx, &mut req, &mut annots, &mut t, size, vec![egui::Event::PointerMoved(b)]);
+        run(&ctx, &mut req, &mut annots, &mut t, size, vec![btn(b, false)]);
+        for _ in 0..3 {
+            run(&ctx, &mut req, &mut annots, &mut t, size, vec![]);
+        }
+        assert_eq!(annots.get(&7).map(|v| v.len()), Some(1), "the highlight was stored in the workspace store");
+        // close: everything is released
+        req = None;
+        run(&ctx, &mut req, &mut annots, &mut t, size, vec![]);
+        assert!(READER.with(|c| c.borrow().is_none()), "reader state is dropped on close");
+        // re-open: annotations come back
+        req = Some(Request { key: 7, title: "t.pdf".into(), source: Some(Source::Local(tiny_pdf().into())) });
+        for _ in 0..4 {
+            run(&ctx, &mut req, &mut annots, &mut t, size, vec![]);
+        }
+        assert_eq!(READER.with(|c| c.borrow().as_ref().map(|r| r.notes.list.len())), Some(1));
     }
 }

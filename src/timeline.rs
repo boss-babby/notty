@@ -20,6 +20,11 @@ const ROW_H: f32 = 38.0;
 const HEAD_H: f32 = 46.0;
 const BAR_H: f32 = 24.0;
 const ZOOMS: [f32; 5] = [9.0, 16.0, 28.0, 44.0, 66.0];
+/// Empty days kept before the first / after the last scheduled day (gives room to drag bars outwards).
+const PAD_LEFT: i64 = 30;
+const PAD_RIGHT: i64 = 60;
+/// Auto-scroll while a bar is dragged near the edge of the grid.
+const EDGE: f32 = 48.0;
 
 pub fn zoom_index(view: &View) -> usize {
     if view.zoom == 0 {
@@ -105,26 +110,53 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
         return;
     }
 
-    // live drag previews (read before laying out so arrows follow the bars)
+    // ── visible day range ──
+    // The range comes from the *committed* spans only and never from a live drag preview. (The old code derived it from the
+    // preview: dragging a bar past the end widened the grid, the bar stayed under the pointer, `dx` kept growing, the grid kept
+    // widening … an endless feedback loop that ended in millions of painted day columns — the freeze / crash.)
+    // The range is also kept monotonic per view so releasing a bar never makes the chart jump.
+    let day_floor = dates::days_from_civil(1000, 1, 1);
+    let day_ceil = dates::days_from_civil(9000, 12, 31);
+    let committed: Vec<(i64, i64)> = items.iter().filter_map(|i| i.span).collect();
+    let lo = committed.iter().map(|s| s.0).min().unwrap_or(today).min(today);
+    let hi = committed.iter().map(|s| s.1).max().unwrap_or(today).max(today);
+    let dom_id = Id::new(("tl_domain", db_id, view.id));
+    let off_id = Id::new(("tl_off", db_id, view.id));
+    let auto_id = Id::new(("tl_auto", db_id, view.id));
+    let mut min_day = (lo - PAD_LEFT).max(day_floor);
+    let mut max_day = (hi + PAD_RIGHT).min(day_ceil).max(min_day + 1);
+    let mut grew_left = 0_i64;
+    if let Some((a, b)) = ctx.data(|d| d.get_temp::<(i64, i64)>(dom_id)) {
+        if a < min_day {
+            min_day = a;
+        } else {
+            grew_left = a - min_day;
+        }
+        max_day = max_day.max(b);
+    }
+    max_day = max_day.max(min_day + (w / dw) as i64 + 4).min(day_ceil.max(min_day + 1));
+    ctx.data_mut(|d| d.insert_temp(dom_id, (min_day, max_day)));
+    let (lim_lo, lim_hi) = (min_day, max_day - 1);
+
+    // live drag previews (read before laying out so arrows follow the bars); always clamped into the visible range
     let mut preview: HashMap<u64, (i64, i64)> = HashMap::new();
     for it in &items {
         if let Some((s, e)) = it.span {
             if let Some((mode, dx)) = ctx.data(|d| d.get_temp::<(Mode, f32)>(Id::new(("tl_drag", it.id)))) {
-                let dd = (dx / dw).round() as i64;
+                let dd = if dx.is_finite() { (dx / dw).round() as i64 } else { 0 };
                 let (ns, ne) = match mode {
-                    Mode::Move => (s + dd, e + dd),
-                    Mode::Left => ((s + dd).min(e), e),
-                    Mode::Right => (s, (e + dd).max(s)),
+                    Mode::Move => {
+                        let dd = dd.max(lim_lo - s).min((lim_hi - e).max(lim_lo - s));
+                        (s + dd, e + dd)
+                    }
+                    Mode::Left => ((s + dd).max(lim_lo).min(e), e),
+                    Mode::Right => (s, (e + dd).max(s).min(lim_hi.max(s))),
                 };
                 preview.insert(it.id, (ns, ne));
             }
         }
     }
     let span_of = |id: u64, it: &Item| -> Option<(i64, i64)> { preview.get(&id).copied().or(it.span) };
-    let spans: Vec<(i64, i64)> = items.iter().filter_map(|i| span_of(i.id, i)).collect();
-    let (lo, hi) = if spans.is_empty() { (today, today) } else { (spans.iter().map(|s| s.0).min().unwrap_or(today).min(today), spans.iter().map(|s| s.1).max().unwrap_or(today).max(today)) };
-    let min_day = lo - 10;
-    let max_day = (hi + 45).max(min_day + (w / dw) as i64 + 4);
     let n_days = (max_day - min_day + 1) as f32;
     let total_w = n_days * dw;
     let label_w = if w < 560.0 { 112.0 } else { 220.0 };
@@ -160,6 +192,12 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
     let inited_id = Id::new(("tl_init", db_id, view.id));
     let inited: bool = ctx.data(|d| d.get_temp(inited_id)).unwrap_or(false);
     let mut sa = ScrollArea::horizontal().id_salt(("tl_scroll", db_id, view.id)).auto_shrink([false, false]);
+    let last_off: f32 = ctx.data(|d| d.get_temp(off_id)).unwrap_or(0.0);
+    let auto: f32 = ctx.data_mut(|d| {
+        let v = d.get_temp::<f32>(auto_id).unwrap_or(0.0);
+        d.remove::<f32>(auto_id);
+        v
+    });
     if goto || !inited {
         let off = ((today - min_day) as f32 * dw - (grid_outer.width() * 0.3)).max(0.0);
         sa = sa.horizontal_scroll_offset(off);
@@ -167,17 +205,24 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
             d.insert_temp(inited_id, true);
             d.insert_temp(Id::new(("tl_goto", db_id)), false);
         });
+    } else if grew_left != 0 || auto != 0.0 {
+        // keep the chart visually still when it grows to the left, and follow a bar dragged to the edge
+        sa = sa.horizontal_scroll_offset((last_off + grew_left as f32 * dw + auto).max(0.0));
     }
     let mut bar_rects: HashMap<u64, Rect> = HashMap::new();
     let mut to_draw_links: Vec<(u64, Rect)> = vec![];
     let mut link_drop: Option<(u64, Pos2)> = None;
     let mut ui_child = ui.new_child(egui::UiBuilder::new().max_rect(grid_outer).layout(egui::Layout::top_down(egui::Align::Min)));
-    sa.show(&mut ui_child, |ui| {
+    let scroll_out = sa.show(&mut ui_child, |ui| {
         let (content, _) = ui.allocate_exact_size(vec2(total_w, height), Sense::hover());
         let p = ui.painter().clone();
         let x_of = |d: i64| content.left() + (d - min_day) as f32 * dw;
+        // only the visible columns are painted (the grid can be thousands of days wide)
+        let vis = ui.clip_rect();
+        let d0 = (min_day + ((vis.left() - content.left()) / dw).floor() as i64 - 1).max(min_day);
+        let d1 = (min_day + ((vis.right() - content.left()) / dw).ceil() as i64 + 1).min(max_day);
         // header + weekend shading + grid lines
-        for d in min_day..=max_day {
+        for d in d0..=d1 {
             let x = x_of(d);
             let (y, m, dd) = dates::civil_from_days(d);
             let wd = dates::weekday(y, m, dd);
@@ -187,7 +232,7 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
             if wd == 0 || dd == 1 {
                 p.vline(x, (content.top() + 20.0)..=content.bottom(), Stroke::new(1.0_f32, with_alpha(pal.border, if dd == 1 { 0.9 } else { 0.45 })));
             }
-            if dd == 1 || d == min_day {
+            if dd == 1 || d == d0 {
                 p.text(pos2(x + 6.0, content.top() + 10.0), Align2::LEFT_CENTER, format!("{} {}", &dates::MONTHS[m as usize - 1][..3], y), bold(11.5), pal.text);
             }
             if dw >= 24.0 {
@@ -215,7 +260,7 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
                 None => {
                     // unscheduled: click a day to schedule, drag to create a range
                     let resp = ui.interact(row_rect, Id::new(("tl_new", it.id)), Sense::click_and_drag());
-                    let day_at = |pos: Pos2| min_day + ((pos.x - content.left()) / dw).floor() as i64;
+                    let day_at = |pos: Pos2| (min_day + ((pos.x - content.left()) / dw).floor() as i64).max(min_day).min(max_day - 1);
                     if resp.hovered() || resp.dragged() {
                         if let Some(pos) = ctx.pointer_hover_pos() {
                             let d = day_at(pos);
@@ -266,7 +311,7 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
                         if zone.width() <= 0.0 {
                             continue;
                         }
-                        let id = Id::new(("tl_bar", it.id, mode as u8 as usize + if mode == Mode::Move { 0 } else if mode == Mode::Left { 1 } else { 2 }));
+                        let id = Id::new(("tl_bar", it.id, mode as u8));
                         let resp = ui.interact(zone, id, Sense::click_and_drag());
                         hover |= resp.hovered() || resp.dragged();
                         let key = Id::new(("tl_drag", it.id));
@@ -277,9 +322,37 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
                             ctx.data_mut(|d| d.insert_temp(key, (mode, 0.0_f32)));
                         }
                         if resp.dragged() {
+                            // auto-scroll when the pointer is near either edge of the grid
+                            let mut auto_dx = 0.0_f32;
+                            if let Some(pos) = ctx.pointer_interact_pos() {
+                                let speed = (ctx.input(|i| i.stable_dt).clamp(0.004, 0.05)) * 520.0;
+                                if pos.x > grid_outer.right() - EDGE {
+                                    auto_dx = speed * ((pos.x - (grid_outer.right() - EDGE)) / EDGE).clamp(0.2, 1.5);
+                                } else if pos.x < grid_outer.left() + EDGE {
+                                    auto_dx = -speed * (((grid_outer.left() + EDGE) - pos.x) / EDGE).clamp(0.2, 1.5);
+                                }
+                                if auto_dx < 0.0 && last_off <= 0.5 {
+                                    auto_dx = 0.0;
+                                }
+                            }
+                            let (s, e) = it.span.unwrap_or((s, e)); // limits are relative to the committed span
+                            let (lo_px, hi_px) = match mode {
+                                Mode::Move => ((lim_lo - s) as f32 * dw, (lim_hi - e) as f32 * dw),
+                                Mode::Left => ((lim_lo - s) as f32 * dw, (e - s) as f32 * dw),
+                                Mode::Right => ((s - e) as f32 * dw, (lim_hi - e) as f32 * dw),
+                            };
+                            let hi_px = hi_px.max(lo_px);
+                            // NOTE: `resp.drag_delta()` reads the egui input state; calling it *inside* `ctx.data_mut` (which holds the
+                            // context write-lock) dead-locked the whole app on the first dragged frame — the original freeze.
+                            let ddx = resp.drag_delta().x;
                             ctx.data_mut(|d| {
                                 if let Some((m, dx)) = d.get_temp::<(Mode, f32)>(key) {
-                                    d.insert_temp(key, (m, dx + resp.drag_delta().x));
+                                    let step = ddx + auto_dx;
+                                    let nx = if (dx + step).is_finite() { (dx + step).max(lo_px).min(hi_px) } else { 0.0 };
+                                    d.insert_temp(key, (m, nx));
+                                }
+                                if auto_dx != 0.0 {
+                                    d.insert_temp(auto_id, auto_dx);
                                 }
                             });
                             ctx.request_repaint();
@@ -396,6 +469,9 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
             }
         }
     });
+    ctx.data_mut(|d| d.insert_temp(off_id, scroll_out.state.offset.x));
+    #[cfg(test)]
+    ctx.data_mut(|d| d.insert_temp(Id::new(("tl_bars_test", db_id)), bar_rects.clone()));
     if let Some((from, pos)) = link_drop {
         if let Some((to, _)) = bar_rects.iter().find(|(id, r)| **id != from && r.expand(2.0).contains(pos)) {
             acts.push(A::AddDep(*to, from));

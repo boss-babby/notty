@@ -631,3 +631,58 @@ fn inline_marks_underline_highlight_link_roundtrip_text() {
     let spans = editor::rich_job("a ==hi== __u__ [site](https://x.io) b", &egui::FontId::proportional(14.0), egui::Color32::BLACK, &Palette::light(), true);
     assert_eq!(spans.text, "a hi u site b", "markers are hidden when the block is not focused");
 }
+
+
+/// Regression: dragging a Gantt bar towards (and past) the edge of the chart used to widen the chart every frame while the bar
+/// stayed under the pointer, `dx` grew without bound and the app froze. The chart must stay bounded and the drop must commit.
+#[test]
+fn gantt_drag_past_the_edge_stays_bounded_and_commits() {
+    use std::collections::HashMap;
+    let ctx = test_ctx();
+    let mut ws = Workspace::seed();
+    let (id, vi) = ws
+        .pages
+        .iter()
+        .filter(|p| !p.trashed)
+        .find_map(|p| p.db.as_ref().and_then(|d| d.views.iter().position(|v| v.kind == ViewKind::Timeline).map(|i| (p.id, i))))
+        .expect("a timeline view");
+    ws.db_mut(id).unwrap().active = vi;
+    let dp = {
+        let d = ws.db(id).unwrap();
+        d.date_prop(&d.views[vi]).unwrap()
+    };
+    let mut ed = EditorState::default();
+    let mut t = 0.0;
+    for _ in 0..4 {
+        frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![Event::PointerMoved(pos2(300.0, 300.0))]);
+    }
+    let bars: HashMap<u64, Rect> = ctx.data(|d| d.get_temp(Id::new(("tl_bars_test", id)))).expect("bars were laid out");
+    let mut vis: Vec<(u64, Rect)> = bars.into_iter().filter(|(_, r)| r.center().x > 420.0 && r.center().x < 1000.0 && r.width() > 40.0 && r.center().y < 800.0).collect();
+    vis.sort_by_key(|x| x.0);
+    let (rid, r) = vis.first().copied().expect("a visible bar");
+    let span_of = |ws: &Workspace| match ws.page(rid).unwrap().props.get(&dp) {
+        Some(Val::Text(s)) => dates::span(s).unwrap(),
+        _ => panic!("scheduled row expected"),
+    };
+    let (s0, e0) = span_of(&ws);
+    let start = pos2(r.center().x, r.center().y);
+    let started = std::time::Instant::now();
+    frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![Event::PointerMoved(start), ptr(start, true)]);
+    let far = pos2(1270.0, start.y);
+    frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![Event::PointerMoved(pos2(900.0, start.y))]);
+    // hold the pointer at the right edge for a long time (auto-scroll keeps pushing the bar outwards)
+    for _ in 0..400 {
+        frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![Event::PointerMoved(far)]);
+    }
+    frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![ptr(far, false)]);
+    for _ in 0..3 {
+        frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![]);
+    }
+    assert!(started.elapsed().as_secs() < 60, "dragging must not stall the frame loop");
+    let (s1, e1) = span_of(&ws);
+    assert!(s1 > s0, "the bar moved to the right ({s0} → {s1})");
+    assert_eq!(e1 - s1, e0 - s0, "moving keeps the duration");
+    let (a, b): (i64, i64) = ctx.data(|d| d.get_temp(Id::new(("tl_domain", id, ws.db(id).unwrap().views[vi].id)))).expect("domain");
+    assert!(b - a < 2000, "the chart range stays bounded ({} days)", b - a);
+    assert!(e1 <= b, "the bar stays inside the chart");
+}

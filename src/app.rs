@@ -1548,7 +1548,9 @@ impl eframe::App for LumenApp {
     }
 
     fn auto_save_interval(&self) -> Duration {
-        Duration::from_secs(4)
+        // Serialising the whole workspace is the most expensive thing an idle app does: every 30 s is plenty
+        // (eframe also saves when the window is closed).
+        Duration::from_secs(30)
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -1589,7 +1591,8 @@ impl LumenApp {
         if !self.locked && self.cred.is_some() && now - self.last_active > 300.0 {
             self.lock_now();
         }
-        ctx.request_repaint_after(Duration::from_secs(10));
+        // Idle wake-ups: only the auto-lock timer needs one, and only when a password is set.
+        ctx.request_repaint_after(Duration::from_secs(if self.cred.is_some() { 10 } else { 30 }));
 
         if self.locked {
             match self.lock.show(ctx, self.cred.as_ref()) {
@@ -1865,7 +1868,7 @@ impl LumenApp {
         self.trash_ui(ctx, &pal);
         self.security_ui(ctx, &pal);
         self.history_ui(ctx, &pal);
-        crate::pdf::reader_ui(ctx, &mut self.ed.pdf_req, &pal);
+        crate::pdf::reader_ui(ctx, &mut self.ed.pdf_req, &mut self.ws.pdf_annots, &pal);
         self.toasts_ui(ctx, &pal);
     }
 

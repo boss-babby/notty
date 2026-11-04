@@ -660,6 +660,37 @@ pub struct Workspace {
     pub accent: usize,
     #[serde(default)]
     pub icons_v2: bool,
+    /// PDF annotations (highlights, underlines, notes, drawings) per document key — see `pdf.rs`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pdf_annots: BTreeMap<u64, Vec<PdfAnnot>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
+pub enum AnnotKind {
+    Highlight,
+    Underline,
+    Strike,
+    Note,
+    Ink,
+}
+
+/// One annotation on a PDF page. All coordinates are fractions (0‥1) of the page width / height, so they survive any zoom level.
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
+pub struct PdfAnnot {
+    pub id: u64,
+    pub page: u32,
+    pub kind: AnnotKind,
+    /// Highlight / underline / strike: `[x0, y0, x1, y1]`; note: the anchor point (`x0, y0`).
+    pub rect: [f32; 4],
+    /// Freehand strokes: points of the stroke.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pts: Vec<[f32; 2]>,
+    pub color: u8,
+    /// Comment attached to the annotation.
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub created: f64,
 }
 
 pub const ICONS: [&str; 36] = [
@@ -1233,7 +1264,7 @@ impl Workspace {
     // ───────── first-run content ─────────
 
     pub fn seed() -> Self {
-        let mut ws = Workspace { name: "My Workspace".into(), pages: vec![], next_id: 0, current: None, dark: false, sidebar_open: true, accent: 0, icons_v2: false };
+        let mut ws = Workspace { name: "My Workspace".into(), pages: vec![], next_id: 0, current: None, dark: false, sidebar_open: true, accent: 0, icons_v2: false, pdf_annots: BTreeMap::new() };
         use BlockKind::*;
 
         let start = ws.add_page(None, PageKind::Doc);

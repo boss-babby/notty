@@ -71,7 +71,7 @@ pub const SCISSORS: &str = "\u{e14e}";
 pub const CLIPBOARD: &str = "\u{e085}";
 pub const CLIPBOARD_PASTE: &str = "\u{e3e8}";
 pub const CLIPBOARD_COPY: &str = "\u{e225}";
-pub const TEXT_SELECT: &str = "\u{e6ea}";
+pub const TEXT_SELECT: &str = "\u{e3de}";
 pub const BOLD: &str = "\u{e05d}";
 pub const ITALIC: &str = "\u{e0fb}";
 pub const STRIKETHROUGH: &str = "\u{e177}";
@@ -345,3 +345,10 @@ pub const GIT_BRANCH: &str = "\u{e0e2}";
 pub const MINIMIZE_2: &str = "\u{e11b}";
 pub const BOOK_OPEN_TEXT: &str = "\u{e54a}";
 pub const SCROLL: &str = "\u{e2ed}";
+
+// ── PDF annotation tools ──
+pub const MESSAGE_SQUARE_TEXT: &str = "\u{e575}";
+pub const STICKY_NOTE: &str = "\u{e303}";
+pub const PEN_LINE: &str = "\u{e130}";
+pub const MOUSE_POINTER_2: &str = "\u{e1c3}";
+pub const PANEL_RIGHT: &str = "\u{e431}";

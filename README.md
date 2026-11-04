@@ -59,3 +59,35 @@ cargo test --lib               # 44 tests: model, import/export, editor ops, hea
 On Windows just run `cargo build --release` → `target\release\lumen.exe`.
 
 Fonts: Inter (SIL OFL 1.1), Lucide icons (ISC), Twemoji images (CC-BY 4.0). `assets/` must contain `Inter-Regular.otf`, `Inter-Bold.otf` (rsms/inter v4.0 `extras/otf`) and `lucide.ttf` (npm `lucide-static`).
+
+
+## v2.1 — what changed (Gantt fixes, sharper + annotated PDF reader, responsive tables)
+
+### 1. Gantt / timeline (`src/timeline.rs`, `src/database.rs`)
+| Bug | Root cause | Fix |
+|---|---|---|
+| **App freezes the moment a bar is dragged / resized** | `resp.drag_delta()` (reads egui's input state) was called *inside* `ctx.data_mut(|d| …)`, which holds the context write-lock → the same thread tried to take the read-lock again: a **self-deadlock** | read the delta first, then lock. Regression test `gantt_drag_past_the_edge_stays_bounded_and_commits` |
+| Chart widens forever while dragging towards the edge (memory blow-up, millions of painted day columns) | the visible day range was computed from the *live drag preview*; the bar stayed under the pointer, so `dx` grew every frame | range comes from committed dates only, is monotonic per view, `dx` and the preview are clamped to it, scroll offset compensates when the chart grows to the left |
+| No way to reach dates outside the screen while dragging | – | edge auto-scroll while dragging a bar |
+| Only visible columns should cost CPU | all `min_day..=max_day` columns were painted every frame | culled to the clip rectangle |
+| Dependency cycles (A→B→A) possible | `AddDep` had no check | cycle-safe iterative check; self-dependency refused |
+| Dates outside years 1000-9000 could corrupt the ISO text | no clamp | clamped |
+
+Incomplete code found and finished: the repo shipped **without its fonts** (`assets/Inter-*.otf`, `lucide.ttf` – the build did not compile; they are now generated: Inter v4 without its private-use alternates, Lucide 1.29 subset to the private-use range, `TEXT_SELECT` re-mapped), and **without `web/index.html`** (the loader the web build script copies).
+
+### 2. PDF reader (`src/pdf.rs`, `src/pdfnotes.rs`)
+* **Sharpness** – tiles used to be rendered at a scale quantised to 1/64 and drawn into fractionally positioned rectangles, so below 100 % every tile was resampled (up to 5 % scale error). Pages are now snapped to whole physical pixels and tiles are rendered at the exact on-screen scale (1/4096 resolution): one texel = one pixel at every zoom level and DPI. A test checks the tile size equals the page's pixel size for 25 %-300 % on desktop and phone viewports.
+* **Annotations** – highlight, underline, strike-through, sticky notes with comments, freehand pen, eraser, 5 colours, notes list with per-annotation comments, *Copy as Markdown*. Stored in the workspace (`Workspace::pdf_annots`, page-relative coordinates) so they survive restarts and every zoom level.
+* **Open / close time** – parsing is deferred by one frame (the reader is on screen immediately), the open time is displayed, closing drops the engine, hayro caches, every texture and the remote download and asks for one more frame so GPU memory is released.
+* **RAM** – the tile cache is capped by *bytes* (96 MB native / 40 MB web) instead of by tile count (up to 140 × 1 MB), trimmed to what is on screen 2.5 s after the last input, thumbnails of far pages are dropped; the idle app saves every 30 s instead of 4 s and wakes up every 30 s (10 s when a password lock is set).
+
+### 3. Responsiveness
+* Database table: names, headers, dates, formulas and chips are truncated with an ellipsis inside their own cell (no text spills into the neighbouring column), the name column shrinks on phones and the *OPEN* button stays visible on touch screens.
+* PDF reader: toolbar buttons drop out in priority order on narrow screens (no overlap down to 320 px), the annotation bar wraps to two rows, the notes list becomes a full-screen sheet on phones.
+
+### Build
+```
+cargo test --lib                                   # 50+ headless tests
+WASM_OPT=0 ./build-web.sh                          # → ../public/webapp   (needs wasm-bindgen-cli 0.2.130)
+./build-windows.sh                                 # → ../public/downloads (mingw-w64) or `cargo build --release` on Windows
+```
