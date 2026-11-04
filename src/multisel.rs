@@ -88,8 +88,17 @@ pub fn apply_op(ctx: &Context, page: &mut Page, next_id: &mut u64, ed: &mut Edit
         return false;
     }
     if matches!(op, Op::Copy | Op::Cut) {
-        let text = idxs.iter().map(|&i| md_line(&page.blocks[i])).collect::<Vec<_>>().join("\n");
-        ctx.copy_text(text);
+        // children travel with their parent; the *exact* blocks are kept in the in-app clipboard
+        let mut all: Vec<usize> = vec![];
+        for &i in &idxs {
+            let end = (i + 1..page.blocks.len()).find(|&j| page.blocks[j].indent <= page.blocks[i].indent).unwrap_or(page.blocks.len());
+            all.extend(i..end);
+        }
+        all.sort_unstable();
+        all.dedup();
+        let text = all.iter().map(|&i| md_line(&page.blocks[i])).collect::<Vec<_>>().join("\n");
+        ctx.copy_text(text.clone());
+        crate::clip::set_blocks(text, all.iter().map(|&i| page.blocks[i].clone()).collect());
         if op == Op::Copy {
             return false;
         }
@@ -252,6 +261,29 @@ pub fn handle(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorSt
             }
         } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::A)) {
             ed.sel = page.blocks.iter().map(|b| b.id).collect();
+        }
+        // paste: exact blocks (or Markdown → blocks) after the selection / at the end of the page
+        let pasted = ctx.input(|i| i.events.iter().find_map(|e| if let Event::Paste(t) = e { Some(t.clone()) } else { None }));
+        if let Some(t) = pasted {
+            if let Some(blocks) = crate::clip::blocks_for(&t).or_else(|| crate::clip::markdown_blocks(&t)) {
+                push_undo(ed, page);
+                let after = page.blocks.iter().rposition(|b| ed.sel.contains(&b.id));
+                let at = match after {
+                    Some(i) => (i + 1..page.blocks.len()).find(|&j| page.blocks[j].indent <= page.blocks[i].indent).unwrap_or(page.blocks.len()),
+                    None => page.blocks.len(),
+                };
+                let base = after.map_or(0, |i| page.blocks[i].indent);
+                let mut ids = vec![];
+                for (k, mut nb) in blocks.into_iter().enumerate() {
+                    *next_id += 1;
+                    nb.id = *next_id;
+                    nb.indent = (nb.indent + base).min(6);
+                    ids.push(nb.id);
+                    page.blocks.insert(at + k, nb);
+                }
+                ed.sel = ids;
+                changed = true;
+            }
         }
         let redo_k = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) || i.consume_key(Modifiers::COMMAND, Key::Y));
         if redo_k {

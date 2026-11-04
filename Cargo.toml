@@ -21,6 +21,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 log = "0.4"
+hayro = "0.9"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env_logger = "0.11"
@@ -49,7 +50,7 @@ panic = "abort"
 [profile.web]
 inherits = "release"
 opt-level = "s"
-lto = "fat"
+lto = "thin"
 codegen-units = 1
 
 [profile.dev]

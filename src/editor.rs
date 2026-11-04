@@ -19,6 +19,8 @@ use crate::media;
 use crate::mediablocks;
 use crate::multisel;
 use crate::pickers;
+use crate::rich::{self, Fmt, Rich};
+use crate::clip;
 use crate::platform;
 use crate::widgets::{
     self, appear, context_menu, gradient_rect, menu_item, popup_area, replace_chars, reset_appear, right_clicked, section_label,
@@ -79,6 +81,19 @@ pub struct EditorState {
     pub media_sizes: HashMap<u64, usize>,
     pub cover_reposition: bool,
     pub cur_page: u64,
+    /// Format toggled with an empty selection (block id, caret, format) — applies to the next typed text.
+    pub pending: Option<(u64, usize, Fmt)>,
+    /// Link editor popup opened from the selection toolbar.
+    pub link_edit: Option<LinkEdit>,
+}
+
+pub struct LinkEdit {
+    pub bid: u64,
+    pub a: usize,
+    pub b: usize,
+    pub url: String,
+    pub pos: egui::Pos2,
+    pub fresh: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -133,7 +148,8 @@ fn slash_all() -> Vec<SlashItem> {
         (BlockKind::Embed, "Audio", "Embed Spotify or any audio player.", l::MUSIC, "audio spotify music podcast sound"),
         (BlockKind::Embed, "Embed", "Embed any website, map, Figma file or document.", l::GLOBE, "embed website iframe map figma codepen docs"),
         (BlockKind::Bookmark, "Web bookmark", "Save a link as a visual card.", l::BOOKMARK, "bookmark link url web card"),
-        (BlockKind::File, "File", "Attach a file to this page.", l::PAPERCLIP, "file attachment upload pdf document"),
+        (BlockKind::File, "PDF", "Upload a PDF and read it right inside the page.", l::FILE_TEXT, "pdf reader document read viewer paper"),
+        (BlockKind::File, "File", "Attach a file to this page.", l::PAPERCLIP, "file attachment upload document"),
     ] {
         v.push(SlashItem { act: Slash::Block(k), label, hint, glyph, kw, sec: med });
     }
@@ -176,6 +192,8 @@ enum Act {
     SetColor(usize, u8, bool),
     /// A URL was pasted into an empty text block: turn it into an image / embed / bookmark.
     UrlBlock(usize),
+    /// Paste the exact blocks that were copied (kind, indent, colours, media … preserved).
+    PasteBlocks(usize, Vec<Block>),
 }
 
 fn slash_act(idx: usize, s: SlashItem) -> Act {
@@ -220,16 +238,33 @@ fn md_shortcut(text: &str, cursor: usize) -> Option<(BlockKind, usize)> {
 
 // ───────────────────────────── inline formatting ─────────────────────────────
 
-struct Span {
-    text: String,
-    bold: bool,
-    italic: bool,
-    strike: bool,
-    code: bool,
-    ul: bool,
-    hl: bool,
-    link: Option<String>,
-    marker: bool,
+pub(crate) struct Span {
+    pub(crate) text: String,
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
+    pub(crate) strike: bool,
+    pub(crate) code: bool,
+    pub(crate) ul: bool,
+    pub(crate) hl: bool,
+    pub(crate) link: Option<String>,
+    pub(crate) marker: bool,
+}
+
+fn is_escapable(c: char) -> bool {
+    matches!(c, '\\' | '*' | '_' | '~' | '=' | '`' | '[' | ']')
+}
+
+/// Removes the backslash escapes of a marked-up string fragment.
+pub(crate) fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\' && it.peek().map_or(false, |n| is_escapable(*n)) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Finds `[text](url)` starting at `i`; returns the indices of `]` and `)`.
@@ -237,10 +272,17 @@ fn find_link(ch: &[char], i: usize) -> Option<(usize, usize)> {
     let n = ch.len();
     let mut j = i + 1;
     while j < n && ch[j] != ']' {
+        if ch[j] == '\\' && j + 1 < n && is_escapable(ch[j + 1]) {
+            j += 2;
+            continue;
+        }
         if ch[j] == '[' || ch[j] == '\n' {
             return None;
         }
         j += 1;
+    }
+    if j >= n {
+        return None;
     }
     if j == i + 1 || j + 2 >= n || ch[j + 1] != '(' {
         return None;
@@ -260,7 +302,7 @@ fn find_link(ch: &[char], i: usize) -> Option<(usize, usize)> {
 
 /// Splits `**bold**`, `*italic*`, `__underline__`, `~~strike~~`, `==highlight==`, `` `code` `` and `[link](url)` into styled spans
 /// (markers are kept as spans so the text is preserved byte-for-byte).
-fn parse_spans(s: &str) -> Vec<Span> {
+pub(crate) fn parse_spans(s: &str) -> Vec<Span> {
     let ch: Vec<char> = s.chars().collect();
     let n = ch.len();
     let (mut bo, mut it, mut st, mut co, mut ul, mut hl) = (false, false, false, false, false, false);
@@ -304,13 +346,21 @@ fn parse_spans(s: &str) -> Vec<Span> {
             i += 1;
             continue;
         }
+        if c == '\\' && i + 1 < n && is_escapable(ch[i + 1]) {
+            flush!(false);
+            cur.push('\\');
+            flush!(true);
+            cur.push(ch[i + 1]);
+            i += 2;
+            continue;
+        }
         let open_ok = |from: usize| from < n && !ch[from].is_whitespace();
         if c == '[' {
             if let Some((j, k)) = find_link(&ch, i) {
                 flush!(false);
                 cur.push('[');
                 flush!(true);
-                let inner: String = ch[i + 1..j].iter().collect();
+                let inner: String = unescape(&ch[i + 1..j].iter().collect::<String>());
                 out.push(Span { text: inner, bold: bo, italic: it, strike: st, code: false, ul, hl, link: Some(ch[j + 2..k].iter().collect()), marker: false });
                 cur = ch[j..=k].iter().collect();
                 flush!(true);
@@ -353,7 +403,7 @@ fn parse_spans(s: &str) -> Vec<Span> {
 }
 
 fn has_marks(s: &str) -> bool {
-    s.contains('*') || s.contains('`') || s.contains("~~") || s.contains("==") || s.contains("__") || s.contains("](")
+    crate::rich::has_marks(s)
 }
 
 pub fn rich_job(text: &str, font: &FontId, color: Color32, pal: &Palette, strip: bool) -> LayoutJob {
@@ -477,38 +527,6 @@ fn code_job(text: &str, font: &FontId, pal: &Palette) -> LayoutJob {
 }
 
 /// Wraps (or unwraps) the current selection in `mark`.
-fn wrap_selection(ctx: &Context, id: Id, text: &mut String, mark: &str) {
-    let mut st = TextEdit::load_state(ctx, id).unwrap_or_default();
-    let Some(r) = st.cursor.char_range() else { return };
-    let (a, b) = (r.primary.index.min(r.secondary.index), r.primary.index.max(r.secondary.index));
-    let (ba, bb) = (byte_at(text, a), byte_at(text, b));
-    let m = mark.chars().count();
-    let (sa, sb);
-    if a >= m && text[..ba].ends_with(mark) && text[bb..].starts_with(mark) {
-        let inner = text[ba..bb].to_owned();
-        let new = format!("{}{}{}", &text[..ba - mark.len()], inner, &text[bb + mark.len()..]);
-        *text = new;
-        sa = a - m;
-        sb = b - m;
-    } else {
-        let inner = text[ba..bb].to_owned();
-        text.replace_range(ba..bb, &format!("{mark}{inner}{mark}"));
-        sa = a + m;
-        sb = b + m;
-    }
-    st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(sa), CCursor::new(sb))));
-    st.store(ctx, id);
-}
-
-/// Turns the selection into `[text](https://)` and returns the char range of the placeholder URL (so typing replaces it).
-fn link_selection(text: &mut String, a: usize, b: usize) -> (usize, usize) {
-    let (ba, bb) = (byte_at(text, a), byte_at(text, b));
-    let inner = text[ba..bb].to_owned();
-    text.replace_range(ba..bb, &format!("[{inner}](https://)"));
-    let start = a + 1 + inner.chars().count() + 2;
-    (start, start + 8)
-}
-
 fn hidden(bl: &[Block], j: usize) -> bool {
     let mut lvl = bl[j].indent;
     for k in (0..j).rev() {
@@ -730,9 +748,9 @@ fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
         .iter()
         .filter(|_| has_toc)
         .filter_map(|b| match b.kind {
-            BlockKind::H1 => Some((b.id, 1, b.text.clone())),
-            BlockKind::H2 => Some((b.id, 2, b.text.clone())),
-            BlockKind::H3 => Some((b.id, 3, b.text.clone())),
+            BlockKind::H1 => Some((b.id, 1, rich::strip(&b.text))),
+            BlockKind::H2 => Some((b.id, 2, rich::strip(&b.text))),
+            BlockKind::H3 => Some((b.id, 3, rich::strip(&b.text))),
             _ => None,
         })
         .collect();
@@ -784,7 +802,7 @@ fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
             use std::hash::{Hash, Hasher};
             let b = &page.blocks[i];
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            (b.kind as u8, b.text.len(), b.indent, b.collapsed, b.checked, w.to_bits(), ed.scale.to_bits(), heads.len(), b.bg, b.size, b.url.len(), b.media).hash(&mut h);
+            (b.kind as u8, &b.text, b.indent, b.collapsed, b.checked, w.to_bits(), ed.scale.to_bits(), heads.len(), b.bg, b.size, b.url.len(), b.media).hash(&mut h);
             h.finish()
         };
         if ed.dragging.is_none()
@@ -949,8 +967,9 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
         Act::Split(i, at) => {
             let kind = bl[i].kind;
             let indent = bl[i].indent;
-            let cut = byte_at(&bl[i].text, at);
-            let right = bl[i].text.split_off(cut);
+            let (left, rightp) = Rich::parse(&bl[i].text).split(at);
+            bl[i].text = left.markup();
+            let right = rightp.markup();
             let (nk, ni) = match kind {
                 BlockKind::Todo | BlockKind::Bullet | BlockKind::Numbered => (kind, indent),
                 BlockKind::Toggle if !bl[i].collapsed => (BlockKind::Text, (indent + 1).min(6)),
@@ -972,8 +991,10 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
             } else {
                 let b = bl.remove(i);
                 let prev = &mut bl[i - 1];
-                let pos = prev.text.chars().count();
-                prev.text.push_str(&b.text);
+                let mut joined = Rich::parse(&prev.text);
+                let pos = joined.len();
+                joined.append(&Rich::parse(&b.text));
+                prev.text = joined.markup();
                 ed.focus = Some((prev.id, pos));
             }
         }
@@ -1006,8 +1027,8 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
             }
         }
         Act::Strip(i, kind, n) => {
-            let cut = byte_at(&bl[i].text, n);
-            bl[i].text = bl[i].text[cut..].to_owned();
+            let whole = Rich::parse(&bl[i].text);
+            bl[i].text = whole.slice(n, whole.len()).markup();
             bl[i].kind = kind;
             if kind == BlockKind::Divider {
                 bl[i].text.clear();
@@ -1085,7 +1106,7 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
             ed.focus = Some((bl[i].id, usize::MAX));
         }
         Act::UrlBlock(i) => {
-            let url = bl[i].text.trim().to_owned();
+            let url = Rich::parse(&bl[i].text).plain.trim().to_owned();
             let kind = if media::is_image_name(&url) {
                 BlockKind::Image
             } else if media::embed_info(&url).service != "Website" {
@@ -1101,6 +1122,32 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
                 let nb = new_block(next_id, BlockKind::Text, String::new(), ind);
                 ed.focus = Some((nb.id, 0));
                 bl.push(nb);
+            }
+        }
+        Act::PasteBlocks(i, blocks) => {
+            if blocks.is_empty() {
+                return;
+            }
+            let base = bl[i].indent;
+            let replace = bl[i].kind.has_text() && bl[i].text.is_empty();
+            let mut new = blocks;
+            for nb in new.iter_mut() {
+                *next_id += 1;
+                nb.id = *next_id;
+                nb.indent = (nb.indent + base).min(6);
+            }
+            let focus_last = new.last().filter(|b| b.kind.has_text()).map(|b| b.id);
+            let at = if replace {
+                bl.remove(i);
+                i
+            } else {
+                subtree_end(bl, i)
+            };
+            for (k, nb) in new.into_iter().enumerate() {
+                bl.insert(at + k, nb);
+            }
+            if let Some(id) = focus_last {
+                ed.focus = Some((id, usize::MAX));
             }
         }
         Act::SetColor(i, c, is_bg) => {
@@ -1362,13 +1409,15 @@ struct Tx<'a> {
 fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorState, pal: &Palette, tx: Tx, act: &mut Option<Act>) -> bool {
     let ctx = ui.ctx().clone();
     let id = Id::new(("blk", b.id));
-    let nchars = b.text.chars().count();
+    let is_code = b.kind == BlockKind::Code;
+    let mut rt = if is_code { Rich::plain(&b.text) } else { Rich::parse(&b.text) };
+    let nchars = rt.len();
     let Tx { font, color, hint, width } = tx;
     let focus_request = ed.focus.map_or(false, |(f, _)| f == b.id) || ed.restore_sel.map_or(false, |r| r.0 == b.id);
 
     // Unfocused blocks with inline formatting render the styled text without the markers.
     if !focus_request && b.kind != BlockKind::Code && has_marks(&b.text) && !ctx.memory(|m| m.has_focus(id)) {
-        let mut job = rich_job(&b.text, &font, color, pal, true);
+        let mut job = rt.job(&font, color, pal);
         job.wrap.max_width = width;
         let galley = ui.painter().layout_job(job);
         ui.add_space(3.0);
@@ -1378,14 +1427,9 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         let mut link_hit: Option<String> = None;
         if let Some(p) = resp.hover_pos().or_else(|| resp.interact_pointer_pos()) {
             let idx = galley.cursor_from_pos(p - rect.min).ccursor.index;
-            let mut acc = 0usize;
-            for sp in parse_spans(&b.text).iter().filter(|s| !s.marker) {
-                let len = sp.text.chars().count();
-                if idx >= acc && idx < acc + len {
-                    link_hit = sp.link.clone();
-                    break;
-                }
-                acc += len;
+            // only a click *on* the text of a link counts (not the empty space after it)
+            if p.x - rect.min.x <= galley.rect.max.x + 2.0 {
+                link_hit = rt.link_at(idx).map(str::to_owned);
             }
         }
         if link_hit.is_some() && resp.hovered() {
@@ -1430,7 +1474,7 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
     }
 
     let focused = ctx.memory(|m| m.has_focus(id));
-    let items = if focused && b.kind == BlockKind::Text && b.text.starts_with('/') && !b.text.contains('\n') { slash_items(&b.text[1..]) } else { vec![] };
+    let items = if focused && b.kind == BlockKind::Text && rt.plain.starts_with('/') && !rt.plain.contains('\n') { slash_items(&rt.plain[1..]) } else { vec![] };
     let slash_active = !items.is_empty();
     if slash_active {
         ed.slash_sel = ed.slash_sel.min(items.len() - 1);
@@ -1449,8 +1493,27 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
             ];
             for (m, k, mark) in marks {
                 if ui.input_mut(|i| i.consume_key(m, k)) {
-                    wrap_selection(&ctx, id, &mut b.text, mark);
+                    let (sa, sb) = widgets::selection(&ctx, id).unwrap_or((nchars, nchars));
+                    toggle_format(&mut rt, ed, b.id, sa, sb, rich::flag_for(mark));
+                    b.text = rt.markup();
                     ed.slash_sel = 0;
+                }
+            }
+            // Copy / Cut of a formatted fragment: remember the exact formatting for the next paste.
+            let copying = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy | egui::Event::Cut)));
+            if copying {
+                if let Some((sa, sb)) = widgets::selection(&ctx, id) {
+                    if sa != sb {
+                        clip::set_rich(rt.slice(sa, sb));
+                    }
+                }
+            }
+            // Pasting blocks that were copied in this app: insert the exact blocks, not their Markdown.
+            let pasted = ctx.input(|i| i.events.iter().find_map(|e| if let egui::Event::Paste(t) = e { Some(t.clone()) } else { None }));
+            if let Some(t) = pasted {
+                if let Some(blocks) = clip::blocks_for(&t) {
+                    ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Paste(_))));
+                    *act = Some(Act::PasteBlocks(idx, blocks));
                 }
             }
         }
@@ -1474,7 +1537,7 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
                 let shift = ui.input(|i| i.modifiers.shift);
                 if !shift && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
                     let listy = matches!(b.kind, BlockKind::Todo | BlockKind::Bullet | BlockKind::Numbered | BlockKind::Quote | BlockKind::Callout | BlockKind::Toggle);
-                    if b.text.is_empty() && listy {
+                    if rt.is_empty() && listy {
                         *act = Some(if b.indent > 0 { Act::Indent(idx, -1) } else { Act::Convert(idx, BlockKind::Text, false) });
                     } else {
                         *act = Some(Act::Split(idx, cursor));
@@ -1512,14 +1575,25 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
     }
 
     let hint_txt = if b.kind == BlockKind::Text && !focused { String::new() } else { hint.to_owned() };
-    let is_code = b.kind == BlockKind::Code;
     let (pal2, font2) = (*pal, font.clone());
+    let pending_fmt = ed.pending.filter(|p| p.0 == b.id).map(|p| p.2);
+    let rt_old = rt.clone();
+    let mut buf = rt.plain.clone();
+    // The layouter shows the formatted text *without any markers*; while the text changes inside a frame it adapts the formats.
     let mut layouter = |ui: &Ui, s: &str, wrap: f32| {
-        let mut job = if is_code { code_job(s, &font2, &pal2) } else { rich_job(s, &font2, color, &pal2, false) };
+        let mut job = if is_code {
+            code_job(s, &font2, &pal2)
+        } else if s == rt_old.plain {
+            rt_old.job(&font2, color, &pal2)
+        } else {
+            let mut r = rt_old.clone();
+            r.adjust(s, pending_fmt, None);
+            r.job(&font2, color, &pal2)
+        };
         job.wrap.max_width = wrap;
         ui.fonts(|f| f.layout_job(job))
     };
-    let out = TextEdit::multiline(&mut b.text)
+    let out = TextEdit::multiline(&mut buf)
         .id(id)
         .frame(false)
         .font(font.clone())
@@ -1532,6 +1606,24 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         .hint_text(RichText::new(hint_txt).font(font).color(with_alpha(pal.muted, 0.75)))
         .show(ui);
 
+    if out.response.changed() {
+        if is_code {
+            b.text = buf.clone();
+        } else {
+            let paste = ctx.input(|i| i.events.iter().find_map(|e| if let egui::Event::Paste(t) = e { clip::rich_for(t) } else { None }));
+            rt.adjust(&buf, pending_fmt, paste.as_ref());
+            b.text = rt.markup();
+            ed.pending = None;
+        }
+    }
+    if let Some((pb, pc, _)) = ed.pending {
+        // the caret moved away: the pending format no longer applies
+        let cur = out.cursor_range.map(|c| c.primary.ccursor.index);
+        if pb == b.id && cur.is_some() && cur != Some(pc) {
+            ed.pending = None;
+        }
+    }
+
     let mut cursor_idx = 0;
     if let Some(cr) = out.cursor_range {
         cursor_idx = cr.primary.ccursor.index;
@@ -1542,7 +1634,7 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
 
     if !ed.rc_frame {
         if let Some(p) = right_clicked(ui, out.response.rect) {
-            open_text_menu(ed, &ctx, id, b.id, b.text.chars().count(), p);
+            open_text_menu(ed, &ctx, id, b.id, rt.len(), p);
         }
     }
 
@@ -1569,13 +1661,13 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
     if out.response.changed()
         && b.kind == BlockKind::Text
         && act.is_none()
-        && media::looks_like_url(&b.text)
+        && media::looks_like_url(&rt.plain)
         && ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))))
     {
         *act = Some(Act::UrlBlock(idx));
     }
     if out.response.changed() && b.kind == BlockKind::Text && act.is_none() {
-        if let Some((kind, n)) = md_shortcut(&b.text, cursor_idx) {
+        if let Some((kind, n)) = md_shortcut(&rt.plain, cursor_idx) {
             *act = Some(Act::Strip(idx, kind, n));
         }
     }
@@ -1627,6 +1719,23 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
     }
 
     out.response.changed()
+}
+
+/// Bold / italic / … on the selection, or — with an empty selection — on the text typed next.
+fn toggle_format(rt: &mut Rich, ed: &mut EditorState, bid: u64, a: usize, b: usize, flag: u8) {
+    let (a, b) = (a.min(b), a.max(b));
+    if a != b {
+        rt.toggle(a, b, flag);
+        ed.pending = None;
+    } else {
+        let mut f = match ed.pending {
+            Some((pb, pc, f)) if pb == bid && pc == a => f,
+            _ => a.checked_sub(1).and_then(|i| rt.fmts.get(i).copied()).unwrap_or_default(),
+        };
+        f.link = 0;
+        f.flags ^= flag;
+        ed.pending = Some((bid, a, f));
+    }
 }
 
 fn open_text_menu(ed: &mut EditorState, ctx: &Context, id: Id, bid: u64, nchars: usize, p: egui::Pos2) {
@@ -1699,16 +1808,26 @@ fn ed_menu(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState
     if let Some(pi) = pick {
         let tid = Id::new(("blk", bid));
         let (a, b) = sel.unwrap_or((0, 0));
-        let nchars = page.blocks[idx].text.chars().count();
+        let mut rt = Rich::parse(&page.blocks[idx].text);
+        let nchars = rt.len();
         match list[pi].1 {
             Cmd::Copy => {
-                ctx.copy_text(slice_chars(&page.blocks[idx].text, a, b));
+                let frag = rt.slice(a, b);
+                ctx.copy_text(frag.plain.clone());
+                clip::set_rich(frag);
                 ed.restore_sel = Some((bid, a, b));
             }
-            Cmd::CopyBlock => ctx.copy_text(page.blocks[idx].text.clone()),
+            Cmd::CopyBlock => {
+                ctx.copy_text(rt.plain.clone());
+                clip::set_blocks(rt.plain.clone(), vec![page.blocks[idx].clone()]);
+            }
             Cmd::Cut => {
-                ctx.copy_text(slice_chars(&page.blocks[idx].text, a, b));
-                let at = replace_chars(&mut page.blocks[idx].text, a, b, "");
+                let frag = rt.slice(a, b);
+                ctx.copy_text(frag.plain.clone());
+                clip::set_rich(frag);
+                rt.replace(a, b, &Rich::default());
+                page.blocks[idx].text = rt.markup();
+                let at = a.min(b);
                 ed.restore_sel = Some((bid, at, at));
                 changed = true;
             }
@@ -1719,10 +1838,10 @@ fn ed_menu(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState
             }
             Cmd::SelAll => ed.restore_sel = Some((bid, 0, nchars)),
             Cmd::Fmt(mark) => {
-                widgets::set_selection(&ctx, tid, a, b);
-                wrap_selection(&ctx, tid, &mut page.blocks[idx].text, mark);
-                let (na, nb) = widgets::selection(&ctx, tid).unwrap_or((a, b));
-                ed.restore_sel = Some((bid, na, nb));
+                rt.toggle(a, b, rich::flag_for(mark));
+                page.blocks[idx].text = rt.markup();
+                ed.restore_sel = Some((bid, a, b));
+                let _ = tid;
                 changed = true;
             }
             Cmd::Style => {
@@ -1774,20 +1893,41 @@ fn finish_paste(page: &mut Page, next_id: &mut u64, ed: &mut EditorState) -> boo
         return false;
     }
     let (a, b) = (a.min(b), a.max(b));
-    if !clip.contains('\n') || page.blocks[idx].kind == BlockKind::Code {
+    let is_code = page.blocks[idx].kind == BlockKind::Code;
+    // 1. our own blocks come back as exactly the same blocks
+    if !is_code {
+        if let Some(blocks) = clip::blocks_for(&clip) {
+            apply(page, Act::PasteBlocks(idx, blocks), next_id, ed);
+            return true;
+        }
+    }
+    if is_code {
         let at = replace_chars(&mut page.blocks[idx].text, a, b, &clip);
         ed.restore_sel = Some((bid, at, at));
         return true;
     }
-    // Multi-line paste: one block per line (list items continue the list).
-    let tail = {
-        let t = &page.blocks[idx].text;
-        t[byte_at(t, b)..].to_owned()
-    };
-    let head = byte_at(&page.blocks[idx].text, a);
+    // 2. a formatted fragment copied inside the app keeps its formatting
+    if !clip.contains('\n') {
+        let frag = clip::rich_for(&clip).unwrap_or_else(|| Rich::plain(&clip));
+        let mut rt = Rich::parse(&page.blocks[idx].text);
+        rt.replace(a, b, &frag);
+        page.blocks[idx].text = rt.markup();
+        let at = a + frag.len();
+        ed.restore_sel = Some((bid, at, at));
+        return true;
+    }
+    // 3. Markdown from elsewhere becomes real blocks (headings, lists, to-dos, quotes, code …)
+    if let Some(blocks) = clip::markdown_blocks(&clip) {
+        apply(page, Act::PasteBlocks(idx, blocks), next_id, ed);
+        return true;
+    }
+    // 4. plain multi-line text: one block per line (list items continue the list)
+    let whole = Rich::parse(&page.blocks[idx].text);
+    let (head, tail) = (whole.slice(0, a), whole.slice(b, whole.len()));
     let mut lines = clip.split('\n');
-    page.blocks[idx].text.truncate(head);
-    page.blocks[idx].text.push_str(lines.next().unwrap_or(""));
+    let mut first = head;
+    first.append(&Rich::plain(lines.next().unwrap_or("")));
+    page.blocks[idx].text = first.markup();
     let rest: Vec<&str> = lines.collect();
     let (kind, indent) = (page.blocks[idx].kind, page.blocks[idx].indent);
     let nk = match kind {
@@ -1795,15 +1935,15 @@ fn finish_paste(page: &mut Page, next_id: &mut u64, ed: &mut EditorState) -> boo
         _ => BlockKind::Text,
     };
     let mut at = idx + 1;
-    let mut last = (bid, page.blocks[idx].text.chars().count());
+    let mut last = (bid, first.len());
     let n = rest.len();
     for (k, line) in rest.into_iter().enumerate() {
-        let mut text = line.to_owned();
-        let cur = text.chars().count();
+        let mut r = Rich::plain(line);
+        let cur = r.len();
         if k + 1 == n {
-            text.push_str(&tail);
+            r.append(&tail);
         }
-        let nb = new_block(next_id, nk, text, indent);
+        let nb = new_block(next_id, nk, r.markup(), indent);
         last = (nb.id, cur);
         page.blocks.insert(at, nb);
         at += 1;
@@ -1860,6 +2000,7 @@ fn fmt_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) ->
                     clicked = Some(Cmd::Style);
                 }
                 sep(ui);
+                let state = Rich::parse(&page.blocks[idx].text);
                 for (icon, mark, tip) in [
                     (Icon::Bold, "**", "Bold  Ctrl+B"),
                     (Icon::Italic, "*", "Italic  Ctrl+I"),
@@ -1868,11 +2009,20 @@ fn fmt_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) ->
                     (Icon::Code, "`", "Inline code  Ctrl+E"),
                     (Icon::Highlight, "==", "Highlight  Ctrl+Shift+H"),
                 ] {
-                    if widgets::icon_button(ui, pal, icon, 15.0, tip).clicked() {
+                    let r = widgets::icon_button(ui, pal, icon, 15.0, tip);
+                    if state.all_have(bar.a, bar.b, rich::flag_for(mark)) {
+                        ui.painter().rect_filled(r.rect.shrink2(vec2(0.0, 1.0)), 6.0, with_alpha(pal.accent, 0.22));
+                        ui.painter().hline(r.rect.x_range().shrink(7.0), r.rect.bottom() - 3.0, Stroke::new(2.0_f32, pal.accent));
+                    }
+                    if r.clicked() {
                         clicked = Some(Cmd::Fmt(mark));
                     }
                 }
-                if widgets::icon_button(ui, pal, Icon::Link, 15.0, "Link").clicked() {
+                let lr = widgets::icon_button(ui, pal, Icon::Link, 15.0, "Link");
+                if state.link_in(bar.a, bar.b).is_some() {
+                    ui.painter().rect_filled(lr.rect.shrink2(vec2(0.0, 1.0)), 6.0, with_alpha(pal.accent, 0.22));
+                }
+                if lr.clicked() {
                     link_clicked = true;
                 }
                 sep(ui);
@@ -1886,17 +2036,17 @@ fn fmt_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) ->
     ctx.data_mut(|d| d.insert_temp(rect_id, area.response.rect));
     let mut changed = false;
     if link_clicked && clicked.is_none() {
-        let (sa, sb) = link_selection(&mut page.blocks[idx].text, bar.a, bar.b);
-        ed.restore_sel = Some((bar.bid, sa, sb));
+        let existing = Rich::parse(&page.blocks[idx].text).link_in(bar.a, bar.b).unwrap_or_else(|| "https://".to_owned());
+        ed.link_edit = Some(LinkEdit { bid: bar.bid, a: bar.a, b: bar.b, url: existing, pos: pos2(area.response.rect.left(), area.response.rect.bottom() + 6.0), fresh: true });
         ed.fmt_bar = None;
-        return true;
+        return false;
     }
     match clicked {
         Some(Cmd::Fmt(mark)) => {
-            widgets::set_selection(&ctx, tid, bar.a, bar.b);
-            wrap_selection(&ctx, tid, &mut page.blocks[idx].text, mark);
-            let (na, nb) = widgets::selection(&ctx, tid).unwrap_or((bar.a, bar.b));
-            ed.restore_sel = Some((bar.bid, na, nb));
+            let mut rt = Rich::parse(&page.blocks[idx].text);
+            rt.toggle(bar.a, bar.b, rich::flag_for(mark));
+            page.blocks[idx].text = rt.markup();
+            ed.restore_sel = Some((bar.bid, bar.a, bar.b));
             changed = true;
         }
         Some(_) => {
@@ -1906,6 +2056,69 @@ fn fmt_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) ->
             ed.fmt_bar = None;
         }
         None => {}
+    }
+    changed
+}
+
+pub fn link_popup(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) -> bool {
+    let Some(mut le) = ed.link_edit.take() else { return false };
+    let ctx = ui.ctx().clone();
+    let Some(idx) = page.blocks.iter().position(|b| b.id == le.bid) else { return false };
+    let (mut apply_it, mut remove, mut close) = (false, false, false);
+    let id = Id::new("link_url");
+    let screen = ctx.screen_rect();
+    let pos = pos2(le.pos.x.min(screen.right() - 340.0).max(8.0), le.pos.y.min(screen.bottom() - 90.0).max(8.0));
+    let area = egui::Area::new(Id::new("link_popup")).order(Order::Foreground).fixed_pos(pos).show(&ctx, |ui| {
+        crate::widgets::popup_frame(pal).inner_margin(Margin::same(8)).show(ui, |ui| {
+            ui.set_width(318.0);
+            ui.horizontal(|ui| {
+                icons::paint(ui.painter(), ui.cursor().min + vec2(10.0, 12.0), 14.0, Icon::Link, pal.muted);
+                ui.add_space(24.0);
+                let r = ui.add(TextEdit::singleline(&mut le.url).id(id).hint_text("Paste or type a link").desired_width(200.0));
+                if le.fresh {
+                    r.request_focus();
+                }
+                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    apply_it = true;
+                }
+                if ui.button("Apply").clicked() {
+                    apply_it = true;
+                }
+                if ui.button("✕").on_hover_text("Remove link").clicked() {
+                    remove = true;
+                }
+            });
+        });
+    });
+    ctx.move_to_top(area.response.layer_id);
+    if ctx.input(|i| i.key_pressed(Key::Escape)) {
+        close = true;
+    }
+    if !le.fresh && ctx.input(|i| i.pointer.any_pressed()) && !ctx.pointer_interact_pos().map_or(false, |p| area.response.rect.contains(p)) {
+        close = true;
+    }
+    le.fresh = false;
+    let mut changed = false;
+    if apply_it || remove {
+        let mut rt = Rich::parse(&page.blocks[idx].text);
+        let url = le.url.trim();
+        if remove || url.is_empty() || url == "https://" {
+            rt.set_link(le.a, le.b, None);
+        } else {
+            let full = if url.contains("://") || url.starts_with("mailto:") { url.to_owned() } else { format!("https://{url}") };
+            rt.set_link(le.a, le.b, Some(&full));
+        }
+        page.blocks[idx].text = rt.markup();
+        ed.restore_sel = Some((le.bid, le.b, le.b));
+        changed = true;
+        close = true;
+    }
+    if close {
+        if !changed {
+            ed.restore_sel = Some((le.bid, le.a, le.b));
+        }
+    } else {
+        ed.link_edit = Some(le);
     }
     changed
 }
@@ -1944,6 +2157,7 @@ fn popups(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
         changed |= ed_menu(ui, page, next_id, ed, pal, m);
     }
     changed |= fmt_bar(ui, page, ed, pal);
+    changed |= link_popup(ui, page, ed, pal);
 
     // block menu
     if let Some((bid, pos)) = ed.block_menu {

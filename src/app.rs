@@ -1658,9 +1658,55 @@ impl LumenApp {
             let ws = &mut self.ws;
             let ed = &mut self.ed;
             let mut changed = false;
-            ScrollArea::vertical().id_salt(("page_scroll", cur)).drag_to_scroll(false).auto_shrink([false, false]).show(ui, |ui| {
+            // Eased ("inertial") wheel / touchpad scrolling: the raw deltas move a target offset and the view glides towards it,
+            // which hides the uneven chunks touchpads deliver. Scrollbar drags and jumps (TOC, scroll_to) resync the target.
+            let ctx2 = ui.ctx().clone();
+            let sk = Id::new(("smooth_scroll", cur));
+            let (mut target, mut curr, last_actual, max_off): (f32, f32, f32, f32) = ctx2.data(|d| d.get_temp(sk)).unwrap_or((0.0, 0.0, 0.0, f32::MAX));
+            let over = ui.rect_contains_pointer(ui.max_rect()) && ed.menu.is_none() && ed.block_menu.is_none() && ed.link_edit.is_none();
+            let wheel = if over && !ctx2.input(|i| i.modifiers.command) {
+                ctx2.input_mut(|i| {
+                    let d = i.raw_scroll_delta.y + i.smooth_scroll_delta.y.min(0.0) * 0.0;
+                    if d != 0.0 {
+                        i.raw_scroll_delta.y = 0.0;
+                        i.smooth_scroll_delta.y = 0.0;
+                    }
+                    d
+                })
+            } else {
+                0.0
+            };
+            if (last_actual - curr).abs() > 1.0 {
+                // something else moved the view
+                curr = last_actual;
+                target = last_actual;
+            }
+            if wheel != 0.0 {
+                target = (target - wheel).clamp(0.0, max_off.max(0.0));
+            }
+            let animating = (target - curr).abs() > 0.3;
+            if animating {
+                let dt = ctx2.input(|i| i.stable_dt).clamp(0.001, 0.05);
+                curr += (target - curr) * (1.0 - (-dt * 16.0).exp());
+                if (target - curr).abs() <= 0.3 {
+                    curr = target;
+                }
+                ctx2.request_repaint();
+            }
+            let mut sa = ScrollArea::vertical().id_salt(("page_scroll", cur)).drag_to_scroll(false).auto_shrink([false, false]);
+            if animating || wheel != 0.0 {
+                sa = sa.vertical_scroll_offset(curr);
+            }
+            let out = sa.show(ui, |ui| {
                 changed = editor::show_page(ui, ws, cur, ed, &pal);
             });
+            let actual = out.state.offset.y;
+            let max_off = (out.content_size.y - out.inner_rect.height()).max(0.0);
+            if !animating && wheel == 0.0 {
+                target = actual;
+                curr = actual;
+            }
+            ctx2.data_mut(|d| d.insert_temp(sk, (target, curr, actual, max_off)));
             if changed {
                 ws.touch(cur);
             }

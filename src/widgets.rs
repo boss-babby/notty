@@ -141,6 +141,17 @@ pub fn section_label(ui: &mut Ui, pal: &Palette, text: &str) {
 }
 
 /// Full-width menu row with optional leading glyph and sub-label.
+/// Paints single-line text that is truncated with an ellipsis instead of overflowing its box. Returns the painted width.
+pub fn text_fit(p: &egui::Painter, pos: Pos2, anchor: Align2, text: &str, font: egui::FontId, color: Color32, max_w: f32) -> f32 {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_w.max(10.0));
+    let g = p.layout_job(job);
+    let rect = anchor.anchor_size(pos, g.size());
+    let w = g.size().x;
+    p.galley(rect.min, g, color);
+    w
+}
+
 pub fn menu_item(
     ui: &mut Ui,
     pal: &Palette,
@@ -177,11 +188,12 @@ pub fn menu_item(
     }
     match sub {
         Some(s) => {
-            p.text(pos2(x, rect.center().y - 8.0), Align2::LEFT_CENTER, label, body(14.0), col);
-            p.text(pos2(x, rect.center().y + 9.0), Align2::LEFT_CENTER, s, body(12.0), pal.muted);
+            let mw = rect.right() - x - 8.0;
+            text_fit(p, pos2(x, rect.center().y - 8.0), Align2::LEFT_CENTER, label, body(14.0), col, mw);
+            text_fit(p, pos2(x, rect.center().y + 9.0), Align2::LEFT_CENTER, s, body(12.0), pal.muted, mw);
         }
         None => {
-            p.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, label, body(14.0), col);
+            text_fit(p, pos2(x, rect.center().y), Align2::LEFT_CENTER, label, body(14.0), col, rect.right() - x - 8.0);
         }
     }
     resp.on_hover_cursor(CursorIcon::PointingHand)
@@ -400,10 +412,11 @@ pub fn context_menu(ctx: &Context, id: Id, pos: Pos2, pal: &Palette, fresh: &mut
                 let col = if it.danger { pal.danger } else { pal.text };
                 let ic = if it.danger { pal.danger } else { lerp_color(pal.muted, pal.text, h) };
                 p.text(pos2(rect.left() + 17.0, rect.center().y), Align2::CENTER_CENTER, it.icon, icons::font(15.5), with_alpha(ic, dim));
-                p.text(pos2(rect.left() + 36.0, rect.center().y), Align2::LEFT_CENTER, it.label, body(14.0), with_alpha(col, dim));
+                let mut hint_w = 0.0;
                 if !it.hint.is_empty() {
-                    p.text(pos2(rect.right() - 10.0, rect.center().y), Align2::RIGHT_CENTER, it.hint, body(11.5), with_alpha(pal.muted, 0.9 * dim));
+                    hint_w = text_fit(p, pos2(rect.right() - 10.0, rect.center().y), Align2::RIGHT_CENTER, it.hint, body(11.5), with_alpha(pal.muted, 0.9 * dim), 90.0) + 12.0;
                 }
+                text_fit(p, pos2(rect.left() + 36.0, rect.center().y), Align2::LEFT_CENTER, it.label, body(14.0), with_alpha(col, dim), W - 46.0 - hint_w);
                 if r.on_hover_cursor(if it.enabled { CursorIcon::PointingHand } else { CursorIcon::Default }).clicked() && it.enabled {
                     picked = Some(i);
                 }

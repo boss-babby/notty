@@ -397,11 +397,16 @@ fn file(ui: &mut Ui, b: &mut Block, page_id: u64, ed: &mut EditorState, pal: &Pa
     }
     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() && !clicked_chip {
         if local {
-            ed.dl_req = Some((b.media, name));
+            ed.dl_req = Some((b.media, name.clone()));
         } else {
             platform::open_url(&ctx, &b.url);
         }
     }
     ui.add_space(4.0);
+    if crate::pdf::looks_like_pdf(&name, &b.url) {
+        ui.add_space(4.0);
+        crate::pdf::viewer(ui, &ctx, b.id, &media::src_uri(&b.src()), &name, pal, w);
+        ui.add_space(4.0);
+    }
     changed
 }

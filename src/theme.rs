@@ -161,14 +161,18 @@ pub fn setup_fonts(ctx: &Context) {
     );
     // Lucide icon font: its own family and a last-resort fallback everywhere, so icon glyphs work in any text.
     fonts.font_data.insert("lucide".to_owned(), Arc::new(FontData::from_static(include_bytes!("../assets/lucide.ttf"))));
-    let mut fallback: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    fallback.push("lucide".to_owned());
+    // The Lucide glyphs live in the private-use area, which egui's bundled emoji/icon fonts also use for *different* shapes.
+    // Inter v4 ships 700+ private-use stylistic alternates (e.g. U+E286 = an accented 'u'); they were stripped from the bundled
+    // Inter files (assets/) so that they can no longer shadow Lucide. Lucide is also subset to the private-use range only. Otherwise some
+    // icons render as other symbols, dots or empty boxes.
+    let rest: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     let prop = fonts.families.entry(FontFamily::Proportional).or_default();
     prop.insert(0, "inter".to_owned());
-    prop.push("lucide".to_owned());
-    fonts.families.entry(FontFamily::Monospace).or_default().push("lucide".to_owned());
-    let mut b = vec!["inter-bold".to_owned()];
-    b.extend(fallback);
+    prop.insert(1, "lucide".to_owned());
+    let mono = fonts.families.entry(FontFamily::Monospace).or_default();
+    mono.insert(1.min(mono.len()), "lucide".to_owned());
+    let mut b = vec!["inter-bold".to_owned(), "lucide".to_owned()];
+    b.extend(rest);
     fonts.families.insert(FontFamily::Name("bold".into()), b);
     fonts.families.insert(FontFamily::Name("lucide".into()), vec!["lucide".to_owned()]);
     ctx.set_fonts(fonts);

@@ -28,6 +28,14 @@ import Markdown / CSV / JSON by pasting or dropping a file on the window. Option
 
 Limits: no real-time collaboration / cloud sync / comments / history yet; web build stores local media in localStorage (~2.6 MB cap, use image links for more).
 
+## What's new in 2.1
+- **WYSIWYG inline editing** — markers (`**`, `==`, `__` …) are never shown while editing. Blocks are edited as plain text + per-character formats (`src/rich.rs`); the stored form stays Markdown-compatible. Typing inherits the neighbouring format, Ctrl+B/I/U/E/Shift+S/Shift+H toggle formats on a selection *or* for the next typed text, the selection toolbar highlights the active formats, and links are edited in a small popup.
+- **Exact block copy / paste** (`src/clip.rs`) — copying blocks (with their children) or a formatted fragment keeps the exact data in an in-app clipboard next to the Markdown text; pasting restores the same blocks (kind, colours, indent, media, nesting) / formatting. Pasted Markdown becomes real blocks (headings, lists, to-dos, quotes, code).
+- **Icons fixed** — the root cause: Inter v4 contains 764 private-use stylistic alternates that shadowed Lucide's private-use code points (U+E286 drew an accented *u*). They are stripped from the bundled Inter files and Lucide is subset to its private-use range.
+- **No more overflow** — menu / slash-menu / context-menu labels, descriptions and shortcut hints are truncated with an ellipsis (`widgets::text_fit`).
+- **Smooth scrolling** — eased wheel / touchpad scrolling on the page.
+- **PDF reader** — `/pdf` (or any file block with a `.pdf`) renders pages inline with [hayro](https://github.com/LaurenzV/hayro) (pure Rust: same code on Windows and WASM), page navigation and zoom. MuPDF (AGPL, C) and pdfium (binary) were evaluated and rejected.
+
 ## Shortcuts
 `Ctrl/Cmd+K` palette · `N` new page · `J` journal · `\` sidebar · `.` focus · `L` lock · `Shift+L` theme · `Shift+E` export · `/` all shortcuts
 
