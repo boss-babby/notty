@@ -11,6 +11,7 @@ use crate::dates;
 use crate::editor::{EditorState, GUTTER};
 use crate::icons::{self, Icon};
 use crate::model::*;
+use crate::platform;
 use crate::theme::{bold, body, lerp_color, tag_color, Palette, COVERS, TAG_NAMES};
 use crate::widgets::{field, gradient_rect, icon_button, menu_item, popup_area, section_label, with_alpha};
 
@@ -350,7 +351,7 @@ fn cell(ui: &mut Ui, db: &Database, row: &Page, prop: &Prop, rect: Rect, pal: &P
                 clip.text(br.center(), Align2::CENTER_CENTER, l::EXTERNAL_LINK, body(14.0), if resp.hovered() { pal.accent } else { pal.muted });
                 if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Open link").clicked() {
                     let url = if buf.starts_with("http") { buf.clone() } else { format!("https://{buf}") };
-                    ctx.open_url(egui::OpenUrl::new_tab(url));
+                    platform::open_url(&ctx, &url);
                 }
             }
         }
@@ -702,7 +703,7 @@ fn list(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], pal: &Palette,
         let (rect, resp) = ui.allocate_exact_size(vec2(w, 36.0), Sense::click());
         let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
         ui.painter().rect_filled(rect, 6.0, with_alpha(pal.hover, t));
-        let icon = if row.icon.is_empty() { l::FILE_TEXT } else { &row.icon };
+        let icon = if row.icon.is_empty() { l::FILE_TEXT } else { icons::icon_text(&row.icon) };
         ui.painter().text(pos2(rect.left() + 18.0, rect.center().y), Align2::CENTER_CENTER, icon, body(16.0), pal.muted);
         let g = ui.painter().layout_no_wrap(title_of(row).to_owned(), bold(14.5), if row.title.is_empty() { pal.muted } else { pal.text });
         let tw = g.size().x;
@@ -767,8 +768,11 @@ fn gallery(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], pal: &Palet
                     let top_r = CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 };
                     ui.painter().rect_filled(cr, top_r, Color32::from_rgb(a.0, a.1, a.2));
                     gradient_rect(ui, Rect::from_min_max(cr.min + vec2(0.0, 10.0), cr.max), Color32::from_rgb(a.0, a.1, a.2), Color32::from_rgb(b.0, b.1, b.2));
+                    if !row.cover_img.is_empty() {
+                        crate::icons::paint_cover(ui, cr, &crate::media::src_uri(&row.cover_img), row.cover_pos);
+                    }
                     if !row.icon.is_empty() {
-                        ui.painter().text(cr.center(), Align2::CENTER_CENTER, &row.icon, body(34.0), pal.text);
+                        crate::icons::paint_page_icon(ui, cr.center(), &row.icon, 40.0, pal.text);
                     }
                     Frame::new().inner_margin(Margin::symmetric(12, 10)).show(ui, |ui| {
                         ui.set_width(cw - 24.0);

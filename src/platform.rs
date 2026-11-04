@@ -100,3 +100,178 @@ pub fn request_paste(ctx: &egui::Context) {
 pub fn take_paste() -> Option<String> {
     PASTE.with(|p| p.borrow_mut().take())
 }
+
+// ───────────────────────────── opening links ─────────────────────────────
+
+/// Opens a URL in the system browser (desktop) or a new tab (web).
+pub fn open_url(ctx: &egui::Context, url: &str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = ctx;
+        let _ = webbrowser::open(url);
+    }
+    #[cfg(target_arch = "wasm32")]
+    ctx.open_url(egui::OpenUrl::new_tab(url));
+}
+
+// ───────────────────────────── file picking ─────────────────────────────
+
+/// Where a picked file goes once the (asynchronous) dialog returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickTarget {
+    BlockImage { page: u64, block: u64 },
+    BlockFile { page: u64, block: u64 },
+    Cover { page: u64 },
+    Icon { page: u64 },
+}
+
+pub struct Picked {
+    pub target: PickTarget,
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
+static PICKED: std::sync::Mutex<Vec<Picked>> = std::sync::Mutex::new(Vec::new());
+
+pub fn take_picked() -> Vec<Picked> {
+    PICKED.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default()
+}
+
+pub fn push_picked(p: Picked) {
+    if let Ok(mut v) = PICKED.lock() {
+        v.push(p);
+    }
+}
+
+/// True when a native "open file" dialog exists on this platform (Windows, macOS, web).
+pub fn can_pick_files() -> bool {
+    cfg!(any(windows, target_os = "macos", target_arch = "wasm32"))
+}
+
+/// Opens the system file dialog; the result shows up in [`take_picked`].
+pub fn pick_file(ctx: &egui::Context, target: PickTarget, images_only: bool) {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let mut d = rfd::FileDialog::new();
+            if images_only {
+                d = d.add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
+            }
+            if let Some(path) = d.pick_file() {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_owned();
+                    push_picked(Picked { target, name, bytes });
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let ctx = ctx.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut d = rfd::AsyncFileDialog::new();
+            if images_only {
+                d = d.add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
+            }
+            if let Some(h) = d.pick_file().await {
+                let bytes = h.read().await;
+                push_picked(Picked { target, name: h.file_name(), bytes });
+            }
+            ctx.request_repaint();
+        });
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_arch = "wasm32")))]
+    {
+        let _ = (ctx, target, images_only);
+    }
+}
+
+// ───────────────────────────── live embeds (web) ─────────────────────────────
+
+/// An embed block that wants a live web page drawn over its area.
+#[derive(Clone, Debug)]
+pub struct EmbedRect {
+    pub id: u64,
+    pub url: String,
+    pub rect: egui::Rect,
+    /// Visible part (the scroll area's clip rectangle).
+    pub clip: egui::Rect,
+}
+
+/// Web: creates / moves / removes real `<iframe>` elements over the canvas so websites, videos and maps are embedded live.
+/// Desktop: no-op (blocks show a preview card and open the system browser).
+pub fn sync_iframes(items: &[EmbedRect]) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+        let run = || -> Option<()> {
+            let doc = web_sys::window()?.document()?;
+            let container = match doc.get_element_by_id("lumen-embeds") {
+                Some(c) => c,
+                None => {
+                    let c = doc.create_element("div").ok()?;
+                    c.set_id("lumen-embeds");
+                    c.set_attribute("style", "position:fixed;left:0;top:0;width:0;height:0;z-index:5;").ok()?;
+                    doc.body()?.append_child(&c).ok()?;
+                    c
+                }
+            };
+            let want: std::collections::HashSet<String> = items.iter().map(|i| format!("lumen-embed-{}", i.id)).collect();
+            let kids = container.children();
+            let mut dead = vec![];
+            for n in 0..kids.length() {
+                if let Some(k) = kids.item(n) {
+                    if !want.contains(&k.id()) {
+                        dead.push(k);
+                    }
+                }
+            }
+            for k in dead {
+                k.remove();
+            }
+            for it in items {
+                let eid = format!("lumen-embed-{}", it.id);
+                let frame: web_sys::HtmlIFrameElement = match doc.get_element_by_id(&eid) {
+                    Some(e) => e.dyn_into().ok()?,
+                    None => {
+                        let f: web_sys::HtmlIFrameElement = doc.create_element("iframe").ok()?.dyn_into().ok()?;
+                        f.set_id(&eid);
+                        f.set_attribute("allow", "autoplay; fullscreen; clipboard-write; encrypted-media; picture-in-picture").ok()?;
+                        f.set_attribute("allowfullscreen", "true").ok()?;
+                        f.set_attribute("referrerpolicy", "no-referrer-when-downgrade").ok()?;
+                        container.append_child(&f).ok()?;
+                        f
+                    }
+                };
+                if frame.get_attribute("src").as_deref() != Some(it.url.as_str()) {
+                    frame.set_attribute("src", &it.url).ok()?;
+                }
+                let vis = it.rect.intersect(it.clip);
+                let st = frame.style();
+                if vis.width() < 2.0 || vis.height() < 2.0 {
+                    st.set_property("display", "none").ok()?;
+                    continue;
+                }
+                let (t, l) = ((vis.top() - it.rect.top()).max(0.0), (vis.left() - it.rect.left()).max(0.0));
+                let (b, r) = ((it.rect.bottom() - vis.bottom()).max(0.0), (it.rect.right() - vis.right()).max(0.0));
+                st.set_property("display", "block").ok()?;
+                st.set_property("position", "absolute").ok()?;
+                st.set_property("border", "0").ok()?;
+                st.set_property("background", "#fff").ok()?;
+                st.set_property("left", &format!("{}px", it.rect.left())).ok()?;
+                st.set_property("top", &format!("{}px", it.rect.top())).ok()?;
+                st.set_property("width", &format!("{}px", it.rect.width())).ok()?;
+                st.set_property("height", &format!("{}px", it.rect.height())).ok()?;
+                st.set_property("clip-path", &format!("inset({t}px {r}px {b}px {l}px round 8px)")).ok()?;
+            }
+            Some(())
+        };
+        run();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = items;
+    }
+}

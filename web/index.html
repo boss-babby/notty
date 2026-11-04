@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lumen — free Notion alternative (WebAssembly)</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #191919; }
+    canvas { display: block; width: 100vw; height: 100vh; outline: none; }
+    #loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      color: #e8e8e8; font: 500 15px system-ui, sans-serif; gap: 14px; background: #191919; z-index: 10; }
+    .spin { width: 34px; height: 34px; border: 3px solid #444; border-top-color: #4a9eff; border-radius: 50%; animation: s 0.9s linear infinite; }
+    @keyframes s { to { transform: rotate(360deg); } }
+    #err { display: none; color: #ff8080; max-width: 520px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div id="loading"><div class="spin"></div><div>Loading Lumen (Rust + WebAssembly)…</div><div id="err"></div></div>
+  <canvas id="lumen_canvas"></canvas>
+  <script type="module">
+    import init, { LumenWeb } from "./lumen.js";
+    try {
+      await init({ module_or_path: new URL("./lumen_bg.wasm", import.meta.url) });
+      const app = new LumenWeb();
+      await app.start(document.getElementById("lumen_canvas"));
+      document.getElementById("loading").remove();
+    } catch (e) {
+      console.error(e);
+      const el = document.getElementById("err");
+      el.style.display = "block";
+      el.textContent = "Could not start Lumen: " + e;
+    }
+  </script>
+</body>
+</html>

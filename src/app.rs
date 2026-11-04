@@ -16,7 +16,9 @@ use crate::io as nio;
 use crate::platform;
 use crate::icons::{self, Icon};
 use crate::lock::{LockEvent, LockScreen};
-use crate::model::{Page, PageKind, Workspace, TEMPLATES};
+use crate::media::{self, MediaStore};
+use crate::model::{Block, BlockKind, Page, PageKind, Workspace, TEMPLATES};
+use crate::platform::{PickTarget};
 use crate::theme::{self, bold, body, lerp_color, Palette, ACCENTS};
 use crate::widgets::{
     appear, context_menu, field, icon_button, menu_item, popup_area, primary_button, reset_appear, section_label, with_alpha, CtxItem,
@@ -121,11 +123,13 @@ pub struct LumenApp {
     page_menu: Option<Pos2>,
     focus_mode: bool,
     last_accent: usize,
+    media: MediaStore,
 }
 
 impl LumenApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::setup_fonts(&cc.egui_ctx);
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         let saved: Option<Saved> = cc.storage.and_then(|s| eframe::get_value(s, STORAGE_KEY));
         let (ws, cred, skipped) = match saved {
             Some(s) => (s.ws, s.cred, s.skipped),
@@ -137,13 +141,26 @@ impl LumenApp {
             ws.current = ws.pages.iter().find(|p| !p.trashed && !p.row).map(|p| p.id);
         }
         let locked = cred.is_some() || !skipped;
+        let mut media = MediaStore::load(cc.storage);
+        {
+            let mut used = std::collections::HashSet::new();
+            for p in &ws.pages {
+                used.extend(media::media_id(&p.cover_img));
+                used.extend(p.icon.strip_prefix("img:").and_then(media::media_id));
+                used.extend(p.blocks.iter().filter(|b| b.media != 0).map(|b| b.media));
+            }
+            media.gc(&used);
+            media.register(&cc.egui_ctx);
+        }
+        let mut ed = EditorState::default();
+        ed.media_sizes = media.items.iter().map(|(k, v)| (*k, v.data.len())).collect();
         Self {
             ws,
             cred,
             skipped_setup: skipped,
             locked,
             lock: LockScreen::new(),
-            ed: EditorState::default(),
+            ed,
             palette: None,
             row_menu: None,
             side_menu: None,
@@ -163,6 +180,110 @@ impl LumenApp {
             page_menu: None,
             focus_mode: false,
             last_accent: usize::MAX,
+            media,
+        }
+    }
+
+    /// Stores a picked / dropped file and wires it into its target (block, cover or icon).
+    fn set_media(&mut self, ctx: &Context, target: PickTarget, name: &str, bytes: Vec<u8>) {
+        let as_image = !matches!(target, PickTarget::BlockFile { .. });
+        let size_hint = bytes.len();
+        match self.media.add(ctx, name, bytes, as_image) {
+            Err(e) => self.toast(e, None),
+            Ok(id) => {
+                let size = self.media.get(id).map(|i| i.data.len()).unwrap_or(size_hint);
+                self.ed.media_sizes.insert(id, size);
+                let page = match target {
+                    PickTarget::BlockImage { page, .. } | PickTarget::BlockFile { page, .. } | PickTarget::Cover { page } | PickTarget::Icon { page } => page,
+                };
+                if let Some(p) = self.ws.page_mut(page) {
+                    match target {
+                        PickTarget::BlockImage { block, .. } => {
+                            if let Some(b) = p.blocks.iter_mut().find(|b| b.id == block) {
+                                b.kind = BlockKind::Image;
+                                b.media = id;
+                                b.url.clear();
+                            }
+                        }
+                        PickTarget::BlockFile { block, .. } => {
+                            if let Some(b) = p.blocks.iter_mut().find(|b| b.id == block) {
+                                b.kind = BlockKind::File;
+                                b.media = id;
+                                b.url.clear();
+                                b.text = name.to_owned();
+                            }
+                        }
+                        PickTarget::Cover { .. } => {
+                            p.cover_img = format!("media:{id}");
+                            p.cover = None;
+                            p.cover_pos = 0.5;
+                            self.ed.cover_picker = None;
+                        }
+                        PickTarget::Icon { .. } => {
+                            p.icon = format!("img:media:{id}");
+                            self.ed.icon_picker = None;
+                        }
+                    }
+                }
+                self.ws.touch(page);
+            }
+        }
+    }
+
+    /// Appends an image / file block to the current page (used by drag & drop).
+    fn add_media_block(&mut self, ctx: &Context, kind: BlockKind, name: &str, bytes: Vec<u8>) {
+        let Some(cur) = self.ws.current else { return };
+        let bid = self.ws.id();
+        let tail_id = self.ws.id();
+        let target = if kind == BlockKind::Image { PickTarget::BlockImage { page: cur, block: bid } } else { PickTarget::BlockFile { page: cur, block: bid } };
+        if let Some(p) = self.ws.page_mut(cur) {
+            if p.kind != PageKind::Doc {
+                self.toast("Open a document page to add files", None);
+                return;
+            }
+            let mut b = Block::new(bid, kind, "", 0);
+            b.text = String::new();
+            let empty_tail = p.blocks.last().map_or(false, |l| l.kind == BlockKind::Text && l.text.is_empty());
+            let at = if empty_tail { p.blocks.len() - 1 } else { p.blocks.len() };
+            p.blocks.insert(at, b);
+            if !empty_tail {
+                p.blocks.push(Block::new(tail_id, BlockKind::Text, "", 0));
+            }
+        }
+        self.set_media(ctx, target, name, bytes);
+        self.toast(if kind == BlockKind::Image { "Image added to the page" } else { "File attached" }, None);
+    }
+
+    /// Applies finished file dialogs, saves requested attachments.
+    fn poll_media(&mut self, ctx: &Context) {
+        for pk in platform::take_picked() {
+            self.set_media(ctx, pk.target, &pk.name, pk.bytes);
+        }
+        if let Some((id, name)) = self.ed.dl_req.take() {
+            if let Some(it) = self.media.get(id) {
+                let msg = platform::save_download(&name, &it.data, "application/octet-stream");
+                self.toast(msg, None);
+            }
+        }
+    }
+
+    /// Web: draws live iframes over embed blocks (hidden while a modal / palette is open).
+    fn sync_embeds(&mut self) {
+        let overlay = self.locked
+            || self.palette.is_some()
+            || self.help_open
+            || self.import.is_some()
+            || self.templates_open
+            || self.trash_open
+            || self.security.is_some()
+            || self.ed.menu.is_some()
+            || self.ed.block_menu.is_some()
+            || self.ed.icon_picker.is_some()
+            || self.ed.cover_picker.is_some();
+        if overlay {
+            platform::sync_iframes(&[]);
+        } else {
+            platform::sync_iframes(&self.ed.embed_rects);
         }
     }
 
@@ -517,7 +638,7 @@ impl LumenApp {
         let q = q.trim().to_lowercase();
         let mut out = vec![];
         let title_of = |p: &Page| if p.title.is_empty() { "Untitled".to_owned() } else { p.title.clone() };
-        let icon_of = |p: &Page| if p.icon.is_empty() { l::FILE_TEXT.to_owned() } else { p.icon.clone() };
+        let icon_of = |p: &Page| if p.icon.is_empty() { l::FILE_TEXT.to_owned() } else { icons::icon_text(&p.icon).to_owned() };
         if q.is_empty() {
             let mut pages: Vec<&Page> = self.ws.pages.iter().filter(|p| !p.trashed).collect();
             pages.sort_by(|a, b| b.updated.partial_cmp(&a.updated).unwrap_or(std::cmp::Ordering::Equal));
@@ -840,7 +961,7 @@ impl LumenApp {
             .pages
             .iter()
             .filter(|p| p.trashed && !p.parent.and_then(|pp| self.ws.page(pp)).map_or(false, |pp| pp.trashed))
-            .map(|p| (p.id, if p.title.is_empty() { "Untitled".into() } else { p.title.clone() }, p.icon.clone()))
+            .map(|p| (p.id, if p.title.is_empty() { "Untitled".into() } else { p.title.clone() }, icons::icon_text(&p.icon).to_owned()))
             .collect();
         let mut restore: Option<u64> = None;
         let mut delete: Option<u64> = None;
@@ -1340,6 +1461,7 @@ impl LumenApp {
 impl eframe::App for LumenApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, STORAGE_KEY, &SavedRef { ws: &self.ws, cred: &self.cred, skipped: self.skipped_setup });
+        self.media.save(storage);
     }
 
     fn auto_save_interval(&self) -> Duration {
@@ -1356,7 +1478,9 @@ impl eframe::App for LumenApp {
     }
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.ed.embed_rects.clear();
         self.frame(ctx);
+        self.sync_embeds();
         crate::widgets::end_frame(ctx);
     }
 }
@@ -1413,6 +1537,7 @@ impl LumenApp {
         }
 
         self.ws.migrate_icons();
+        self.poll_media(ctx);
 
         // global shortcuts
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::L)) {
@@ -1452,14 +1577,26 @@ impl LumenApp {
             let name = platform::file_name(&f);
             let lower = name.to_lowercase();
             let Some(bytes) = platform::dropped_bytes(&f) else { continue };
-            let text = String::from_utf8_lossy(&bytes).to_string();
             let stem = name.rsplit_once('.').map(|x| x.0.to_owned()).unwrap_or(name.clone());
+            if media::is_image_name(&lower) {
+                if let (Some(cur), true) = (self.ws.current, self.ed.cover_picker.is_some()) {
+                    self.set_media(ctx, PickTarget::Cover { page: cur }, &name, bytes);
+                } else if let (Some(cur), true) = (self.ws.current, self.ed.icon_picker.is_some()) {
+                    self.set_media(ctx, PickTarget::Icon { page: cur }, &name, bytes);
+                } else {
+                    self.add_media_block(ctx, BlockKind::Image, &name, bytes);
+                }
+                continue;
+            }
+            let text = String::from_utf8_lossy(&bytes).to_string();
             if lower.ends_with(".csv") || lower.ends_with(".tsv") {
                 self.import_text(&stem, &text, true);
             } else if lower.ends_with(".json") {
                 self.import = Some(ImportDialog { name: stem, text });
-            } else {
+            } else if lower.ends_with(".md") || lower.ends_with(".markdown") || lower.ends_with(".txt") {
                 self.import_text(&stem, &text, false);
+            } else {
+                self.add_media_block(ctx, BlockKind::File, &name, bytes);
             }
         }
 
@@ -1521,7 +1658,7 @@ impl LumenApp {
             let ws = &mut self.ws;
             let ed = &mut self.ed;
             let mut changed = false;
-            ScrollArea::vertical().id_salt(("page_scroll", cur)).auto_shrink([false, false]).show(ui, |ui| {
+            ScrollArea::vertical().id_salt(("page_scroll", cur)).drag_to_scroll(false).auto_shrink([false, false]).show(ui, |ui| {
                 changed = editor::show_page(ui, ws, cur, ed, &pal);
             });
             if changed {
@@ -1605,7 +1742,7 @@ fn crumb(ui: &mut Ui, pal: &Palette, icon: &str, title: &str, last: bool) -> egu
     ui.painter().rect_filled(rect, 6.0, with_alpha(pal.hover, t));
     let mut x = rect.left() + 8.0;
     if !icon.is_empty() {
-        ui.painter().text(pos2(x + 7.0, rect.center().y), Align2::CENTER_CENTER, icon, body(14.0), pal.text);
+        icons::paint_page_icon(ui, pos2(x + 7.0, rect.center().y), icon, 16.0, pal.text);
         x += iw;
     }
     let clip = Rect::from_min_max(pos2(x, rect.top()), pos2(rect.right() - 4.0, rect.bottom()));
@@ -1671,7 +1808,7 @@ fn page_row(ui: &mut Ui, pal: &Palette, key: Id, w: f32, depth: usize, page: &Pa
     if page.icon.is_empty() {
         icons::paint(p, ic, 15.0, if page.kind == PageKind::Database { Icon::Board } else { Icon::Page }, pal.muted);
     } else {
-        p.text(ic, Align2::CENTER_CENTER, &page.icon, body(15.0), pal.text);
+        icons::paint_page_icon(ui, ic, &page.icon, 17.0, pal.text);
     }
     let label_right = rect.right() - 6.0 - 48.0 * t;
     let clip = Rect::from_min_max(pos2(x0 + 46.0, rect.top()), pos2(label_right.max(x0 + 60.0), rect.bottom()));

@@ -15,6 +15,10 @@ use crate::icons::{self, Icon};
 use crate::model::{Block, BlockKind, Page, PageKind, ViewKind, Workspace, ICONS};
 use crate::theme::{bold, body, lerp_color, tag_color, Palette, COVERS, TAG_NAMES};
 use crate::lucide as l;
+use crate::media;
+use crate::mediablocks;
+use crate::multisel;
+use crate::pickers;
 use crate::platform;
 use crate::widgets::{
     self, appear, context_menu, gradient_rect, menu_item, popup_area, replace_chars, reset_appear, right_clicked, section_label,
@@ -59,6 +63,22 @@ pub struct EditorState {
     pub fmt_bar: Option<FmtBar>,
     /// Measured block heights (id → (height, layout key)); lets us skip laying out off-screen blocks.
     pub heights: HashMap<u64, (f32, u64)>,
+    /// Multi-block selection (ids) and the marquee drag state (start point in content space).
+    pub sel: Vec<u64>,
+    pub sel_base: Vec<u64>,
+    pub marquee: Option<egui::Vec2>,
+    /// 0 = none, 1 = "turn into" panel, 2 = colour panel of the selection toolbar.
+    pub sel_menu: u8,
+    pub want_undo: bool,
+    pub undo: Vec<(u64, Vec<Block>)>,
+    pub redo: Vec<(u64, Vec<Block>)>,
+    /// Live web embeds requested this frame (web build draws iframes over them).
+    pub embed_rects: Vec<platform::EmbedRect>,
+    /// File attachment the user wants saved: (media id, file name).
+    pub dl_req: Option<(u64, String)>,
+    pub media_sizes: HashMap<u64, usize>,
+    pub cover_reposition: bool,
+    pub cur_page: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -106,6 +126,17 @@ fn slash_all() -> Vec<SlashItem> {
         .map(|k| SlashItem { act: Slash::Block(*k), label: k.label(), hint: k.hint(), glyph: k.glyph(), kw: k.keywords(), sec: "BASIC BLOCKS" })
         .collect();
     v.push(SlashItem { act: Slash::Block(BlockKind::Divider), label: "Divider", hint: "Visually divide blocks.", glyph: l::MINUS, kw: "divider line hr separator", sec: "BASIC BLOCKS" });
+    let med = "MEDIA";
+    for (k, label, hint, glyph, kw) in [
+        (BlockKind::Image, "Image", "Upload a picture or paste an image link.", l::IMAGE, "image picture photo upload png jpg gif"),
+        (BlockKind::Embed, "Video", "Embed a YouTube, Vimeo or Loom video.", l::VIDEO, "video youtube vimeo loom movie clip"),
+        (BlockKind::Embed, "Audio", "Embed Spotify or any audio player.", l::MUSIC, "audio spotify music podcast sound"),
+        (BlockKind::Embed, "Embed", "Embed any website, map, Figma file or document.", l::GLOBE, "embed website iframe map figma codepen docs"),
+        (BlockKind::Bookmark, "Web bookmark", "Save a link as a visual card.", l::BOOKMARK, "bookmark link url web card"),
+        (BlockKind::File, "File", "Attach a file to this page.", l::PAPERCLIP, "file attachment upload pdf document"),
+    ] {
+        v.push(SlashItem { act: Slash::Block(k), label, hint, glyph, kw, sec: med });
+    }
     let adv = "ADVANCED";
     v.push(SlashItem { act: Slash::Block(BlockKind::Toc), label: "Table of contents", hint: "Jump links to every heading.", glyph: l::TABLE_OF_CONTENTS, kw: "table of contents toc outline", sec: adv });
     v.push(SlashItem { act: Slash::NewPage, label: "Page", hint: "Embed a new sub-page inside this page.", glyph: l::FILE_PLUS, kw: "page subpage new child", sec: adv });
@@ -143,6 +174,8 @@ enum Act {
     Indent(usize, i8),
     Special(usize, Slash),
     SetColor(usize, u8, bool),
+    /// A URL was pasted into an empty text block: turn it into an image / embed / bookmark.
+    UrlBlock(usize),
 }
 
 fn slash_act(idx: usize, s: SlashItem) -> Act {
@@ -193,14 +226,44 @@ struct Span {
     italic: bool,
     strike: bool,
     code: bool,
+    ul: bool,
+    hl: bool,
+    link: Option<String>,
     marker: bool,
 }
 
-/// Splits `**bold**`, `*italic*`, `~~strike~~` and `` `code` `` into styled spans (markers are kept as spans).
+/// Finds `[text](url)` starting at `i`; returns the indices of `]` and `)`.
+fn find_link(ch: &[char], i: usize) -> Option<(usize, usize)> {
+    let n = ch.len();
+    let mut j = i + 1;
+    while j < n && ch[j] != ']' {
+        if ch[j] == '[' || ch[j] == '\n' {
+            return None;
+        }
+        j += 1;
+    }
+    if j == i + 1 || j + 2 >= n || ch[j + 1] != '(' {
+        return None;
+    }
+    let mut k = j + 2;
+    while k < n && ch[k] != ')' {
+        if ch[k].is_whitespace() {
+            return None;
+        }
+        k += 1;
+    }
+    if k >= n {
+        return None;
+    }
+    Some((j, k))
+}
+
+/// Splits `**bold**`, `*italic*`, `__underline__`, `~~strike~~`, `==highlight==`, `` `code` `` and `[link](url)` into styled spans
+/// (markers are kept as spans so the text is preserved byte-for-byte).
 fn parse_spans(s: &str) -> Vec<Span> {
     let ch: Vec<char> = s.chars().collect();
     let n = ch.len();
-    let (mut bo, mut it, mut st, mut co) = (false, false, false, false);
+    let (mut bo, mut it, mut st, mut co, mut ul, mut hl) = (false, false, false, false, false, false);
     let mut out: Vec<Span> = vec![];
     let mut cur = String::new();
     let mut i = 0;
@@ -208,9 +271,23 @@ fn parse_spans(s: &str) -> Vec<Span> {
     macro_rules! flush {
         ($marker:expr) => {
             if !cur.is_empty() {
-                out.push(Span { text: std::mem::take(&mut cur), bold: bo, italic: it, strike: st, code: co, marker: $marker });
+                out.push(Span { text: std::mem::take(&mut cur), bold: bo, italic: it, strike: st, code: co, ul, hl, link: None, marker: $marker });
             }
         };
+    }
+    macro_rules! toggle2 {
+        ($flag:ident, $mark:expr) => {{
+            flush!(false);
+            cur.push_str($mark);
+            if $flag {
+                flush!(true);
+                $flag = false;
+            } else {
+                $flag = true;
+                flush!(true);
+            }
+            i += 2;
+        }};
     }
     while i < n {
         let c = ch[i];
@@ -227,6 +304,20 @@ fn parse_spans(s: &str) -> Vec<Span> {
             i += 1;
             continue;
         }
+        let open_ok = |from: usize| from < n && !ch[from].is_whitespace();
+        if c == '[' {
+            if let Some((j, k)) = find_link(&ch, i) {
+                flush!(false);
+                cur.push('[');
+                flush!(true);
+                let inner: String = ch[i + 1..j].iter().collect();
+                out.push(Span { text: inner, bold: bo, italic: it, strike: st, code: false, ul, hl, link: Some(ch[j + 2..k].iter().collect()), marker: false });
+                cur = ch[j..=k].iter().collect();
+                flush!(true);
+                i = k + 1;
+                continue;
+            }
+        }
         if c == '`' && has_later(i + 1, &['`']) {
             flush!(false);
             cur.push(c);
@@ -234,27 +325,13 @@ fn parse_spans(s: &str) -> Vec<Span> {
             flush!(true);
             i += 1;
         } else if c == '*' && two && (bo || has_later(i + 2, &['*', '*'])) {
-            flush!(false);
-            cur.push_str("**");
-            if bo {
-                flush!(true);
-                bo = false;
-            } else {
-                bo = true;
-                flush!(true);
-            }
-            i += 2;
+            toggle2!(bo, "**");
         } else if c == '~' && two && (st || has_later(i + 2, &['~', '~'])) {
-            flush!(false);
-            cur.push_str("~~");
-            if st {
-                flush!(true);
-                st = false;
-            } else {
-                st = true;
-                flush!(true);
-            }
-            i += 2;
+            toggle2!(st, "~~");
+        } else if c == '_' && two && (ul || (open_ok(i + 2) && has_later(i + 2, &['_', '_']))) {
+            toggle2!(ul, "__");
+        } else if c == '=' && two && (hl || (open_ok(i + 2) && has_later(i + 2, &['=', '=']))) {
+            toggle2!(hl, "==");
         } else if c == '*' && !two && (it || (i + 1 < n && !ch[i + 1].is_whitespace() && has_later(i + 1, &['*']))) {
             flush!(false);
             cur.push(c);
@@ -276,7 +353,7 @@ fn parse_spans(s: &str) -> Vec<Span> {
 }
 
 fn has_marks(s: &str) -> bool {
-    s.contains('*') || s.contains('`') || s.contains("~~")
+    s.contains('*') || s.contains('`') || s.contains("~~") || s.contains("==") || s.contains("__") || s.contains("](")
 }
 
 pub fn rich_job(text: &str, font: &FontId, color: Color32, pal: &Palette, strip: bool) -> LayoutJob {
@@ -285,12 +362,29 @@ pub fn rich_job(text: &str, font: &FontId, color: Color32, pal: &Palette, strip:
         if strip && sp.marker {
             continue;
         }
+        let is_link = sp.link.is_some() && !sp.marker;
+        let fg = if sp.marker {
+            with_alpha(pal.muted, 0.75)
+        } else if is_link {
+            pal.accent
+        } else if sp.code {
+            tag_color(5)
+        } else {
+            color
+        };
         let fmt = TextFormat {
             font_id: if sp.code { FontId::monospace(font.size * 0.88) } else if sp.bold { bold(font.size) } else { font.clone() },
-            color: if sp.marker { with_alpha(pal.muted, 0.75) } else if sp.code { tag_color(5) } else { color },
-            background: if sp.code && !sp.marker { pal.hover } else { Color32::TRANSPARENT },
+            color: fg,
+            background: if sp.hl && !sp.marker {
+                Color32::from_rgba_unmultiplied(255, 208, 0, 100)
+            } else if sp.code && !sp.marker {
+                pal.hover
+            } else {
+                Color32::TRANSPARENT
+            },
             italics: sp.italic,
             strikethrough: if sp.strike && !sp.marker { Stroke::new(1.3_f32, color) } else { Stroke::NONE },
+            underline: if (sp.ul || is_link) && !sp.marker { Stroke::new(1.2_f32, fg) } else { Stroke::NONE },
             ..Default::default()
         };
         job.append(&sp.text, 0.0, fmt);
@@ -406,6 +500,15 @@ fn wrap_selection(ctx: &Context, id: Id, text: &mut String, mark: &str) {
     st.store(ctx, id);
 }
 
+/// Turns the selection into `[text](https://)` and returns the char range of the placeholder URL (so typing replaces it).
+fn link_selection(text: &mut String, a: usize, b: usize) -> (usize, usize) {
+    let (ba, bb) = (byte_at(text, a), byte_at(text, b));
+    let inner = text[ba..bb].to_owned();
+    text.replace_range(ba..bb, &format!("[{inner}](https://)"));
+    let start = a + 1 + inner.chars().count() + 2;
+    (start, start + 8)
+}
+
 fn hidden(bl: &[Block], j: usize) -> bool {
     let mut lvl = bl[j].indent;
     for k in (0..j).rev() {
@@ -438,13 +541,19 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
     let Some(idx) = ws.pages.iter().position(|p| p.id == id) else { return false };
     let mut changed = false;
     ed.rc_frame = false;
+    ed.embed_rects.clear();
+    ed.cur_page = id;
     let avail = ui.available_width();
     let (kind, is_row, full, small) = {
         let p = &ws.pages[idx];
         (p.kind, p.row, p.full_width, p.small_text)
     };
     ed.scale = if small { 0.9 } else { 1.0 };
-    changed |= cover(ui, &mut ws.pages[idx], ed, pal, avail);
+    // Page-wide drag surface (registered first = lowest): blank space starts the selection rectangle.
+    let top = ui.cursor().min;
+    let bg_rect = Rect::from_min_max(pos2(ui.max_rect().left(), top.y), pos2(ui.max_rect().right(), top.y + 30000.0));
+    let bg = ui.interact(bg_rect, Id::new(("page_bg", id)), Sense::click_and_drag());
+    changed |= pickers::cover(ui, &mut ws.pages[idx], ed, pal, avail);
 
     let wide = kind == PageKind::Database || full;
     let col_w = if wide { (avail - 96.0).max(300.0) } else { (avail - 80.0).clamp(300.0, 900.0) };
@@ -472,7 +581,7 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
                     }
                     {
                         let Workspace { pages, next_id, .. } = &mut *ws;
-                        changed |= blocks(ui, &mut pages[idx], next_id, ed, pal, content_w, &links);
+                        changed |= blocks(ui, &mut pages[idx], next_id, ed, pal, content_w, &links, &bg);
                     }
                     backlinks(ui, ws, id, ed, pal, content_w);
                 }
@@ -505,7 +614,7 @@ fn backlinks(ui: &mut Ui, ws: &Workspace, id: u64, ed: &mut EditorState, pal: &P
         let r = Rect::from_min_max(pos2(rect.left() + GUTTER - 6.0, rect.top()), rect.right_bottom());
         ui.painter().rect_filled(r, 6.0, with_alpha(pal.hover, t));
         let icon = if p.icon.is_empty() { l::FILE_TEXT } else { &p.icon };
-        ui.painter().text(pos2(r.left() + 18.0, r.center().y), Align2::CENTER_CENTER, icon, body(15.0), pal.text);
+        icons::paint_page_icon(ui, pos2(r.left() + 18.0, r.center().y), icon, 17.0, pal.text);
         let title = if p.title.is_empty() { "Untitled" } else { &p.title };
         ui.painter().text(pos2(r.left() + 38.0, r.center().y), Align2::LEFT_CENTER, title, body(14.5), pal.text);
         if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
@@ -514,39 +623,9 @@ fn backlinks(ui: &mut Ui, ws: &Workspace, id: u64, ed: &mut EditorState, pal: &P
     }
 }
 
-fn cover(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, avail: f32) -> bool {
-    let mut changed = false;
-    let Some(ci) = page.cover else { return false };
-    let (rect, _) = ui.allocate_exact_size(vec2(avail, 200.0), Sense::hover());
-    let (a, b) = COVERS[ci % COVERS.len()];
-    gradient_rect(ui, rect, Color32::from_rgb(a.0, a.1, a.2), Color32::from_rgb(b.0, b.1, b.2));
-    let hovered = ui.rect_contains_pointer(rect);
-    let t = ui.ctx().animate_bool_with_time(Id::new(("cover_h", page.id)), hovered, 0.15);
-    if t > 0.01 {
-        let r = Rect::from_min_size(pos2(rect.right() - 262.0, rect.bottom() - 42.0), vec2(120.0, 28.0));
-        let r2 = Rect::from_min_size(pos2(rect.right() - 134.0, rect.bottom() - 42.0), vec2(110.0, 28.0));
-        for (rr, label, id) in [(r, "Change cover", "cc"), (r2, "Remove", "cr")] {
-            let resp = ui.interact(rr, Id::new((id, page.id)), Sense::click());
-            let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-            ui.painter().rect_filled(rr, 6.0, with_alpha(lerp_color(pal.bg, pal.hover, h), t * 0.92));
-            ui.painter().text(rr.center(), Align2::CENTER_CENTER, label, body(12.5), with_alpha(pal.text, t));
-            if resp.clicked() {
-                if id == "cc" {
-                    ed.cover_picker = Some(rr.left_bottom() + vec2(0.0, 6.0));
-                    ed.fresh = true;
-                } else {
-                    page.cover = None;
-                    changed = true;
-                }
-            }
-        }
-    }
-    changed
-}
-
 fn header(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, content_w: f32) -> bool {
     let mut changed = false;
-    let has_cover = page.cover.is_some();
+    let has_cover = page.has_cover();
     ui.add_space(if has_cover { 0.0 } else { 40.0 });
 
     let icon_h = 76.0;
@@ -559,7 +638,7 @@ fn header(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, con
         let resp = ui.interact(ir, Id::new(("icon", page.id)), Sense::click());
         let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
         ui.painter().rect_filled(ir, 12.0, with_alpha(pal.hover, t));
-        ui.painter().text(pos2(ir.center().x, ir.center().y + 2.0), Align2::CENTER_CENTER, &page.icon, body(54.0), pal.text);
+        icons::paint_page_icon(ui, pos2(ir.center().x, ir.center().y + 2.0), &page.icon, 60.0, pal.text);
         if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
             ed.icon_picker = Some(ir.left_bottom() + vec2(0.0, 6.0));
             ed.fresh = true;
@@ -575,7 +654,7 @@ fn header(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, con
     if page.icon.is_empty() {
         buttons.push((format!("{}  Add icon", l::SMILE), "ai"));
     }
-    if page.cover.is_none() {
+    if !page.has_cover() {
         buttons.push((format!("{}  Add cover", l::IMAGE), "ac"));
     }
     for (label, key) in buttons {
@@ -637,7 +716,8 @@ fn font_for(kind: BlockKind, scale: f32) -> FontId {
     }
 }
 
-fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState, pal: &Palette, w: f32, links: &Links) -> bool {
+fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState, pal: &Palette, w: f32, links: &Links, bg: &egui::Response) -> bool {
+    let origin = ui.cursor().min;
     let mut changed = false;
     let n = page.blocks.len();
     let mut act: Option<Act> = None;
@@ -704,7 +784,7 @@ fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
             use std::hash::{Hash, Hasher};
             let b = &page.blocks[i];
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            (b.kind as u8, b.text.len(), b.indent, b.collapsed, b.checked, w.to_bits(), ed.scale.to_bits(), heads.len(), b.bg).hash(&mut h);
+            (b.kind as u8, b.text.len(), b.indent, b.collapsed, b.checked, w.to_bits(), ed.scale.to_bits(), heads.len(), b.bg, b.size, b.url.len(), b.media).hash(&mut h);
             h.finish()
         };
         if ed.dragging.is_none()
@@ -785,8 +865,17 @@ fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
                 ed.dragging = Some(bid);
             }
             if gr.clicked() {
-                ed.block_menu = Some((bid, grip.left_bottom() + vec2(-4.0, 6.0)));
-                ed.fresh = true;
+                if ui.input(|i| i.modifiers.command || i.modifiers.shift) {
+                    // Ctrl/Shift + click on the handle adds the block to the multi-selection
+                    if let Some(pos) = ed.sel.iter().position(|x| *x == bid) {
+                        ed.sel.remove(pos);
+                    } else {
+                        ed.sel.push(bid);
+                    }
+                } else {
+                    ed.block_menu = Some((bid, grip.left_bottom() + vec2(-4.0, 6.0)));
+                    ed.fresh = true;
+                }
             }
             if gr.hovered() || gr.dragged() {
                 ui.ctx().set_cursor_icon(if gr.dragged() { CursorIcon::Grabbing } else { CursorIcon::Grab });
@@ -816,10 +905,11 @@ fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
     }
 
     // click below the last block to append
-    let (rest, resp) = ui.allocate_exact_size(vec2(w + GUTTER, 150.0), Sense::click());
-    let t = ui.ctx().animate_bool_with_time(Id::new(("tail", page.id)), resp.hovered(), 0.15);
+    let (rest, _) = ui.allocate_exact_size(vec2(w + GUTTER, 150.0), Sense::hover());
+    let tail_hover = ui.rect_contains_pointer(rest);
+    let t = ui.ctx().animate_bool_with_time(Id::new(("tail", page.id)), tail_hover, 0.15);
     ui.painter().text(pos2(rest.left() + GUTTER, rest.top() + 16.0), Align2::LEFT_CENTER, "Click to add a block", body(14.0), with_alpha(pal.muted, t * 0.8));
-    if resp.clicked() && n > 0 {
+    if bg.clicked() && tail_hover && n > 0 {
         let last = &page.blocks[n - 1];
         if last.kind == BlockKind::Text && last.text.is_empty() {
             ed.focus = Some((last.id, 0));
@@ -828,7 +918,14 @@ fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
         }
     }
 
+    if multisel::handle(ui, page, next_id, ed, pal, bg, &rects, origin) {
+        changed = true;
+        act = None;
+    }
     if let Some(a) = act {
+        if !matches!(a, Act::FocusPrev(_) | Act::FocusNext(_)) {
+            multisel::push_undo(ed, page);
+        }
         apply(page, a, next_id, ed);
         changed = true;
         ui.ctx().request_repaint();
@@ -843,7 +940,7 @@ fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
 
 fn new_block(next_id: &mut u64, kind: BlockKind, text: String, indent: u8) -> Block {
     *next_id += 1;
-    Block { id: *next_id, kind, text, checked: false, indent, collapsed: false, color: 0, bg: 0, link: None }
+    Block::new(*next_id, kind, &text, indent)
 }
 
 fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
@@ -895,10 +992,13 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
             bl[i].kind = kind;
             if !kind.has_text() {
                 bl[i].text.clear();
-                if kind != BlockKind::PageLink {
+                let media_kind = matches!(kind, BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File);
+                if kind != BlockKind::PageLink && (!media_kind || i + 1 >= bl.len()) {
                     let ind = bl[i].indent;
                     let nb = new_block(next_id, BlockKind::Text, String::new(), ind);
-                    ed.focus = Some((nb.id, 0));
+                    if !media_kind {
+                        ed.focus = Some((nb.id, 0));
+                    }
                     bl.insert(i + 1, nb);
                 }
             } else {
@@ -984,6 +1084,25 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
             }
             ed.focus = Some((bl[i].id, usize::MAX));
         }
+        Act::UrlBlock(i) => {
+            let url = bl[i].text.trim().to_owned();
+            let kind = if media::is_image_name(&url) {
+                BlockKind::Image
+            } else if media::embed_info(&url).service != "Website" {
+                BlockKind::Embed
+            } else {
+                BlockKind::Bookmark
+            };
+            bl[i].kind = kind;
+            bl[i].url = url;
+            bl[i].text.clear();
+            if i + 1 >= bl.len() {
+                let ind = bl[i].indent;
+                let nb = new_block(next_id, BlockKind::Text, String::new(), ind);
+                ed.focus = Some((nb.id, 0));
+                bl.push(nb);
+            }
+        }
         Act::SetColor(i, c, is_bg) => {
             if is_bg {
                 bl[i].bg = c;
@@ -1036,6 +1155,10 @@ fn draw_block(
     let font = font_for(b.kind, ed.scale);
     let base = if b.color > 0 { tag_color(b.color as usize - 1) } else { pal.text };
     match b.kind {
+        BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File => {
+            let pid = ed.cur_page;
+            changed |= mediablocks::draw(ui, b, pid, ed, pal, w);
+        }
         BlockKind::Text | BlockKind::H1 | BlockKind::H2 | BlockKind::H3 => {
             let hint = match b.kind {
                 BlockKind::H1 => "Heading 1",
@@ -1190,7 +1313,7 @@ fn draw_block(
             match (info, b.link) {
                 (Some(i), _) => {
                     let icon = if i.icon.is_empty() { l::FILE_TEXT } else { &i.icon };
-                    ui.painter().text(pos2(rect.left() + 16.0, rect.center().y), Align2::CENTER_CENTER, icon, body(17.0), pal.text);
+                    icons::paint_page_icon(ui, pos2(rect.left() + 16.0, rect.center().y), icon, 19.0, pal.text);
                     let col = pal.text;
                     let g = ui.painter().layout_no_wrap(i.title.clone(), body(16.0 * ed.scale.max(0.5)), col);
                     let (tx, ty) = (rect.left() + 34.0, rect.center().y - g.size().y / 2.0);
@@ -1250,11 +1373,31 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         let galley = ui.painter().layout_job(job);
         ui.add_space(3.0);
         let (rect, resp) = ui.allocate_exact_size(vec2(width, galley.size().y.max(font.size + 4.0)), Sense::click());
-        ui.painter().galley(rect.min, galley, color);
+        ui.painter().galley(rect.min, galley.clone(), color);
+        // hovering a link shows a hand cursor; clicking it opens it
+        let mut link_hit: Option<String> = None;
+        if let Some(p) = resp.hover_pos().or_else(|| resp.interact_pointer_pos()) {
+            let idx = galley.cursor_from_pos(p - rect.min).ccursor.index;
+            let mut acc = 0usize;
+            for sp in parse_spans(&b.text).iter().filter(|s| !s.marker) {
+                let len = sp.text.chars().count();
+                if idx >= acc && idx < acc + len {
+                    link_hit = sp.link.clone();
+                    break;
+                }
+                acc += len;
+            }
+        }
+        if link_hit.is_some() && resp.hovered() {
+            ctx.set_cursor_icon(CursorIcon::PointingHand);
+        }
         ui.add_space(3.0);
         let resp = resp.on_hover_cursor(CursorIcon::Text);
         if resp.clicked() {
-            ed.focus = Some((b.id, usize::MAX));
+            match link_hit {
+                Some(url) => platform::open_url(&ctx, &url),
+                None => ed.focus = Some((b.id, usize::MAX)),
+            }
         }
         if !ed.rc_frame {
             if let Some(p) = right_clicked(ui, rect) {
@@ -1296,11 +1439,13 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
     if focused {
         // inline formatting shortcuts
         if b.kind != BlockKind::Code {
-            let marks: [(Modifiers, Key, &str); 4] = [
+            let marks: [(Modifiers, Key, &str); 6] = [
                 (Modifiers::COMMAND | Modifiers::SHIFT, Key::S, "~~"),
                 (Modifiers::COMMAND, Key::B, "**"),
                 (Modifiers::COMMAND, Key::I, "*"),
                 (Modifiers::COMMAND, Key::E, "`"),
+                (Modifiers::COMMAND, Key::U, "__"),
+                (Modifiers::COMMAND | Modifiers::SHIFT, Key::H, "=="),
             ];
             for (m, k, mark) in marks {
                 if ui.input_mut(|i| i.consume_key(m, k)) {
@@ -1403,17 +1548,32 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
 
     // floating selection toolbar
     if focused && b.kind != BlockKind::Code {
-        let sel = out.cursor_range.filter(|cr| cr.primary.ccursor.index != cr.secondary.ccursor.index);
-        if let Some(cr) = sel {
-            let (pa, pb) = (cr.primary.ccursor.index, cr.secondary.ccursor.index);
-            let lo = if pa < pb { cr.primary } else { cr.secondary };
-            let r = out.galley.pos_from_cursor(&lo).translate(out.galley_pos.to_vec2());
-            ed.fmt_bar = Some(FmtBar { bid: b.id, pos: r.left_top(), a: pa.min(pb), b: pa.max(pb) });
-        } else if ed.fmt_bar.map_or(false, |f| f.bid == b.id) {
-            ed.fmt_bar = None;
+        // NOTE: `cursor_range` is `None` on the frame where a press *outside* the field (e.g. on the toolbar itself)
+        // makes it surrender focus. That must NOT dismiss the toolbar, otherwise its buttons could never be clicked.
+        match out.cursor_range {
+            Some(cr) if cr.primary.ccursor.index != cr.secondary.ccursor.index => {
+                let (pa, pb) = (cr.primary.ccursor.index, cr.secondary.ccursor.index);
+                let lo = if pa < pb { cr.primary } else { cr.secondary };
+                let r = out.galley.pos_from_cursor(&lo).translate(out.galley_pos.to_vec2());
+                ed.fmt_bar = Some(FmtBar { bid: b.id, pos: r.left_top(), a: pa.min(pb), b: pa.max(pb) });
+            }
+            Some(_) => {
+                if ed.fmt_bar.map_or(false, |f| f.bid == b.id) {
+                    ed.fmt_bar = None;
+                }
+            }
+            None => {}
         }
     }
 
+    if out.response.changed()
+        && b.kind == BlockKind::Text
+        && act.is_none()
+        && media::looks_like_url(&b.text)
+        && ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))))
+    {
+        *act = Some(Act::UrlBlock(idx));
+    }
     if out.response.changed() && b.kind == BlockKind::Text && act.is_none() {
         if let Some((kind, n)) = md_shortcut(&b.text, cursor_idx) {
             *act = Some(Act::Strip(idx, kind, n));
@@ -1681,11 +1841,12 @@ fn fmt_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) ->
     }
     let t = appear(&ctx, appear_id, 0.12);
     let screen = ctx.screen_rect();
-    let (w, h) = (6.0 * 30.0 + 2.0 * 9.0 + 12.0, 40.0);
+    let (w, h) = (9.0 * 27.0 + 2.0 * 9.0 + 12.0, 40.0);
     let x = (bar.pos.x - 10.0).clamp(8.0, (screen.right() - w - 8.0).max(8.0));
     let above = bar.pos.y - h - 8.0 > screen.top() + 6.0;
     let y = if above { bar.pos.y - h - 8.0 } else { bar.pos.y + 32.0 };
     let mut clicked: Option<Cmd> = None;
+    let mut link_clicked = false;
     let area = egui::Area::new(Id::new("fmt_bar")).order(Order::Foreground).fixed_pos(pos2(x, y + (1.0 - t) * 5.0)).show(&ctx, |ui| {
         ui.set_opacity(t);
         crate::widgets::popup_frame(pal).inner_margin(Margin::same(4)).corner_radius(CornerRadius::same(9)).show(ui, |ui| {
@@ -1702,15 +1863,20 @@ fn fmt_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) ->
                 for (icon, mark, tip) in [
                     (Icon::Bold, "**", "Bold  Ctrl+B"),
                     (Icon::Italic, "*", "Italic  Ctrl+I"),
+                    (Icon::Underline, "__", "Underline  Ctrl+U"),
                     (Icon::Strike, "~~", "Strikethrough  Ctrl+Shift+S"),
                     (Icon::Code, "`", "Inline code  Ctrl+E"),
+                    (Icon::Highlight, "==", "Highlight  Ctrl+Shift+H"),
                 ] {
                     if widgets::icon_button(ui, pal, icon, 15.0, tip).clicked() {
                         clicked = Some(Cmd::Fmt(mark));
                     }
                 }
+                if widgets::icon_button(ui, pal, Icon::Link, 15.0, "Link").clicked() {
+                    link_clicked = true;
+                }
                 sep(ui);
-                if widgets::icon_button(ui, pal, Icon::Highlight, 15.0, "Colour & highlight").clicked() {
+                if widgets::icon_button(ui, pal, Icon::Palette, 15.0, "Colour & background").clicked() {
                     clicked = Some(Cmd::Style);
                 }
             });
@@ -1719,6 +1885,12 @@ fn fmt_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) ->
     ctx.move_to_top(area.response.layer_id);
     ctx.data_mut(|d| d.insert_temp(rect_id, area.response.rect));
     let mut changed = false;
+    if link_clicked && clicked.is_none() {
+        let (sa, sb) = link_selection(&mut page.blocks[idx].text, bar.a, bar.b);
+        ed.restore_sel = Some((bar.bid, sa, sb));
+        ed.fmt_bar = None;
+        return true;
+    }
     match clicked {
         Some(Cmd::Fmt(mark)) => {
             widgets::set_selection(&ctx, tid, bar.a, bar.b);
@@ -1738,7 +1910,7 @@ fn fmt_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) ->
     changed
 }
 
-fn swatches(ui: &mut Ui, pal: &Palette, cur: u8, is_bg: bool, pick: &mut Option<u8>) {
+pub fn swatches(ui: &mut Ui, pal: &Palette, cur: u8, is_bg: bool, pick: &mut Option<u8>) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
         for c in 0..=9u8 {
@@ -1835,100 +2007,9 @@ fn popups(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
         }
     }
 
-    // icon picker
-    if let Some(pos) = ed.icon_picker {
-        let mut chosen: Option<String> = None;
-        let mut remove = false;
-        let tab_id = Id::new("icon_tab");
-        let open = popup_area(&ctx, Id::new("icon_picker"), pos, pal, &mut ed.fresh, 292.0, |ui| {
-            let mut tab: u8 = ui.ctx().data(|d| d.get_temp(tab_id)).unwrap_or(0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                for (i, label) in ["Icons", "Emoji"].iter().enumerate() {
-                    let g = ui.painter().layout_no_wrap((*label).to_owned(), bold(13.0), pal.text);
-                    let (r, resp) = ui.allocate_exact_size(vec2(g.size().x + 20.0, 28.0), Sense::click());
-                    let on = tab as usize == i;
-                    let t = ui.ctx().animate_bool_with_time(resp.id, on, 0.15);
-                    let h = ui.ctx().animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.1);
-                    ui.painter().rect_filled(r, 6.0, with_alpha(pal.hover, h.max(t)));
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, label, bold(13.0), lerp_color(pal.muted, pal.text, t.max(h)));
-                    if on {
-                        ui.painter().hline(r.x_range().shrink(8.0), r.bottom() - 1.0, Stroke::new(2.0_f32, pal.accent));
-                    }
-                    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                        tab = i as u8;
-                    }
-                }
-            });
-            ui.ctx().data_mut(|d| d.insert_temp(tab_id, tab));
-            ui.add_space(4.0);
-            ScrollArea::vertical().max_height(250.0).auto_shrink([false, true]).show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
-                    let list: Vec<&str> = if tab == 0 { l::PAGE_ICONS.to_vec() } else { ICONS.to_vec() };
-                    for e in list {
-                        let (r, resp) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::click());
-                        let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-                        ui.painter().rect_filled(r, 8.0, with_alpha(pal.hover, t));
-                        if tab == 0 {
-                            ui.painter().text(r.center(), Align2::CENTER_CENTER, e, icons::font(20.0 + 3.0 * t), lerp_color(pal.text, pal.accent, t));
-                        } else {
-                            ui.painter().text(r.center(), Align2::CENTER_CENTER, e, body(22.0 + 3.0 * t), pal.text);
-                        }
-                        if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                            chosen = Some(e.to_owned());
-                        }
-                    }
-                });
-            });
-            ui.add_space(4.0);
-            if menu_item(ui, pal, l::X, "Remove icon", None, false, false).clicked() {
-                remove = true;
-            }
-        });
-        let chosen_flag = chosen.is_some();
-        if let Some(e) = chosen {
-            page.icon = e;
-            changed = true;
-        }
-        if remove {
-            page.icon.clear();
-            changed = true;
-        }
-        if !open || chosen_flag || remove {
-            ed.icon_picker = None;
-        }
-    }
-
-    // cover picker
-    if let Some(pos) = ed.cover_picker {
-        let mut chosen: Option<usize> = None;
-        let open = popup_area(&ctx, Id::new("cover_picker"), pos, pal, &mut ed.fresh, 268.0, |ui| {
-            section_label(ui, pal, "GRADIENTS");
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-                for (i, (a, b)) in COVERS.iter().enumerate() {
-                    let (r, resp) = ui.allocate_exact_size(vec2(60.0, 38.0), Sense::click());
-                    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-                    let rr = r.expand(t * 2.0);
-                    gradient_rect(ui, rr, Color32::from_rgb(a.0, a.1, a.2), Color32::from_rgb(b.0, b.1, b.2));
-                    if page.cover == Some(i) {
-                        ui.painter().rect_stroke(rr, 2.0, Stroke::new(2.0_f32, pal.accent), egui::StrokeKind::Outside);
-                    }
-                    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                        chosen = Some(i);
-                    }
-                }
-            });
-        });
-        if let Some(i) = chosen {
-            page.cover = Some(i);
-            changed = true;
-        }
-        if !open || chosen.is_some() {
-            ed.cover_picker = None;
-        }
-    }
+    changed |= pickers::icon_picker(&ctx, page, ed, pal);
+    changed |= pickers::cover_picker(&ctx, page, ed, pal);
+    changed |= multisel::bar(ui, page, next_id, ed, pal);
     changed
 }
 
@@ -1937,7 +2018,7 @@ mod tests {
     use super::*;
 
     fn blk(id: u64, kind: BlockKind, text: &str, indent: u8) -> Block {
-        Block { id, kind, text: text.into(), checked: false, indent, collapsed: false, color: 0, bg: 0, link: None }
+        Block::new(id, kind, text, indent)
     }
 
     fn page(blocks: Vec<Block>) -> Page {

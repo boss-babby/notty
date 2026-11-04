@@ -1,6 +1,28 @@
 //! Lucide icon font (ISC licence, https://lucide.dev) — private-use code points registered as a fallback font.
 #![allow(dead_code)]
 
+pub const UNDERLINE: &str = "\u{e19a}";
+pub const IMAGES: &str = "\u{e5c4}";
+pub const PAPERCLIP: &str = "\u{e12d}";
+pub const IMAGE_PLUS: &str = "\u{e1f7}";
+pub const MONITOR_PLAY: &str = "\u{e485}";
+pub const SQUARE_DASHED_MOUSE_POINTER: &str = "\u{e509}";
+pub const ARROW_UP_FROM_LINE: &str = "\u{e45a}";
+pub const ARROW_DOWN_FROM_LINE: &str = "\u{e454}";
+pub const MAXIMIZE_2: &str = "\u{e113}";
+pub const PLAY: &str = "\u{e13c}";
+pub const FIGMA: &str = "\u{e0bf}";
+pub const YOUTUBE: &str = "\u{e1b3}";
+pub const MAP: &str = "\u{e110}";
+pub const CODE_XML: &str = "\u{e206}";
+pub const CHEVRONS_UP_DOWN: &str = "\u{e211}";
+pub const ROTATE_CW: &str = "\u{e149}";
+pub const CROP: &str = "\u{e0ab}";
+pub const LIST_CHECKS: &str = "\u{e1d0}";
+pub const SQUARE_PLAY: &str = "\u{e481}";
+pub const FILE_AUDIO: &str = "\u{e31a}";
+pub const APP_WINDOW: &str = "\u{e426}";
+pub const PAINT_BUCKET: &str = "\u{e2e6}";
 pub const MENU: &str = "\u{e115}";
 pub const PLUS: &str = "\u{e13d}";
 pub const ELLIPSIS: &str = "\u{e0b6}";

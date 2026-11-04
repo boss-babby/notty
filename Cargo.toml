@@ -1,8 +1,8 @@
 [package]
 name = "lumen"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
-description = "Lumen — a Notion-style workspace written entirely in Rust with egui (native + WebAssembly)"
+description = "Lumen — a free Notion alternative written entirely in Rust with egui (Windows + WebAssembly)"
 license = "MIT"
 
 [lib]
@@ -15,6 +15,8 @@ path = "src/main.rs"
 [dependencies]
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "persistence", "x11", "wayland"] }
 egui = "0.31"
+egui_extras = { version = "0.31", default-features = false, features = ["image", "http"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -25,18 +27,30 @@ env_logger = "0.11"
 arboard = { version = "3", default-features = false }
 webbrowser = "1"
 
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+rfd = { version = "0.15", default-features = false }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# rfd's build script insists on a Linux backend feature even for wasm32; the feature pulls in nothing there.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "Element", "HtmlElement", "HtmlAnchorElement", "Node", "Blob", "BlobPropertyBag", "Url", "Navigator", "Clipboard"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "Element", "HtmlElement", "HtmlAnchorElement", "Node", "Blob", "BlobPropertyBag", "Url", "Navigator", "Clipboard", "HtmlIFrameElement", "CssStyleDeclaration", "DomRect", "HtmlCollection"] }
 
 [profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+lto = "thin"
+codegen-units = 8
 strip = true
 panic = "abort"
+
+# Smaller, slower-to-build profile used by build-web.sh (download size matters in the browser).
+[profile.web]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
 
 [profile.dev]
 opt-level = 1

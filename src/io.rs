@@ -70,6 +70,9 @@ pub fn page_markdown(ws: &Workspace, id: u64) -> String {
             BlockKind::Code => format!("{pad}```\n{}\n{pad}```", b.text),
             BlockKind::Divider => format!("{pad}---"),
             BlockKind::Toc => String::new(),
+            BlockKind::Image => format!("{pad}![{}]({})", b.text, if b.media != 0 { "(embedded image)".to_owned() } else { b.url.clone() }),
+            BlockKind::Embed | BlockKind::Bookmark => format!("{pad}[{}]({})", if b.text.is_empty() { b.url.as_str() } else { b.text.as_str() }, b.url),
+            BlockKind::File => format!("{pad}📎 {}", if b.url.is_empty() { b.text.clone() } else { format!("[{}]({})", b.text, b.url) }),
             BlockKind::PageLink => format!("{pad}[{}]", b.link.map(|l| ws.display_title(l)).unwrap_or_else(|| "Missing page".into())),
         };
         let tight = matches!(b.kind, BlockKind::Bullet | BlockKind::Numbered | BlockKind::Todo | BlockKind::Toggle);

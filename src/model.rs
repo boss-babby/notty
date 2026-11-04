@@ -29,6 +29,14 @@ pub enum BlockKind {
     Toc,
     /// Link to another page (or database).
     PageLink,
+    /// Picture: uploaded from disk (`media`) or linked (`url`).
+    Image,
+    /// Website / video / map / design file shown as a rich embed (live iframe on the web build).
+    Embed,
+    /// Link card with favicon and address.
+    Bookmark,
+    /// Attached file stored in the workspace.
+    File,
 }
 
 impl BlockKind {
@@ -48,7 +56,7 @@ impl BlockKind {
     ];
 
     pub fn has_text(self) -> bool {
-        !matches!(self, BlockKind::Divider | BlockKind::Toc | BlockKind::PageLink)
+        !matches!(self, BlockKind::Divider | BlockKind::Toc | BlockKind::PageLink | BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File)
     }
 
     pub fn label(self) -> &'static str {
@@ -67,6 +75,10 @@ impl BlockKind {
             BlockKind::Divider => "Divider",
             BlockKind::Toc => "Table of contents",
             BlockKind::PageLink => "Link to page",
+            BlockKind::Image => "Image",
+            BlockKind::Embed => "Embed",
+            BlockKind::Bookmark => "Web bookmark",
+            BlockKind::File => "File",
         }
     }
 
@@ -86,6 +98,10 @@ impl BlockKind {
             BlockKind::Divider => "Visually divide blocks.",
             BlockKind::Toc => "Jump links to every heading.",
             BlockKind::PageLink => "Link to an existing page.",
+            BlockKind::Image => "Upload a picture or paste an image link.",
+            BlockKind::Embed => "Embed a website, video, map or design.",
+            BlockKind::Bookmark => "Save a link as a visual card.",
+            BlockKind::File => "Attach a file to this page.",
         }
     }
 
@@ -105,6 +121,10 @@ impl BlockKind {
             BlockKind::Divider => l::MINUS,
             BlockKind::Toc => l::TABLE_OF_CONTENTS,
             BlockKind::PageLink => l::LINK_2,
+            BlockKind::Image => l::IMAGE,
+            BlockKind::Embed => l::GLOBE,
+            BlockKind::Bookmark => l::BOOKMARK,
+            BlockKind::File => l::PAPERCLIP,
         }
     }
 
@@ -124,6 +144,10 @@ impl BlockKind {
             BlockKind::Divider => "divider line hr separator",
             BlockKind::Toc => "table of contents toc outline",
             BlockKind::PageLink => "link page mention reference",
+            BlockKind::Image => "image picture photo upload png jpg gif",
+            BlockKind::Embed => "embed website iframe video youtube vimeo map figma spotify",
+            BlockKind::Bookmark => "bookmark link url web card",
+            BlockKind::File => "file attachment upload pdf document",
         }
     }
 }
@@ -148,6 +172,30 @@ pub struct Block {
     pub bg: u8,
     #[serde(default)]
     pub link: Option<u64>,
+    /// Online source (image / embed / bookmark URL).
+    #[serde(default)]
+    pub url: String,
+    /// Local media id (0 = none).
+    #[serde(default)]
+    pub media: u64,
+    /// Image width in percent of the column (0 = 100).
+    #[serde(default)]
+    pub size: u8,
+}
+
+impl Block {
+    pub fn new(id: u64, kind: BlockKind, text: &str, indent: u8) -> Block {
+        Block { id, kind, text: text.into(), checked: false, indent, collapsed: false, color: 0, bg: 0, link: None, url: String::new(), media: 0, size: 0 }
+    }
+
+    /// Source string of a media block: `media:<id>` for local files, otherwise the URL.
+    pub fn src(&self) -> String {
+        if self.media != 0 {
+            format!("media:{}", self.media)
+        } else {
+            self.url.clone()
+        }
+    }
 }
 
 // ───────────────────────────── databases ─────────────────────────────
@@ -415,6 +463,12 @@ pub struct Page {
     pub title: String,
     pub icon: String,
     pub cover: Option<usize>,
+    /// Cover picture (`https://…` or `media:<id>`); wins over the gradient `cover`.
+    #[serde(default)]
+    pub cover_img: String,
+    /// Vertical focus of the cover picture (0 = top, 1 = bottom).
+    #[serde(default = "half")]
+    pub cover_pos: f32,
     pub kind: PageKind,
     pub blocks: Vec<Block>,
     /// Legacy kanban columns; read for migration only.
@@ -437,6 +491,16 @@ pub struct Page {
     pub full_width: bool,
 }
 
+fn half() -> f32 {
+    0.5
+}
+
+impl Page {
+    pub fn has_cover(&self) -> bool {
+        self.cover.is_some() || !self.cover_img.is_empty()
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Workspace {
     pub name: String,
@@ -447,6 +511,8 @@ pub struct Workspace {
     pub sidebar_open: bool,
     #[serde(default)]
     pub accent: usize,
+    #[serde(default)]
+    pub icons_v2: bool,
 }
 
 pub const ICONS: [&str; 36] = [
@@ -472,6 +538,8 @@ fn blank_page(id: u64, parent: Option<u64>, kind: PageKind) -> Page {
         title: String::new(),
         icon: String::new(),
         cover: None,
+        cover_img: String::new(),
+        cover_pos: 0.5,
         kind,
         blocks: vec![],
         columns: vec![],
@@ -490,6 +558,11 @@ fn blank_page(id: u64, parent: Option<u64>, kind: PageKind) -> Page {
 impl Workspace {
     /// Converts legacy emoji page icons to Lucide glyphs (cheap no-op when nothing needs migrating).
     pub fn migrate_icons(&mut self) {
+        // One-time conversion of the legacy emoji icons. Afterwards the user's own emoji choices are left alone.
+        if self.icons_v2 {
+            return;
+        }
+        self.icons_v2 = true;
         for p in self.pages.iter_mut() {
             if p.icon.chars().next().map_or(false, |c| (c as u32) >= 0x2000 && !(0xE000..=0xF8FF).contains(&(c as u32))) {
                 let m = l::migrate(&p.icon);
@@ -506,7 +579,7 @@ impl Workspace {
     }
 
     pub fn blk(&mut self, kind: BlockKind, text: &str, indent: u8) -> Block {
-        Block { id: self.id(), kind, text: text.into(), checked: false, indent, collapsed: false, color: 0, bg: 0, link: None }
+        { let id = self.id(); Block::new(id, kind, text, indent) }
     }
 
     pub fn page(&self, id: u64) -> Option<&Page> {
@@ -1011,7 +1084,7 @@ impl Workspace {
     // ───────── first-run content ─────────
 
     pub fn seed() -> Self {
-        let mut ws = Workspace { name: "My Workspace".into(), pages: vec![], next_id: 0, current: None, dark: false, sidebar_open: true, accent: 0 };
+        let mut ws = Workspace { name: "My Workspace".into(), pages: vec![], next_id: 0, current: None, dark: false, sidebar_open: true, accent: 0, icons_v2: false };
         use BlockKind::*;
 
         let start = ws.add_page(None, PageKind::Doc);

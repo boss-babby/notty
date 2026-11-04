@@ -235,7 +235,7 @@ fn run_frame(ctx: &egui::Context, ws: &mut Workspace, id: u64, ed: &mut EditorSt
     let pal = Palette::light();
     let _ = ctx.run(input, |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::ScrollArea::vertical().drag_to_scroll(false).show(ui, |ui| {
                 editor::show_page(ui, ws, id, ed, &pal);
             });
         });
@@ -395,7 +395,7 @@ fn right_click_keeps_selection_and_opens_menu() {
         let pal = Palette::light();
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::ScrollArea::vertical().drag_to_scroll(false).show(ui, |ui| {
                     editor::show_page(ui, ws, id, ed, &pal);
                 });
             });
@@ -431,4 +431,202 @@ fn right_click_keeps_selection_and_opens_menu() {
     }
     assert!(opened, "right-click opens the editor context menu");
     assert_eq!(crate::widgets::selection(&ctx, tid), Some((0, 11)), "selection survives a right-click");
+}
+
+/// Regression: clicking a button of the floating selection toolbar must format the selected text.
+#[test]
+fn clicking_the_selection_toolbar_formats_text() {
+    let ctx = test_ctx();
+    let mut ws = Workspace::seed();
+    let id = ws.current.unwrap();
+    let mut ed = EditorState::default();
+    let b = ws.blk(BlockKind::Text, "hello world", 0);
+    ws.page_mut(id).unwrap().blocks = vec![b];
+    let bid = ws.page(id).unwrap().blocks[0].id;
+    ed.focus = Some((bid, 0));
+    let mut t = 0.0;
+    let mut frame = |ctx: &egui::Context, ws: &mut Workspace, ed: &mut EditorState, evs: Vec<Event>| {
+        t += 0.05;
+        let mut input = RawInput::default();
+        input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 820.0)));
+        input.time = Some(t);
+        input.events = evs;
+        crate::widgets::filter_raw_input(ctx, &mut input);
+        let pal = Palette::light();
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical().drag_to_scroll(false).show(ui, |ui| {
+                    editor::show_page(ui, ws, id, ed, &pal);
+                });
+            });
+        });
+        crate::widgets::end_frame(ctx);
+    };
+    for _ in 0..3 {
+        frame(&ctx, &mut ws, &mut ed, vec![]);
+    }
+    frame(&ctx, &mut ws, &mut ed, vec![key(egui::Key::A, Modifiers::COMMAND)]);
+    for _ in 0..8 {
+        frame(&ctx, &mut ws, &mut ed, vec![]);
+    }
+    assert!(ed.fmt_bar.is_some(), "toolbar must appear for a selection");
+    let rect = ctx.memory(|m| m.area_rect(Id::new("fmt_bar"))).expect("toolbar area");
+    eprintln!("bar rect {rect:?}");
+    // click each button position along the bar until the text changes
+    let mut applied = false;
+    let mut x = rect.left() + 10.0;
+    while x < rect.right() - 6.0 && !applied {
+        let p = pos2(x, rect.center().y);
+        for ev in [
+            vec![Event::PointerMoved(p)],
+            vec![],
+            vec![Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }],
+            vec![],
+            vec![Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }],
+            vec![],
+            vec![],
+        ] {
+            frame(&ctx, &mut ws, &mut ed, ev);
+        }
+        let txt = ws.page(id).unwrap().blocks[0].text.clone();
+        eprintln!("x={x} text={txt:?} bar={}", ed.fmt_bar.is_some());
+        if txt != "hello world" {
+            applied = true;
+        } else {
+            // that button did not format (e.g. it opened the colour menu): reset, re-select and try the next one
+            ed.block_menu = None;
+            ed.menu = None;
+            ed.focus = Some((bid, 0));
+            frame(&ctx, &mut ws, &mut ed, vec![]);
+            frame(&ctx, &mut ws, &mut ed, vec![key(egui::Key::A, Modifiers::COMMAND)]);
+            for _ in 0..6 {
+                frame(&ctx, &mut ws, &mut ed, vec![]);
+            }
+        }
+        x += 27.0;
+    }
+    assert!(applied, "clicking a toolbar button must change the text");
+}
+
+fn frame_with(ctx: &egui::Context, ws: &mut Workspace, id: u64, ed: &mut EditorState, t: &mut f64, evs: Vec<Event>) {
+    *t += 0.05;
+    let mut input = RawInput::default();
+    input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 820.0)));
+    input.time = Some(*t);
+    input.events = evs;
+    crate::widgets::filter_raw_input(ctx, &mut input);
+    let pal = Palette::light();
+    let _ = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().drag_to_scroll(false).show(ui, |ui| {
+                editor::show_page(ui, ws, id, ed, &pal);
+            });
+        });
+    });
+    crate::widgets::end_frame(ctx);
+}
+
+fn ptr(p: egui::Pos2, pressed: bool) -> Event {
+    Event::PointerButton { pos: p, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE }
+}
+
+/// Dragging a rectangle on the empty page area selects the blocks it touches; Delete removes them; Ctrl+Z restores them.
+#[test]
+fn marquee_selects_blocks_and_delete_undo_work() {
+    let ctx = test_ctx();
+    let mut ws = Workspace::seed();
+    let id = ws.current.unwrap();
+    let mut ed = EditorState::default();
+    let blocks: Vec<Block> = (0..6).map(|i| ws.blk(BlockKind::Text, &format!("line {i}"), 0)).collect();
+    ws.page_mut(id).unwrap().blocks = blocks;
+    let mut t = 0.0;
+    for _ in 0..4 {
+        frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![]);
+    }
+    // start in the empty left margin, drag down-right across the text column
+    let (a, b) = (pos2(90.0, 60.0), pos2(520.0, 700.0));
+    frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![Event::PointerMoved(a)]);
+    frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![ptr(a, true)]);
+    for k in 1..=6 {
+        let p = a + (b - a) * (k as f32 / 6.0);
+        frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![Event::PointerMoved(p)]);
+    }
+    frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![ptr(b, false)]);
+    frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![]);
+    eprintln!("selected: {:?}", ed.sel);
+    assert!(ed.sel.len() >= 2, "drag selection must select several blocks, got {}", ed.sel.len());
+    let n_sel = ed.sel.len();
+    // the toolbar is shown
+    assert!(ctx.memory(|m| m.area_rect(Id::new("sel_bar"))).is_some(), "selection toolbar appears");
+    // delete
+    frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![key(egui::Key::Delete, Modifiers::NONE)]);
+    frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![]);
+    let left = ws.page(id).unwrap().blocks.len();
+    assert_eq!(left, (6 - n_sel).max(1), "selected blocks are deleted");
+    // undo
+    frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![key(egui::Key::Z, Modifiers::COMMAND)]);
+    frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![]);
+    assert_eq!(ws.page(id).unwrap().blocks.len(), 6, "undo restores the deleted blocks");
+}
+
+#[test]
+fn media_blocks_and_covers_render() {
+    let ctx = test_ctx();
+    egui_extras::install_image_loaders(&ctx);
+    let mut ws = Workspace::seed();
+    let id = ws.current.unwrap();
+    let mut ed = EditorState::default();
+    let mut blocks = vec![];
+    for (k, url) in [
+        (BlockKind::Image, ""),
+        (BlockKind::Image, "https://example.invalid/pic.png"),
+        (BlockKind::Embed, ""),
+        (BlockKind::Embed, "https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+        (BlockKind::Embed, "https://example.com/page"),
+        (BlockKind::Bookmark, "https://example.com/some/long/path?x=1"),
+        (BlockKind::File, "https://example.com/report.pdf"),
+        (BlockKind::File, ""),
+    ] {
+        let mut b = ws.blk(k, "", 0);
+        b.url = url.into();
+        blocks.push(b);
+    }
+    {
+        let p = ws.page_mut(id).unwrap();
+        p.blocks = blocks;
+        p.cover_img = "https://example.invalid/cover.jpg".into();
+        p.icon = "img:https://example.invalid/icon.png".into();
+    }
+    let mut t = 0.0;
+    for _ in 0..6 {
+        frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![]);
+    }
+    // an emoji icon chosen by the user must survive the legacy-icon migration
+    ws.page_mut(id).unwrap().icon = "🦄".into();
+    ws.icons_v2 = true;
+    ws.migrate_icons();
+    assert_eq!(ws.page(id).unwrap().icon, "🦄");
+    // open both pickers
+    ed.icon_picker = Some(pos2(300.0, 200.0));
+    ed.cover_picker = Some(pos2(300.0, 200.0));
+    for _ in 0..4 {
+        frame_with(&ctx, &mut ws, id, &mut ed, &mut t, vec![]);
+    }
+    // old workspaces without the new fields still load
+    let json = serde_json::to_string(&ws).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    for p in v["pages"].as_array_mut().unwrap() {
+        p.as_object_mut().unwrap().remove("cover_img");
+        for b in p["blocks"].as_array_mut().unwrap() {
+            b.as_object_mut().unwrap().remove("url");
+        }
+    }
+    let back: Workspace = serde_json::from_value(v).unwrap();
+    assert_eq!(back.pages.len(), ws.pages.len());
+}
+
+#[test]
+fn inline_marks_underline_highlight_link_roundtrip_text() {
+    let spans = editor::rich_job("a ==hi== __u__ [site](https://x.io) b", &egui::FontId::proportional(14.0), egui::Color32::BLACK, &Palette::light(), true);
+    assert_eq!(spans.text, "a hi u site b", "markers are hidden when the block is not focused");
 }

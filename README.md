@@ -18,16 +18,15 @@ command palette with full-text search (Ctrl+K), focus mode (Ctrl+.), page width 
 **Data** — autosave (disk on desktop, localStorage on web); export page → Markdown, database → CSV, workspace → JSON backup;
 import Markdown / CSV / JSON by pasting or dropping a file on the window. Optional password lock (salted, iterated SHA-256) with idle auto-lock.
 
-## What's new (this release)
-- **Fixed:** clicking an item in the `/` slash menu now applies it (the menu used egui's hover flag, which is unreliable on the frame where the text field loses focus; it now hit-tests by position). Covered by a headless regression test.
-- **Fixed:** dialogs/pop-ups could look greyed-out or hidden because the modal backdrop could end up above the dialog; layers are now explicitly ordered every frame and pop-ups are kept fully on-screen.
-- **Right-click everywhere** (`widgets::context_menu`): text (Cut / Copy / Paste / Select all / Bold / Italic / Strike / Code / Turn into / Duplicate / Move / Delete), blocks & gutter, sidebar pages & empty sidebar space, breadcrumbs, database rows & cards in every view, view tabs, and every text field. Right-clicks are intercepted in `raw_input_hook`, so they never collapse or move a text selection.
-- **Selection toolbar** that floats above selected text (turn into, bold, italic, strike, code, colour).
-- **Lucide icons** (embedded icon font, also registered as a fallback font so any text can contain icon glyphs) for blocks, menus, databases, palette, icon picker (Icons + Emoji tabs). Legacy emoji page icons are migrated automatically.
-- **Performance:** blocks far outside the viewport are not laid out (height cache), table-of-contents data is only built when needed, the lock-screen animation is throttled to ~30 fps, toast timers repaint only when animating, no depth/stencil/MSAA buffers, window size/position persisted.
-- Multi-line paste creates one block per line; real clipboard access for the context-menu *Paste* (native: arboard, web: async Clipboard API).
+## What's new in 2.0
+- **Images, files, bookmarks & embeds** (`/image`, `/video`, `/embed`, `/bookmark`, `/file`; paste a URL into an empty block; drop files on the window). Web build embeds live websites/videos/maps in real iframes.
+- **Drag-select blocks** on empty space → floating toolbar (turn into, colour, indent, move, duplicate, copy, undo, delete) and keys (Del, Ctrl+C/X/D, Ctrl+A, Esc). Block-level **undo / redo**.
+- **Covers** from a local file or an image URL, drag to reposition. **Icons**: searchable colour emoji (any pasted emoji works), Lucide icons, custom uploaded picture.
+- **Selection toolbar fixed** and extended: underline, highlight, link (`__u__`, `==h==`, `[text](url)`).
+- **Custom emoji fixed** (a per-frame migration was replacing them), **links open on Windows** (browser hook was disabled).
+- See [`ANALYSIS.md`](ANALYSIS.md) for the Notion-parity analysis, root causes and roadmap.
 
-Not (yet) included: real-time collaboration, cloud sync, comments/history/publishing (need a server), formulas/relations/rollups, image & file uploads.
+Limits: no real-time collaboration / cloud sync / comments / history yet; web build stores local media in localStorage (~2.6 MB cap, use image links for more).
 
 ## Shortcuts
 `Ctrl/Cmd+K` palette · `N` new page · `J` journal · `\` sidebar · `.` focus · `L` lock · `Shift+L` theme · `Shift+E` export · `/` all shortcuts
@@ -41,4 +40,4 @@ cargo test --lib               # 20 tests: model, import/export, editor ops, hea
 ```
 On Windows just run `cargo build --release` → `target\release\lumen.exe`.
 
-Fonts: Inter (SIL OFL 1.1), see `assets/LICENSE.txt`.
+Fonts: Inter (SIL OFL 1.1), Lucide icons (ISC), Twemoji images (CC-BY 4.0). `assets/` must contain `Inter-Regular.otf`, `Inter-Bold.otf` (rsms/inter v4.0 `extras/otf`) and `lucide.ttf` (npm `lucide-static`).
