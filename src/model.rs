@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::now_ms;
 use crate::dates;
+use crate::lucide as l;
 
 // ───────────────────────────── blocks ─────────────────────────────
 
@@ -90,20 +91,20 @@ impl BlockKind {
 
     pub fn glyph(self) -> &'static str {
         match self {
-            BlockKind::Text => "T",
-            BlockKind::H1 => "H1",
-            BlockKind::H2 => "H2",
-            BlockKind::H3 => "H3",
-            BlockKind::Todo => "☑",
-            BlockKind::Bullet => "•",
-            BlockKind::Numbered => "1.",
-            BlockKind::Toggle => "▸",
-            BlockKind::Quote => "“",
-            BlockKind::Callout => "💡",
-            BlockKind::Code => "</>",
-            BlockKind::Divider => "—",
-            BlockKind::Toc => "≡",
-            BlockKind::PageLink => "↗",
+            BlockKind::Text => l::TYPE,
+            BlockKind::H1 => l::HEADING_1,
+            BlockKind::H2 => l::HEADING_2,
+            BlockKind::H3 => l::HEADING_3,
+            BlockKind::Todo => l::SQUARE_CHECK,
+            BlockKind::Bullet => l::LIST,
+            BlockKind::Numbered => l::LIST_ORDERED,
+            BlockKind::Toggle => l::TOGGLE_RIGHT,
+            BlockKind::Quote => l::TEXT_QUOTE,
+            BlockKind::Callout => l::LIGHTBULB,
+            BlockKind::Code => l::CODE,
+            BlockKind::Divider => l::MINUS,
+            BlockKind::Toc => l::TABLE_OF_CONTENTS,
+            BlockKind::PageLink => l::LINK_2,
         }
     }
 
@@ -180,13 +181,13 @@ impl PropKind {
 
     pub fn glyph(self) -> &'static str {
         match self {
-            PropKind::Text => "≡",
-            PropKind::Number => "#",
-            PropKind::Select => "◉",
-            PropKind::MultiSelect => "☰",
-            PropKind::Checkbox => "☑",
-            PropKind::Date => "▦",
-            PropKind::Url => "↗",
+            PropKind::Text => l::ALIGN_LEFT,
+            PropKind::Number => l::HASH,
+            PropKind::Select => l::CIRCLE_DOT,
+            PropKind::MultiSelect => l::LIST,
+            PropKind::Checkbox => l::SQUARE_CHECK,
+            PropKind::Date => l::CALENDAR_DAYS,
+            PropKind::Url => l::LINK_2,
         }
     }
 }
@@ -240,11 +241,11 @@ impl ViewKind {
 
     pub fn glyph(self) -> &'static str {
         match self {
-            ViewKind::Table => "⊞",
-            ViewKind::Board => "▥",
-            ViewKind::List => "☰",
-            ViewKind::Gallery => "▦",
-            ViewKind::Calendar => "📅",
+            ViewKind::Table => l::TABLE,
+            ViewKind::Board => l::KANBAN,
+            ViewKind::List => l::LAYOUT_LIST,
+            ViewKind::Gallery => l::LAYOUT_GRID,
+            ViewKind::Calendar => l::CALENDAR_DAYS,
         }
     }
 }
@@ -487,6 +488,18 @@ fn blank_page(id: u64, parent: Option<u64>, kind: PageKind) -> Page {
 }
 
 impl Workspace {
+    /// Converts legacy emoji page icons to Lucide glyphs (cheap no-op when nothing needs migrating).
+    pub fn migrate_icons(&mut self) {
+        for p in self.pages.iter_mut() {
+            if p.icon.chars().next().map_or(false, |c| (c as u32) >= 0x2000 && !(0xE000..=0xF8FF).contains(&(c as u32))) {
+                let m = l::migrate(&p.icon);
+                if m != p.icon {
+                    p.icon = m;
+                }
+            }
+        }
+    }
+
     pub fn id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id

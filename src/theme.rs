@@ -159,12 +159,18 @@ pub fn setup_fonts(ctx: &Context) {
         "inter-bold".to_owned(),
         Arc::new(FontData::from_static(include_bytes!("../assets/Inter-Bold.otf"))),
     );
-    let fallback: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    // Lucide icon font: its own family and a last-resort fallback everywhere, so icon glyphs work in any text.
+    fonts.font_data.insert("lucide".to_owned(), Arc::new(FontData::from_static(include_bytes!("../assets/lucide.ttf"))));
+    let mut fallback: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    fallback.push("lucide".to_owned());
     let prop = fonts.families.entry(FontFamily::Proportional).or_default();
     prop.insert(0, "inter".to_owned());
+    prop.push("lucide".to_owned());
+    fonts.families.entry(FontFamily::Monospace).or_default().push("lucide".to_owned());
     let mut b = vec!["inter-bold".to_owned()];
     b.extend(fallback);
     fonts.families.insert(FontFamily::Name("bold".into()), b);
+    fonts.families.insert(FontFamily::Name("lucide".into()), vec!["lucide".to_owned()]);
     ctx.set_fonts(fonts);
 }
 
@@ -208,7 +214,7 @@ pub fn apply(ctx: &Context, p: &Palette, dark: bool) {
         s.text_styles.insert(TextStyle::Monospace, FontId::monospace(13.5));
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
         s.spacing.button_padding = egui::vec2(10.0, 5.0);
-        s.interaction.selectable_labels = false;
+        s.interaction.selectable_labels = true;
         s.animation_time = 0.12;
         s.spacing.scroll = egui::style::ScrollStyle::floating();
     });

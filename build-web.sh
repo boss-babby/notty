@@ -7,6 +7,7 @@ cd "$(dirname "$0")"
 OUT=../public/webapp
 cargo build --lib --release --target wasm32-unknown-unknown
 WASM="${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/release/lumen.wasm"
+mkdir -p "$OUT"
 wasm-bindgen --target web --no-typescript --out-dir "$OUT" --out-name lumen "$WASM"
 # wasm-opt is opt-in: binaryen < 116 miscompiles wasm-bindgen's externref table. Use WASM_OPT=1 with a recent binaryen.
 if [ "${WASM_OPT:-0}" = "1" ] && command -v wasm-opt >/dev/null 2>&1; then

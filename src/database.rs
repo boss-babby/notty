@@ -2,6 +2,8 @@
 //!
 //! Rendering is read-only over the workspace; every edit is recorded as an [`A`]ction and applied afterwards.
 
+use crate::lucide as l;
+use crate::widgets::{context_menu, right_clicked, CtxItem};
 use egui::{pos2, vec2, Align, Align2, Color32, CornerRadius, CursorIcon, Frame, Id, Key, Layout, Margin, Order, Painter, Pos2, Rect, Response, RichText, ScrollArea, Sense, Stroke, TextEdit, Ui};
 
 use crate::auth::now_ms;
@@ -35,9 +37,13 @@ pub struct DbState {
     drag: Option<u64>,
     new_opt: String,
     focus_row: Option<u64>,
+    rmenu: Option<(u64, Pos2)>,
+    rmenu_fresh: bool,
 }
 
 enum A {
+    RowMenu(u64, Pos2),
+    DupRow(u64),
     SetVal(u64, u64, Option<Val>),
     SetTitle(u64, String),
     AddRow(Option<(u64, Val)>),
@@ -167,12 +173,40 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState, pal:
             ViewKind::Calendar => calendar(ui, wsr, &db, view, &rows, st, pal, w, &mut acts),
         }
         popups(ui, wsr, &db, vi, st, pal, &mut acts);
+        row_menu(ui, wsr, st, pal, &mut acts);
     }
-    let changed = !acts.is_empty();
+    let changed = acts.iter().any(|a| !matches!(a, A::RowMenu(..)));
     for a in acts {
         apply(ws, id, a, ed);
     }
     changed
+}
+
+/// Right-click menu for a database row (works in every view).
+fn row_menu(ui: &mut Ui, ws: &Workspace, st: &mut DbState, pal: &Palette, acts: &mut Vec<A>) {
+    let Some((rid, pos)) = st.rmenu else { return };
+    let Some(row) = ws.page(rid) else {
+        st.rmenu = None;
+        return;
+    };
+    let title = row.title.clone();
+    let items = [
+        CtxItem::new(l::FILE_TEXT, "Open as page"),
+        CtxItem::new(l::COPY_PLUS, "Duplicate"),
+        CtxItem::new(l::COPY, "Copy title").enabled(!title.is_empty()),
+        CtxItem::new(l::TRASH_2, "Delete").danger().sep(),
+    ];
+    let (open, pick) = context_menu(ui.ctx(), Id::new("db_row_menu"), pos, pal, &mut st.rmenu_fresh, &items);
+    match pick {
+        Some(0) => acts.push(A::Open(rid)),
+        Some(1) => acts.push(A::DupRow(rid)),
+        Some(2) => ui.ctx().copy_text(title),
+        Some(3) => acts.push(A::DelRow(rid)),
+        _ => {}
+    }
+    if !open {
+        st.rmenu = None;
+    }
 }
 
 /// Property panel shown under the title of a database row page.
@@ -215,7 +249,14 @@ fn toolbar(ui: &mut Ui, db: &Database, vi: usize, st: &mut DbState, pal: &Palett
         ui.set_width(w);
         ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
         for (i, v) in db.views.iter().enumerate() {
-            let r = pill(ui, pal, &v.name, i == vi, false);
+            let r = pill(ui, pal, &format!("{}  {}", v.kind.glyph(), v.name), i == vi, false);
+            if let Some(p) = right_clicked(ui, r.rect) {
+                if i != vi {
+                    acts.push(A::SetActive(i));
+                }
+                st.popup = Some(Popup::ViewMenu(p));
+                st.fresh = true;
+            }
             if r.clicked() {
                 if i == vi {
                     st.popup = Some(Popup::ViewMenu(r.rect.left_bottom() + vec2(0.0, 6.0)));
@@ -225,29 +266,29 @@ fn toolbar(ui: &mut Ui, db: &Database, vi: usize, st: &mut DbState, pal: &Palett
                 }
             }
         }
-        let r = pill(ui, pal, "+", false, false).on_hover_text("Add a view");
+        let r = pill(ui, pal, l::PLUS, false, false).on_hover_text("Add a view");
         if r.clicked() {
             st.popup = Some(Popup::AddView(r.rect.left_bottom() + vec2(0.0, 6.0)));
             st.fresh = true;
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
-            if pill(ui, pal, "New", false, true).clicked() {
+            if pill(ui, pal, &format!("{}  New", l::PLUS), false, true).clicked() {
                 acts.push(A::AddRow(None));
             }
             ui.add_space(6.0);
-            let r = pill(ui, pal, "Properties", false, false);
+            let r = pill(ui, pal, &format!("{}  Properties", l::SLIDERS_HORIZONTAL), false, false);
             if r.clicked() {
                 st.popup = Some(Popup::Props(pos2(r.rect.right() - 280.0, r.rect.bottom() + 6.0)));
                 st.fresh = true;
             }
-            let fl = if view.filters.is_empty() { "Filter".to_owned() } else { format!("Filter · {}", view.filters.len()) };
+            let fl = if view.filters.is_empty() { format!("{}  Filter", l::FILTER) } else { format!("{}  Filter · {}", l::FILTER, view.filters.len()) };
             let r = pill(ui, pal, &fl, !view.filters.is_empty(), false);
             if r.clicked() {
                 st.popup = Some(Popup::Filter(pos2(r.rect.right() - 440.0, r.rect.bottom() + 6.0)));
                 st.fresh = true;
             }
-            let sl = if view.sorts.is_empty() { "Sort".to_owned() } else { format!("Sort · {}", view.sorts.len()) };
+            let sl = if view.sorts.is_empty() { format!("{}  Sort", l::ARROW_UP_DOWN) } else { format!("{}  Sort · {}", l::ARROW_UP_DOWN, view.sorts.len()) };
             let r = pill(ui, pal, &sl, !view.sorts.is_empty(), false);
             if r.clicked() {
                 st.popup = Some(Popup::Sort(pos2(r.rect.right() - 340.0, r.rect.bottom() + 6.0)));
@@ -289,7 +330,8 @@ fn cell(ui: &mut Ui, db: &Database, row: &Page, prop: &Prop, rect: Rect, pal: &P
                     .margin(Margin::symmetric(0, 2))
                     .horizontal_align(if prop.kind == PropKind::Number { Align::RIGHT } else { Align::LEFT }),
             );
-            if r.changed() {
+            let fm = crate::widgets::field_menu(ui, pal, &r, &mut buf);
+            if r.changed() || fm {
                 ctx.data_mut(|d| d.insert_temp(id.with("buf"), buf.clone()));
                 let v = if buf.is_empty() {
                     None
@@ -305,7 +347,7 @@ fn cell(ui: &mut Ui, db: &Database, row: &Page, prop: &Prop, rect: Rect, pal: &P
             if extra > 0.0 {
                 let br = Rect::from_min_size(pos2(inner.right() - 20.0, inner.top()), vec2(20.0, 24.0));
                 let resp = ui.interact(br, id.with("open"), Sense::click());
-                clip.text(br.center(), Align2::CENTER_CENTER, "↗", body(14.0), if resp.hovered() { pal.accent } else { pal.muted });
+                clip.text(br.center(), Align2::CENTER_CENTER, l::EXTERNAL_LINK, body(14.0), if resp.hovered() { pal.accent } else { pal.muted });
                 if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Open link").clicked() {
                     let url = if buf.starts_with("http") { buf.clone() } else { format!("https://{buf}") };
                     ctx.open_url(egui::OpenUrl::new_tab(url));
@@ -425,7 +467,13 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], st: &mut DbSt
                     .margin(Margin::symmetric(0, 2))
                     .hint_text(RichText::new("Untitled").color(with_alpha(pal.muted, 0.6))),
             );
-            if r.changed() {
+            let fm = crate::widgets::field_menu(ui, pal, &r, &mut title);
+            if let Some(p) = right_clicked(ui, rr) {
+                if !ir.contains(p) {
+                    acts.push(A::RowMenu(row.id, p));
+                }
+            }
+            if r.changed() || fm {
                 acts.push(A::SetTitle(row.id, title));
             }
             if t > 0.05 {
@@ -501,7 +549,7 @@ fn card_chips(ui: &mut Ui, db: &Database, row: &Page, skip: u64, pal: &Palette) 
                     }
                 }
                 (Some(Val::Text(s)), PropKind::Date) if !s.is_empty() => {
-                    ui.label(RichText::new(format!("▦ {}", dates::pretty(s))).font(body(12.0)).color(pal.muted));
+                    ui.label(RichText::new(format!("{} {}", l::CALENDAR_DAYS, dates::pretty(s))).font(body(12.0)).color(pal.muted));
                 }
                 _ => {}
             }
@@ -576,6 +624,9 @@ fn board(ui: &mut Ui, ws: &Workspace, db: &Database, view: &View, rows: &[u64], 
                                 ui.label(RichText::new(title_of(row)).font(bold(14.5)).color(if row.title.is_empty() { pal.muted } else { pal.text }));
                                 card_chips(ui, db, row, gp, pal);
                             });
+                        if let Some(p) = right_clicked(ui, f.response.rect) {
+                            acts.push(A::RowMenu(row.id, p));
+                        }
                         let resp = ui.interact(f.response.rect, Id::new(("card", row.id)), Sense::click_and_drag());
                         ui.ctx().data_mut(|d| d.insert_temp(Id::new(("cardh", row.id)), resp.hovered() || resp.dragged()));
                         if resp.drag_started() {
@@ -651,7 +702,7 @@ fn list(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], pal: &Palette,
         let (rect, resp) = ui.allocate_exact_size(vec2(w, 36.0), Sense::click());
         let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
         ui.painter().rect_filled(rect, 6.0, with_alpha(pal.hover, t));
-        let icon = if row.icon.is_empty() { "📄" } else { &row.icon };
+        let icon = if row.icon.is_empty() { l::FILE_TEXT } else { &row.icon };
         ui.painter().text(pos2(rect.left() + 18.0, rect.center().y), Align2::CENTER_CENTER, icon, body(16.0), pal.muted);
         let g = ui.painter().layout_no_wrap(title_of(row).to_owned(), bold(14.5), if row.title.is_empty() { pal.muted } else { pal.text });
         let tw = g.size().x;
@@ -675,6 +726,9 @@ fn list(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], pal: &Palette,
                     x += gw + 10.0;
                 }
             }
+        }
+        if let Some(p) = right_clicked(ui, rect) {
+            acts.push(A::RowMenu(row.id, p));
         }
         if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
             acts.push(A::Open(row.id));
@@ -731,6 +785,9 @@ fn gallery(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], pal: &Palet
                     });
                     });
                 });
+            if let Some(p) = right_clicked(ui, f.response.rect) {
+                acts.push(A::RowMenu(row.id, p));
+            }
             let resp = ui.interact(f.response.rect, Id::new(("gal", row.id)), Sense::click());
             ui.ctx().data_mut(|d| d.insert_temp(Id::new(("galh", row.id)), resp.hovered()));
             if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
@@ -765,10 +822,10 @@ fn calendar(ui: &mut Ui, ws: &Workspace, db: &Database, view: &View, rows: &[u64
         (y, m)
     });
     ui.horizontal(|ui| {
-        if pill(ui, pal, "‹", false, false).clicked() {
+        if pill(ui, pal, l::CHEVRON_LEFT, false, false).clicked() {
             st.cal = Some(if m == 1 { (y - 1, 12) } else { (y, m - 1) });
         }
-        if pill(ui, pal, "›", false, false).clicked() {
+        if pill(ui, pal, l::CHEVRON_RIGHT, false, false).clicked() {
             st.cal = Some(if m == 12 { (y + 1, 1) } else { (y, m + 1) });
         }
         ui.label(RichText::new(format!("{} {}", dates::MONTHS[m as usize - 1], y)).font(bold(18.0)));
@@ -834,6 +891,9 @@ fn calendar(ui: &mut Ui, ws: &Workspace, db: &Database, view: &View, rows: &[u64
                 clip.rect_filled(ir, 5.0, base.gamma_multiply(0.18 + 0.12 * h));
                 clip.rect_filled(Rect::from_min_size(ir.min, vec2(3.0, ir.height())), 2.0, base);
                 clip.with_clip_rect(ir).text(pos2(ir.left() + 8.0, ir.center().y), Align2::LEFT_CENTER, title_of(it), body(12.5), pal.text);
+                if let Some(p) = right_clicked(ui, ir) {
+                    acts.push(A::RowMenu(it.id, p));
+                }
                 if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                     acts.push(A::Open(it.id));
                 }
@@ -946,7 +1006,7 @@ fn popups(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, st: &mut DbStat
                         let pos = choices.iter().position(|c| c.0 == s.prop).unwrap_or(0);
                         acts.push(A::SetSort(vi, si, Sort { prop: choices[(pos + 1) % choices.len()].0, asc: s.asc }));
                     }
-                    if field_btn(ui, pal, if s.asc { "↑ Ascending" } else { "↓ Descending" }, 110.0).clicked() {
+                    if field_btn(ui, pal, &format!("{} {}", if s.asc { l::ARROW_UP } else { l::ARROW_DOWN }, if s.asc { "Ascending" } else { "Descending" }), 110.0).clicked() {
                         acts.push(A::SetSort(vi, si, Sort { prop: s.prop, asc: !s.asc }));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1023,7 +1083,7 @@ fn popups(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, st: &mut DbStat
                     }
                 }
                 rule(ui, pal);
-                if menu_item(ui, pal, "🗑", "Delete property", None, false, true).clicked() {
+                if menu_item(ui, pal, l::TRASH_2, "Delete property", None, false, true).clicked() {
                     acts.push(A::DelProp(prop));
                     next = Some(None);
                 }
@@ -1048,7 +1108,7 @@ fn popups(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, st: &mut DbStat
                     rule(ui, pal);
                     let cur = db.group_prop(view).unwrap_or(0);
                     let cname = db.prop(cur).map(|p| p.name.clone()).unwrap_or_default();
-                    if menu_item(ui, pal, "▥", &format!("Group by: {cname}"), Some("Click to switch property"), false, false).clicked() {
+                    if menu_item(ui, pal, l::KANBAN, &format!("Group by: {cname}"), Some("Click to switch property"), false, false).clicked() {
                         let pos = sels.iter().position(|p| p.id == cur).unwrap_or(0);
                         acts.push(A::SetGroup(vi, sels[(pos + 1) % sels.len()].id));
                     }
@@ -1060,7 +1120,7 @@ fn popups(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, st: &mut DbStat
                     rule(ui, pal);
                     let cur = db.date_prop(view).unwrap_or(0);
                     let cname = db.prop(cur).map(|p| p.name.clone()).unwrap_or_default();
-                    if menu_item(ui, pal, "▦", &format!("Show by: {cname}"), Some("Click to switch property"), false, false).clicked() {
+                    if menu_item(ui, pal, l::CALENDAR_DAYS, &format!("Show by: {cname}"), Some("Click to switch property"), false, false).clicked() {
                         let pos = ds.iter().position(|p| p.id == cur).unwrap_or(0);
                         acts.push(A::SetDateProp(vi, ds[(pos + 1) % ds.len()].id));
                     }
@@ -1068,7 +1128,7 @@ fn popups(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, st: &mut DbStat
             }
             if db.views.len() > 1 {
                 rule(ui, pal);
-                if menu_item(ui, pal, "🗑", "Delete view", None, false, true).clicked() {
+                if menu_item(ui, pal, l::TRASH_2, "Delete view", None, false, true).clicked() {
                     acts.push(A::DelView(vi));
                     next = Some(None);
                 }
@@ -1110,7 +1170,7 @@ fn popups(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, st: &mut DbStat
                         ui.painter().rect_filled(rr, 6.0, with_alpha(pal.hover, t));
                         chip_paint(ui.painter(), pos2(rr.left() + 8.0, rr.center().y), &o.name, o.color, pal);
                         if cur.contains(&o.id) {
-                            ui.painter().text(pos2(rr.right() - 14.0, rr.center().y), Align2::CENTER_CENTER, "✓", bold(13.0), pal.accent);
+                            ui.painter().text(pos2(rr.right() - 14.0, rr.center().y), Align2::CENTER_CENTER, l::CHECK, body(15.0), pal.accent);
                         }
                         if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                             if multi {
@@ -1255,6 +1315,13 @@ fn apply(ws: &mut Workspace, db_id: u64, a: A, ed: &mut EditorState) {
             ed.db.focus_row = Some(r);
         }
         A::DelRow(r) => ws.set_trashed(r, true),
+        A::DupRow(r) => {
+            ws.duplicate(r);
+        }
+        A::RowMenu(r, pos) => {
+            ed.db.rmenu = Some((r, pos));
+            ed.db.rmenu_fresh = true;
+        }
         A::Open(r) => ed.nav = Some(r),
         A::SetActive(i) => {
             if let Some(d) = ws.db_mut(db_id) {

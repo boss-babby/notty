@@ -1,6 +1,6 @@
 //! Cross-module tests: data model, import/export and headless render passes over every page and view type.
 
-use egui::{pos2, vec2, Event, Modifiers, PointerButton, RawInput, Rect};
+use egui::{Id, pos2, vec2, Event, Modifiers, PointerButton, RawInput, Rect};
 
 use crate::dates;
 use crate::editor::{self, EditorState};
@@ -320,4 +320,115 @@ fn typing_in_the_editor_does_not_panic() {
         run_frame(&ctx, &mut ws, id, &mut ed, t, f);
         run_frame(&ctx, &mut ws, id, &mut ed, t + 0.01, vec![]);
     }
+}
+
+fn key(k: egui::Key, m: Modifiers) -> Event {
+    Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: m }
+}
+
+/// Reproduces the "slash menu items do nothing when clicked" bug: type `/`, hover an item, press and release.
+#[test]
+fn clicking_a_slash_menu_item_applies_it() {
+    let mut worked = 0;
+    for (px, py) in [(360.0f32, 430.0f32), (380.0, 470.0), (380.0, 520.0), (380.0, 560.0), (380.0, 610.0)] {
+        let ctx = test_ctx();
+        let mut ws = Workspace::seed();
+        let id = ws.current.unwrap();
+        let mut ed = EditorState::default();
+        // use an empty page with a single block so the layout is predictable
+        let b = ws.blk(BlockKind::Text, "", 0);
+        ws.page_mut(id).unwrap().blocks = vec![b];
+        let bid = ws.page(id).unwrap().blocks[0].id;
+        ed.focus = Some((bid, 0));
+        let mut t = 0.0;
+        for ev in [vec![], vec![Event::Text("/".into())], vec![], vec![], vec![], vec![]] {
+            t += 0.05;
+            run_frame(&ctx, &mut ws, id, &mut ed, t, ev);
+        }
+        assert_eq!(ws.page(id).unwrap().blocks[0].text, "/");
+        eprintln!("menu rect: {:?} focus={:?}", ctx.memory(|m| m.area_rect(Id::new("slash_menu"))), ctx.memory(|m| m.focused()));
+        let p = pos2(px, py);
+        for ev in [
+            vec![Event::PointerMoved(p)],
+            vec![],
+            vec![Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }],
+            vec![],
+            vec![Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }],
+            vec![],
+            vec![],
+        ] {
+            t += 0.05;
+            run_frame(&ctx, &mut ws, id, &mut ed, t, ev);
+        }
+        let blk = &ws.page(id).unwrap().blocks[0];
+        eprintln!("click at {px},{py}: kind={:?} text={:?} blocks={}", blk.kind, blk.text, ws.page(id).unwrap().blocks.len());
+        if blk.text != "/" {
+            worked += 1;
+        }
+    }
+    assert!(worked >= 3, "clicking slash menu items must apply them ({worked}/5)");
+}
+
+/// Right-click must never collapse an existing text selection, and must open the context menu.
+#[test]
+fn right_click_keeps_selection_and_opens_menu() {
+    let ctx = test_ctx();
+    let mut ws = Workspace::seed();
+    let id = ws.current.unwrap();
+    let mut ed = EditorState::default();
+    let b = ws.blk(BlockKind::Text, "hello world", 0);
+    ws.page_mut(id).unwrap().blocks = vec![b];
+    let bid = ws.page(id).unwrap().blocks[0].id;
+    ed.focus = Some((bid, 0));
+    let mut t = 0.0;
+    let mut frame = |ctx: &egui::Context, ws: &mut Workspace, ed: &mut EditorState, evs: Vec<Event>, rc: bool, p: egui::Pos2| {
+        t += 0.05;
+        let mut input = RawInput::default();
+        input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 820.0)));
+        input.time = Some(t);
+        input.events = evs;
+        if rc {
+            input.events.push(Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed: true, modifiers: Modifiers::NONE });
+            input.events.push(Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed: false, modifiers: Modifiers::NONE });
+        }
+        crate::widgets::filter_raw_input(ctx, &mut input);
+        let pal = Palette::light();
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    editor::show_page(ui, ws, id, ed, &pal);
+                });
+            });
+        });
+        crate::widgets::end_frame(ctx);
+    };
+    let origin = pos2(0.0, 0.0);
+    frame(&ctx, &mut ws, &mut ed, vec![], false, origin);
+    // select all text in the block
+    frame(&ctx, &mut ws, &mut ed, vec![key(egui::Key::A, Modifiers::COMMAND)], false, origin);
+    frame(&ctx, &mut ws, &mut ed, vec![], false, origin);
+    let tid = egui::Id::new(("blk", bid));
+    let sel = crate::widgets::selection(&ctx, tid).expect("selection");
+    assert_eq!(sel, (0, 11), "ctrl+a selects everything");
+    // right-click somewhere over the text (sweep until the menu opens)
+    let mut opened = false;
+    for x in (310..500).step_by(20) {
+        for y in (352..372).step_by(6) {
+            let p = pos2(x as f32, y as f32);
+            frame(&ctx, &mut ws, &mut ed, vec![Event::PointerMoved(p)], false, origin);
+            frame(&ctx, &mut ws, &mut ed, vec![], true, p);
+            if ed.menu.is_some() {
+                opened = true;
+            }
+            frame(&ctx, &mut ws, &mut ed, vec![], false, origin);
+            if opened {
+                break;
+            }
+        }
+        if opened {
+            break;
+        }
+    }
+    assert!(opened, "right-click opens the editor context menu");
+    assert_eq!(crate::widgets::selection(&ctx, tid), Some((0, 11)), "selection survives a right-click");
 }

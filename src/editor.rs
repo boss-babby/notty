@@ -14,7 +14,12 @@ use crate::dates;
 use crate::icons::{self, Icon};
 use crate::model::{Block, BlockKind, Page, PageKind, ViewKind, Workspace, ICONS};
 use crate::theme::{bold, body, lerp_color, tag_color, Palette, COVERS, TAG_NAMES};
-use crate::widgets::{appear, gradient_rect, menu_item, popup_area, reset_appear, section_label, with_alpha};
+use crate::lucide as l;
+use crate::platform;
+use crate::widgets::{
+    self, appear, context_menu, gradient_rect, menu_item, popup_area, replace_chars, reset_appear, right_clicked, section_label,
+    slice_chars, with_alpha, CtxItem,
+};
 
 pub const GUTTER: f32 = 56.0;
 const INDENT: f32 = 28.0;
@@ -42,6 +47,32 @@ pub struct EditorState {
     pub scroll_to: Option<u64>,
     pub scale: f32,
     pub db: DbState,
+    /// Right-click menu (text selection / block).
+    pub menu: Option<EdMenu>,
+    pub menu_fresh: bool,
+    /// Set when a right-click was consumed this frame.
+    pub rc_frame: bool,
+    /// Re-focus a block and restore its selection (after a menu stole the focus).
+    pub restore_sel: Option<(u64, usize, usize)>,
+    pub paste_wait: Option<(u64, usize, usize)>,
+    /// Floating "selection toolbar".
+    pub fmt_bar: Option<FmtBar>,
+    /// Measured block heights (id → (height, layout key)); lets us skip laying out off-screen blocks.
+    pub heights: HashMap<u64, (f32, u64)>,
+}
+
+#[derive(Clone, Copy)]
+pub enum EdMenu {
+    Text { bid: u64, a: usize, b: usize, pos: egui::Pos2 },
+    Block { bid: u64, pos: egui::Pos2 },
+}
+
+#[derive(Clone, Copy)]
+pub struct FmtBar {
+    pub bid: u64,
+    pub pos: egui::Pos2,
+    pub a: usize,
+    pub b: usize,
 }
 
 pub struct LinkInfo {
@@ -74,12 +105,12 @@ fn slash_all() -> Vec<SlashItem> {
         .iter()
         .map(|k| SlashItem { act: Slash::Block(*k), label: k.label(), hint: k.hint(), glyph: k.glyph(), kw: k.keywords(), sec: "BASIC BLOCKS" })
         .collect();
-    v.push(SlashItem { act: Slash::Block(BlockKind::Divider), label: "Divider", hint: "Visually divide blocks.", glyph: "—", kw: "divider line hr separator", sec: "BASIC BLOCKS" });
+    v.push(SlashItem { act: Slash::Block(BlockKind::Divider), label: "Divider", hint: "Visually divide blocks.", glyph: l::MINUS, kw: "divider line hr separator", sec: "BASIC BLOCKS" });
     let adv = "ADVANCED";
-    v.push(SlashItem { act: Slash::Block(BlockKind::Toc), label: "Table of contents", hint: "Jump links to every heading.", glyph: "≡", kw: "table of contents toc outline", sec: adv });
-    v.push(SlashItem { act: Slash::NewPage, label: "Page", hint: "Embed a new sub-page inside this page.", glyph: "📄", kw: "page subpage new child", sec: adv });
-    v.push(SlashItem { act: Slash::Link, label: "Link to page", hint: "Link to an existing page.", glyph: "↗", kw: "link page mention reference", sec: adv });
-    v.push(SlashItem { act: Slash::Today, label: "Today's date", hint: "Insert the current date.", glyph: "▦", kw: "date today now time", sec: adv });
+    v.push(SlashItem { act: Slash::Block(BlockKind::Toc), label: "Table of contents", hint: "Jump links to every heading.", glyph: l::TABLE_OF_CONTENTS, kw: "table of contents toc outline", sec: adv });
+    v.push(SlashItem { act: Slash::NewPage, label: "Page", hint: "Embed a new sub-page inside this page.", glyph: l::FILE_PLUS, kw: "page subpage new child", sec: adv });
+    v.push(SlashItem { act: Slash::Link, label: "Link to page", hint: "Link to an existing page.", glyph: l::LINK_2, kw: "link page mention reference", sec: adv });
+    v.push(SlashItem { act: Slash::Today, label: "Today's date", hint: "Insert the current date.", glyph: l::CALENDAR_DAYS, kw: "date today now time", sec: adv });
     let dbs = [
         (ViewKind::Table, "Table database", "Spreadsheet-style database."),
         (ViewKind::Board, "Board database", "Kanban board grouped by status."),
@@ -406,6 +437,7 @@ fn subtree_end(bl: &[Block], i: usize) -> usize {
 pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState, pal: &Palette) -> bool {
     let Some(idx) = ws.pages.iter().position(|p| p.id == id) else { return false };
     let mut changed = false;
+    ed.rc_frame = false;
     let avail = ui.available_width();
     let (kind, is_row, full, small) = {
         let p = &ws.pages[idx];
@@ -472,7 +504,7 @@ fn backlinks(ui: &mut Ui, ws: &Workspace, id: u64, ed: &mut EditorState, pal: &P
         let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
         let r = Rect::from_min_max(pos2(rect.left() + GUTTER - 6.0, rect.top()), rect.right_bottom());
         ui.painter().rect_filled(r, 6.0, with_alpha(pal.hover, t));
-        let icon = if p.icon.is_empty() { "📄" } else { &p.icon };
+        let icon = if p.icon.is_empty() { l::FILE_TEXT } else { &p.icon };
         ui.painter().text(pos2(r.left() + 18.0, r.center().y), Align2::CENTER_CENTER, icon, body(15.0), pal.text);
         let title = if p.title.is_empty() { "Untitled" } else { &p.title };
         ui.painter().text(pos2(r.left() + 38.0, r.center().y), Align2::LEFT_CENTER, title, body(14.5), pal.text);
@@ -539,12 +571,12 @@ fn header(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, con
     let hov = ui.rect_contains_pointer(Rect::from_min_max(pos2(row.left(), hdr_top - 10.0), pos2(row.right(), row.bottom() + 56.0)));
     let t = ui.ctx().animate_bool_with_time(Id::new(("hdr_h", page.id)), hov, 0.15);
     let mut x = row.left() + GUTTER;
-    let mut buttons: Vec<(&str, &str)> = vec![];
+    let mut buttons: Vec<(String, &str)> = vec![];
     if page.icon.is_empty() {
-        buttons.push(("☺  Add icon", "ai"));
+        buttons.push((format!("{}  Add icon", l::SMILE), "ai"));
     }
     if page.cover.is_none() {
-        buttons.push(("▭  Add cover", "ac"));
+        buttons.push((format!("{}  Add cover", l::IMAGE), "ac"));
     }
     for (label, key) in buttons {
         let w = 100.0 + if key == "ac" { 6.0 } else { 0.0 };
@@ -556,10 +588,10 @@ fn header(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, con
         let resp = ui.interact(r, Id::new((key, page.id)), Sense::click());
         let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
         ui.painter().rect_filled(r, 6.0, with_alpha(pal.hover, h * t));
-        ui.painter().text(r.center(), Align2::CENTER_CENTER, label, body(13.0), with_alpha(lerp_color(pal.muted, pal.text, h), t));
+        ui.painter().text(r.center(), Align2::CENTER_CENTER, &label, body(13.0), with_alpha(lerp_color(pal.muted, pal.text, h), t));
         if resp.clicked() {
             if key == "ai" {
-                page.icon = "📄".into();
+                page.icon = l::FILE_TEXT.into();
             } else {
                 page.cover = Some((page.id as usize) % COVERS.len());
             }
@@ -582,6 +614,7 @@ fn header(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, con
                 .margin(Margin::symmetric(0, 4)),
         );
         changed |= r.changed();
+        changed |= widgets::field_menu(ui, pal, &r, &mut page.title);
         if enter && page.kind == PageKind::Doc {
             if let Some(b) = page.blocks.iter().find(|b| b.kind.has_text()) {
                 ed.focus = Some((b.id, 0));
@@ -611,9 +644,11 @@ fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
     let mut rects: Vec<(usize, Rect)> = Vec::with_capacity(n);
     let mut nums = [0usize; 8];
     let pointer = ui.ctx().pointer_hover_pos();
+    let has_toc = page.blocks.iter().any(|b| b.kind == BlockKind::Toc);
     let heads: Vec<(u64, u8, String)> = page
         .blocks
         .iter()
+        .filter(|_| has_toc)
         .filter_map(|b| match b.kind {
             BlockKind::H1 => Some((b.id, 1, b.text.clone())),
             BlockKind::H2 => Some((b.id, 2, b.text.clone())),
@@ -664,6 +699,30 @@ fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
             });
         }
         let ind_px = indent as f32 * INDENT;
+        // Performance: blocks far outside the viewport are not laid out at all — we just reserve their last known height.
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let b = &page.blocks[i];
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (b.kind as u8, b.text.len(), b.indent, b.collapsed, b.checked, w.to_bits(), ed.scale.to_bits(), heads.len(), b.bg).hash(&mut h);
+            h.finish()
+        };
+        if ed.dragging.is_none()
+            && ed.focus.map_or(true, |(f, _)| f != bid)
+            && ed.restore_sel.map_or(true, |r| r.0 != bid)
+            && ed.scroll_to != Some(bid)
+            && !ui.ctx().memory(|m| m.has_focus(Id::new(("blk", bid))))
+        {
+            if let Some(&(h, k)) = ed.heights.get(&bid) {
+                let clip = ui.clip_rect();
+                let top = ui.cursor().top();
+                if k == key && (top + h < clip.top() - 800.0 || top > clip.bottom() + 800.0) {
+                    let (r, _) = ui.allocate_exact_size(vec2(w + GUTTER, h), Sense::hover());
+                    rects.push((i, r));
+                    continue;
+                }
+            }
+        }
         let bg_slot = ui.painter().add(Shape::Noop);
         let row = ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
@@ -675,6 +734,15 @@ fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
         });
         let rect = row.response.rect;
         rects.push((i, rect));
+        ed.heights.insert(bid, (rect.height(), key));
+        if !ed.rc_frame {
+            if let Some(p) = right_clicked(ui, rect) {
+                ed.menu = Some(EdMenu::Block { bid, pos: p });
+                ed.menu_fresh = true;
+                ed.rc_frame = true;
+                ed.block_menu = None;
+            }
+        }
         let bgc = page.blocks[i].bg;
         if bgc > 0 && !matches!(kind, BlockKind::Divider | BlockKind::Callout | BlockKind::Code) {
             let r = Rect::from_min_max(pos2(rect.left() + GUTTER + ind_px - 6.0, rect.top()), pos2(rect.right() + 4.0, rect.bottom()));
@@ -1060,7 +1128,7 @@ fn draw_block(
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     let (r, _) = ui.allocate_exact_size(vec2(34.0, 26.0), Sense::hover());
-                    ui.painter().text(r.left_center() + vec2(2.0, 0.0), Align2::LEFT_CENTER, "💡", body(20.0), pal.text);
+                    icons::glyph(ui.painter(), r.left_center() + vec2(12.0, 0.0), 19.0, l::LIGHTBULB, tag_color(3));
                     changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: base, hint: "Type something…", width: w - 28.0 - 34.0 }, act);
                 });
             });
@@ -1121,7 +1189,7 @@ fn draw_block(
             ui.painter().rect_filled(rect, 6.0, with_alpha(pal.hover, t));
             match (info, b.link) {
                 (Some(i), _) => {
-                    let icon = if i.icon.is_empty() { "📄" } else { &i.icon };
+                    let icon = if i.icon.is_empty() { l::FILE_TEXT } else { &i.icon };
                     ui.painter().text(pos2(rect.left() + 16.0, rect.center().y), Align2::CENTER_CENTER, icon, body(17.0), pal.text);
                     let col = pal.text;
                     let g = ui.painter().layout_no_wrap(i.title.clone(), body(16.0 * ed.scale.max(0.5)), col);
@@ -1131,10 +1199,10 @@ fn draw_block(
                     ui.painter().line_segment([pos2(tx, rect.center().y + 10.0), pos2(tx + gw, rect.center().y + 10.0)], Stroke::new(1.0_f32, with_alpha(col, 0.35)));
                 }
                 (None, None) => {
-                    ui.painter().text(pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, "↗  Choose a page to link…", body(15.0), pal.muted);
+                    ui.painter().text(pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, format!("{}  Choose a page to link…", l::LINK_2), body(15.0), pal.muted);
                 }
                 (None, Some(_)) => {
-                    ui.painter().text(pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, "⚠  This page was deleted", body(15.0), pal.danger);
+                    ui.painter().text(pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, format!("{}  This page was deleted", l::TRIANGLE_ALERT), body(15.0), pal.danger);
                 }
             }
             if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
@@ -1173,7 +1241,7 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
     let id = Id::new(("blk", b.id));
     let nchars = b.text.chars().count();
     let Tx { font, color, hint, width } = tx;
-    let focus_request = ed.focus.map_or(false, |(f, _)| f == b.id);
+    let focus_request = ed.focus.map_or(false, |(f, _)| f == b.id) || ed.restore_sel.map_or(false, |r| r.0 == b.id);
 
     // Unfocused blocks with inline formatting render the styled text without the markers.
     if !focus_request && b.kind != BlockKind::Code && has_marks(&b.text) && !ctx.memory(|m| m.has_focus(id)) {
@@ -1188,6 +1256,11 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         if resp.clicked() {
             ed.focus = Some((b.id, usize::MAX));
         }
+        if !ed.rc_frame {
+            if let Some(p) = right_clicked(ui, rect) {
+                open_text_menu(ed, &ctx, id, b.id, nchars, p);
+            }
+        }
         return false;
     }
 
@@ -1198,6 +1271,17 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
             st.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(pos.min(nchars)))));
             st.store(&ctx, id);
             ed.focus = None;
+            ed.slash_sel = 0;
+        }
+    }
+
+    if let Some((rb, a, c)) = ed.restore_sel {
+        if rb == b.id {
+            ctx.memory_mut(|m| m.request_focus(id));
+            let mut st = TextEdit::load_state(&ctx, id).unwrap_or_default();
+            st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(a.min(nchars)), CCursor::new(c.min(nchars)))));
+            st.store(&ctx, id);
+            ed.restore_sel = None;
             ed.slash_sel = 0;
         }
     }
@@ -1311,6 +1395,25 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         ctx.data_mut(|d| d.insert_temp(id.with("rows"), (row, rows)));
     }
 
+    if !ed.rc_frame {
+        if let Some(p) = right_clicked(ui, out.response.rect) {
+            open_text_menu(ed, &ctx, id, b.id, b.text.chars().count(), p);
+        }
+    }
+
+    // floating selection toolbar
+    if focused && b.kind != BlockKind::Code {
+        let sel = out.cursor_range.filter(|cr| cr.primary.ccursor.index != cr.secondary.ccursor.index);
+        if let Some(cr) = sel {
+            let (pa, pb) = (cr.primary.ccursor.index, cr.secondary.ccursor.index);
+            let lo = if pa < pb { cr.primary } else { cr.secondary };
+            let r = out.galley.pos_from_cursor(&lo).translate(out.galley_pos.to_vec2());
+            ed.fmt_bar = Some(FmtBar { bid: b.id, pos: r.left_top(), a: pa.min(pb), b: pa.max(pb) });
+        } else if ed.fmt_bar.map_or(false, |f| f.bid == b.id) {
+            ed.fmt_bar = None;
+        }
+    }
+
     if out.response.changed() && b.kind == BlockKind::Text && act.is_none() {
         if let Some((kind, n)) = md_shortcut(&b.text, cursor_idx) {
             *act = Some(Act::Strip(idx, kind, n));
@@ -1326,7 +1429,8 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         let mut pick: Option<SlashItem> = None;
         let screen = ctx.screen_rect();
         let y = pos.y.min(screen.bottom() - 380.0).max(10.0);
-        egui::Area::new(Id::new("slash_menu")).order(Order::Foreground).fixed_pos(pos2(pos.x, y + (1.0 - t) * -5.0)).show(&ctx, |ui| {
+        let pressed = ctx.input(|i| i.pointer.primary_pressed());
+        let area = egui::Area::new(Id::new("slash_menu")).order(Order::Foreground).fixed_pos(pos2(pos.x, y + (1.0 - t) * -5.0)).show(&ctx, |ui| {
             ui.set_opacity(t);
             crate::widgets::popup_frame(pal).show(ui, |ui| {
                 ui.set_width(310.0);
@@ -1341,16 +1445,20 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
                         if i == sel && moved {
                             r.scroll_to_me(None);
                         }
-                        if r.hovered() {
+                        // Hit-test by position (not by egui's hover flag): the text field loses focus on the very
+                        // press that clicks an item, and the flag is unreliable on that frame.
+                        let over = ui.rect_contains_pointer(r.rect) && ui.clip_rect().contains(r.rect.center());
+                        if over {
                             ed.slash_sel = i;
                         }
-                        if r.hovered() && ui.input(|i| i.pointer.primary_pressed()) {
+                        if pressed && over {
                             pick = Some(*k);
                         }
                     }
                 });
             });
         });
+        ctx.move_to_top(area.response.layer_id);
         if let Some(k) = pick {
             *act = Some(slash_act(idx, k));
         }
@@ -1359,6 +1467,275 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
     }
 
     out.response.changed()
+}
+
+fn open_text_menu(ed: &mut EditorState, ctx: &Context, id: Id, bid: u64, nchars: usize, p: egui::Pos2) {
+    let (a, b) = widgets::selection(ctx, id).unwrap_or((nchars, nchars));
+    let (a, b) = (a.min(nchars), b.min(nchars));
+    ed.menu = Some(EdMenu::Text { bid, a, b, pos: p });
+    ed.menu_fresh = true;
+    ed.rc_frame = true;
+    ed.block_menu = None;
+    ed.fmt_bar = None;
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Cmd {
+    Cut,
+    Copy,
+    Paste,
+    SelAll,
+    Fmt(&'static str),
+    Style,
+    Dup,
+    Del,
+    Indent,
+    Outdent,
+    Up,
+    Down,
+    CopyBlock,
+}
+
+fn ed_menu(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState, pal: &Palette, m: EdMenu) -> bool {
+    let ctx = ui.ctx().clone();
+    let (bid, pos, sel) = match m {
+        EdMenu::Text { bid, a, b, pos } => (bid, pos, Some((a, b))),
+        EdMenu::Block { bid, pos } => (bid, pos, None),
+    };
+    let Some(idx) = page.blocks.iter().position(|b| b.id == bid) else {
+        ed.menu = None;
+        return false;
+    };
+    let kind = page.blocks[idx].kind;
+    let has_text = kind.has_text();
+    let has_sel = sel.map_or(false, |(a, b)| a != b);
+    let mut list: Vec<(CtxItem, Cmd)> = vec![];
+    if has_text {
+        if sel.is_some() {
+            list.push((CtxItem::new(l::SCISSORS, "Cut").hint("Ctrl+X").enabled(has_sel), Cmd::Cut));
+            list.push((CtxItem::new(l::COPY, "Copy").hint("Ctrl+C").enabled(has_sel), Cmd::Copy));
+            list.push((CtxItem::new(l::CLIPBOARD_PASTE, "Paste").hint("Ctrl+V"), Cmd::Paste));
+            list.push((CtxItem::new(l::TEXT_SELECT, "Select all").hint("Ctrl+A"), Cmd::SelAll));
+            if kind != BlockKind::Code {
+                list.push((CtxItem::new(l::BOLD, "Bold").hint("Ctrl+B").enabled(has_sel).sep(), Cmd::Fmt("**")));
+                list.push((CtxItem::new(l::ITALIC, "Italic").hint("Ctrl+I").enabled(has_sel), Cmd::Fmt("*")));
+                list.push((CtxItem::new(l::STRIKETHROUGH, "Strikethrough").hint("Ctrl+Shift+S").enabled(has_sel), Cmd::Fmt("~~")));
+                list.push((CtxItem::new(l::CODE, "Inline code").hint("Ctrl+E").enabled(has_sel), Cmd::Fmt("`")));
+            }
+        } else {
+            list.push((CtxItem::new(l::COPY, "Copy text"), Cmd::CopyBlock));
+        }
+    }
+    list.push((CtxItem::new(l::REPLACE, if has_text { "Turn into & colour…" } else { "Style…" }).sep(), Cmd::Style));
+    list.push((CtxItem::new(l::COPY_PLUS, "Duplicate").hint("Ctrl+D"), Cmd::Dup));
+    list.push((CtxItem::new(l::ARROW_UP, "Move up").enabled(idx > 0), Cmd::Up));
+    list.push((CtxItem::new(l::ARROW_DOWN, "Move down").enabled(subtree_end(&page.blocks, idx) < page.blocks.len()), Cmd::Down));
+    list.push((CtxItem::new(l::INDENT_INCREASE, "Indent").hint("Tab").enabled(idx > 0), Cmd::Indent));
+    list.push((CtxItem::new(l::INDENT_DECREASE, "Outdent").hint("Shift+Tab").enabled(page.blocks[idx].indent > 0), Cmd::Outdent));
+    list.push((CtxItem::new(l::TRASH_2, "Delete").hint("Del").danger().sep(), Cmd::Del));
+    let items: Vec<CtxItem> = list.iter().map(|x| x.0).collect();
+    let (open, pick) = context_menu(&ctx, Id::new("ed_menu"), pos, pal, &mut ed.menu_fresh, &items);
+    let mut changed = false;
+    if let Some(pi) = pick {
+        let tid = Id::new(("blk", bid));
+        let (a, b) = sel.unwrap_or((0, 0));
+        let nchars = page.blocks[idx].text.chars().count();
+        match list[pi].1 {
+            Cmd::Copy => {
+                ctx.copy_text(slice_chars(&page.blocks[idx].text, a, b));
+                ed.restore_sel = Some((bid, a, b));
+            }
+            Cmd::CopyBlock => ctx.copy_text(page.blocks[idx].text.clone()),
+            Cmd::Cut => {
+                ctx.copy_text(slice_chars(&page.blocks[idx].text, a, b));
+                let at = replace_chars(&mut page.blocks[idx].text, a, b, "");
+                ed.restore_sel = Some((bid, at, at));
+                changed = true;
+            }
+            Cmd::Paste => {
+                platform::request_paste(&ctx);
+                ed.paste_wait = Some((bid, a, b));
+                ed.restore_sel = Some((bid, a, b));
+            }
+            Cmd::SelAll => ed.restore_sel = Some((bid, 0, nchars)),
+            Cmd::Fmt(mark) => {
+                widgets::set_selection(&ctx, tid, a, b);
+                wrap_selection(&ctx, tid, &mut page.blocks[idx].text, mark);
+                let (na, nb) = widgets::selection(&ctx, tid).unwrap_or((a, b));
+                ed.restore_sel = Some((bid, na, nb));
+                changed = true;
+            }
+            Cmd::Style => {
+                ed.block_menu = Some((bid, pos));
+                ed.fresh = true;
+            }
+            Cmd::Dup => {
+                apply(page, Act::Dup(idx), next_id, ed);
+                changed = true;
+            }
+            Cmd::Del => {
+                apply(page, Act::Remove(idx), next_id, ed);
+                changed = true;
+            }
+            Cmd::Indent => {
+                apply(page, Act::Indent(idx, 1), next_id, ed);
+                changed = true;
+            }
+            Cmd::Outdent => {
+                apply(page, Act::Indent(idx, -1), next_id, ed);
+                changed = true;
+            }
+            Cmd::Up => {
+                apply(page, Act::MoveTo(idx, idx - 1), next_id, ed);
+                changed = true;
+            }
+            Cmd::Down => {
+                let j = subtree_end(&page.blocks, idx);
+                let to = subtree_end(&page.blocks, j);
+                apply(page, Act::MoveTo(idx, to), next_id, ed);
+                changed = true;
+            }
+        }
+    }
+    if !open {
+        ed.menu = None;
+    }
+    changed
+}
+
+/// Applies clipboard text that arrived (asynchronously on the web) after "Paste" was chosen from a menu.
+fn finish_paste(page: &mut Page, next_id: &mut u64, ed: &mut EditorState) -> bool {
+    let Some((bid, a, b)) = ed.paste_wait else { return false };
+    let Some(clip) = platform::take_paste() else { return false };
+    ed.paste_wait = None;
+    let Some(idx) = page.blocks.iter().position(|x| x.id == bid) else { return false };
+    let clip = clip.replace("\r\n", "\n");
+    if clip.is_empty() {
+        return false;
+    }
+    let (a, b) = (a.min(b), a.max(b));
+    if !clip.contains('\n') || page.blocks[idx].kind == BlockKind::Code {
+        let at = replace_chars(&mut page.blocks[idx].text, a, b, &clip);
+        ed.restore_sel = Some((bid, at, at));
+        return true;
+    }
+    // Multi-line paste: one block per line (list items continue the list).
+    let tail = {
+        let t = &page.blocks[idx].text;
+        t[byte_at(t, b)..].to_owned()
+    };
+    let head = byte_at(&page.blocks[idx].text, a);
+    let mut lines = clip.split('\n');
+    page.blocks[idx].text.truncate(head);
+    page.blocks[idx].text.push_str(lines.next().unwrap_or(""));
+    let rest: Vec<&str> = lines.collect();
+    let (kind, indent) = (page.blocks[idx].kind, page.blocks[idx].indent);
+    let nk = match kind {
+        BlockKind::Todo | BlockKind::Bullet | BlockKind::Numbered => kind,
+        _ => BlockKind::Text,
+    };
+    let mut at = idx + 1;
+    let mut last = (bid, page.blocks[idx].text.chars().count());
+    let n = rest.len();
+    for (k, line) in rest.into_iter().enumerate() {
+        let mut text = line.to_owned();
+        let cur = text.chars().count();
+        if k + 1 == n {
+            text.push_str(&tail);
+        }
+        let nb = new_block(next_id, nk, text, indent);
+        last = (nb.id, cur);
+        page.blocks.insert(at, nb);
+        at += 1;
+    }
+    ed.focus = Some(last);
+    true
+}
+
+/// Floating toolbar shown above a text selection (Notion style).
+fn fmt_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) -> bool {
+    let ctx = ui.ctx().clone();
+    let appear_id = Id::new("fmt_appear");
+    let Some(bar) = ed.fmt_bar else {
+        reset_appear(&ctx, appear_id);
+        return false;
+    };
+    let Some(idx) = page.blocks.iter().position(|b| b.id == bar.bid) else {
+        ed.fmt_bar = None;
+        return false;
+    };
+    let tid = Id::new(("blk", bar.bid));
+    let rect_id = Id::new("fmt_rect");
+    let prev: Option<Rect> = ctx.data(|d| d.get_temp(rect_id));
+    let (down, released) = ctx.input(|i| (i.pointer.any_down(), i.pointer.any_released()));
+    let ptr = ctx.pointer_interact_pos();
+    let over = matches!((prev, ptr), (Some(r), Some(p)) if r.contains(p));
+    let focused = ctx.memory(|m| m.has_focus(tid));
+    if (!focused && !(over && (down || released))) || ed.menu.is_some() || ed.block_menu.is_some() {
+        ed.fmt_bar = None;
+        reset_appear(&ctx, appear_id);
+        return false;
+    }
+    if down && !over {
+        return false; // still dragging out a selection
+    }
+    let t = appear(&ctx, appear_id, 0.12);
+    let screen = ctx.screen_rect();
+    let (w, h) = (6.0 * 30.0 + 2.0 * 9.0 + 12.0, 40.0);
+    let x = (bar.pos.x - 10.0).clamp(8.0, (screen.right() - w - 8.0).max(8.0));
+    let above = bar.pos.y - h - 8.0 > screen.top() + 6.0;
+    let y = if above { bar.pos.y - h - 8.0 } else { bar.pos.y + 32.0 };
+    let mut clicked: Option<Cmd> = None;
+    let area = egui::Area::new(Id::new("fmt_bar")).order(Order::Foreground).fixed_pos(pos2(x, y + (1.0 - t) * 5.0)).show(&ctx, |ui| {
+        ui.set_opacity(t);
+        crate::widgets::popup_frame(pal).inner_margin(Margin::same(4)).corner_radius(CornerRadius::same(9)).show(ui, |ui| {
+            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+            ui.horizontal(|ui| {
+                let sep = |ui: &mut Ui| {
+                    let (r, _) = ui.allocate_exact_size(vec2(9.0, 26.0), Sense::hover());
+                    ui.painter().vline(r.center().x, r.y_range().shrink(4.0), Stroke::new(1.0_f32, pal.border));
+                };
+                if widgets::icon_button(ui, pal, Icon::Type, 15.0, "Turn into & colour").clicked() {
+                    clicked = Some(Cmd::Style);
+                }
+                sep(ui);
+                for (icon, mark, tip) in [
+                    (Icon::Bold, "**", "Bold  Ctrl+B"),
+                    (Icon::Italic, "*", "Italic  Ctrl+I"),
+                    (Icon::Strike, "~~", "Strikethrough  Ctrl+Shift+S"),
+                    (Icon::Code, "`", "Inline code  Ctrl+E"),
+                ] {
+                    if widgets::icon_button(ui, pal, icon, 15.0, tip).clicked() {
+                        clicked = Some(Cmd::Fmt(mark));
+                    }
+                }
+                sep(ui);
+                if widgets::icon_button(ui, pal, Icon::Highlight, 15.0, "Colour & highlight").clicked() {
+                    clicked = Some(Cmd::Style);
+                }
+            });
+        });
+    });
+    ctx.move_to_top(area.response.layer_id);
+    ctx.data_mut(|d| d.insert_temp(rect_id, area.response.rect));
+    let mut changed = false;
+    match clicked {
+        Some(Cmd::Fmt(mark)) => {
+            widgets::set_selection(&ctx, tid, bar.a, bar.b);
+            wrap_selection(&ctx, tid, &mut page.blocks[idx].text, mark);
+            let (na, nb) = widgets::selection(&ctx, tid).unwrap_or((bar.a, bar.b));
+            ed.restore_sel = Some((bar.bid, na, nb));
+            changed = true;
+        }
+        Some(_) => {
+            ed.restore_sel = Some((bar.bid, bar.a, bar.b));
+            ed.block_menu = Some((bar.bid, pos2(area.response.rect.left(), area.response.rect.bottom() + 6.0)));
+            ed.fresh = true;
+            ed.fmt_bar = None;
+        }
+        None => {}
+    }
+    changed
 }
 
 fn swatches(ui: &mut Ui, pal: &Palette, cur: u8, is_bg: bool, pick: &mut Option<u8>) {
@@ -1389,6 +1766,12 @@ fn swatches(ui: &mut Ui, pal: &Palette, cur: u8, is_bg: bool, pick: &mut Option<
 fn popups(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState, pal: &Palette) -> bool {
     let ctx = ui.ctx().clone();
     let mut changed = false;
+
+    changed |= finish_paste(page, next_id, ed);
+    if let Some(m) = ed.menu {
+        changed |= ed_menu(ui, page, next_id, ed, pal, m);
+    }
+    changed |= fmt_bar(ui, page, ed, pal);
 
     // block menu
     if let Some((bid, pos)) = ed.block_menu {
@@ -1425,16 +1808,16 @@ fn popups(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
                     ui.add_space(4.0);
                     ui.painter().hline(ui.available_rect_before_wrap().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
                     ui.add_space(5.0);
-                    if menu_item(ui, pal, "⇥", "Indent", None, false, false).clicked() {
+                    if menu_item(ui, pal, l::INDENT_INCREASE, "Indent", None, false, false).clicked() {
                         action = Some(Act::Indent(idx, 1));
                     }
-                    if menu_item(ui, pal, "⇤", "Outdent", None, false, false).clicked() {
+                    if menu_item(ui, pal, l::INDENT_DECREASE, "Outdent", None, false, false).clicked() {
                         action = Some(Act::Indent(idx, -1));
                     }
-                    if menu_item(ui, pal, "⎘", "Duplicate", None, false, false).clicked() {
+                    if menu_item(ui, pal, l::COPY_PLUS, "Duplicate", None, false, false).clicked() {
                         action = Some(Act::Dup(idx));
                     }
-                    if menu_item(ui, pal, "×", "Delete", None, false, true).clicked() {
+                    if menu_item(ui, pal, l::TRASH_2, "Delete", None, false, true).clicked() {
                         action = Some(Act::Remove(idx));
                     }
                 });
@@ -1456,22 +1839,50 @@ fn popups(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
     if let Some(pos) = ed.icon_picker {
         let mut chosen: Option<String> = None;
         let mut remove = false;
-        let open = popup_area(&ctx, Id::new("icon_picker"), pos, pal, &mut ed.fresh, 268.0, |ui| {
-            section_label(ui, pal, "ICON");
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
-                for e in ICONS {
-                    let (r, resp) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::click());
-                    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-                    ui.painter().rect_filled(r, 8.0, with_alpha(pal.hover, t));
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, e, body(22.0 + 3.0 * t), pal.text);
+        let tab_id = Id::new("icon_tab");
+        let open = popup_area(&ctx, Id::new("icon_picker"), pos, pal, &mut ed.fresh, 292.0, |ui| {
+            let mut tab: u8 = ui.ctx().data(|d| d.get_temp(tab_id)).unwrap_or(0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (i, label) in ["Icons", "Emoji"].iter().enumerate() {
+                    let g = ui.painter().layout_no_wrap((*label).to_owned(), bold(13.0), pal.text);
+                    let (r, resp) = ui.allocate_exact_size(vec2(g.size().x + 20.0, 28.0), Sense::click());
+                    let on = tab as usize == i;
+                    let t = ui.ctx().animate_bool_with_time(resp.id, on, 0.15);
+                    let h = ui.ctx().animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.1);
+                    ui.painter().rect_filled(r, 6.0, with_alpha(pal.hover, h.max(t)));
+                    ui.painter().text(r.center(), Align2::CENTER_CENTER, label, bold(13.0), lerp_color(pal.muted, pal.text, t.max(h)));
+                    if on {
+                        ui.painter().hline(r.x_range().shrink(8.0), r.bottom() - 1.0, Stroke::new(2.0_f32, pal.accent));
+                    }
                     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                        chosen = Some(e.to_owned());
+                        tab = i as u8;
                     }
                 }
             });
+            ui.ctx().data_mut(|d| d.insert_temp(tab_id, tab));
             ui.add_space(4.0);
-            if menu_item(ui, pal, "×", "Remove icon", None, false, false).clicked() {
+            ScrollArea::vertical().max_height(250.0).auto_shrink([false, true]).show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+                    let list: Vec<&str> = if tab == 0 { l::PAGE_ICONS.to_vec() } else { ICONS.to_vec() };
+                    for e in list {
+                        let (r, resp) = ui.allocate_exact_size(vec2(40.0, 40.0), Sense::click());
+                        let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+                        ui.painter().rect_filled(r, 8.0, with_alpha(pal.hover, t));
+                        if tab == 0 {
+                            ui.painter().text(r.center(), Align2::CENTER_CENTER, e, icons::font(20.0 + 3.0 * t), lerp_color(pal.text, pal.accent, t));
+                        } else {
+                            ui.painter().text(r.center(), Align2::CENTER_CENTER, e, body(22.0 + 3.0 * t), pal.text);
+                        }
+                        if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                            chosen = Some(e.to_owned());
+                        }
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            if menu_item(ui, pal, l::X, "Remove icon", None, false, false).clicked() {
                 remove = true;
             }
         });

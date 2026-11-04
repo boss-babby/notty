@@ -69,7 +69,8 @@ impl LockScreen {
                 let cy = r.top() + r.height() * (y + 0.06 * (time * 0.28 + ph * 1.3).cos());
                 radial_glow(p, pos2(cx, cy), r.width().max(r.height()) * 0.45 * s, col);
             }
-            ctx.request_repaint();
+            // ~30 fps is plenty for a slow aurora and halves the GPU cost of the lock screen
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         });
 
         let a = appear(ctx, Id::new("lock_card_in"), 0.7);

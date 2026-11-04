@@ -1,8 +1,9 @@
 //! Small reusable, animated widgets.
 
 use egui::{
-    emath::easing, pos2, vec2, Align2, Area, Color32, Context, CornerRadius, CursorIcon, Frame, Id, Key, Margin, Order,
-    Pos2, Rect, Response, Sense, Shadow, Stroke, Ui,
+    emath::easing, pos2, text::{CCursor, CCursorRange}, vec2, Align2, Area, Color32, Context, CornerRadius, CursorIcon,
+    Event, Frame, Id, Key, Margin, Modifiers, Order, PointerButton, Pos2, RawInput, Rect, Response, Sense, Shadow,
+    Stroke, TextEdit, Ui, Vec2,
 };
 
 use crate::icons::{self, Icon};
@@ -53,9 +54,12 @@ pub fn popup_area(
     let t = appear(ctx, id.with("appear"), 0.16);
     let screen = ctx.screen_rect();
     let x = pos.x.min(screen.right() - width - 12.0).max(8.0);
+    // Keep the whole popup on screen: use the size measured on the previous frame.
+    let h = ctx.data(|d| d.get_temp::<f32>(id.with("h"))).unwrap_or(0.0);
+    let y = if h > 0.0 { pos.y.min(screen.bottom() - h - 10.0).max(8.0) } else { pos.y };
     let resp = Area::new(id)
         .order(Order::Foreground)
-        .fixed_pos(pos2(x, pos.y + (1.0 - t) * -6.0))
+        .fixed_pos(pos2(x, y + (1.0 - t) * -6.0))
         .show(ctx, |ui| {
             ui.set_opacity(t);
             popup_frame(pal).show(ui, |ui| {
@@ -63,13 +67,21 @@ pub fn popup_area(
                 add(ui);
             });
         });
+    // Always draw popups above everything else (modal backdrops included).
+    ctx.move_to_top(resp.response.layer_id);
     let rect = resp.response.rect;
+    ctx.data_mut(|d| d.insert_temp(id.with("h"), rect.height()));
     let mut open = true;
     if ctx.input(|i| i.pointer.any_pressed()) && !*fresh {
         if let Some(p) = ctx.pointer_interact_pos() {
             if !rect.contains(p) {
                 open = false;
             }
+        }
+    }
+    if let (Some(p), false) = (rclick(ctx), *fresh) {
+        if !rect.contains(p) {
+            open = false;
         }
     }
     if ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -148,15 +160,19 @@ pub fn menu_item(
     let col = if danger { pal.danger } else { pal.text };
     let mut x = rect.left() + 8.0;
     if !lead.is_empty() {
+        let is_icon = lead.chars().next().map_or(false, |c| (0xE000..=0xF8FF).contains(&(c as u32)));
         if sub.is_some() {
             let b = Rect::from_center_size(pos2(x + 17.0, rect.center().y), vec2(34.0, 34.0));
             p.rect_filled(b, 6.0, pal.bg);
             p.rect_stroke(b, 6.0, Stroke::new(1.0_f32, pal.border), egui::StrokeKind::Inside);
-            p.text(b.center(), Align2::CENTER_CENTER, lead, bold(13.0), col);
+            let f = if is_icon { icons::font(17.0) } else { bold(13.0) };
+            p.text(b.center(), Align2::CENTER_CENTER, lead, f, lerp_color(col, pal.accent, t * 0.6));
             x += 44.0;
         } else {
-            p.text(pos2(x + 9.0, rect.center().y), Align2::CENTER_CENTER, lead, bold(12.5), pal.muted);
-            x += 26.0;
+            let f = if is_icon { icons::font(15.5) } else { bold(12.5) };
+            let ic = if danger { pal.danger } else { lerp_color(pal.muted, pal.text, t) };
+            p.text(pos2(x + 9.0, rect.center().y), Align2::CENTER_CENTER, lead, f, ic);
+            x += 28.0;
         }
     }
     match sub {
@@ -230,4 +246,302 @@ pub fn field(
             )
         })
         .inner
+}
+
+
+// ───────────────────────────── right-click support ─────────────────────────────
+
+const RC_KEY: &str = "lumen_rclick";
+
+/// Hook for `App::raw_input_hook`: strips right-button events so egui's text fields never collapse or move the
+/// selection when you right-click, and remembers where the click happened (see [`rclick`]).
+pub fn filter_raw_input(ctx: &Context, raw: &mut RawInput) {
+    let mut found = None;
+    raw.events.retain(|e| match e {
+        Event::PointerButton { pos, button: PointerButton::Secondary, pressed, .. } => {
+            if *pressed {
+                found = Some(*pos);
+            }
+            false
+        }
+        _ => true,
+    });
+    if let Some(p) = found {
+        ctx.data_mut(|d| d.insert_temp(Id::new(RC_KEY), p));
+        ctx.request_repaint();
+    }
+}
+
+/// Position of a right-click that happened this frame.
+pub fn rclick(ctx: &Context) -> Option<Pos2> {
+    ctx.data(|d| d.get_temp::<Pos2>(Id::new(RC_KEY)))
+}
+
+/// Must be called once at the end of every frame.
+pub fn end_frame(ctx: &Context) {
+    ctx.data_mut(|d| d.remove::<Pos2>(Id::new(RC_KEY)));
+}
+
+/// A right-click landed on `rect` (and that part of the screen is not covered by a popup / other layer).
+pub fn right_clicked(ui: &Ui, rect: Rect) -> Option<Pos2> {
+    let p = rclick(ui.ctx())?;
+    if rect.contains(p) && ui.clip_rect().contains(p) && ui.ctx().layer_id_at(p).map_or(true, |l| l == ui.layer_id()) {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct CtxItem {
+    pub icon: &'static str,
+    pub label: &'static str,
+    pub hint: &'static str,
+    pub danger: bool,
+    pub enabled: bool,
+    pub sep: bool,
+}
+
+impl CtxItem {
+    pub fn new(icon: &'static str, label: &'static str) -> Self {
+        Self { icon, label, hint: "", danger: false, enabled: true, sep: false }
+    }
+    pub fn hint(mut self, h: &'static str) -> Self {
+        self.hint = h;
+        self
+    }
+    pub fn danger(mut self) -> Self {
+        self.danger = true;
+        self
+    }
+    pub fn enabled(mut self, e: bool) -> Self {
+        self.enabled = e;
+        self
+    }
+    /// Draw a separator line above this item.
+    pub fn sep(mut self) -> Self {
+        self.sep = true;
+        self
+    }
+}
+
+/// Animated right-click menu. Returns `(still_open, picked_index)`.
+/// Flips to stay on screen, supports ↑/↓/Enter, closes on Esc or when clicking elsewhere.
+pub fn context_menu(ctx: &Context, id: Id, pos: Pos2, pal: &Palette, fresh: &mut bool, items: &[CtxItem]) -> (bool, Option<usize>) {
+    const W: f32 = 236.0;
+    let t = appear(ctx, id.with("appear"), 0.14);
+    let screen = ctx.screen_rect();
+    let size = ctx
+        .data(|d| d.get_temp::<Vec2>(id.with("size")))
+        .unwrap_or_else(|| vec2(W + 14.0, 14.0 + items.len() as f32 * 30.0));
+    let mut x = pos.x;
+    let mut y = pos.y;
+    if x + size.x > screen.right() - 8.0 {
+        x = (pos.x - size.x).max(8.0);
+    }
+    let flip = y + size.y > screen.bottom() - 8.0;
+    if flip {
+        y = (pos.y - size.y).max(8.0);
+    }
+    let slide = (1.0 - t) * 7.0 * if flip { 1.0 } else { -1.0 };
+
+    let sel_id = id.with("sel");
+    let mut sel: Option<usize> = ctx.data(|d| d.get_temp(sel_id));
+    let n = items.len();
+    let mut picked: Option<usize> = None;
+    if n > 0 {
+        let step = |from: Option<usize>, dir: i32| -> Option<usize> {
+            let mut i = from.map_or(if dir > 0 { -1 } else { 0 }, |v| v as i32);
+            for _ in 0..n {
+                i = (i + dir).rem_euclid(n as i32);
+                if items[i as usize].enabled {
+                    return Some(i as usize);
+                }
+            }
+            None
+        };
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+            sel = step(sel, 1);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+            sel = step(sel, -1);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+            if let Some(i) = sel {
+                picked = Some(i);
+            }
+        }
+    }
+
+    let resp = Area::new(id).order(Order::Foreground).fixed_pos(pos2(x, y + slide)).show(ctx, |ui| {
+        ui.set_opacity(t);
+        popup_frame(pal).inner_margin(Margin::same(6)).show(ui, |ui| {
+            ui.set_width(W);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for (i, it) in items.iter().enumerate() {
+                if it.sep && i > 0 {
+                    ui.add_space(3.0);
+                    let r = ui.available_rect_before_wrap();
+                    ui.painter().hline(r.x_range().shrink(6.0), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
+                    ui.add_space(4.0);
+                }
+                let (rect, r) = ui.allocate_exact_size(vec2(W, 30.0), if it.enabled { Sense::click() } else { Sense::hover() });
+                if r.hovered() && it.enabled {
+                    sel = Some(i);
+                }
+                let active = sel == Some(i) && it.enabled;
+                let h = ui.ctx().animate_bool_with_time(r.id, active, 0.09);
+                let p = ui.painter();
+                if h > 0.0 {
+                    let base = if it.danger { pal.danger.gamma_multiply(0.14) } else { pal.hover };
+                    p.rect_filled(rect, 6.0, with_alpha(base, h));
+                }
+                let dim = if it.enabled { 1.0 } else { 0.38 };
+                let col = if it.danger { pal.danger } else { pal.text };
+                let ic = if it.danger { pal.danger } else { lerp_color(pal.muted, pal.text, h) };
+                p.text(pos2(rect.left() + 17.0, rect.center().y), Align2::CENTER_CENTER, it.icon, icons::font(15.5), with_alpha(ic, dim));
+                p.text(pos2(rect.left() + 36.0, rect.center().y), Align2::LEFT_CENTER, it.label, body(14.0), with_alpha(col, dim));
+                if !it.hint.is_empty() {
+                    p.text(pos2(rect.right() - 10.0, rect.center().y), Align2::RIGHT_CENTER, it.hint, body(11.5), with_alpha(pal.muted, 0.9 * dim));
+                }
+                if r.on_hover_cursor(if it.enabled { CursorIcon::PointingHand } else { CursorIcon::Default }).clicked() && it.enabled {
+                    picked = Some(i);
+                }
+            }
+        });
+    });
+    ctx.move_to_top(resp.response.layer_id);
+    let rect = resp.response.rect;
+    ctx.data_mut(|d| {
+        d.insert_temp(id.with("size"), rect.size());
+        match sel {
+            Some(s) => d.insert_temp(sel_id, s),
+            None => {
+                d.remove::<usize>(sel_id);
+            }
+        }
+    });
+
+    let mut open = true;
+    if !*fresh {
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            if let Some(p) = ctx.pointer_interact_pos() {
+                open &= rect.contains(p);
+            }
+        }
+        if let Some(p) = rclick(ctx) {
+            open &= rect.contains(p);
+        }
+    }
+    if ctx.input(|i| i.key_pressed(Key::Escape)) {
+        open = false;
+    }
+    *fresh = false;
+    if picked.is_some() {
+        open = false;
+    }
+    if !open {
+        reset_appear(ctx, id.with("appear"));
+        ctx.data_mut(|d| {
+            d.remove::<Vec2>(id.with("size"));
+            d.remove::<usize>(sel_id);
+        });
+    }
+    (open, picked)
+}
+
+// ───────────────────────────── text helpers ─────────────────────────────
+
+fn char_to_byte(s: &str, chars: usize) -> usize {
+    s.char_indices().nth(chars).map(|(i, _)| i).unwrap_or(s.len())
+}
+
+/// Text of the char range `a..b`.
+pub fn slice_chars(s: &str, a: usize, b: usize) -> String {
+    let (a, b) = (a.min(b), a.max(b));
+    s[char_to_byte(s, a)..char_to_byte(s, b)].to_owned()
+}
+
+/// Replaces the char range `a..b` with `with`; returns the new caret position (in chars).
+pub fn replace_chars(s: &mut String, a: usize, b: usize, with: &str) -> usize {
+    let (a, b) = (a.min(b), a.max(b));
+    let (ba, bb) = (char_to_byte(s, a), char_to_byte(s, b));
+    s.replace_range(ba..bb, with);
+    a + with.chars().count()
+}
+
+/// Selection of a text edit as ordered `(start, end)` char indices (collapsed caret → `start == end`).
+pub fn selection(ctx: &Context, id: Id) -> Option<(usize, usize)> {
+    let r = TextEdit::load_state(ctx, id)?.cursor.char_range()?;
+    let (a, b) = (r.primary.index, r.secondary.index);
+    Some((a.min(b), a.max(b)))
+}
+
+/// Sets the selection of a text edit and gives it keyboard focus.
+pub fn set_selection(ctx: &Context, id: Id, a: usize, b: usize) {
+    let mut st = TextEdit::load_state(ctx, id).unwrap_or_default();
+    st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(a), CCursor::new(b))));
+    st.store(ctx, id);
+    ctx.memory_mut(|m| m.request_focus(id));
+}
+
+/// Right-click menu (Cut / Copy / Paste / Select all) for any single text field. Call right after adding the
+/// `TextEdit` with its response; `text` is the same buffer.
+pub fn field_menu(ui: &Ui, pal: &Palette, resp: &Response, text: &mut String) -> bool {
+    let ctx = ui.ctx().clone();
+    let id = resp.id;
+    let mkey = id.with("fmenu");
+    let mut changed = false;
+
+    // finish a pending async paste
+    if let Some((a, b)) = ctx.data(|d| d.get_temp::<(usize, usize)>(id.with("fwait"))) {
+        if let Some(clip) = crate::platform::take_paste() {
+            let clip = clip.replace(['\r', '\n'], " ");
+            let at = replace_chars(text, a, b, &clip);
+            set_selection(&ctx, id, at, at);
+            ctx.data_mut(|d| d.remove::<(usize, usize)>(id.with("fwait")));
+            changed = true;
+        }
+    }
+    if let Some(p) = right_clicked(ui, resp.rect) {
+        let sel = selection(&ctx, id).unwrap_or((text.chars().count(), text.chars().count()));
+        ctx.data_mut(|d| {
+            d.insert_temp(mkey, (p, sel.0, sel.1));
+            d.insert_temp(mkey.with("fresh"), true);
+        });
+    }
+    let Some((pos, a, b)) = ctx.data(|d| d.get_temp::<(Pos2, usize, usize)>(mkey)) else { return changed };
+    let mut fresh = ctx.data(|d| d.get_temp::<bool>(mkey.with("fresh"))).unwrap_or(false);
+    let has_sel = a != b;
+    let items = [
+        CtxItem::new(crate::lucide::SCISSORS, "Cut").hint("Ctrl+X").enabled(has_sel),
+        CtxItem::new(crate::lucide::COPY, "Copy").hint("Ctrl+C").enabled(has_sel),
+        CtxItem::new(crate::lucide::CLIPBOARD_PASTE, "Paste").hint("Ctrl+V"),
+        CtxItem::new(crate::lucide::TEXT_SELECT, "Select all").hint("Ctrl+A").sep().enabled(!text.is_empty()),
+    ];
+    let (open, pick) = context_menu(&ctx, mkey, pos, pal, &mut fresh, &items);
+    ctx.data_mut(|d| d.insert_temp(mkey.with("fresh"), fresh));
+    match pick {
+        Some(0) | Some(1) => {
+            ctx.copy_text(slice_chars(text, a, b));
+            if pick == Some(0) {
+                let at = replace_chars(text, a, b, "");
+                set_selection(&ctx, id, at, at);
+                changed = true;
+            } else {
+                set_selection(&ctx, id, a, b);
+            }
+        }
+        Some(2) => {
+            crate::platform::request_paste(&ctx);
+            set_selection(&ctx, id, a, b);
+            ctx.data_mut(|d| d.insert_temp(id.with("fwait"), (a, b)));
+        }
+        Some(3) => set_selection(&ctx, id, 0, text.chars().count()),
+        _ => {}
+    }
+    if !open {
+        ctx.data_mut(|d| d.remove::<(Pos2, usize, usize)>(mkey));
+    }
+    changed
 }

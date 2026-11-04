@@ -9,6 +9,7 @@ mod editor;
 mod icons;
 mod io;
 mod lock;
+mod lucide;
 mod model;
 mod platform;
 mod theme;

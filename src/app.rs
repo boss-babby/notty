@@ -1,5 +1,6 @@
 //! Application shell: sidebar, top bar, command palette, dialogs, toasts and persistence.
 
+use crate::lucide as l;
 use std::f32::consts::FRAC_PI_2;
 use std::time::Duration;
 
@@ -18,7 +19,7 @@ use crate::lock::{LockEvent, LockScreen};
 use crate::model::{Page, PageKind, Workspace, TEMPLATES};
 use crate::theme::{self, bold, body, lerp_color, Palette, ACCENTS};
 use crate::widgets::{
-    appear, field, icon_button, menu_item, popup_area, primary_button, reset_appear, section_label, with_alpha,
+    appear, context_menu, field, icon_button, menu_item, popup_area, primary_button, reset_appear, section_label, with_alpha, CtxItem,
 };
 
 const SIDEBAR_W: f32 = 264.0;
@@ -44,6 +45,7 @@ enum Ev {
     Toggle(u64),
     AddChild(u64),
     Menu(u64, Pos2),
+    Blank(Pos2),
 }
 
 #[derive(Clone, Copy)]
@@ -102,6 +104,7 @@ pub struct LumenApp {
     ed: EditorState,
     palette: Option<PaletteState>,
     row_menu: Option<(u64, Pos2)>,
+    side_menu: Option<Pos2>,
     ws_menu: Option<Pos2>,
     trash_open: bool,
     security: Option<SecurityDialog>,
@@ -143,6 +146,7 @@ impl LumenApp {
             ed: EditorState::default(),
             palette: None,
             row_menu: None,
+            side_menu: None,
             ws_menu: None,
             trash_open: false,
             security: None,
@@ -359,7 +363,7 @@ impl LumenApp {
                     if out.click {
                         ev.push(Ev::Open(id));
                     }
-                    if let Some(pos) = out.more {
+                    if let Some(pos) = out.more.or(out.rclick) {
                         ev.push(Ev::Menu(id, pos));
                     }
                     if out.plus {
@@ -386,8 +390,18 @@ impl LumenApp {
             self.run(PalAct::Lock);
         }
 
+        if !ev.iter().any(|e| matches!(e, Ev::Menu(..))) {
+            if let Some(p) = crate::widgets::right_clicked(ui, ui.max_rect()) {
+                ev.push(Ev::Blank(p));
+            }
+        }
         for e in ev {
             match e {
+                Ev::Blank(pos) => {
+                    self.side_menu = Some(pos);
+                    self.row_menu = None;
+                    self.fresh = true;
+                }
                 Ev::Open(id) => self.ws.current = Some(id),
                 Ev::Toggle(id) => {
                     if let Some(p) = self.ws.page_mut(id) {
@@ -397,6 +411,7 @@ impl LumenApp {
                 Ev::AddChild(id) => self.new_page(Some(id), PageKind::Doc),
                 Ev::Menu(id, pos) => {
                     self.row_menu = Some((id, pos));
+                    self.side_menu = None;
                     self.fresh = true;
                 }
             }
@@ -418,7 +433,7 @@ impl LumenApp {
             if out.plus {
                 ev.push(Ev::AddChild(id));
             }
-            if let Some(pos) = out.more {
+            if let Some(pos) = out.more.or(out.rclick) {
                 ev.push(Ev::Menu(id, pos));
             }
             let t = ui.ctx().animate_bool_with_time(key.with("kids"), p.expanded && has, 0.18);
@@ -442,11 +457,16 @@ impl LumenApp {
         let crumbs = self.ws.breadcrumb(cur);
         let n = crumbs.len();
         let mut nav: Option<u64> = None;
+        let mut crumb_menu: Option<(u64, Pos2)> = None;
         for (i, id) in crumbs.iter().enumerate() {
             if let Some(p) = self.ws.page(*id) {
                 let title = if p.title.is_empty() { "Untitled" } else { &p.title };
-                if crumb(ui, pal, &p.icon, title, i + 1 == n).clicked() {
+                let cr = crumb(ui, pal, &p.icon, title, i + 1 == n);
+                if cr.clicked() {
                     nav = Some(*id);
+                }
+                if let Some(pos) = crate::widgets::right_clicked(ui, cr.rect) {
+                    crumb_menu = Some((*id, pos));
                 }
                 if i + 1 < n {
                     ui.label(RichText::new("/").color(with_alpha(pal.muted, 0.6)).font(body(14.0)));
@@ -455,6 +475,10 @@ impl LumenApp {
         }
         if let Some(id) = nav {
             self.ws.current = Some(id);
+        }
+        if let Some(m) = crumb_menu {
+            self.row_menu = Some(m);
+            self.fresh = true;
         }
         let (updated, fav) = self.ws.page(cur).map(|p| (p.updated, p.favorite)).unwrap_or((0.0, false));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -493,7 +517,7 @@ impl LumenApp {
         let q = q.trim().to_lowercase();
         let mut out = vec![];
         let title_of = |p: &Page| if p.title.is_empty() { "Untitled".to_owned() } else { p.title.clone() };
-        let icon_of = |p: &Page| if p.icon.is_empty() { "▤".to_owned() } else { p.icon.clone() };
+        let icon_of = |p: &Page| if p.icon.is_empty() { l::FILE_TEXT.to_owned() } else { p.icon.clone() };
         if q.is_empty() {
             let mut pages: Vec<&Page> = self.ws.pages.iter().filter(|p| !p.trashed).collect();
             pages.sort_by(|a, b| b.updated.partial_cmp(&a.updated).unwrap_or(std::cmp::Ordering::Equal));
@@ -538,20 +562,20 @@ impl LumenApp {
             out.extend(scored.into_iter().take(8).map(|(_, a, i, t, s)| (a, i, t, s)));
         }
         let actions: [(PalAct, &str, &str, &str); 14] = [
-            (PalAct::NewPage, "+", "New page", "Create a blank page"),
-            (PalAct::NewDb, "▥", "New database", "Table, board, list, gallery or calendar"),
-            (PalAct::Journal, "📖", "Today's journal", "Open or create today's entry  (Ctrl+J)"),
-            (PalAct::Templates, "▦", "Browse templates", "Meeting notes, trackers, wiki…"),
-            (PalAct::Import, "⇩", "Import…", "Markdown, CSV or a workspace backup"),
-            (PalAct::ExportMd, "⇧", "Export page as Markdown", "Download the current page"),
-            (PalAct::ExportCsv, "⇧", "Export database as CSV", "Download the current database"),
-            (PalAct::Backup, "📦", "Back up workspace", "Download everything as JSON"),
-            (PalAct::Focus, "◎", "Toggle focus mode", "Hide sidebar and top bar  (Ctrl+.)"),
-            (PalAct::Theme, "◐", "Toggle theme", "Switch between light and dark"),
-            (PalAct::Lock, "🔒", "Lock workspace", "Require your password again"),
-            (PalAct::Sidebar, "◧", "Toggle sidebar", "Show or hide the sidebar"),
-            (PalAct::Trash, "🗑", "Open trash", "Restore deleted pages"),
-            (PalAct::Help, "⌨", "Keyboard shortcuts", "Everything you can do without the mouse  (Ctrl+/)"),
+            (PalAct::NewPage, l::PLUS, "New page", "Create a blank page"),
+            (PalAct::NewDb, l::KANBAN, "New database", "Table, board, list, gallery or calendar"),
+            (PalAct::Journal, l::BOOK_OPEN, "Today's journal", "Open or create today's entry  (Ctrl+J)"),
+            (PalAct::Templates, l::LAYOUT_TEMPLATE, "Browse templates", "Meeting notes, trackers, wiki…"),
+            (PalAct::Import, l::FILE_DOWN, "Import…", "Markdown, CSV or a workspace backup"),
+            (PalAct::ExportMd, l::FILE_UP, "Export page as Markdown", "Download the current page"),
+            (PalAct::ExportCsv, l::FILE_SPREADSHEET, "Export database as CSV", "Download the current database"),
+            (PalAct::Backup, l::PACKAGE, "Back up workspace", "Download everything as JSON"),
+            (PalAct::Focus, l::FOCUS, "Toggle focus mode", "Hide sidebar and top bar  (Ctrl+.)"),
+            (PalAct::Theme, l::SUN_MOON, "Toggle theme", "Switch between light and dark"),
+            (PalAct::Lock, l::LOCK, "Lock workspace", "Require your password again"),
+            (PalAct::Sidebar, l::PANEL_LEFT, "Toggle sidebar", "Show or hide the sidebar"),
+            (PalAct::Trash, l::TRASH_2, "Open trash", "Restore deleted pages"),
+            (PalAct::Help, l::KEYBOARD, "Keyboard shortcuts", "Everything you can do without the mouse  (Ctrl+/)"),
         ];
         for (a, i, t, s) in actions {
             if q.is_empty() || t.to_lowercase().contains(&q) {
@@ -659,41 +683,66 @@ impl LumenApp {
             return;
         };
         let fav = page.favorite;
-        let mut act: Option<u8> = None;
-        let open = popup_area(ctx, Id::new("row_menu"), pos, pal, &mut self.fresh, 220.0, |ui| {
-            if menu_item(ui, pal, if fav { "☆" } else { "★" }, if fav { "Remove from favorites" } else { "Add to favorites" }, None, false, false).clicked() {
-                act = Some(0);
-            }
-            if menu_item(ui, pal, "⎘", "Duplicate", None, false, false).clicked() {
-                act = Some(1);
-            }
-            if menu_item(ui, pal, "+", "Add sub-page", None, false, false).clicked() {
-                act = Some(2);
-            }
-            ui.add_space(3.0);
-            ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
-            ui.add_space(4.0);
-            if menu_item(ui, pal, "🗑", "Move to trash", None, false, true).clicked() {
-                act = Some(3);
-            }
-        });
-        if !open || act.is_some() {
+        let title = page.title.clone();
+        let items = [
+            CtxItem::new(l::FILE_TEXT, "Open"),
+            CtxItem::new(l::STAR, if fav { "Remove from favorites" } else { "Add to favorites" }),
+            CtxItem::new(l::PENCIL, "Rename").hint("F2"),
+            CtxItem::new(l::COPY_PLUS, "Duplicate"),
+            CtxItem::new(l::FILE_PLUS, "Add sub-page"),
+            CtxItem::new(l::COPY, "Copy title").enabled(!title.is_empty()),
+            CtxItem::new(l::TRASH_2, "Move to trash").danger().sep(),
+        ];
+        let (open, pick) = context_menu(ctx, Id::new("row_menu"), pos, pal, &mut self.fresh, &items);
+        if !open {
             self.row_menu = None;
         }
-        match act {
-            Some(0) => {
+        match pick {
+            Some(0) => self.ws.current = Some(id),
+            Some(1) => {
                 if let Some(p) = self.ws.page_mut(id) {
                     p.favorite = !p.favorite;
                 }
             }
-            Some(1) => {
+            Some(2) => {
+                self.ws.current = Some(id);
+                self.focus_title = Some(id);
+            }
+            Some(3) => {
                 self.ws.duplicate(id);
             }
-            Some(2) => self.new_page(Some(id), PageKind::Doc),
-            Some(3) => {
+            Some(4) => self.new_page(Some(id), PageKind::Doc),
+            Some(5) => ctx.copy_text(title),
+            Some(6) => {
                 self.ws.set_trashed(id, true);
                 self.toast("Moved to trash", Some(id));
             }
+            _ => {}
+        }
+    }
+
+    /// Right-click on empty sidebar space.
+    fn side_menu_ui(&mut self, ctx: &Context, pal: &Palette) {
+        let Some(pos) = self.side_menu else { return };
+        let items = [
+            CtxItem::new(l::FILE_PLUS, "New page").hint("Ctrl+N"),
+            CtxItem::new(l::KANBAN, "New database"),
+            CtxItem::new(l::BOOK_OPEN, "Today's journal").hint("Ctrl+J"),
+            CtxItem::new(l::LAYOUT_TEMPLATE, "Templates…").sep(),
+            CtxItem::new(l::FILE_DOWN, "Import…"),
+            CtxItem::new(l::TRASH_2, "Open trash"),
+        ];
+        let (open, pick) = context_menu(ctx, Id::new("side_menu"), pos, pal, &mut self.fresh, &items);
+        if !open {
+            self.side_menu = None;
+        }
+        match pick {
+            Some(0) => self.new_page(None, PageKind::Doc),
+            Some(1) => self.new_page(None, PageKind::Database),
+            Some(2) => self.run(PalAct::Journal),
+            Some(3) => self.templates_open = true,
+            Some(4) => self.run(PalAct::Import),
+            Some(5) => self.trash_open = true,
             _ => {}
         }
     }
@@ -715,28 +764,28 @@ impl LumenApp {
             ui.add_space(3.0);
             ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
             ui.add_space(4.0);
-            if menu_item(ui, pal, "◐", if dark { "Light mode" } else { "Dark mode" }, None, false, false).clicked() {
+            if menu_item(ui, pal, l::SUN_MOON, if dark { "Light mode" } else { "Dark mode" }, None, false, false).clicked() {
                 act = Some(0);
             }
-            if has_pw && menu_item(ui, pal, "🔒", "Lock now", None, false, false).clicked() {
+            if has_pw && menu_item(ui, pal, l::LOCK, "Lock now", None, false, false).clicked() {
                 act = Some(1);
             }
-            if menu_item(ui, pal, "🔑", if has_pw { "Change or remove password…" } else { "Set a password…" }, None, false, false).clicked() {
+            if menu_item(ui, pal, l::KEY_ROUND, if has_pw { "Change or remove password…" } else { "Set a password…" }, None, false, false).clicked() {
                 act = Some(2);
             }
-            if menu_item(ui, pal, "▦", "Templates…", None, false, false).clicked() {
+            if menu_item(ui, pal, l::LAYOUT_TEMPLATE, "Templates…", None, false, false).clicked() {
                 act = Some(4);
             }
-            if menu_item(ui, pal, "⇩", "Import Markdown / CSV / backup…", None, false, false).clicked() {
+            if menu_item(ui, pal, l::FILE_DOWN, "Import Markdown / CSV / backup…", None, false, false).clicked() {
                 act = Some(5);
             }
-            if menu_item(ui, pal, "📦", "Back up workspace (download JSON)", None, false, false).clicked() {
+            if menu_item(ui, pal, l::PACKAGE, "Back up workspace (download JSON)", None, false, false).clicked() {
                 act = Some(6);
             }
-            if menu_item(ui, pal, "⎘", "Copy workspace as JSON", None, false, false).clicked() {
+            if menu_item(ui, pal, l::COPY, "Copy workspace as JSON", None, false, false).clicked() {
                 act = Some(3);
             }
-            if menu_item(ui, pal, "⌨", "Keyboard shortcuts", None, false, false).clicked() {
+            if menu_item(ui, pal, l::KEYBOARD, "Keyboard shortcuts", None, false, false).clicked() {
                 act = Some(7);
             }
             ui.add_space(3.0);
@@ -812,7 +861,7 @@ impl LumenApp {
             if trashed.is_empty() {
                 ui.add_space(26.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("🗑").font(body(34.0)).color(pal.muted));
+                    ui.label(RichText::new(l::TRASH_2).font(body(34.0)).color(pal.muted));
                     ui.label(RichText::new("Trash is empty").color(pal.muted));
                 });
                 ui.add_space(30.0);
@@ -822,7 +871,7 @@ impl LumenApp {
                     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
                     let t = ui.ctx().animate_bool_with_time(Id::new(("trash_row", *id)), ui.rect_contains_pointer(r), 0.1);
                     ui.painter().rect_filled(r, 7.0, with_alpha(pal.hover, t));
-                    ui.painter().text(pos2(r.left() + 20.0, r.center().y), Align2::CENTER_CENTER, if icon.is_empty() { "▤" } else { icon }, body(16.0), pal.text);
+                    ui.painter().text(pos2(r.left() + 20.0, r.center().y), Align2::CENTER_CENTER, if icon.is_empty() { l::FILE_TEXT } else { icon }, body(16.0), pal.text);
                     ui.painter().text(pos2(r.left() + 42.0, r.center().y), Align2::LEFT_CENTER, title, body(14.5), pal.text);
                     let _ = resp;
                     let rr = Rect::from_center_size(pos2(r.right() - 48.0, r.center().y), vec2(28.0, 28.0));
@@ -876,25 +925,25 @@ impl LumenApp {
         let mut act: Option<u8> = None;
         let open = popup_area(ctx, Id::new("page_menu"), pos, pal, &mut self.fresh, 262.0, |ui| {
             section_label(ui, pal, "PAGE STYLE");
-            if menu_item(ui, pal, "Aa", if small { "Normal text size" } else { "Small text" }, None, false, false).clicked() {
+            if menu_item(ui, pal, l::TYPE, if small { "Normal text size" } else { "Small text" }, None, false, false).clicked() {
                 act = Some(0);
             }
-            if menu_item(ui, pal, "↔", if full { "Standard page width" } else { "Full width" }, None, false, false).clicked() {
+            if menu_item(ui, pal, l::MAXIMIZE, if full { "Standard page width" } else { "Full width" }, None, false, false).clicked() {
                 act = Some(1);
             }
             ui.add_space(3.0);
             ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
             ui.add_space(4.0);
-            if menu_item(ui, pal, "⎘", "Duplicate", None, false, false).clicked() {
+            if menu_item(ui, pal, l::COPY_PLUS, "Duplicate", None, false, false).clicked() {
                 act = Some(2);
             }
-            if menu_item(ui, pal, "⇧", "Export as Markdown", Some("Downloads a .md file"), false, false).clicked() {
+            if menu_item(ui, pal, l::FILE_UP, "Export as Markdown", Some("Downloads a .md file"), false, false).clicked() {
                 act = Some(3);
             }
-            if menu_item(ui, pal, "⎘", "Copy as Markdown", None, false, false).clicked() {
+            if menu_item(ui, pal, l::COPY, "Copy as Markdown", None, false, false).clicked() {
                 act = Some(4);
             }
-            if is_db && menu_item(ui, pal, "⇧", "Export as CSV", Some("Downloads a .csv file"), false, false).clicked() {
+            if is_db && menu_item(ui, pal, l::FILE_SPREADSHEET, "Export as CSV", Some("Downloads a .csv file"), false, false).clicked() {
                 act = Some(5);
             }
             ui.add_space(3.0);
@@ -908,7 +957,7 @@ impl LumenApp {
                 });
                 ui.add_space(4.0);
             }
-            if menu_item(ui, pal, "🗑", "Move to trash", None, false, true).clicked() {
+            if menu_item(ui, pal, l::TRASH_2, "Move to trash", None, false, true).clicked() {
                 act = Some(6);
             }
         });
@@ -1273,7 +1322,11 @@ impl LumenApp {
                     });
                 });
         });
-        ctx.request_repaint();
+        if age < 0.3 || age > 4.1 {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         if let Some(id) = undo {
             self.ws.set_trashed(id, false);
             self.ws.current = Some(id);
@@ -1297,7 +1350,19 @@ impl eframe::App for LumenApp {
         if self.ws.dark || self.locked { [0.098, 0.098, 0.098, 1.0] } else { [1.0, 1.0, 1.0, 1.0] }
     }
 
+    fn raw_input_hook(&mut self, ctx: &Context, raw_input: &mut egui::RawInput) {
+        // Right-clicks are handled by us (context menus) and never reach egui's text fields.
+        crate::widgets::filter_raw_input(ctx, raw_input);
+    }
+
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.frame(ctx);
+        crate::widgets::end_frame(ctx);
+    }
+}
+
+impl LumenApp {
+    fn frame(&mut self, ctx: &Context) {
         // theme (animated)
         let target = if self.locked || self.ws.dark { 1.0 } else { 0.0 };
         let t = ctx.animate_value_with_time(Id::new("theme_t"), target, 0.35);
@@ -1346,6 +1411,8 @@ impl eframe::App for LumenApp {
             }
             return;
         }
+
+        self.ws.migrate_icons();
 
         // global shortcuts
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::L)) {
@@ -1426,7 +1493,7 @@ impl eframe::App for LumenApp {
             let Some(cur) = self.ws.current.filter(|id| self.ws.page(*id).map_or(false, |p| !p.trashed)) else {
                 ui.add_space(ui.available_height() * 0.3);
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("📄").font(body(46.0)).color(pal.muted));
+                    ui.label(RichText::new(l::FILE_TEXT).font(body(46.0)).color(pal.muted));
                     ui.label(RichText::new("No page selected").font(bold(18.0)));
                     ui.add_space(6.0);
                     if primary_button(ui, &pal, "Create a page", 160.0).clicked() {
@@ -1472,6 +1539,7 @@ impl eframe::App for LumenApp {
         }
 
         self.row_menu_ui(ctx, &pal);
+        self.side_menu_ui(ctx, &pal);
         self.page_menu_ui(ctx, &pal);
         self.templates_ui(ctx, &pal);
         self.import_ui(ctx, &pal);
@@ -1501,22 +1569,28 @@ fn modal(ctx: &Context, id: Id, pal: &Palette, width: f32, top: f32, add: impl F
     let t = appear(ctx, id.with("a"), 0.2);
     let mut open = true;
     let screen = ctx.screen_rect();
-    Area::new(id.with("backdrop")).order(Order::Foreground).fixed_pos(Pos2::ZERO).show(ctx, |ui| {
+    let bd = Area::new(id.with("backdrop")).order(Order::Foreground).fixed_pos(Pos2::ZERO).show(ctx, |ui| {
         let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
         ui.painter().rect_filled(r, 0.0, Color32::from_black_alpha((120.0 * t) as u8));
         if resp.clicked() {
             open = false;
         }
     });
-    Area::new(id).order(Order::Foreground).anchor(Align2::CENTER_TOP, vec2(0.0, top + (1.0 - t) * 16.0)).show(ctx, |ui| {
+    // The backdrop must always sit *below* the dialog, otherwise the dialog looks greyed-out/hidden.
+    ctx.move_to_top(bd.response.layer_id);
+    let md = Area::new(id).order(Order::Foreground).anchor(Align2::CENTER_TOP, vec2(0.0, top + (1.0 - t) * 16.0)).show(ctx, |ui| {
         ui.set_opacity(t);
         crate::widgets::popup_frame(pal).corner_radius(CornerRadius::same(14)).inner_margin(Margin::same(8)).show(ui, |ui| {
-            ui.set_width(width);
+            ui.set_width(width.min((screen.width() - 32.0).max(280.0)));
             add(ui);
         });
     });
+    ctx.move_to_top(md.response.layer_id);
     if ctx.input(|i| i.key_pressed(Key::Escape)) {
         open = false;
+    }
+    if !open {
+        reset_appear(ctx, id.with("a"));
     }
     open
 }
@@ -1571,6 +1645,7 @@ struct RowOut {
     arrow: bool,
     plus: bool,
     more: Option<Pos2>,
+    rclick: Option<Pos2>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1609,7 +1684,7 @@ fn page_row(ui: &mut Ui, pal: &Palette, key: Id, w: f32, depth: usize, page: &Pa
     p.with_clip_rect(clip).text(pos2(x0 + 46.0, rect.center().y), Align2::LEFT_CENTER, title, body(14.5), col);
 
     // hover actions
-    let mut out = RowOut { click: false, arrow: false, plus: false, more: None };
+    let mut out = RowOut { click: false, arrow: false, plus: false, more: None, rclick: crate::widgets::right_clicked(ui, rect) };
     if t > 0.02 && hovered {
         let more = Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), vec2(22.0, 22.0));
         let plus = Rect::from_center_size(pos2(rect.right() - 40.0, rect.center().y), vec2(22.0, 22.0));

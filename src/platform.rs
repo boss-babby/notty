@@ -67,3 +67,36 @@ pub fn file_name(f: &egui::DroppedFile) -> String {
     }
     f.path.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("").to_owned()
 }
+
+thread_local! {
+    static PASTE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Starts reading the system clipboard. The text arrives via [`take_paste`] (immediately on desktop, a moment later
+/// in the browser because the Clipboard API is asynchronous).
+pub fn request_paste(ctx: &egui::Context) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let text = arboard::Clipboard::new().and_then(|mut c| c.get_text()).unwrap_or_default();
+        PASTE.with(|p| *p.borrow_mut() = Some(text));
+        ctx.request_repaint();
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let ctx = ctx.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut text = String::new();
+            if let Some(w) = web_sys::window() {
+                if let Ok(v) = wasm_bindgen_futures::JsFuture::from(w.navigator().clipboard().read_text()).await {
+                    text = v.as_string().unwrap_or_default();
+                }
+            }
+            PASTE.with(|p| *p.borrow_mut() = Some(text));
+            ctx.request_repaint();
+        });
+    }
+}
+
+pub fn take_paste() -> Option<String> {
+    PASTE.with(|p| p.borrow_mut().take())
+}

@@ -18,6 +18,15 @@ command palette with full-text search (Ctrl+K), focus mode (Ctrl+.), page width 
 **Data** — autosave (disk on desktop, localStorage on web); export page → Markdown, database → CSV, workspace → JSON backup;
 import Markdown / CSV / JSON by pasting or dropping a file on the window. Optional password lock (salted, iterated SHA-256) with idle auto-lock.
 
+## What's new (this release)
+- **Fixed:** clicking an item in the `/` slash menu now applies it (the menu used egui's hover flag, which is unreliable on the frame where the text field loses focus; it now hit-tests by position). Covered by a headless regression test.
+- **Fixed:** dialogs/pop-ups could look greyed-out or hidden because the modal backdrop could end up above the dialog; layers are now explicitly ordered every frame and pop-ups are kept fully on-screen.
+- **Right-click everywhere** (`widgets::context_menu`): text (Cut / Copy / Paste / Select all / Bold / Italic / Strike / Code / Turn into / Duplicate / Move / Delete), blocks & gutter, sidebar pages & empty sidebar space, breadcrumbs, database rows & cards in every view, view tabs, and every text field. Right-clicks are intercepted in `raw_input_hook`, so they never collapse or move a text selection.
+- **Selection toolbar** that floats above selected text (turn into, bold, italic, strike, code, colour).
+- **Lucide icons** (embedded icon font, also registered as a fallback font so any text can contain icon glyphs) for blocks, menus, databases, palette, icon picker (Icons + Emoji tabs). Legacy emoji page icons are migrated automatically.
+- **Performance:** blocks far outside the viewport are not laid out (height cache), table-of-contents data is only built when needed, the lock-screen animation is throttled to ~30 fps, toast timers repaint only when animating, no depth/stencil/MSAA buffers, window size/position persisted.
+- Multi-line paste creates one block per line; real clipboard access for the context-menu *Paste* (native: arboard, web: async Clipboard API).
+
 Not (yet) included: real-time collaboration, cloud sync, comments/history/publishing (need a server), formulas/relations/rollups, image & file uploads.
 
 ## Shortcuts
@@ -28,7 +37,7 @@ Not (yet) included: real-time collaboration, cloud sync, comments/history/publis
 cargo run --release            # native (any OS)
 cargo test --lib               # 20 tests: model, import/export, editor ops, headless render passes
 ./build-windows.sh             # Windows .exe from Linux (rustup target add x86_64-pc-windows-gnu; mingw-w64)
-./build-web.sh                 # WebAssembly -> ../public/webapp  (wasm-bindgen-cli 0.2.130)
+./build-web.sh                 # WebAssembly -> ../public/webapp  (wasm-bindgen-cli 0.2.130; uses --cfg web_sys_unstable_apis from .cargo/config.toml)
 ```
 On Windows just run `cargo build --release` → `target\release\lumen.exe`.
 
