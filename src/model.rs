@@ -181,11 +181,17 @@ pub struct Block {
     /// Image width in percent of the column (0 = 100).
     #[serde(default)]
     pub size: u8,
+    /// Video blocks: start offset in seconds.
+    #[serde(default)]
+    pub start: u32,
+    /// Video blocks: 1 = autoplay, 2 = muted, 4 = loop. (`size` holds the aspect ratio: 0 = 16:9, 1 = 4:3, 2 = 21:9, 3 = 1:1, 4 = 9:16.)
+    #[serde(default)]
+    pub vopts: u8,
 }
 
 impl Block {
     pub fn new(id: u64, kind: BlockKind, text: &str, indent: u8) -> Block {
-        Block { id, kind, text: text.into(), checked: false, indent, collapsed: false, color: 0, bg: 0, link: None, url: String::new(), media: 0, size: 0 }
+        Block { id, kind, text: text.into(), checked: false, indent, collapsed: false, color: 0, bg: 0, link: None, url: String::new(), media: 0, size: 0, start: 0, vopts: 0 }
     }
 
     /// Source string of a media block: `media:<id>` for local files, otherwise the URL.
@@ -209,11 +215,32 @@ pub enum PropKind {
     Checkbox,
     Date,
     Url,
+    /// Computed from other properties with a Notion-style expression.
+    Formula,
+    /// Links to rows of another (or the same) database.
+    Relation,
+    /// Aggregates a property of the related rows.
+    Rollup,
 }
 
 impl PropKind {
-    pub const ALL: [PropKind; 7] =
-        [PropKind::Text, PropKind::Number, PropKind::Select, PropKind::MultiSelect, PropKind::Checkbox, PropKind::Date, PropKind::Url];
+    pub const ALL: [PropKind; 10] = [
+        PropKind::Text,
+        PropKind::Number,
+        PropKind::Select,
+        PropKind::MultiSelect,
+        PropKind::Checkbox,
+        PropKind::Date,
+        PropKind::Url,
+        PropKind::Formula,
+        PropKind::Relation,
+        PropKind::Rollup,
+    ];
+
+    /// Formula and rollup values are computed (read-only).
+    pub fn computed(self) -> bool {
+        matches!(self, PropKind::Formula | PropKind::Rollup)
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -224,6 +251,9 @@ impl PropKind {
             PropKind::Checkbox => "Checkbox",
             PropKind::Date => "Date",
             PropKind::Url => "URL",
+            PropKind::Formula => "Formula",
+            PropKind::Relation => "Relation",
+            PropKind::Rollup => "Rollup",
         }
     }
 
@@ -236,6 +266,9 @@ impl PropKind {
             PropKind::Checkbox => l::SQUARE_CHECK,
             PropKind::Date => l::CALENDAR_DAYS,
             PropKind::Url => l::LINK_2,
+            PropKind::Formula => l::SIGMA,
+            PropKind::Relation => l::ARROW_UP_RIGHT,
+            PropKind::Rollup => l::LAYERS,
         }
     }
 }
@@ -254,6 +287,84 @@ pub struct Prop {
     pub kind: PropKind,
     #[serde(default)]
     pub opts: Vec<Opt>,
+    /// Settings of formula / relation / rollup properties.
+    #[serde(default)]
+    pub cfg: PropCfg,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+pub enum RollupFn {
+    #[default]
+    Count,
+    CountValues,
+    Unique,
+    Sum,
+    Average,
+    Min,
+    Max,
+    Median,
+    Range,
+    PercentChecked,
+    PercentEmpty,
+    ShowOriginal,
+    Earliest,
+    Latest,
+}
+
+impl RollupFn {
+    pub const ALL: [RollupFn; 14] = [
+        RollupFn::Count,
+        RollupFn::CountValues,
+        RollupFn::Unique,
+        RollupFn::Sum,
+        RollupFn::Average,
+        RollupFn::Min,
+        RollupFn::Max,
+        RollupFn::Median,
+        RollupFn::Range,
+        RollupFn::PercentChecked,
+        RollupFn::PercentEmpty,
+        RollupFn::ShowOriginal,
+        RollupFn::Earliest,
+        RollupFn::Latest,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RollupFn::Count => "Count all",
+            RollupFn::CountValues => "Count values",
+            RollupFn::Unique => "Count unique values",
+            RollupFn::Sum => "Sum",
+            RollupFn::Average => "Average",
+            RollupFn::Min => "Min",
+            RollupFn::Max => "Max",
+            RollupFn::Median => "Median",
+            RollupFn::Range => "Range (max − min)",
+            RollupFn::PercentChecked => "Percent checked",
+            RollupFn::PercentEmpty => "Percent empty",
+            RollupFn::ShowOriginal => "Show original",
+            RollupFn::Earliest => "Earliest date",
+            RollupFn::Latest => "Latest date",
+        }
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize, Debug)]
+pub struct PropCfg {
+    /// Formula expression, e.g. `prop("Price") * prop("Qty")`.
+    #[serde(default)]
+    pub formula: String,
+    /// Relation: id of the related database page.
+    #[serde(default)]
+    pub relation: u64,
+    /// Rollup: the relation property (of this database) to follow.
+    #[serde(default)]
+    pub rollup_rel: u64,
+    /// Rollup: the property of the related database to aggregate (0 = its title).
+    #[serde(default)]
+    pub rollup_prop: u64,
+    #[serde(default)]
+    pub rollup_fn: RollupFn,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
@@ -272,10 +383,12 @@ pub enum ViewKind {
     List,
     Gallery,
     Calendar,
+    /// Gantt-style timeline with draggable date-range bars and dependency arrows.
+    Timeline,
 }
 
 impl ViewKind {
-    pub const ALL: [ViewKind; 5] = [ViewKind::Table, ViewKind::Board, ViewKind::List, ViewKind::Gallery, ViewKind::Calendar];
+    pub const ALL: [ViewKind; 6] = [ViewKind::Table, ViewKind::Board, ViewKind::List, ViewKind::Gallery, ViewKind::Calendar, ViewKind::Timeline];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -284,6 +397,7 @@ impl ViewKind {
             ViewKind::List => "List",
             ViewKind::Gallery => "Gallery",
             ViewKind::Calendar => "Calendar",
+            ViewKind::Timeline => "Timeline",
         }
     }
 
@@ -294,6 +408,7 @@ impl ViewKind {
             ViewKind::List => l::LAYOUT_LIST,
             ViewKind::Gallery => l::LAYOUT_GRID,
             ViewKind::Calendar => l::CALENDAR_DAYS,
+            ViewKind::Timeline => l::CHART_GANTT,
         }
     }
 }
@@ -342,6 +457,8 @@ impl FilterOp {
             PropKind::MultiSelect => &[Contains, IsEmpty, NotEmpty],
             PropKind::Checkbox => &[Checked, Unchecked],
             PropKind::Date => &[Is, Gt, Lt, IsEmpty, NotEmpty],
+            PropKind::Formula | PropKind::Rollup => &[Contains, Is, Gt, Lt, IsEmpty, NotEmpty],
+            PropKind::Relation => &[IsEmpty, NotEmpty],
         }
     }
 }
@@ -371,6 +488,12 @@ pub struct View {
     /// Calendar date property (0 = auto: first date property).
     #[serde(default)]
     pub date: u64,
+    /// Timeline: self-relation used for dependency arrows (0 = auto: first self-relation).
+    #[serde(default)]
+    pub dep: u64,
+    /// Timeline: pixels per day (0 = default).
+    #[serde(default)]
+    pub zoom: u8,
     #[serde(default)]
     pub filters: Vec<Filter>,
     #[serde(default)]
@@ -400,6 +523,14 @@ impl Database {
 
     pub fn date_prop(&self, v: &View) -> Option<u64> {
         self.prop(v.date).filter(|p| p.kind == PropKind::Date).map(|p| p.id).or_else(|| self.first_of(PropKind::Date))
+    }
+
+    /// Self-relation (a relation pointing at this very database) used for task dependencies.
+    pub fn dep_prop(&self, v: &View, my_id: u64) -> Option<u64> {
+        self.prop(v.dep)
+            .filter(|p| p.kind == PropKind::Relation && p.cfg.relation == my_id)
+            .map(|p| p.id)
+            .or_else(|| self.props.iter().find(|p| p.kind == PropKind::Relation && p.cfg.relation == my_id).map(|p| p.id))
     }
 
     pub fn kind_of(&self, prop: u64) -> PropKind {
@@ -489,6 +620,22 @@ pub struct Page {
     pub small_text: bool,
     #[serde(default)]
     pub full_width: bool,
+    /// Versioned snapshots (oldest first), see `history.rs`.
+    #[serde(default)]
+    pub history: Vec<Version>,
+}
+
+/// A saved snapshot of a page's content.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Version {
+    pub ts: f64,
+    pub title: String,
+    pub blocks: Vec<Block>,
+    /// True for versions the user saved by hand (kept when pruning).
+    #[serde(default)]
+    pub manual: bool,
+    #[serde(default)]
+    pub note: String,
 }
 
 fn half() -> f32 {
@@ -552,6 +699,7 @@ fn blank_page(id: u64, parent: Option<u64>, kind: PageKind) -> Page {
         db: None,
         small_text: false,
         full_width: false,
+        history: vec![],
     }
 }
 
@@ -657,7 +805,7 @@ impl Workspace {
         let pid = self.id();
         let opts: Vec<Opt> = opts.iter().enumerate().map(|(i, n)| Opt { id: self.id(), name: (*n).into(), color: i % 9 }).collect();
         if let Some(d) = self.db_mut(db) {
-            d.props.push(Prop { id: pid, name: name.into(), kind, opts });
+            d.props.push(Prop { id: pid, name: name.into(), kind, opts, cfg: PropCfg::default() });
         }
         pid
     }
@@ -667,7 +815,7 @@ impl Workspace {
         if let Some(d) = self.db_mut(db) {
             let same = d.views.iter().filter(|v| v.kind == kind).count();
             let name = if same == 0 { format!("{} view", kind.label()) } else { format!("{} view {}", kind.label(), same + 1) };
-            d.views.push(View { id: vid, name, kind, group: 0, date: 0, filters: vec![], sorts: vec![] });
+            d.views.push(View { id: vid, name, kind, group: 0, date: 0, dep: 0, zoom: 0, filters: vec![], sorts: vec![] });
             d.active = d.views.len() - 1;
         }
         vid
@@ -795,6 +943,7 @@ impl Workspace {
         copy.id = nid;
         copy.title = if copy.title.is_empty() { "Untitled copy".into() } else { format!("{} (copy)", copy.title) };
         copy.favorite = false;
+        copy.history.clear();
         copy.updated = now_ms();
         for b in copy.blocks.iter_mut() {
             b.id = self.id();
@@ -1170,8 +1319,87 @@ impl Workspace {
             p.title = "Reading".into();
         }
 
+        ws.seed_projects();
         ws.current = Some(start);
         ws
+    }
+
+    /// Demo databases showing date-range timelines with dependencies, formulas, relations and rollups.
+    fn seed_projects(&mut self) {
+        let plan = self.add_database(None, ViewKind::Timeline);
+        self.clear_rows(plan);
+        let status = self.db(plan).and_then(|d| d.first_of(PropKind::Select)).unwrap_or(0);
+        let date = self.db(plan).and_then(|d| d.first_of(PropKind::Date)).unwrap_or(0);
+        let done = self.add_prop(plan, "Done", PropKind::Checkbox, &[]);
+        let dep = self.add_prop(plan, "Blocked by", PropKind::Relation, &[]);
+        let days = self.add_prop(plan, "Days", PropKind::Formula, &[]);
+        if let Some(d) = self.db_mut(plan) {
+            for p in d.props.iter_mut() {
+                if p.id == date {
+                    p.name = "Schedule".into();
+                } else if p.id == dep {
+                    p.cfg.relation = plan;
+                } else if p.id == days {
+                    p.cfg.formula = "dateBetween(end(prop(\"Schedule\")), start(prop(\"Schedule\")), \"days\") + 1".into();
+                }
+            }
+        }
+        self.add_view(plan, ViewKind::Table);
+        if let Some(d) = self.db_mut(plan) {
+            d.active = 0;
+        }
+        let items = [
+            ("Research & discovery", "Done", -8, -3, true),
+            ("Design system", "In progress", -2, 4, false),
+            ("Build prototype", "In progress", 5, 12, false),
+            ("User testing", "Not started", 10, 15, false),
+            ("Launch", "Not started", 17, 18, false),
+        ];
+        let mut ids = vec![];
+        for (t, s, a, b, d) in items {
+            let sid = self.opt_id(plan, status, s).unwrap_or(0);
+            let (da, db) = (dates::today_day() + a, dates::today_day() + b);
+            ids.push(self.titled_row(plan, t, vec![(status, Val::Sel(sid)), (date, Val::Text(dates::span_value(da, db))), (done, Val::Check(d))]));
+        }
+        for (i, pred) in [(1usize, 0usize), (2, 1), (3, 2), (4, 3)] {
+            if let Some(r) = self.page_mut(ids[i]) {
+                r.props.insert(dep, Val::Multi(vec![ids[pred]]));
+            }
+        }
+        if let Some(p) = self.page_mut(plan) {
+            p.title = "Project plan".into();
+            p.icon = "📅".into();
+        }
+
+        let ms = self.add_database(None, ViewKind::Table);
+        self.clear_rows(ms);
+        let tasks = self.add_prop(ms, "Tasks", PropKind::Relation, &[]);
+        let count = self.add_prop(ms, "Task count", PropKind::Rollup, &[]);
+        let prog = self.add_prop(ms, "Progress %", PropKind::Rollup, &[]);
+        let ends = self.add_prop(ms, "Ends", PropKind::Rollup, &[]);
+        if let Some(d) = self.db_mut(ms) {
+            for p in d.props.iter_mut() {
+                if p.id == tasks {
+                    p.cfg.relation = plan;
+                } else if p.id == count {
+                    p.cfg = PropCfg { rollup_rel: tasks, rollup_prop: 0, rollup_fn: RollupFn::Count, ..Default::default() };
+                } else if p.id == prog {
+                    p.cfg = PropCfg { rollup_rel: tasks, rollup_prop: done, rollup_fn: RollupFn::PercentChecked, ..Default::default() };
+                } else if p.id == ends {
+                    p.cfg = PropCfg { rollup_rel: tasks, rollup_prop: date, rollup_fn: RollupFn::Latest, ..Default::default() };
+                }
+            }
+            d.props.retain(|p| p.name != "Date" && p.name != "Tags");
+        }
+        for (t, set) in [("Alpha", vec![0usize, 1]), ("Beta", vec![2, 3]), ("Release", vec![4])] {
+            let r = self.titled_row(ms, t, vec![(tasks, Val::Multi(set.iter().map(|i| ids[*i]).collect()))]);
+            let _ = r;
+        }
+        if let Some(p) = self.page_mut(ms) {
+            p.title = "Milestones".into();
+            p.icon = "🏆".into();
+        }
+        crate::formula::recompute(self);
     }
 }
 
@@ -1194,8 +1422,12 @@ fn names_of(d: &Database, prop: u64, v: &Val) -> Vec<String> {
 }
 
 pub fn row_matches(row: &Page, d: &Database, f: &Filter) -> bool {
-    let kind = d.kind_of(f.prop);
     let val = row_val(row, f.prop);
+    let kind = match (d.kind_of(f.prop), &val) {
+        (PropKind::Formula | PropKind::Rollup, Some(Val::Num(_))) => PropKind::Number,
+        (PropKind::Formula | PropKind::Rollup, _) => PropKind::Text,
+        (k, _) => k,
+    };
     let empty = match &val {
         None => true,
         Some(Val::Text(s)) => s.trim().is_empty(),

@@ -196,6 +196,10 @@ pub struct EmbedRect {
     pub id: u64,
     pub url: String,
     pub rect: egui::Rect,
+    /// Play with a native `<video>` element instead of an iframe.
+    pub video: bool,
+    /// Video playback options (1 = autoplay, 2 = muted, 4 = loop).
+    pub opts: u8,
     /// Visible part (the scroll area's clip rectangle).
     pub clip: egui::Rect,
 }
@@ -233,14 +237,32 @@ pub fn sync_iframes(items: &[EmbedRect]) {
             }
             for it in items {
                 let eid = format!("lumen-embed-{}", it.id);
-                let frame: web_sys::HtmlIFrameElement = match doc.get_element_by_id(&eid) {
+                let frame: web_sys::HtmlElement = match doc.get_element_by_id(&eid) {
                     Some(e) => e.dyn_into().ok()?,
                     None => {
-                        let f: web_sys::HtmlIFrameElement = doc.create_element("iframe").ok()?.dyn_into().ok()?;
+                        let f: web_sys::HtmlElement = doc.create_element(if it.video { "video" } else { "iframe" }).ok()?.dyn_into().ok()?;
                         f.set_id(&eid);
-                        f.set_attribute("allow", "autoplay; fullscreen; clipboard-write; encrypted-media; picture-in-picture").ok()?;
-                        f.set_attribute("allowfullscreen", "true").ok()?;
-                        f.set_attribute("referrerpolicy", "no-referrer-when-downgrade").ok()?;
+                        if it.video {
+                            f.set_attribute("controls", "").ok()?;
+                            f.set_attribute("playsinline", "").ok()?;
+                            f.set_attribute("preload", "metadata").ok()?;
+                            f.set_attribute("controlslist", "nodownload").ok()?;
+                            if it.opts & 1 != 0 {
+                                f.set_attribute("autoplay", "").ok()?;
+                            }
+                            if it.opts & 2 != 0 {
+                                f.set_attribute("muted", "").ok()?;
+                                let _ = js_sys::Reflect::set(&f, &"muted".into(), &true.into());
+                            }
+                            if it.opts & 4 != 0 {
+                                f.set_attribute("loop", "").ok()?;
+                            }
+                        } else {
+                            f.set_attribute("allow", "autoplay; fullscreen; clipboard-write; encrypted-media; picture-in-picture").ok()?;
+                            f.set_attribute("allowfullscreen", "true").ok()?;
+                            f.set_attribute("loading", "lazy").ok()?;
+                            f.set_attribute("referrerpolicy", "no-referrer-when-downgrade").ok()?;
+                        }
                         container.append_child(&f).ok()?;
                         f
                     }
@@ -259,7 +281,8 @@ pub fn sync_iframes(items: &[EmbedRect]) {
                 st.set_property("display", "block").ok()?;
                 st.set_property("position", "absolute").ok()?;
                 st.set_property("border", "0").ok()?;
-                st.set_property("background", "#fff").ok()?;
+                st.set_property("background", if it.video { "#000" } else { "#fff" }).ok()?;
+                st.set_property("object-fit", "contain").ok()?;
                 st.set_property("left", &format!("{}px", it.rect.left())).ok()?;
                 st.set_property("top", &format!("{}px", it.rect.top())).ok()?;
                 st.set_property("width", &format!("{}px", it.rect.width())).ok()?;
@@ -273,5 +296,45 @@ pub fn sync_iframes(items: &[EmbedRect]) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = items;
+    }
+}
+
+// ───────────────────────────── printing ─────────────────────────────
+
+/// Shows a self-contained HTML document in the browser (new tab on the web, system browser on desktop) so the user can print
+/// it or save it as PDF. Returns a status message.
+pub fn open_html(name: &str, html: &str) -> String {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut path = std::env::temp_dir();
+        path.push(name);
+        match std::fs::write(&path, html.as_bytes()) {
+            Ok(_) => match webbrowser::open(&path.to_string_lossy()) {
+                Ok(_) => "Opened the print preview in your browser".to_owned(),
+                Err(_) => format!("Saved the print version to {}", path.display()),
+            },
+            Err(e) => format!("Could not write the print file: {e}"),
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let run = || -> Result<bool, wasm_bindgen::JsValue> {
+            let arr = js_sys::Uint8Array::from(html.as_bytes());
+            let parts = js_sys::Array::of1(&arr);
+            let opts = web_sys::BlobPropertyBag::new();
+            opts.set_type("text/html;charset=utf-8");
+            let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &opts)?;
+            let url = web_sys::Url::create_object_url_with_blob(&blob)?;
+            let win = web_sys::window().ok_or("no window")?;
+            Ok(win.open_with_url_and_target(&url, "_blank")?.is_some())
+        };
+        match run() {
+            Ok(true) => "Print preview opened in a new tab".to_owned(),
+            Ok(false) => {
+                // pop-up blocked → fall back to a download
+                save_download(name, html.as_bytes(), "text/html")
+            }
+            Err(_) => "Could not open the print preview".to_owned(),
+        }
     }
 }

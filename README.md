@@ -36,13 +36,23 @@ Limits: no real-time collaboration / cloud sync / comments / history yet; web bu
 - **Smooth scrolling** — eased wheel / touchpad scrolling on the page.
 - **PDF reader** — `/pdf` (or any file block with a `.pdf`) renders pages inline with [hayro](https://github.com/LaurenzV/hayro) (pure Rust: same code on Windows and WASM), page navigation and zoom. MuPDF (AGPL, C) and pdfium (binary) were evaluated and rejected.
 
+## What's new in 3.0
+- **PDF reader rebuilt** (`src/pdf.rs`) — a PDF block is now just a card (nothing parsed, rendered or resident). *Read* opens a full-window reader: continuous scroll, pinch / Ctrl+wheel zoom anchored under the pointer (25–600 %), fit width / page, page box, thumbnails, keyboard (PgUp/PgDn/Home/End/Space/Ctrl±), night mode, password prompt. Pages are rasterised as 512 px **tiles** only where visible, at exact screen resolution, with ≤12 ms of rendering per frame, an LRU texture cap (72 tiles on wasm / 140 native) and low-res previews while sharp tiles arrive. Closing the reader drops the document, hayro's caches and all textures. Attached files are no longer kept in RAM at all (`MediaStore::bytes` loads from disk / local storage on demand). Native builds catch panics inside the PDF engine so a damaged file cannot crash the app.
+- **Formula / relation / rollup properties** (`src/formula.rs`) — Notion-style expressions (`prop("Price") * prop("Qty")`, `if`, `dateBetween`, `formatDate`, `.length()` …, ~70 functions), relations (also to the same database) and 14 rollup functions. Results are cached in rows so filters, sorts, CSV and every view just work.
+- **Date ranges + Timeline view** (`src/timeline.rs`) — date properties can have an end date; the Timeline draws draggable / resizable bars, today marker, zoom levels, dependency arrows (red when violated), connector drag to link tasks and *Auto-schedule*. Calendar shows multi-day items.
+- **Undo / redo + page history** (`src/history.rs`) — multi-level undo for every block operation, versioned snapshots per page (auto + named), change summary, restore (itself undoable).
+- **Print-ready export** (`src/print.rs`) — A4 HTML with inlined images, databases as tables, timelines as SVG Gantt charts; opens the print dialog (Save as PDF).
+- **Video blocks** — 1080p posters with fallback, aspect ratios, autoplay / mute / loop, start time, native `<video>` for direct files on the web build.
+- **Responsive** — slide-over sidebar and compact top bar below 720 pt, horizontally scrolling tables / calendar, touch panning, mobile viewport + loading progress in `web/index.html`.
+- **WebAssembly** — `build-web.sh` uses the size-optimised `web` profile (`opt-level = "s"`, thin LTO, `panic = "abort"`) and `wasm-opt -O3`.
+
 ## Shortcuts
 `Ctrl/Cmd+K` palette · `N` new page · `J` journal · `\` sidebar · `.` focus · `L` lock · `Shift+L` theme · `Shift+E` export · `/` all shortcuts
 
 ## Build
 ```bash
 cargo run --release            # native (any OS)
-cargo test --lib               # 20 tests: model, import/export, editor ops, headless render passes
+cargo test --lib               # 44 tests: model, import/export, editor ops, headless render passes
 ./build-windows.sh             # Windows .exe from Linux (rustup target add x86_64-pc-windows-gnu; mingw-w64)
 ./build-web.sh                 # WebAssembly -> ../public/webapp  (wasm-bindgen-cli 0.2.130; uses --cfg web_sys_unstable_apis from .cargo/config.toml)
 ```

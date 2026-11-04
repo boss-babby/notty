@@ -13,38 +13,16 @@ use crate::widgets::{self, with_alpha};
 
 // ───────────────────────────── undo / redo ─────────────────────────────
 
-pub fn push_undo(ed: &mut EditorState, page: &Page) {
-    ed.undo.push((page.id, page.blocks.clone()));
-    if ed.undo.len() > 80 {
-        ed.undo.remove(0);
-    }
-    ed.redo.clear();
-}
+/// Undo steps are recorded centrally by `history::track` (it sees every change, whatever caused it), so the
+/// per-operation hook is a no-op kept for call-site clarity.
+pub fn push_undo(_ed: &mut EditorState, _page: &Page) {}
 
 pub fn undo(ed: &mut EditorState, page: &mut Page) -> bool {
-    match ed.undo.iter().rposition(|(p, _)| *p == page.id) {
-        Some(pos) => {
-            let (_, blocks) = ed.undo.remove(pos);
-            let cur = std::mem::replace(&mut page.blocks, blocks);
-            ed.redo.push((page.id, cur));
-            ed.sel.clear();
-            true
-        }
-        None => false,
-    }
+    crate::history::undo(ed, page)
 }
 
 pub fn redo(ed: &mut EditorState, page: &mut Page) -> bool {
-    match ed.redo.iter().rposition(|(p, _)| *p == page.id) {
-        Some(pos) => {
-            let (_, blocks) = ed.redo.remove(pos);
-            let cur = std::mem::replace(&mut page.blocks, blocks);
-            ed.undo.push((page.id, cur));
-            ed.sel.clear();
-            true
-        }
-        None => false,
-    }
+    crate::history::redo(ed, page)
 }
 
 // ───────────────────────────── operations on the selection ─────────────────────────────

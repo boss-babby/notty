@@ -92,3 +92,17 @@ Legend: ✅ done · 🟡 partial · 🛠 next · 🗓 planned · 💡 idea
 5. **Relations / rollups / formulas**, timeline view.
 6. **Sync + collaboration**: `yrs` CRDT, WebSocket server in the companion Next.js backend, share links & publish-to-web.
 7. **HTML/PDF export**, web clipper, public API, Android build.
+
+
+## 4. v3.0 status update
+| Area | Status | Notes |
+|---|---|---|
+| Formula / relation / rollup | ✅ | `formula.rs`; two-way relations and rollups of rollups are the next step |
+| Timeline + dependencies | ✅ | `timeline.rs`; baseline vs actual, critical path 💡 |
+| Page history, undo / redo | ✅ | `history.rs`; per-database undo 🛠 |
+| Print / PDF export | ✅ | `print.rs`; true PDF writer (no browser dialog) 💡 |
+| PDF reader | ✅ | tiled renderer, LRU, zero idle memory; text selection & search need a text-extraction API in hayro 🗓 |
+| Video | ✅ | HLS / captions 💡 |
+| Mobile / responsive | ✅ | native Android / iOS targets 💡 |
+| Collaboration, cloud sync, comments, permissions | 🗓 | needs the Next.js/PostgreSQL backend |
+| Synced blocks, equations, columns, buttons | 🗓 | |

@@ -231,7 +231,10 @@ fn embed(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: f32
     let web = cfg!(target_arch = "wasm32");
     let live = web && b.checked;
     let h = match info.kind {
-        EmbedKind::Video => (w * 9.0 / 16.0).clamp(180.0, 520.0),
+        EmbedKind::Video => {
+            let ratio = media::ASPECTS[(b.size as usize).min(media::ASPECTS.len() - 1)].1;
+            (w / ratio).clamp(160.0, 720.0)
+        }
         EmbedKind::Audio => 152.0,
         _ => 440.0,
     };
@@ -240,7 +243,12 @@ fn embed(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: f32
     icons::paint_image(ui, Rect::from_center_size(pos2(hr.left() + 10.0, hr.center().y), vec2(16.0, 16.0)), &media::favicon_url(&info.host), 3.0);
     let title = format!("{}  ·  {}", info.service, info.host);
     ui.painter().text(pos2(hr.left() + 26.0, hr.center().y), Align2::LEFT_CENTER, title, body(13.0), pal.muted);
-    let items: Vec<(&str, bool)> = if web { vec![(if live { "Stop" } else { "Live" }, live), ("Open", false), ("Replace", false)] } else { vec![("Open", false), ("Replace", false)] };
+    let is_video = info.kind == EmbedKind::Video;
+    let opts_open: bool = ctx.data(|d| d.get_temp(Id::new(("vid_opts", b.id)))).unwrap_or(false);
+    let mut items: Vec<(&str, bool)> = if web { vec![(if live { "Stop" } else { "Live" }, live), ("Open", false), ("Replace", false)] } else { vec![("Open", false), ("Replace", false)] };
+    if is_video {
+        items.insert(0, ("Edit", opts_open));
+    }
     let hr2 = Rect::from_min_max(pos2(hr.left(), hr.top() - 6.0), hr.right_bottom());
     if let Some(i) = chips(ui, pal, hr2, Id::new(("emb_c", b.id)), &items, 1.0) {
         match items[i].0 {
@@ -248,6 +256,7 @@ fn embed(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: f32
                 b.checked = !b.checked;
                 changed = true;
             }
+            "Edit" => ctx.data_mut(|d| d.insert_temp(Id::new(("vid_opts", b.id)), !opts_open)),
             "Open" => platform::open_url(&ctx, &b.url),
             _ => {
                 b.url.clear();
@@ -256,16 +265,64 @@ fn embed(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: f32
             }
         }
     }
+    // video options: aspect ratio, playback flags, start time
+    if is_video && opts_open {
+        let (orow, _) = ui.allocate_exact_size(vec2(w, 36.0), Sense::hover());
+        ui.painter().rect_filled(orow, 8.0, with_alpha(pal.hover, 0.6));
+        let mut x = orow.left() + 8.0;
+        let bid = b.id;
+        let pill = |ui: &mut Ui, x: &mut f32, label: &str, on: bool, key: &str| -> bool {
+            let gw = ui.painter().layout_no_wrap(label.to_owned(), body(12.5), pal.text).size().x;
+            let r = Rect::from_min_size(pos2(*x, orow.top() + 6.0), vec2(gw + 16.0, 24.0));
+            *x = r.right() + 5.0;
+            chip(ui, pal, r, Id::new(("vo", bid, key)), label, 1.0, on)
+        };
+        for (i, (name, _)) in media::ASPECTS.iter().enumerate() {
+            if pill(ui, &mut x, name, b.size as usize == i, name) {
+                b.size = i as u8;
+                changed = true;
+            }
+        }
+        x += 8.0;
+        for (bit, name) in [(1u8, "Autoplay"), (2, "Muted"), (4, "Loop")] {
+            if pill(ui, &mut x, name, b.vopts & bit != 0, name) {
+                b.vopts ^= bit;
+                changed = true;
+            }
+        }
+        x += 8.0;
+        let sr = Rect::from_min_size(pos2(x, orow.top() + 6.0), vec2(96.0, 24.0));
+        if sr.right() < orow.right() {
+            ui.painter().text(pos2(sr.left(), sr.center().y), Align2::LEFT_CENTER, "Start", body(12.5), pal.muted);
+            let mut t = if b.start == 0 { String::new() } else { format!("{}:{:02}", b.start / 60, b.start % 60) };
+            let r = ui.put(Rect::from_min_size(pos2(sr.left() + 38.0, sr.top()), vec2(58.0, 24.0)), TextEdit::singleline(&mut t).hint_text("0:00").font(body(12.5)).desired_width(54.0));
+            if r.changed() {
+                let secs = match t.split_once(':') {
+                    Some((m, s)) => m.trim().parse::<u32>().unwrap_or(0) * 60 + s.trim().parse::<u32>().unwrap_or(0),
+                    None => t.trim().parse::<u32>().unwrap_or(0),
+                };
+                b.start = secs.min(86_400);
+                changed = true;
+            }
+        }
+        ui.add_space(4.0);
+    }
     // body
     let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
     if live {
         ui.painter().rect_filled(rect, 8.0, pal.hover);
         ui.painter().text(rect.center(), Align2::CENTER_CENTER, "Loading…", body(14.0), pal.muted);
-        ed.embed_rects.push(EmbedRect { id: b.id, url: info.frame.clone(), rect, clip: ui.clip_rect() });
+        ed.embed_rects.push(EmbedRect { id: b.id, url: media::frame_url(&info, b.vopts, b.start), rect, video: info.file, opts: b.vopts, clip: ui.clip_rect() });
     } else {
         let mut drawn = false;
         if let Some(th) = &info.thumb {
-            drawn = icons::paint_cover(ui, rect, th, 0.5) == ImgState::Ready;
+            let mut st = icons::paint_cover(ui, rect, th, 0.5);
+            if st == ImgState::Failed {
+                if let Some(alt) = &info.thumb_alt {
+                    st = icons::paint_cover(ui, rect, alt, 0.5);
+                }
+            }
+            drawn = st == ImgState::Ready;
             if drawn {
                 ui.painter().rect_filled(rect, 8.0, Color32::from_black_alpha(55));
             }
@@ -282,7 +339,7 @@ fn embed(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: f32
             EmbedKind::Web => l::GLOBE,
         };
         let hover = resp.hovered();
-        if info.kind == EmbedKind::Video && info.thumb.is_some() {
+        if info.kind == EmbedKind::Video && (info.thumb.is_some() || info.file) {
             play_button(ui, rect.center(), if hover { 34.0 } else { 30.0 });
         } else {
             icons::glyph(ui.painter(), rect.center() + vec2(0.0, -26.0), 38.0, glyph, if hover { pal.accent } else { pal.muted });
@@ -369,20 +426,25 @@ fn file(ui: &mut Ui, b: &mut Block, page_id: u64, ed: &mut EditorState, pal: &Pa
         b.url.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("File").to_owned()
     };
     let sub = if local { ed.media_sizes.get(&b.media).map(|s| media::fmt_size(*s)).unwrap_or_default() } else { media::host_of(&b.url) };
+    let sub = if crate::pdf::looks_like_pdf(&name, &b.url) { format!("PDF · {sub} · opens in the reader") } else { sub };
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 58.0), Sense::click());
     let h = ctx.animate_bool_with_time(resp.id, resp.hovered(), 0.12);
     ui.painter().rect_filled(rect, 8.0, with_alpha(pal.hover, 0.35 + 0.65 * h));
     ui.painter().rect_stroke(rect, 8.0, Stroke::new(1.0_f32, pal.border), egui::StrokeKind::Inside);
-    icons::glyph(ui.painter(), pos2(rect.left() + 28.0, rect.center().y), 24.0, l::PAPERCLIP, pal.accent);
+    let pdf_card = crate::pdf::looks_like_pdf(&name, &b.url);
+    icons::glyph(ui.painter(), pos2(rect.left() + 28.0, rect.center().y), 24.0, if pdf_card { l::BOOK_OPEN } else { l::PAPERCLIP }, pal.accent);
     let g1 = elide(ui, &name, bold(14.5), pal.text, rect.width() - 230.0);
     ui.painter().galley(pos2(rect.left() + 54.0, rect.center().y - 19.0), g1, pal.text);
     ui.painter().text(pos2(rect.left() + 54.0, rect.center().y + 9.0), Align2::LEFT_CENTER, sub, body(12.5), pal.muted);
-    let items: [(&str, bool); 2] = [(if local { "Save" } else { "Open" }, false), ("Replace", false)];
+    let is_pdf = crate::pdf::looks_like_pdf(&name, &b.url);
+    let items: Vec<(&str, bool)> = if is_pdf { vec![("Read", true), (if local { "Save" } else { "Open" }, false), ("Replace", false)] } else { vec![(if local { "Save" } else { "Open" }, false), ("Replace", false)] };
     let area = Rect::from_min_max(pos2(rect.left(), rect.top() + 11.0), rect.right_bottom());
     let mut clicked_chip = false;
     if let Some(i) = chips(ui, pal, area, Id::new(("file_c", b.id)), &items, 1.0) {
         clicked_chip = true;
-        if i == 0 {
+        if items[i].0 == "Read" {
+            ed.pdf_ask = Some((b.media, b.url.clone(), name.clone()));
+        } else if items[i].0 != "Replace" {
             if local {
                 ed.dl_req = Some((b.media, name.clone()));
             } else {
@@ -396,17 +458,14 @@ fn file(ui: &mut Ui, b: &mut Block, page_id: u64, ed: &mut EditorState, pal: &Pa
         }
     }
     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() && !clicked_chip {
-        if local {
+        if is_pdf {
+            ed.pdf_ask = Some((b.media, b.url.clone(), name.clone()));
+        } else if local {
             ed.dl_req = Some((b.media, name.clone()));
         } else {
             platform::open_url(&ctx, &b.url);
         }
     }
     ui.add_space(4.0);
-    if crate::pdf::looks_like_pdf(&name, &b.url) {
-        ui.add_space(4.0);
-        crate::pdf::viewer(ui, &ctx, b.id, &media::src_uri(&b.src()), &name, pal, w);
-        ui.add_space(4.0);
-    }
     changed
 }

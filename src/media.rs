@@ -30,7 +30,15 @@ const INDEX_KEY: &str = "lumen_media_idx";
 pub struct MediaItem {
     pub name: String,
     pub mime: String,
-    pub data: Arc<[u8]>,
+    /// Size in bytes (known even when the bytes themselves are not resident).
+    pub size: usize,
+    /// Pictures stay in memory (they are drawn constantly). Attached *files* (PDFs, …) are not kept in RAM: they are read from
+    /// disk / local storage on demand — see [`MediaStore::bytes`].
+    pub data: Option<Arc<[u8]>>,
+}
+
+pub fn is_image_mime(m: &str) -> bool {
+    m.starts_with("image/")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -93,8 +101,13 @@ impl MediaStore {
             if let Some(dir) = data_dir() {
                 if let Some(idx) = std::fs::read_to_string(dir.join("index.json")).ok().and_then(|t| serde_json::from_str::<Vec<IndexEntry>>(&t).ok()) {
                     for e in idx {
-                        if let Ok(bytes) = std::fs::read(dir.join(format!("{:016x}.bin", e.id))) {
-                            s.items.insert(e.id, MediaItem { name: e.name, mime: e.mime, data: bytes.into() });
+                        let path = dir.join(format!("{:016x}.bin", e.id));
+                        if is_image_mime(&e.mime) {
+                            if let Ok(bytes) = std::fs::read(&path) {
+                                s.items.insert(e.id, MediaItem { name: e.name, mime: e.mime, size: bytes.len(), data: Some(bytes.into()) });
+                            }
+                        } else if let Ok(md) = std::fs::metadata(&path) {
+                            s.items.insert(e.id, MediaItem { name: e.name, mime: e.mime, size: md.len() as usize, data: None });
                         }
                     }
                 }
@@ -104,8 +117,12 @@ impl MediaStore {
         if let Some(st) = storage {
             if let Some(idx) = st.get_string(INDEX_KEY).and_then(|t| serde_json::from_str::<Vec<IndexEntry>>(&t).ok()) {
                 for e in idx {
-                    if let Some(b) = st.get_string(&format!("lumen_media_{}", e.id)).and_then(|t| b64_decode(&t)) {
-                        s.items.insert(e.id, MediaItem { name: e.name, mime: e.mime, data: b.into() });
+                    if is_image_mime(&e.mime) {
+                        if let Some(b) = st.get_string(&format!("lumen_media_{}", e.id)).and_then(|t| b64_decode(&t)) {
+                            s.items.insert(e.id, MediaItem { name: e.name, mime: e.mime, size: b.len(), data: Some(b.into()) });
+                        }
+                    } else if let Some(n) = st.get_string(&format!("lumen_media_{}", e.id)).map(|t| t.len() / 4 * 3) {
+                        s.items.insert(e.id, MediaItem { name: e.name, mime: e.mime, size: n, data: None });
                     }
                 }
             }
@@ -116,12 +133,34 @@ impl MediaStore {
     /// Makes every stored item available to egui's image loaders.
     pub fn register(&self, ctx: &egui::Context) {
         for (id, it) in &self.items {
-            ctx.include_bytes(uri_for(*id), egui::load::Bytes::from(it.data.clone()));
+            if let Some(d) = &it.data {
+                ctx.include_bytes(uri_for(*id), egui::load::Bytes::from(d.clone()));
+            }
         }
     }
 
     pub fn total(&self) -> usize {
-        self.items.values().map(|i| i.data.len()).sum()
+        self.items.values().map(|i| i.size).sum()
+    }
+
+    /// Bytes of an item. Pictures are resident; files are loaded from disk / local storage on demand and are **not** cached,
+    /// so an attached PDF costs no memory until it is opened (and none after the reader is closed).
+    pub fn bytes(&self, id: u64) -> Option<Arc<[u8]>> {
+        let it = self.items.get(&id)?;
+        if let Some(d) = &it.data {
+            return Some(d.clone());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let dir = data_dir()?;
+            std::fs::read(dir.join(format!("{id:016x}.bin"))).ok().map(Into::into)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let st = web_sys::window()?.local_storage().ok()??;
+            let t = st.get_item(&format!("lumen_media_{id}")).ok()??;
+            b64_decode(&t).map(Into::into)
+        }
     }
 
     pub fn get(&self, id: u64) -> Option<&MediaItem> {
@@ -142,12 +181,16 @@ impl MediaStore {
         if self.items.contains_key(&id) {
             return Ok(id);
         }
+        let is_img = as_image || is_image_mime(&mime);
         if self.total() + data.len() > MAX_TOTAL {
             return Err("Local media storage is full — paste an image link instead".to_owned());
         }
+        let size = data.len();
         let data: Arc<[u8]> = data.into();
-        ctx.include_bytes(uri_for(id), egui::load::Bytes::from(data.clone()));
-        self.items.insert(id, MediaItem { name: name.to_owned(), mime, data });
+        if is_img {
+            ctx.include_bytes(uri_for(id), egui::load::Bytes::from(data.clone()));
+        }
+        self.items.insert(id, MediaItem { name: name.to_owned(), mime, size, data: Some(data) });
         self.pending.push(id);
         self.index_dirty = true;
         Ok(id)
@@ -174,8 +217,8 @@ impl MediaStore {
             let _ = storage;
             if let Some(dir) = data_dir() {
                 for id in self.pending.drain(..) {
-                    if let Some(it) = self.items.get(&id) {
-                        let _ = std::fs::write(dir.join(format!("{id:016x}.bin")), &*it.data);
+                    if let Some(d) = self.items.get(&id).and_then(|it| it.data.as_ref()) {
+                        let _ = std::fs::write(dir.join(format!("{id:016x}.bin")), &**d);
                     }
                 }
                 for id in self.removed.drain(..) {
@@ -187,14 +230,20 @@ impl MediaStore {
         #[cfg(target_arch = "wasm32")]
         {
             for id in self.pending.drain(..) {
-                if let Some(it) = self.items.get(&id) {
-                    storage.set_string(&format!("lumen_media_{id}"), b64_encode(&it.data));
+                if let Some(d) = self.items.get(&id).and_then(|it| it.data.as_ref()) {
+                    storage.set_string(&format!("lumen_media_{id}"), b64_encode(d));
                 }
             }
             for id in self.removed.drain(..) {
                 storage.set_string(&format!("lumen_media_{id}"), String::new());
             }
             storage.set_string(INDEX_KEY, idx_json);
+        }
+        // attached files are not kept resident once they are safely stored
+        for it in self.items.values_mut() {
+            if !is_image_mime(&it.mime) {
+                it.data = None;
+            }
         }
         self.index_dirty = false;
     }
@@ -349,6 +398,10 @@ pub struct Embed {
     pub host: String,
     /// Still image shown before the live frame is loaded.
     pub thumb: Option<String>,
+    /// Lower-resolution still used when `thumb` does not exist (YouTube has no 1080p poster for every video).
+    pub thumb_alt: Option<String>,
+    /// A direct video file (mp4 / webm …), played with a native `<video>` element on the web.
+    pub file: bool,
     /// URL to load inside an iframe (the web build).
     pub frame: String,
 }
@@ -368,10 +421,33 @@ fn path_seg(url: &str, after: &str) -> Option<String> {
     }
 }
 
+pub fn is_video_file(url: &str) -> bool {
+    let p = url.split(['?', '#']).next().unwrap_or("").to_lowercase();
+    [".mp4", ".webm", ".mov", ".m4v", ".ogv"].iter().any(|e| p.ends_with(e))
+}
+
+pub const ASPECTS: [(&str, f32); 5] = [("16:9", 16.0 / 9.0), ("4:3", 4.0 / 3.0), ("21:9", 21.0 / 9.0), ("1:1", 1.0), ("9:16", 9.0 / 16.0)];
+
+/// Embeddable URL with the user's playback options (autoplay 1, muted 2, loop 4) and start offset applied.
+pub fn frame_url(info: &Embed, opts: u8, start: u32) -> String {
+    let (auto, mute, lp) = (opts & 1 != 0, opts & 2 != 0, opts & 4 != 0);
+    let b = |v: bool| if v { "1" } else { "0" };
+    match info.service {
+        "YouTube" => {
+            let id = info.frame.rsplit('/').next().unwrap_or("");
+            format!("{}?rel=0&modestbranding=1&playsinline=1&iv_load_policy=3&color=white&autoplay={}&mute={}&loop={}&playlist={id}&start={start}", info.frame, b(auto), b(mute), b(lp))
+        }
+        "Vimeo" => format!("{}?dnt=1&byline=0&portrait=0&title=0&autoplay={}&muted={}&loop={}#t={start}s", info.frame, b(auto), b(mute), b(lp)),
+        "Loom" => format!("{}?hide_owner=true&hide_share=true&hideEmbedTopBar=true&autoplay={}{}", info.frame, b(auto), if start > 0 { format!("&t={start}") } else { String::new() }),
+        "Video file" => if start > 0 { format!("{}#t={start}", info.frame) } else { info.frame.clone() },
+        _ => info.frame.clone(),
+    }
+}
+
 /// Recognises well-known services and derives their embeddable URL.
 pub fn embed_info(url: &str) -> Embed {
     let host = host_of(url);
-    let mut e = Embed { kind: EmbedKind::Web, service: "Website", host: host.clone(), thumb: None, frame: url.to_owned() };
+    let mut e = Embed { kind: EmbedKind::Web, service: "Website", host: host.clone(), thumb: None, thumb_alt: None, file: false, frame: url.to_owned() };
     let yt = if host.ends_with("youtube.com") {
         query_param(url, "v").map(|s| s.to_owned()).or_else(|| path_seg(url, "/embed/")).or_else(|| path_seg(url, "/shorts/")).or_else(|| path_seg(url, "/live/"))
     } else if host == "youtu.be" {
@@ -382,8 +458,13 @@ pub fn embed_info(url: &str) -> Embed {
     if let Some(id) = yt {
         e.kind = EmbedKind::Video;
         e.service = "YouTube";
-        e.thumb = Some(format!("https://img.youtube.com/vi/{id}/hqdefault.jpg"));
+        e.thumb = Some(format!("https://i.ytimg.com/vi/{id}/maxresdefault.jpg"));
+        e.thumb_alt = Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"));
         e.frame = format!("https://www.youtube.com/embed/{id}");
+    } else if is_video_file(url) {
+        e.kind = EmbedKind::Video;
+        e.service = "Video file";
+        e.file = true;
     } else if host.ends_with("vimeo.com") {
         if let Some(id) = path_seg(url, "vimeo.com/").filter(|s| s.chars().all(|c| c.is_ascii_digit())) {
             e.kind = EmbedKind::Video;

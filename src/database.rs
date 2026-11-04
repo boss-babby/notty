@@ -22,6 +22,7 @@ const TITLE_W: f32 = 280.0;
 enum Popup {
     Select { row: u64, prop: u64, pos: Pos2 },
     Date { row: u64, prop: u64, pos: Pos2, y: i32, m: u32 },
+    Relation { row: u64, prop: u64, pos: Pos2 },
     Filter(Pos2),
     Sort(Pos2),
     Props(Pos2),
@@ -40,9 +41,33 @@ pub struct DbState {
     focus_row: Option<u64>,
     rmenu: Option<(u64, Pos2)>,
     rmenu_fresh: bool,
+    date_range: bool,
 }
 
-enum A {
+thread_local! {
+    /// Titles of all live database rows (for relation chips) — refreshed at the start of every database render.
+    static TITLES: std::cell::RefCell<std::collections::HashMap<u64, String>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn load_titles(ws: &Workspace) {
+    TITLES.with(|t| {
+        let mut t = t.borrow_mut();
+        t.clear();
+        for p in ws.pages.iter().filter(|p| p.row && !p.trashed) {
+            t.insert(p.id, if p.title.is_empty() { "Untitled".to_owned() } else { p.title.clone() });
+        }
+    });
+}
+
+fn rel_title(id: u64) -> Option<String> {
+    TITLES.with(|t| t.borrow().get(&id).cloned())
+}
+
+fn is_date_text(s: &str) -> bool {
+    (s.len() == 10 || s.len() == 21) && dates::parse(s).is_some()
+}
+
+pub(crate) enum A {
     RowMenu(u64, Pos2),
     DupRow(u64),
     SetVal(u64, u64, Option<Val>),
@@ -71,6 +96,17 @@ enum A {
     RenameOpt(u64, u64, String),
     RecolorOpt(u64, u64),
     DelOpt(u64, u64),
+    SetFormula(u64, String),
+    SetRelation(u64, u64),
+    RollupRel(u64, u64),
+    RollupProp(u64, u64),
+    RollupFn(u64, RollupFn),
+    SetDep(usize, u64),
+    SetZoom(usize, u8),
+    /// (row that depends, row it depends on) — toggles the link.
+    AddDep(u64, u64),
+    AddDepProp,
+    Reschedule,
 }
 
 fn col_w(k: PropKind) -> f32 {
@@ -82,6 +118,9 @@ fn col_w(k: PropKind) -> f32 {
         PropKind::Checkbox => 100.0,
         PropKind::Date => 150.0,
         PropKind::Url => 210.0,
+        PropKind::Formula => 170.0,
+        PropKind::Relation => 210.0,
+        PropKind::Rollup => 160.0,
     }
 }
 
@@ -103,7 +142,7 @@ fn chip_ui(ui: &mut Ui, pal: &Palette, text: &str, color: usize) {
     chip_paint(ui.painter(), r.left_center(), text, color, pal);
 }
 
-fn pill(ui: &mut Ui, pal: &Palette, label: &str, active: bool, accent: bool) -> Response {
+pub(crate) fn pill(ui: &mut Ui, pal: &Palette, label: &str, active: bool, accent: bool) -> Response {
     let g = ui.painter().layout_no_wrap(label.to_owned(), body(13.5), pal.text);
     let (rect, resp) = ui.allocate_exact_size(g.size() + vec2(18.0, 12.0), Sense::click());
     let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
@@ -137,7 +176,7 @@ fn check_box(ui: &Ui, pal: &Palette, c: Pos2, on: bool) {
     }
 }
 
-fn title_of(r: &Page) -> &str {
+pub(crate) fn title_of(r: &Page) -> &str {
     if r.title.is_empty() {
         "Untitled"
     } else {
@@ -156,6 +195,7 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState, pal:
     }
     let vi = db.active.min(db.views.len() - 1);
     let mut acts: Vec<A> = vec![];
+    load_titles(ws);
     {
         let wsr: &Workspace = ws;
         let st = &mut ed.db;
@@ -171,9 +211,12 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState, pal:
             ViewKind::Board => board(ui, wsr, &db, view, &rows, st, pal, &mut acts),
             ViewKind::List => list(ui, wsr, &db, &rows, pal, w, &mut acts),
             ViewKind::Gallery => gallery(ui, wsr, &db, &rows, pal, w, &mut acts),
-            ViewKind::Calendar => calendar(ui, wsr, &db, view, &rows, st, pal, w, &mut acts),
+            ViewKind::Calendar => {
+                ScrollArea::horizontal().id_salt("cal_scroll").auto_shrink([false, true]).show(ui, |ui| calendar(ui, wsr, &db, view, &rows, st, pal, w, &mut acts));
+            }
+            ViewKind::Timeline => crate::timeline::timeline(ui, wsr, id, &db, vi, &rows, pal, w, &mut acts),
         }
-        popups(ui, wsr, &db, vi, st, pal, &mut acts);
+        popups(ui, wsr, id, &db, vi, st, pal, &mut acts);
         row_menu(ui, wsr, st, pal, &mut acts);
     }
     let changed = acts.iter().any(|a| !matches!(a, A::RowMenu(..)));
@@ -215,6 +258,7 @@ pub fn row_props(ui: &mut Ui, ws: &mut Workspace, row_id: u64, ed: &mut EditorSt
     let Some(db_id) = ws.page(row_id).and_then(|p| p.parent) else { return false };
     let Some(db) = ws.db(db_id).cloned() else { return false };
     let mut acts: Vec<A> = vec![];
+    load_titles(ws);
     {
         let wsr: &Workspace = ws;
         let Some(row) = wsr.page(row_id) else { return false };
@@ -233,7 +277,7 @@ pub fn row_props(ui: &mut Ui, ws: &mut Workspace, row_id: u64, ed: &mut EditorSt
         let (lr, _) = ui.allocate_exact_size(vec2(w + GUTTER, 1.0), Sense::hover());
         ui.painter().rect_filled(Rect::from_min_max(pos2(lr.left() + GUTTER, lr.top()), lr.right_bottom()), 0.0, pal.border);
         ui.add_space(6.0);
-        popups(ui, wsr, &db, db.active, st, pal, &mut acts);
+        popups(ui, wsr, db_id, &db, db.active, st, pal, &mut acts);
     }
     let changed = !acts.is_empty();
     for a in acts {
@@ -383,6 +427,53 @@ fn cell(ui: &mut Ui, db: &Database, row: &Page, prop: &Prop, rect: Rect, pal: &P
                 acts.push(A::SetVal(row.id, prop.id, Some(Val::Check(!on))));
             }
         }
+        PropKind::Formula | PropKind::Rollup => {
+            let resp = ui.interact(rect, id, Sense::hover());
+            let cy = rect.center().y;
+            let mut err = false;
+            let (txt, right, chk) = match val {
+                Some(Val::Num(n)) => (crate::formula::fmt_num(*n), true, None),
+                Some(Val::Text(s)) => {
+                    err = s.starts_with('⚠');
+                    (if is_date_text(s) { dates::pretty(s) } else { s.clone() }, false, None)
+                }
+                Some(Val::Check(b)) => (String::new(), false, Some(*b)),
+                _ => (String::new(), false, None),
+            };
+            if let Some(b) = chk {
+                check_box(ui, pal, pos2(rect.left() + 18.0, cy), b);
+            } else if right {
+                clip.text(pos2(rect.right() - 10.0, cy), Align2::RIGHT_CENTER, txt, body(14.0), pal.text);
+            } else {
+                clip.text(pos2(rect.left() + 10.0, cy), Align2::LEFT_CENTER, txt, body(14.0), if err { pal.danger } else { pal.text });
+            }
+            let tip = if prop.kind == PropKind::Formula { format!("Formula: {}", prop.cfg.formula) } else { format!("Rollup · {}", prop.cfg.rollup_fn.label()) };
+            resp.on_hover_text(tip);
+        }
+        PropKind::Relation => {
+            let resp = ui.interact(rect, id, Sense::click());
+            let ids: Vec<u64> = match val {
+                Some(Val::Multi(m)) => m.clone(),
+                _ => vec![],
+            };
+            let mut x = rect.left() + 8.0;
+            let mut any = false;
+            for rid in ids {
+                if let Some(t) = rel_title(rid) {
+                    if x > rect.right() - 20.0 {
+                        break;
+                    }
+                    any = true;
+                    x += chip_paint(&clip, pos2(x, rect.center().y), &t, 7, pal) + 5.0;
+                }
+            }
+            if !any && resp.hovered() {
+                clip.text(pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, "Link rows", body(13.5), with_alpha(pal.muted, 0.7));
+            }
+            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                open_popup_at(st, Popup::Relation { row: row.id, prop: prop.id, pos: rect.left_bottom() + vec2(0.0, 4.0) });
+            }
+        }
         PropKind::Date => {
             let resp = ui.interact(rect, id, Sense::click());
             let txt = match val {
@@ -401,6 +492,7 @@ fn cell(ui: &mut Ui, db: &Database, row: &Page, prop: &Prop, rect: Rect, pal: &P
                     Some(Val::Text(s)) => dates::parse(s).unwrap_or_else(dates::today),
                     _ => dates::today(),
                 };
+                st.date_range = matches!(val, Some(Val::Text(s)) if dates::parse_end(s).is_some());
                 open_popup_at(st, Popup::Date { row: row.id, prop: prop.id, pos: rect.left_bottom() + vec2(0.0, 4.0), y, m });
             }
         }
@@ -881,7 +973,8 @@ fn calendar(ui: &mut Ui, ws: &Workspace, db: &Database, view: &View, rows: &[u64
                     acts.push(A::AddRow(Some((dp, Val::Text(iso.clone())))));
                 }
             }
-            let items: Vec<&Page> = rows.iter().filter_map(|r| ws.page(*r)).filter(|r| matches!(r.props.get(&dp), Some(Val::Text(s)) if *s == iso)).collect();
+            let day_n = dates::days_from_civil(y, m, day);
+            let items: Vec<&Page> = rows.iter().filter_map(|r| ws.page(*r)).filter(|r| matches!(r.props.get(&dp), Some(Val::Text(s)) if dates::span(s).map_or(false, |(a, b)| (a..=b).contains(&day_n)))).collect();
             let clip = ui.painter().with_clip_rect(cr.shrink(1.0));
             for (k, it) in items.iter().take(3).enumerate() {
                 let ir = Rect::from_min_size(pos2(cr.left() + 4.0, cr.top() + 30.0 + k as f32 * 25.0), vec2(cw - 8.0, 22.0));
@@ -936,7 +1029,7 @@ fn prop_choices(db: &Database) -> Vec<(u64, String, PropKind)> {
     v
 }
 
-fn popups(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, st: &mut DbState, pal: &Palette, acts: &mut Vec<A>) {
+fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st: &mut DbState, pal: &Palette, acts: &mut Vec<A>) {
     let Some(pop) = st.popup.clone() else { return };
     let ctx = ui.ctx().clone();
     let pid = Id::new("db_popup");
@@ -1058,6 +1151,90 @@ fn popups(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, st: &mut DbStat
                         acts.push(A::SetPropKind(prop, k));
                     }
                 }
+                match p.kind {
+                    PropKind::Formula => {
+                        rule(ui, pal);
+                        section_label(ui, pal, "FORMULA");
+                        let mut f = p.cfg.formula.clone();
+                        let r = ui.add(
+                            TextEdit::multiline(&mut f)
+                                .id(Id::new(("fx", prop)))
+                                .desired_rows(3)
+                                .desired_width(250.0)
+                                .font(egui::FontId::monospace(13.0))
+                                .hint_text("prop(\"Price\") * prop(\"Qty\")"),
+                        );
+                        if r.changed() {
+                            acts.push(A::SetFormula(prop, f.clone()));
+                        }
+                        let first = ws.rows(db_id).first().copied();
+                        match first.map(|row| crate::formula::eval_str(ws, db_id, row, &f)) {
+                            Some(Ok(v)) => {
+                                ui.label(RichText::new(format!("  = {}", v.text())).font(body(13.0)).color(pal.accent));
+                            }
+                            Some(Err(e)) => {
+                                ui.label(RichText::new(format!("  ⚠ {e}")).font(body(12.5)).color(pal.danger));
+                            }
+                            None => {}
+                        }
+                        ui.add_space(2.0);
+                        egui::CollapsingHeader::new(RichText::new("Functions & operators").font(body(12.5)).color(pal.muted)).id_salt(("fxh", prop)).show(ui, |ui| {
+                            ui.add(egui::Label::new(RichText::new(crate::formula::HELP).font(body(12.0)).color(pal.muted)).wrap());
+                        });
+                    }
+                    PropKind::Relation => {
+                        rule(ui, pal);
+                        section_label(ui, pal, "RELATED DATABASE");
+                        let dbs: Vec<(u64, String)> = ws.pages.iter().filter(|x| x.db.is_some() && !x.trashed).map(|x| (x.id, ws.display_title(x.id))).collect();
+                        ScrollArea::vertical().max_height(150.0).id_salt(("reldbs", prop)).auto_shrink([false, true]).show(ui, |ui| {
+                            for (did, name) in dbs {
+                                let label = if did == db_id { format!("{name}  (this database)") } else { name };
+                                if menu_item(ui, pal, l::TABLE, &label, None, p.cfg.relation == did, false).clicked() {
+                                    acts.push(A::SetRelation(prop, did));
+                                }
+                            }
+                        });
+                        if p.cfg.relation == db_id {
+                            ui.label(RichText::new("  Relating a database to itself gives you task dependencies on the Timeline view.").font(body(12.0)).color(pal.muted));
+                        }
+                    }
+                    PropKind::Rollup => {
+                        rule(ui, pal);
+                        let rels: Vec<&Prop> = db.props.iter().filter(|x| x.kind == PropKind::Relation).collect();
+                        if rels.is_empty() {
+                            ui.label(RichText::new("   Add a Relation property first — a rollup summarises the linked rows.").font(body(12.5)).color(pal.muted));
+                        } else {
+                            section_label(ui, pal, "RELATION");
+                            for rp in &rels {
+                                if menu_item(ui, pal, l::ARROW_UP_RIGHT, &rp.name, None, p.cfg.rollup_rel == rp.id, false).clicked() {
+                                    acts.push(A::RollupRel(prop, rp.id));
+                                }
+                            }
+                            if let Some(tdb) = rels.iter().find(|x| x.id == p.cfg.rollup_rel).and_then(|x| ws.db(x.cfg.relation)) {
+                                section_label(ui, pal, "PROPERTY");
+                                ScrollArea::vertical().max_height(120.0).id_salt(("rlp", prop)).auto_shrink([false, true]).show(ui, |ui| {
+                                    if menu_item(ui, pal, PropKind::Text.glyph(), "Name", None, p.cfg.rollup_prop == 0, false).clicked() {
+                                        acts.push(A::RollupProp(prop, 0));
+                                    }
+                                    for tp in &tdb.props {
+                                        if menu_item(ui, pal, tp.kind.glyph(), &tp.name, None, p.cfg.rollup_prop == tp.id, false).clicked() {
+                                            acts.push(A::RollupProp(prop, tp.id));
+                                        }
+                                    }
+                                });
+                                section_label(ui, pal, "CALCULATE");
+                                ScrollArea::vertical().max_height(150.0).id_salt(("rlf", prop)).auto_shrink([false, true]).show(ui, |ui| {
+                                    for f in RollupFn::ALL {
+                                        if menu_item(ui, pal, l::SIGMA, f.label(), None, p.cfg.rollup_fn == f, false).clicked() {
+                                            acts.push(A::RollupFn(prop, f));
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 if matches!(p.kind, PropKind::Select | PropKind::MultiSelect) {
                     rule(ui, pal);
                     section_label(ui, pal, "OPTIONS");
@@ -1118,7 +1295,19 @@ fn popups(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, st: &mut DbStat
                     }
                 }
             }
-            if view.kind == ViewKind::Calendar {
+            if view.kind == ViewKind::Timeline {
+                let selfrels: Vec<&Prop> = db.props.iter().filter(|p| p.kind == PropKind::Relation && p.cfg.relation == db_id).collect();
+                if !selfrels.is_empty() {
+                    rule(ui, pal);
+                    let cur = db.dep_prop(view, db_id).unwrap_or(0);
+                    let cname = db.prop(cur).map(|p| p.name.clone()).unwrap_or_default();
+                    if menu_item(ui, pal, l::ARROW_UP_RIGHT, &format!("Dependencies: {cname}"), Some("Click to switch property"), false, false).clicked() {
+                        let pos = selfrels.iter().position(|p| p.id == cur).unwrap_or(0);
+                        acts.push(A::SetDep(vi, selfrels[(pos + 1) % selfrels.len()].id));
+                    }
+                }
+            }
+            if view.kind == ViewKind::Calendar || view.kind == ViewKind::Timeline {
                 let ds: Vec<&Prop> = db.props.iter().filter(|p| p.kind == PropKind::Date).collect();
                 if !ds.is_empty() {
                     rule(ui, pal);
@@ -1213,10 +1402,11 @@ fn popups(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, st: &mut DbStat
             })
         }
         Popup::Date { row, prop, pos, y, m } => {
-            let cur = match ws.page(row).and_then(|r| r.props.get(&prop)) {
-                Some(Val::Text(s)) => dates::parse(s),
+            let curv = match ws.page(row).and_then(|r| r.props.get(&prop)) {
+                Some(Val::Text(s)) => dates::span(s),
                 _ => None,
             };
+            let range_on = st.date_range;
             popup_area(&ctx, pid, pos, pal, &mut st.fresh, 260.0, |ui| {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
@@ -1243,11 +1433,20 @@ fn popups(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, st: &mut DbStat
                 for day in 1..=dim {
                     let idx = first + day - 1;
                     let (col, rw) = (idx % 7, idx / 7);
-                    let r = Rect::from_center_size(pos2(grid.left() + cw * col as f32 + cw / 2.0, grid.top() + 20.0 + 32.0 * rw as f32 + 16.0), vec2(30.0, 28.0));
+                    let center = pos2(grid.left() + cw * col as f32 + cw / 2.0, grid.top() + 20.0 + 32.0 * rw as f32 + 16.0);
+                    let r = Rect::from_center_size(center, vec2(30.0, 28.0));
+                    let dn = dates::days_from_civil(y, m, day);
+                    let (is_s, is_e, inside) = match curv {
+                        Some((a, b)) => (dn == a, dn == b, dn > a && dn < b),
+                        None => (false, false, false),
+                    };
                     let resp = ui.interact(r, Id::new(("dp", day)), Sense::click());
-                    let sel = cur == Some((y, m, day));
                     let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.08);
-                    if sel {
+                    if inside || ((is_s || is_e) && curv.map_or(false, |(a, b)| a != b)) {
+                        let band = Rect::from_min_max(pos2(if is_s { center.x } else { center.x - cw / 2.0 }, r.top()), pos2(if is_e { center.x } else { center.x + cw / 2.0 }, r.bottom()));
+                        ui.painter().rect_filled(band, 0.0, with_alpha(pal.accent, 0.22));
+                    }
+                    if is_s || is_e {
                         ui.painter().rect_filled(r, 14.0, pal.accent);
                     } else {
                         ui.painter().rect_filled(r, 14.0, with_alpha(pal.hover, t));
@@ -1255,10 +1454,16 @@ fn popups(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, st: &mut DbStat
                             ui.painter().rect_stroke(r, 14.0, Stroke::new(1.3_f32, pal.accent), egui::StrokeKind::Inside);
                         }
                     }
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, day.to_string(), body(13.0), if sel { Color32::WHITE } else { pal.text });
+                    ui.painter().text(r.center(), Align2::CENTER_CENTER, day.to_string(), body(13.0), if is_s || is_e { Color32::WHITE } else { pal.text });
                     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                        acts.push(A::SetVal(row, prop, Some(Val::Text(dates::iso(y, m, day)))));
-                        next = Some(None);
+                        let (nv, done) = match curv {
+                            Some((a, b)) if range_on && a == b => ((a.min(dn), a.max(dn)), true),
+                            _ => ((dn, dn), !range_on),
+                        };
+                        acts.push(A::SetVal(row, prop, Some(Val::Text(dates::span_value(nv.0, nv.1)))));
+                        if done {
+                            next = Some(None);
+                        }
                     }
                 }
                 rule(ui, pal);
@@ -1267,11 +1472,80 @@ fn popups(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, st: &mut DbStat
                         acts.push(A::SetVal(row, prop, Some(Val::Text(dates::today_iso()))));
                         next = Some(None);
                     }
-                    if cur.is_some() && pill(ui, pal, "Clear", false, false).clicked() {
+                    if pill(ui, pal, if range_on { "✓ End date" } else { "End date" }, range_on, false).on_hover_text("Turn the date into a range (shown as a bar on the timeline)").clicked() {
+                        st.date_range = !range_on;
+                        if range_on {
+                            if let Some((a, _)) = curv {
+                                acts.push(A::SetVal(row, prop, Some(Val::Text(dates::iso_of_day(a)))));
+                            }
+                        }
+                    }
+                    if curv.is_some() && pill(ui, pal, "Clear", false, false).clicked() {
                         acts.push(A::SetVal(row, prop, None));
                         next = Some(None);
                     }
                 });
+                if range_on {
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(if curv.map_or(true, |(a, b)| a != b) { "  Click a day to start a new range" } else { "  Now click the end day" }).font(body(12.0)).color(pal.muted));
+                }
+            })
+        }
+        Popup::Relation { row, prop, pos } => {
+            let Some(p) = db.prop(prop) else {
+                st.popup = None;
+                return;
+            };
+            let target = p.cfg.relation;
+            let cur: Vec<u64> = match ws.page(row).and_then(|r| r.props.get(&prop)) {
+                Some(Val::Multi(m)) => m.clone(),
+                _ => vec![],
+            };
+            let target_rows: Vec<(u64, String)> = ws.rows(target).into_iter().filter(|r| *r != row).filter_map(|r| ws.page(r).map(|x| (r, title_of(x).to_owned()))).collect();
+            let has_target = ws.db(target).is_some();
+            popup_area(&ctx, pid, pos, pal, &mut st.fresh, 280.0, |ui| {
+                if !has_target {
+                    ui.label(RichText::new("   Choose the related database first.").font(body(13.0)).color(pal.muted));
+                    if menu_item(ui, pal, l::SLIDERS_HORIZONTAL, "Open property settings", None, false, false).clicked() {
+                        next = Some(Some(Popup::PropMenu { prop, pos }));
+                    }
+                    return;
+                }
+                let r = field(ui, pal, pal.bg, &mut st.new_opt, &format!("Link {}…", ws.display_title(target)), false, 260.0, Id::new(("rel_q", prop)));
+                if !r.has_focus() && st.new_opt.is_empty() {
+                    r.request_focus();
+                }
+                let q = st.new_opt.trim().to_lowercase();
+                ui.add_space(4.0);
+                ScrollArea::vertical().max_height(240.0).auto_shrink([false, true]).show(ui, |ui| {
+                    if target_rows.is_empty() {
+                        ui.label(RichText::new("   The related database has no other rows.").font(body(13.0)).color(pal.muted));
+                    }
+                    for (rid, title) in target_rows.iter().filter(|(_, t)| q.is_empty() || t.to_lowercase().contains(&q)) {
+                        let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+                        let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+                        ui.painter().rect_filled(rr, 6.0, with_alpha(pal.hover, t));
+                        let on = cur.contains(rid);
+                        check_box(ui, pal, pos2(rr.left() + 16.0, rr.center().y), on);
+                        crate::widgets::text_fit(ui.painter(), pos2(rr.left() + 34.0, rr.center().y), Align2::LEFT_CENTER, title, body(14.0), pal.text, rr.width() - 46.0);
+                        if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                            let mut m = cur.clone();
+                            if let Some(i) = m.iter().position(|x| x == rid) {
+                                m.remove(i);
+                            } else {
+                                m.push(*rid);
+                            }
+                            acts.push(A::SetVal(row, prop, if m.is_empty() { None } else { Some(Val::Multi(m)) }));
+                        }
+                    }
+                });
+                if !cur.is_empty() {
+                    rule(ui, pal);
+                    if menu_item(ui, pal, "×", "Clear all", None, false, false).clicked() {
+                        acts.push(A::SetVal(row, prop, None));
+                        next = Some(None);
+                    }
+                }
             })
         }
     };
@@ -1407,6 +1681,11 @@ fn apply(ws: &mut Workspace, db_id: u64, a: A, ed: &mut EditorState) {
             };
             let opts: &[&str] = if matches!(k, PropKind::Select | PropKind::MultiSelect) { &["Option 1", "Option 2"] } else { &[] };
             let pid = ws.add_prop(db_id, &name, k, opts);
+            if k == PropKind::Formula {
+                if let Some(x) = ws.db_mut(db_id).and_then(|d| d.props.iter_mut().find(|x| x.id == pid)) {
+                    x.cfg.formula = "prop(\"Name\")".into();
+                }
+            }
             ed.db.popup = Some(Popup::PropMenu { prop: pid, pos: pos2(300.0, 160.0) });
             ed.db.fresh = true;
         }
@@ -1433,7 +1712,8 @@ fn apply(ws: &mut Workspace, db_id: u64, a: A, ed: &mut EditorState) {
                     (Val::Text(s), PropKind::Text | PropKind::Url, PropKind::Date) => dates::parse(s).map(|_| Val::Text(s.clone())),
                     (Val::Text(s), PropKind::Text, PropKind::Number) => s.trim().parse::<f64>().ok().map(Val::Num),
                     (Val::Num(n), PropKind::Number, PropKind::Text) => Some(Val::Text(format!("{n}"))),
-                    (Val::Text(s), PropKind::Date, PropKind::Text | PropKind::Url) => Some(Val::Text(s.clone())),
+                    (Val::Text(s), PropKind::Date, PropKind::Text | PropKind::Url) => Some(Val::Text(dates::pretty(s))),
+                    (Val::Num(n), PropKind::Number, PropKind::Formula) | (Val::Num(n), PropKind::Formula, PropKind::Number) => Some(Val::Num(*n)),
                     _ => None,
                 };
                 if let Some(nv) = nv {
@@ -1458,10 +1738,123 @@ fn apply(ws: &mut Workspace, db_id: u64, a: A, ed: &mut EditorState) {
                     if v.date == p {
                         v.date = 0;
                     }
+                    if v.dep == p {
+                        v.dep = 0;
+                    }
                 }
             }
             for r in ws.pages.iter_mut().filter(|r| r.row && r.parent == Some(db_id)) {
                 r.props.remove(&p);
+            }
+        }
+        A::SetFormula(p, f) => {
+            if let Some(x) = ws.db_mut(db_id).and_then(|d| d.props.iter_mut().find(|x| x.id == p)) {
+                x.cfg.formula = f;
+            }
+        }
+        A::SetRelation(p, target) => {
+            if let Some(x) = ws.db_mut(db_id).and_then(|d| d.props.iter_mut().find(|x| x.id == p)) {
+                if x.cfg.relation != target {
+                    x.cfg.relation = target;
+                    for r in ws.pages.iter_mut().filter(|r| r.row && r.parent == Some(db_id)) {
+                        r.props.remove(&p);
+                    }
+                }
+            }
+        }
+        A::RollupRel(p, rel) => {
+            if let Some(x) = ws.db_mut(db_id).and_then(|d| d.props.iter_mut().find(|x| x.id == p)) {
+                x.cfg.rollup_rel = rel;
+                x.cfg.rollup_prop = 0;
+            }
+        }
+        A::RollupProp(p, tp) => {
+            if let Some(x) = ws.db_mut(db_id).and_then(|d| d.props.iter_mut().find(|x| x.id == p)) {
+                x.cfg.rollup_prop = tp;
+            }
+        }
+        A::RollupFn(p, f) => {
+            if let Some(x) = ws.db_mut(db_id).and_then(|d| d.props.iter_mut().find(|x| x.id == p)) {
+                x.cfg.rollup_fn = f;
+            }
+        }
+        A::SetDep(i, p) => {
+            if let Some(v) = ws.db_mut(db_id).and_then(|d| d.views.get_mut(i)) {
+                v.dep = p;
+            }
+        }
+        A::SetZoom(i, z) => {
+            if let Some(v) = ws.db_mut(db_id).and_then(|d| d.views.get_mut(i)) {
+                v.zoom = z.clamp(1, 5);
+            }
+        }
+        A::AddDepProp => {
+            let pid = ws.add_prop(db_id, "Blocked by", PropKind::Relation, &[]);
+            if let Some(x) = ws.db_mut(db_id).and_then(|d| d.props.iter_mut().find(|x| x.id == pid)) {
+                x.cfg.relation = db_id;
+            }
+        }
+        A::AddDep(succ, pred) => {
+            let Some(dp) = ws.db(db_id).and_then(|d| d.views.get(d.active).and_then(|v| d.dep_prop(v, db_id))) else { return };
+            if let Some(r) = ws.page_mut(succ) {
+                let mut m = match r.props.get(&dp) {
+                    Some(Val::Multi(m)) => m.clone(),
+                    _ => vec![],
+                };
+                if let Some(i) = m.iter().position(|x| *x == pred) {
+                    m.remove(i);
+                } else {
+                    m.push(pred);
+                }
+                if m.is_empty() {
+                    r.props.remove(&dp);
+                } else {
+                    r.props.insert(dp, Val::Multi(m));
+                }
+                r.updated = now_ms();
+            }
+        }
+        A::Reschedule => {
+            let Some((dp, depp)) = ws.db(db_id).and_then(|d| {
+                let v = d.views.get(d.active)?;
+                Some((d.date_prop(v)?, d.dep_prop(v, db_id)?))
+            }) else {
+                return;
+            };
+            let rows = ws.rows(db_id);
+            for _ in 0..rows.len().max(1) {
+                let mut moved = false;
+                for rid in &rows {
+                    let Some(r) = ws.page(*rid) else { continue };
+                    let Some(Val::Multi(preds)) = r.props.get(&depp) else { continue };
+                    let Some((s, e)) = (match r.props.get(&dp) {
+                        Some(Val::Text(t)) => dates::span(t),
+                        _ => None,
+                    }) else {
+                        continue;
+                    };
+                    let need = preds
+                        .iter()
+                        .filter_map(|p| ws.page(*p))
+                        .filter_map(|p| match p.props.get(&dp) {
+                            Some(Val::Text(t)) => dates::span(t).map(|x| x.1),
+                            _ => None,
+                        })
+                        .max();
+                    if let Some(end) = need {
+                        if s <= end {
+                            let shift = end + 1 - s;
+                            if let Some(rm) = ws.page_mut(*rid) {
+                                rm.props.insert(dp, Val::Text(dates::span_value(s + shift, e + shift)));
+                                rm.updated = now_ms();
+                                moved = true;
+                            }
+                        }
+                    }
+                }
+                if !moved {
+                    break;
+                }
             }
         }
         A::AddOpt(p, name, set_on) => {

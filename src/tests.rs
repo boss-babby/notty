@@ -524,6 +524,7 @@ fn frame_with(ctx: &egui::Context, ws: &mut Workspace, id: u64, ed: &mut EditorS
         });
     });
     crate::widgets::end_frame(ctx);
+    crate::history::track(ws, id, ed, *t);
 }
 
 fn ptr(p: egui::Pos2, pressed: bool) -> Event {

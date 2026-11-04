@@ -74,6 +74,16 @@ pub struct EditorState {
     pub want_undo: bool,
     pub undo: Vec<(u64, Vec<Block>)>,
     pub redo: Vec<(u64, Vec<Block>)>,
+    /// PDF reader: "open this" request from a block (media id, url, title) and the active reader request.
+    pub pdf_ask: Option<(u64, String, String)>,
+    pub pdf_req: Option<crate::pdf::Request>,
+    /// History tracking (see `history.rs`): page, previous blocks, fingerprints, last change, dirty-since.
+    pub hist_page: u64,
+    pub hist_prev: Vec<Block>,
+    pub hist_fp: u64,
+    pub hist_sig: u64,
+    pub hist_last: f64,
+    pub hist_dirty: f64,
     /// Live web embeds requested this frame (web build draws iframes over them).
     pub embed_rects: Vec<platform::EmbedRect>,
     /// File attachment the user wants saved: (media id, file name).

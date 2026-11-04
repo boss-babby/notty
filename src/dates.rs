@@ -68,7 +68,8 @@ pub fn today_iso() -> String {
     iso(y, m, d)
 }
 
-pub fn parse(s: &str) -> Option<(i32, u32, u32)> {
+/// Date values are `YYYY-MM-DD` or a range `YYYY-MM-DD/YYYY-MM-DD` (start/end, inclusive).
+pub fn parse_one(s: &str) -> Option<(i32, u32, u32)> {
     let mut it = s.trim().split('-');
     let y: i32 = it.next()?.parse().ok()?;
     let m: u32 = it.next()?.parse().ok()?;
@@ -79,12 +80,58 @@ pub fn parse(s: &str) -> Option<(i32, u32, u32)> {
     Some((y, m, d))
 }
 
-/// "Jan 5, 2026" style label; falls back to the raw string.
-pub fn pretty(s: &str) -> String {
-    match parse(s) {
-        Some((y, m, d)) => format!("{} {d}, {y}", &MONTHS[m as usize - 1][..3]),
-        None => s.to_owned(),
+/// Start date of a (possibly ranged) date value.
+pub fn parse(s: &str) -> Option<(i32, u32, u32)> {
+    parse_one(s.split('/').next().unwrap_or(""))
+}
+
+/// End date of a ranged value (`None` for single dates).
+pub fn parse_end(s: &str) -> Option<(i32, u32, u32)> {
+    s.split_once('/').and_then(|(_, e)| parse_one(e))
+}
+
+pub fn day_of(t: (i32, u32, u32)) -> i64 {
+    days_from_civil(t.0, t.1, t.2)
+}
+
+pub fn iso_of_day(n: i64) -> String {
+    let (y, m, d) = civil_from_days(n);
+    iso(y, m, d)
+}
+
+/// Inclusive `(start_day, end_day)` numbers of a date value; single dates have `end == start`.
+pub fn span(s: &str) -> Option<(i64, i64)> {
+    let a = day_of(parse(s)?);
+    let b = parse_end(s).map(day_of).unwrap_or(a).max(a);
+    Some((a, b))
+}
+
+/// Builds a value from day numbers (collapses to a single date when `start == end`).
+pub fn span_value(a: i64, b: i64) -> String {
+    let (a, b) = if b < a { (b, a) } else { (a, b) };
+    if a == b {
+        iso_of_day(a)
+    } else {
+        format!("{}/{}", iso_of_day(a), iso_of_day(b))
     }
+}
+
+fn pretty_one(t: (i32, u32, u32)) -> String {
+    format!("{} {}, {}", &MONTHS[t.1 as usize - 1][..3], t.2, t.0)
+}
+
+/// "Jan 5, 2026" or "Jan 5 → Jan 9, 2026" style label; falls back to the raw string.
+pub fn pretty(s: &str) -> String {
+    match (parse(s), parse_end(s)) {
+        (Some(a), Some(b)) if a.0 == b.0 => format!("{} {} → {} {}, {}", &MONTHS[a.1 as usize - 1][..3], a.2, &MONTHS[b.1 as usize - 1][..3], b.2, a.0),
+        (Some(a), Some(b)) => format!("{} → {}", pretty_one(a), pretty_one(b)),
+        (Some(a), None) => pretty_one(a),
+        _ => s.to_owned(),
+    }
+}
+
+pub fn today_day() -> i64 {
+    day_of(today())
 }
 
 pub fn long_today() -> String {

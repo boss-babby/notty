@@ -67,6 +67,10 @@ enum PalAct {
     Lock,
     Sidebar,
     Trash,
+    Print,
+    History,
+    Undo,
+    Redo,
 }
 
 struct PaletteState {
@@ -124,6 +128,10 @@ pub struct LumenApp {
     focus_mode: bool,
     last_accent: usize,
     media: MediaStore,
+    history: Option<crate::history::HistState>,
+    last_calc: f64,
+    calc_dirty: bool,
+    prev_sidebar_page: Option<u64>,
 }
 
 impl LumenApp {
@@ -153,7 +161,7 @@ impl LumenApp {
             media.register(&cc.egui_ctx);
         }
         let mut ed = EditorState::default();
-        ed.media_sizes = media.items.iter().map(|(k, v)| (*k, v.data.len())).collect();
+        ed.media_sizes = media.items.iter().map(|(k, v)| (*k, v.size)).collect();
         Self {
             ws,
             cred,
@@ -181,6 +189,10 @@ impl LumenApp {
             focus_mode: false,
             last_accent: usize::MAX,
             media,
+            history: None,
+            last_calc: 0.0,
+            calc_dirty: true,
+            prev_sidebar_page: None,
         }
     }
 
@@ -191,7 +203,7 @@ impl LumenApp {
         match self.media.add(ctx, name, bytes, as_image) {
             Err(e) => self.toast(e, None),
             Ok(id) => {
-                let size = self.media.get(id).map(|i| i.data.len()).unwrap_or(size_hint);
+                let size = self.media.get(id).map(|i| i.size).unwrap_or(size_hint);
                 self.ed.media_sizes.insert(id, size);
                 let page = match target {
                     PickTarget::BlockImage { page, .. } | PickTarget::BlockFile { page, .. } | PickTarget::Cover { page } | PickTarget::Icon { page } => page,
@@ -256,12 +268,23 @@ impl LumenApp {
 
     /// Applies finished file dialogs, saves requested attachments.
     fn poll_media(&mut self, ctx: &Context) {
+        if let Some((media_id, url, title)) = self.ed.pdf_ask.take() {
+            let (key, source) = if media_id != 0 {
+                (media_id, self.media.bytes(media_id).map(crate::pdf::Source::Local))
+            } else {
+                (crate::pdf::key_of(&url), Some(crate::pdf::Source::Remote(media::normalize_url(&url))))
+            };
+            match source {
+                Some(s) => self.ed.pdf_req = Some(crate::pdf::Request { key, title, source: Some(s) }),
+                None => self.toast("The attached file could not be read", None),
+            }
+        }
         for pk in platform::take_picked() {
             self.set_media(ctx, pk.target, &pk.name, pk.bytes);
         }
         if let Some((id, name)) = self.ed.dl_req.take() {
-            if let Some(it) = self.media.get(id) {
-                let msg = platform::save_download(&name, &it.data, "application/octet-stream");
+            if let Some(data) = self.media.bytes(id) {
+                let msg = platform::save_download(&name, &data, "application/octet-stream");
                 self.toast(msg, None);
             }
         }
@@ -270,6 +293,8 @@ impl LumenApp {
     /// Web: draws live iframes over embed blocks (hidden while a modal / palette is open).
     fn sync_embeds(&mut self) {
         let overlay = self.locked
+            || self.ed.pdf_req.is_some()
+            || self.history.is_some()
             || self.palette.is_some()
             || self.help_open
             || self.import.is_some()
@@ -370,6 +395,25 @@ impl LumenApp {
         }
     }
 
+    fn print_page(&mut self) {
+        let Some(cur) = self.ws.current else { return };
+        let html = crate::print::page_html(&self.ws, &self.media, cur, !cfg!(target_arch = "wasm32"));
+        let name = format!("{}-print.html", nio::file_safe(&self.ws.display_title(cur)));
+        let msg = platform::open_html(&name, &html);
+        self.toast(msg, None);
+    }
+
+    fn undo_redo(&mut self, redo: bool) {
+        let Some(cur) = self.ws.current else { return };
+        let Some(p) = self.ws.page_mut(cur) else { return };
+        let ok = if redo { crate::history::redo(&mut self.ed, p) } else { crate::history::undo(&mut self.ed, p) };
+        if ok {
+            p.updated = now_ms();
+        } else {
+            self.toast(if redo { "Nothing to redo" } else { "Nothing to undo" }, None);
+        }
+    }
+
     fn lock_now(&mut self) {
         if self.cred.is_some() {
             self.locked = true;
@@ -410,6 +454,14 @@ impl LumenApp {
             }
             PalAct::Sidebar => self.ws.sidebar_open = !self.ws.sidebar_open,
             PalAct::Trash => self.trash_open = true,
+            PalAct::Print => self.print_page(),
+            PalAct::History => {
+                if self.ws.current.is_some() {
+                    self.history = Some(crate::history::HistState::default());
+                }
+            }
+            PalAct::Undo => self.undo_redo(false),
+            PalAct::Redo => self.undo_redo(true),
         }
     }
 
@@ -575,11 +627,15 @@ impl LumenApp {
             self.ws.sidebar_open = !self.ws.sidebar_open;
         }
         let Some(cur) = self.ws.current else { return };
+        let narrow = ui.ctx().screen_rect().width() < 720.0;
         let crumbs = self.ws.breadcrumb(cur);
         let n = crumbs.len();
         let mut nav: Option<u64> = None;
         let mut crumb_menu: Option<(u64, Pos2)> = None;
         for (i, id) in crumbs.iter().enumerate() {
+            if narrow && i + 1 < n {
+                continue;
+            }
             if let Some(p) = self.ws.page(*id) {
                 let title = if p.title.is_empty() { "Untitled" } else { &p.title };
                 let cr = crumb(ui, pal, &p.icon, title, i + 1 == n);
@@ -609,9 +665,12 @@ impl LumenApp {
                 self.page_menu = Some(r.rect.left_bottom() + vec2(-220.0, 6.0));
                 self.fresh = true;
             }
+            let (can_u, can_r) = (crate::history::can_undo(&self.ed, cur), crate::history::can_redo(&self.ed, cur));
             let (lock_icon, tip) = if self.cred.is_some() { (Icon::Lock, "Lock workspace  (Ctrl+L)") } else { (Icon::Shield, "Set a password") };
-            if icon_button(ui, pal, lock_icon, 16.0, tip).clicked() {
-                self.run(PalAct::Lock);
+            if !narrow {
+                if icon_button(ui, pal, lock_icon, 16.0, tip).clicked() {
+                    self.run(PalAct::Lock);
+                }
             }
             let (ti, tt) = if self.ws.dark { (Icon::Sun, "Switch to light mode") } else { (Icon::Moon, "Switch to dark mode") };
             if icon_button(ui, pal, ti, 16.0, tt).clicked() {
@@ -628,7 +687,19 @@ impl LumenApp {
                 }
             }
             ui.add_space(6.0);
-            ui.label(RichText::new(format!("Edited {}", ago(updated))).color(pal.muted).font(body(12.5)));
+            if !narrow {
+                if ui.add_enabled_ui(can_r, |ui| icon_button(ui, pal, Icon::Redo, 16.0, "Redo  (Ctrl+Shift+Z)")).inner.clicked() {
+                    self.run(PalAct::Redo);
+                }
+                if ui.add_enabled_ui(can_u, |ui| icon_button(ui, pal, Icon::Undo, 16.0, "Undo  (Ctrl+Z)")).inner.clicked() {
+                    self.run(PalAct::Undo);
+                }
+                if icon_button(ui, pal, Icon::History, 16.0, "Page history").clicked() {
+                    self.run(PalAct::History);
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new(format!("Edited {}", ago(updated))).color(pal.muted).font(body(12.5)));
+            }
         });
     }
 
@@ -682,7 +753,11 @@ impl LumenApp {
             scored.sort_by_key(|s| s.0);
             out.extend(scored.into_iter().take(8).map(|(_, a, i, t, s)| (a, i, t, s)));
         }
-        let actions: [(PalAct, &str, &str, &str); 14] = [
+        let actions: [(PalAct, &str, &str, &str); 18] = [
+            (PalAct::Undo, l::UNDO_2, "Undo", "Undo the last block change  (Ctrl+Z)"),
+            (PalAct::Redo, l::REDO_2, "Redo", "Redo  (Ctrl+Shift+Z)"),
+            (PalAct::History, l::HISTORY, "Page history", "Browse, name and restore earlier versions"),
+            (PalAct::Print, l::PRINTER, "Print / Save as PDF", "Print-ready version with images and databases"),
             (PalAct::NewPage, l::PLUS, "New page", "Create a blank page"),
             (PalAct::NewDb, l::KANBAN, "New database", "Table, board, list, gallery or calendar"),
             (PalAct::Journal, l::BOOK_OPEN, "Today's journal", "Open or create today's entry  (Ctrl+J)"),
@@ -1067,6 +1142,12 @@ impl LumenApp {
             if is_db && menu_item(ui, pal, l::FILE_SPREADSHEET, "Export as CSV", Some("Downloads a .csv file"), false, false).clicked() {
                 act = Some(5);
             }
+            if menu_item(ui, pal, l::PRINTER, "Print / Save as PDF", Some("Images and databases included"), false, false).clicked() {
+                act = Some(7);
+            }
+            if menu_item(ui, pal, l::HISTORY, "Page history", Some("Versions & restore"), false, false).clicked() {
+                act = Some(8);
+            }
             ui.add_space(3.0);
             ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
             ui.add_space(4.0);
@@ -1105,6 +1186,8 @@ impl LumenApp {
                 self.toast("Markdown copied to clipboard", None);
             }
             Some(5) => self.export_csv(),
+            Some(7) => self.print_page(),
+            Some(8) => self.history = Some(crate::history::HistState::default()),
             Some(6) => {
                 self.ws.set_trashed(cur, true);
                 self.toast("Moved to trash", Some(cur));
@@ -1539,7 +1622,8 @@ impl LumenApp {
         self.ws.migrate_icons();
         self.poll_media(ctx);
 
-        // global shortcuts
+        // global shortcuts (suspended while the PDF reader is open — it has its own keys)
+        if self.ed.pdf_req.is_none() {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::L)) {
             self.ws.dark = !self.ws.dark;
         }
@@ -1569,6 +1653,7 @@ impl LumenApp {
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::P)) {
             self.palette = Some(PaletteState { query: String::new(), sel: 0, focused: false, pick: None });
+        }
         }
 
         // files dropped onto the window
@@ -1600,9 +1685,42 @@ impl LumenApp {
             }
         }
 
-        // sidebar
+        // sidebar — a docked panel on wide screens, a slide-over drawer on phones / narrow windows
+        let screen_w = ctx.screen_rect().width();
+        let narrow = screen_w < 720.0;
+        if !ctx.data(|d| d.get_temp::<bool>(Id::new("narrow_init")).unwrap_or(false)) {
+            ctx.data_mut(|d| d.insert_temp(Id::new("narrow_init"), true));
+            if narrow {
+                self.ws.sidebar_open = false;
+            }
+        }
+        if narrow && self.prev_sidebar_page != self.ws.current {
+            self.ws.sidebar_open = false;
+        }
+        self.prev_sidebar_page = self.ws.current;
         let st = ctx.animate_bool_with_time_and_easing(Id::new("sidebar_t"), self.ws.sidebar_open && !self.focus_mode, 0.28, egui::emath::easing::cubic_out);
-        if st > 0.003 {
+        if narrow {
+            if st > 0.003 {
+                let sw = SIDEBAR_W.min(screen_w * 0.88);
+                let screen = ctx.screen_rect();
+                let bd = Area::new(Id::new("drawer_backdrop")).order(Order::Middle).fixed_pos(Pos2::ZERO).show(ctx, |ui| {
+                    let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                    ui.painter().rect_filled(r, 0.0, Color32::from_black_alpha((110.0 * st) as u8));
+                    if resp.clicked() {
+                        self.ws.sidebar_open = false;
+                    }
+                });
+                ctx.move_to_top(bd.response.layer_id);
+                let dr = Area::new(Id::new("drawer")).order(Order::Middle).fixed_pos(pos2(-(1.0 - st) * sw, 0.0)).show(ctx, |ui| {
+                    Frame::new().fill(pal.sidebar).inner_margin(Margin::symmetric(8, 0)).show(ui, |ui| {
+                        ui.set_min_size(vec2(sw - 16.0, screen.height()));
+                        ui.set_max_width(sw - 16.0);
+                        self.sidebar(ui, &pal);
+                    });
+                });
+                ctx.move_to_top(dr.response.layer_id);
+            }
+        } else if st > 0.003 {
             egui::SidePanel::left("sidebar")
                 .resizable(false)
                 .exact_width(SIDEBAR_W * st)
@@ -1712,6 +1830,21 @@ impl LumenApp {
             }
         });
 
+        // computed properties (formulas / rollups), undo stack and page versions
+        let tnow = now_ms() / 1000.0;
+        if ctx.input(|i| !i.events.is_empty()) || self.calc_dirty || tnow - self.last_calc > 1.5 {
+            if tnow - self.last_calc > 0.12 || self.calc_dirty {
+                if crate::formula::recompute(&mut self.ws) {
+                    ctx.request_repaint();
+                }
+                self.last_calc = tnow;
+                self.calc_dirty = false;
+            }
+        }
+        if let Some(cur) = self.ws.current {
+            crate::history::track(&mut self.ws, cur, &mut self.ed, tnow);
+        }
+
         if let Some(id) = self.ed.nav.take() {
             if self.ws.page(id).map_or(false, |p| !p.trashed) {
                 self.ws.current = Some(id);
@@ -1731,13 +1864,31 @@ impl LumenApp {
         self.palette_ui(ctx, &pal);
         self.trash_ui(ctx, &pal);
         self.security_ui(ctx, &pal);
+        self.history_ui(ctx, &pal);
+        crate::pdf::reader_ui(ctx, &mut self.ed.pdf_req, &pal);
         self.toasts_ui(ctx, &pal);
+    }
+
+    fn history_ui(&mut self, ctx: &Context, pal: &Palette) {
+        let (Some(st), Some(cur)) = (self.history.as_mut(), self.ws.current) else {
+            self.history = None;
+            return;
+        };
+        let narrow = ctx.screen_rect().width() < 720.0;
+        let out = crate::history::dialog(ctx, pal, &mut self.ws, cur, st, narrow);
+        if let Some(t) = out.toast {
+            self.toast(t, None);
+        }
+        if out.close {
+            self.history = None;
+            reset_appear(ctx, Id::new("page_history").with("a"));
+        }
     }
 }
 
 // ───────────── helpers ─────────────
 
-fn ago(ms: f64) -> String {
+pub(crate) fn ago(ms: f64) -> String {
     let s = ((now_ms() - ms) / 1000.0).max(0.0) as u64;
     match s {
         0..=9 => "just now".into(),
@@ -1748,7 +1899,7 @@ fn ago(ms: f64) -> String {
     }
 }
 
-fn modal(ctx: &Context, id: Id, pal: &Palette, width: f32, top: f32, add: impl FnOnce(&mut Ui)) -> bool {
+pub(crate) fn modal(ctx: &Context, id: Id, pal: &Palette, width: f32, top: f32, add: impl FnOnce(&mut Ui)) -> bool {
     let t = appear(ctx, id.with("a"), 0.2);
     let mut open = true;
     let screen = ctx.screen_rect();

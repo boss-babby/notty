@@ -37,14 +37,15 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "a
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "Element", "HtmlElement", "HtmlAnchorElement", "Node", "Blob", "BlobPropertyBag", "Url", "Navigator", "Clipboard", "HtmlIFrameElement", "CssStyleDeclaration", "DomRect", "HtmlCollection"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "Element", "HtmlElement", "HtmlAnchorElement", "Node", "Blob", "BlobPropertyBag", "Url", "Navigator", "Clipboard", "HtmlIFrameElement", "CssStyleDeclaration", "DomRect", "HtmlCollection", "Storage"] }
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 codegen-units = 8
 strip = true
-panic = "abort"
+# unwind on native so a damaged PDF can never take the app down (the PDF engine catches panics); wasm always aborts
+panic = "unwind"
 
 # Smaller, slower-to-build profile used by build-web.sh (download size matters in the browser).
 [profile.web]
@@ -52,6 +53,7 @@ inherits = "release"
 opt-level = "s"
 lto = "thin"
 codegen-units = 1
+panic = "abort"
 
 [profile.dev]
 opt-level = 1

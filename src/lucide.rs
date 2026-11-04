@@ -332,3 +332,16 @@ pub fn migrate(icon: &str) -> String {
         _ => icon.to_owned(),
     }
 }
+
+pub const CHART_GANTT: &str = "\u{e624}";
+pub const ZOOM_IN: &str = "\u{e1b6}";
+pub const ZOOM_OUT: &str = "\u{e1b7}";
+pub const MOVE_HORIZONTAL: &str = "\u{e1c6}";
+pub const FILM: &str = "\u{e0d0}";
+pub const SCAN_LINE: &str = "\u{e258}";
+pub const BETWEEN_HORIZONTAL_START: &str = "\u{e592}";
+pub const CHART_NO_AXES_GANTT: &str = "\u{e4c4}";
+pub const GIT_BRANCH: &str = "\u{e0e2}";
+pub const MINIMIZE_2: &str = "\u{e11b}";
+pub const BOOK_OPEN_TEXT: &str = "\u{e54a}";
+pub const SCROLL: &str = "\u{e2ed}";

@@ -10,7 +10,7 @@ WASM="${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/web/lumen.wasm"
 mkdir -p "$OUT"
 wasm-bindgen --target web --no-typescript --out-dir "$OUT" --out-name lumen "$WASM"
 cp web/index.html "$OUT/index.html"
-if [ "${WASM_OPT:-0}" = "1" ] && command -v wasm-opt >/dev/null 2>&1; then
+if [ "${WASM_OPT:-1}" = "1" ] && command -v wasm-opt >/dev/null 2>&1; then
   wasm-opt -O3 --enable-bulk-memory --enable-sign-ext --enable-mutable-globals --enable-nontrapping-float-to-int --enable-multivalue --enable-reference-types "$OUT/lumen_bg.wasm" -o "$OUT/lumen_bg.wasm"
 fi
 ls -la "$OUT"
