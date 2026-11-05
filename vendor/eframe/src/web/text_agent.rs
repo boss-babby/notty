@@ -8,7 +8,7 @@ use wasm_bindgen::prelude::*;
 use super::{AppRunner, WebRunner};
 
 /// How long the app may stop editing text before the soft keyboard is dismissed.
-pub const KEYBOARD_GRACE_SECS: f64 = 0.35;
+pub const KEYBOARD_GRACE_SECS: f64 = 0.7;
 
 pub struct TextAgent {
     input: web_sys::HtmlInputElement,
@@ -49,7 +49,7 @@ impl TextAgent {
         style.set_property("padding", "0")?;
         style.set_property("margin", "0")?;
         style.set_property("z-index", "-1")?;
-        style.set_property("position", "absolute")?;
+        style.set_property("position", "fixed")?;
         style.set_property("top", "0")?;
         style.set_property("left", "0")?;
         document.body().unwrap().append_child(&input)?;
@@ -143,17 +143,20 @@ impl TextAgent {
         }
         let cursor_rect = ime.cursor_rect.translate(canvas_rect.min.to_vec2());
 
+        // The hidden input must always stay inside the *visible* part of the page. When the caret is scrolled below the
+        // keyboard (or above the top) a focused input outside the viewport makes the browser scroll / resize the page to reveal it,
+        // which closes and re-opens the on-screen keyboard over and over. So the position is clamped to the visual viewport.
+        let (vw, vh) = web_sys::window()
+            .map(|w| (w.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(300.0), w.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(300.0)))
+            .unwrap_or((300.0, 300.0));
+        let x = ((cursor_rect.center().x * zoom_factor) as f64).clamp(0.0, (vw - 4.0).max(0.0));
+        let y = ((cursor_rect.center().y * zoom_factor) as f64).clamp(0.0, (vh - 4.0).max(0.0));
+
         let style = self.input.style();
 
         // This is where the IME input will point to:
-        style.set_property(
-            "left",
-            &format!("{}px", cursor_rect.center().x * zoom_factor),
-        )?;
-        style.set_property(
-            "top",
-            &format!("{}px", cursor_rect.center().y * zoom_factor),
-        )?;
+        style.set_property("left", &format!("{x}px"))?;
+        style.set_property("top", &format!("{y}px"))?;
 
         Ok(())
     }

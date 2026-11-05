@@ -30,7 +30,7 @@ use crate::widgets::{menu_item, popup_area, section_label, text_fit, with_alpha}
 /// Height of one grid row unit (a widget with `rows = 3` is `3 × UNIT + 2 × GAP` high).
 pub const UNIT: f32 = 104.0;
 pub const GAP: f32 = 14.0;
-const HEADER_H: f32 = 34.0;
+pub(crate) const HEADER_H: f32 = 34.0;
 
 /// What the dashboard wants the app to do besides opening a page.
 #[derive(Default)]
@@ -75,6 +75,9 @@ struct UiState {
     resize: Option<(u64, Pos2)>,
     rename: String,
     rects: Vec<(u64, Rect)>,
+    /// "Remove dashboard" was tapped once; a second tap before this time (seconds) really removes it.
+    confirm_until: f64,
+    drop_now: bool,
 }
 
 thread_local! {
@@ -95,7 +98,7 @@ fn gallery_for(scope: Scope) -> Gallery {
     Gallery { board: if let Scope::Page(b) = scope { b } else { 0 }, ..Gallery::default() }
 }
 
-fn card_frame(ui: &Ui, pal: &Palette, r: Rect, edit: bool, hot: bool, hover: bool) {
+pub(crate) fn card_frame(ui: &Ui, pal: &Palette, r: Rect, edit: bool, hot: bool, hover: bool) {
     let dark = pal.bg.r() < 100;
     // soft shadow, then the card itself
     let sh = Color32::from_black_alpha(if dark { 50 } else { 14 });
@@ -158,7 +161,7 @@ fn quick_card(ui: &mut Ui, pal: &Palette, r: Rect, id: &str, glyph: &str, title:
     resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
 }
 
-fn auto_title(ws: &Workspace, d: Option<&dw::Def>, w: &cfg::Widget) -> String {
+pub(crate) fn auto_title(ws: &Workspace, d: Option<&dw::Def>, w: &cfg::Widget) -> String {
     if !w.title.is_empty() {
         return w.title.clone();
     }
@@ -216,7 +219,7 @@ fn toolbar(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, sco
         st.gallery = Some(gallery_for(scope));
         st.edit = true;
     }
-    if action(ui, pal, if st.edit { l::CHECK } else { l::SLIDERS_HORIZONTAL }, if st.edit { "Done" } else { "Customize" }, false, st.edit).clicked() {
+    if action(ui, pal, if st.edit { l::CHECK } else { l::SLIDERS_HORIZONTAL }, if st.edit { "Done" } else if matches!(scope, Scope::Page(_)) { "Edit" } else { "Customize" }, false, st.edit).clicked() {
         st.edit = !st.edit;
         if !st.edit {
             st.inspect = None;
@@ -266,7 +269,21 @@ fn toolbar(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, sco
             st.menu = Some((Menu::Layouts(b), r.rect.left_bottom() + vec2(-120.0, 6.0)));
             st.fresh = true;
         }
-        r.on_hover_text("Fill this dashboard with a ready-made set of widgets, or remove it");
+        r.on_hover_text("Fill this dashboard with a ready-made set of widgets");
+        // A visible, one-tap-plus-confirm way to take the dashboard off the page (the page and its text stay).
+        let now = ui.ctx().input(|i| i.time);
+        let armed = st.confirm_until > now;
+        let label = if armed { "Tap again to remove" } else { "Remove" };
+        let r = action(ui, pal, l::TRASH_2, label, false, armed);
+        if r.clicked() {
+            if armed {
+                st.drop_now = true;
+            } else {
+                st.confirm_until = now + 4.0;
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(4100));
+            }
+        }
+        r.on_hover_text("Remove the dashboard from this page — the page and its text stay");
     }
 }
 
@@ -644,6 +661,18 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
     }
 
     // ───────────── overlays ─────────────
+    if st.drop_now {
+        st.drop_now = false;
+        if let Scope::Page(b) = scope {
+            if let Some(i) = ws.dash.board_index(b) {
+                let page = ws.dash.boards[i].page;
+                ws.dash.drop_page_board(page);
+                nav.dropped = true;
+                nav.toast = Some("Dashboard removed from this page".into());
+            }
+        }
+        return;
+    }
     // widget / board menus
     if let Some((menu, pos)) = st.menu.take() {
         let pid = Id::new("dash_menu");
@@ -798,41 +827,7 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
     }
 
     // drill-down list
-    if let Some(mut dr) = st.drill.take() {
-        let pid = Id::new("dash_drill");
-        let mut fresh = dr.fresh;
-        let mut open: Option<u64> = None;
-        let keep = popup_area(&ctx, pid, dr.at, pal, &mut fresh, 320.0, |ui| {
-            ui.label(RichText::new(&dr.title).font(bold(14.0)).color(pal.text));
-            ui.label(RichText::new(format!("{} record{}", dr.rows.len(), if dr.rows.len() == 1 { "" } else { "s" })).font(body(12.0)).color(pal.muted));
-            ui.add_space(6.0);
-            for id in dr.rows.iter().take(12) {
-                let t = ws.page(*id).map(|p| if p.title.is_empty() { "Untitled".to_owned() } else { p.title.clone() }).unwrap_or_else(|| "Untitled".into());
-                let parent = ws.page(*id).and_then(|p| p.parent).and_then(|d| ws.page(d)).map(|d| d.title.clone()).unwrap_or_default();
-                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
-                if resp.hovered() {
-                    ui.painter().rect_filled(r, 7.0, pal.hover);
-                }
-                let rw = if parent.is_empty() { 0.0 } else { 100.0 };
-                text_fit(ui.painter(), pos2(r.left() + 6.0, r.center().y), Align2::LEFT_CENTER, &t, body(13.5), pal.text, r.width() - rw - 14.0);
-                if !parent.is_empty() {
-                    text_fit(ui.painter(), pos2(r.right() - 6.0, r.center().y), Align2::RIGHT_CENTER, &parent, body(11.5), pal.muted, rw);
-                }
-                if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                    open = Some(*id);
-                }
-            }
-            if dr.rows.len() > 12 {
-                ui.label(RichText::new(format!("+ {} more", dr.rows.len() - 12)).font(body(12.0)).color(pal.muted));
-            }
-        });
-        dr.fresh = fresh;
-        if let Some(id) = open {
-            nav.out.open = Some(id);
-        } else if keep {
-            st.drill = Some(dr);
-        }
-    }
+    drill_popup(&ctx, ws, pal, &mut st.drill, nav);
 
     // gallery + inspector
     if let Some(mut g) = st.gallery.take() {
@@ -894,7 +889,47 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
     }
 }
 
-fn chip(ui: &mut Ui, pal: &Palette, text: &str, on: bool) -> egui::Response {
+/// The list of records behind a clicked chart bar / number (shared by the dashboard grid and widgets placed inside pages).
+pub(crate) fn drill_popup(ctx: &egui::Context, ws: &mut Workspace, pal: &Palette, drill: &mut Option<Drill>, nav: &mut Nav) {
+    let ctx = ctx.clone();
+    if let Some(mut dr) = drill.take() {
+        let pid = Id::new("dash_drill");
+        let mut fresh = dr.fresh;
+        let mut open: Option<u64> = None;
+        let keep = popup_area(&ctx, pid, dr.at, pal, &mut fresh, 320.0, |ui| {
+            ui.label(RichText::new(&dr.title).font(bold(14.0)).color(pal.text));
+            ui.label(RichText::new(format!("{} record{}", dr.rows.len(), if dr.rows.len() == 1 { "" } else { "s" })).font(body(12.0)).color(pal.muted));
+            ui.add_space(6.0);
+            for id in dr.rows.iter().take(12) {
+                let t = ws.page(*id).map(|p| if p.title.is_empty() { "Untitled".to_owned() } else { p.title.clone() }).unwrap_or_else(|| "Untitled".into());
+                let parent = ws.page(*id).and_then(|p| p.parent).and_then(|d| ws.page(d)).map(|d| d.title.clone()).unwrap_or_default();
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::click());
+                if resp.hovered() {
+                    ui.painter().rect_filled(r, 7.0, pal.hover);
+                }
+                let rw = if parent.is_empty() { 0.0 } else { 100.0 };
+                text_fit(ui.painter(), pos2(r.left() + 6.0, r.center().y), Align2::LEFT_CENTER, &t, body(13.5), pal.text, r.width() - rw - 14.0);
+                if !parent.is_empty() {
+                    text_fit(ui.painter(), pos2(r.right() - 6.0, r.center().y), Align2::RIGHT_CENTER, &parent, body(11.5), pal.muted, rw);
+                }
+                if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                    open = Some(*id);
+                }
+            }
+            if dr.rows.len() > 12 {
+                ui.label(RichText::new(format!("+ {} more", dr.rows.len() - 12)).font(body(12.0)).color(pal.muted));
+            }
+        });
+        dr.fresh = fresh;
+        if let Some(id) = open {
+            nav.out.open = Some(id);
+        } else if keep {
+            *drill = Some(dr);
+        }
+    }
+}
+
+pub(crate) fn chip(ui: &mut Ui, pal: &Palette, text: &str, on: bool) -> egui::Response {
     let g = ui.painter().layout_no_wrap(text.to_owned(), body(12.0), pal.text);
     let (r, resp) = ui.allocate_exact_size(vec2(g.size().x + 18.0, 24.0), Sense::click());
     ui.painter().rect_filled(r, 12.0, if on { pal.accent_soft } else if resp.hovered() { pal.hover } else { with_alpha(pal.muted, 0.08) });
@@ -902,7 +937,7 @@ fn chip(ui: &mut Ui, pal: &Palette, text: &str, on: bool) -> egui::Response {
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
-fn glyph_chip(ui: &mut Ui, pal: &Palette, glyph: &str, on: bool) -> egui::Response {
+pub(crate) fn glyph_chip(ui: &mut Ui, pal: &Palette, glyph: &str, on: bool) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(vec2(30.0, 28.0), Sense::click());
     ui.painter().rect_filled(r, 8.0, if on { pal.accent_soft } else if resp.hovered() { pal.hover } else { with_alpha(pal.muted, 0.08) });
     ui.painter().text(r.center(), Align2::CENTER_CENTER, glyph, body(15.0), if on { pal.accent } else { pal.text });

@@ -97,7 +97,13 @@ pub fn now_sec() -> f64 {
 ///
 /// Corresponds to [`window.devicePixelRatio`](https://developer.mozilla.org/en-US/docs/Web/API/Window/devicePixelRatio) in JavaScript.
 pub fn native_pixels_per_point() -> f32 {
-    let pixels_per_point = web_sys::window().unwrap().device_pixel_ratio() as f32;
+    let window = web_sys::window().unwrap();
+    let mut pixels_per_point = window.device_pixel_ratio() as f32;
+    // Phones report 3x or more: that is 2.25x the pixels of a 2x canvas to fill, tessellate and upload every frame, which makes the
+    // app feel slow on mid-range devices while text stays crisp enough at 2x. Touch devices are therefore capped at 2.
+    if window.navigator().max_touch_points() > 0 {
+        pixels_per_point = pixels_per_point.min(2.0);
+    }
     if pixels_per_point > 0.0 && pixels_per_point.is_finite() {
         pixels_per_point
     } else {

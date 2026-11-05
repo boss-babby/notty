@@ -66,7 +66,11 @@ pub fn popup_area(
             ui.set_opacity(t);
             popup_frame(pal).show(ui, |ui| {
                 ui.set_width(width);
-                add(ui);
+                // a menu taller than the screen (phones, landscape) scrolls instead of running off it
+                let max_h = (screen.height() - 28.0).max(140.0);
+                egui::ScrollArea::vertical().id_salt(id.with("popup_scroll")).max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                    add(ui);
+                });
             });
         });
     // Always draw popups above everything else (modal backdrops included).

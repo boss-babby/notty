@@ -3,6 +3,17 @@
 A free, offline-first **Notion alternative written entirely in Rust** with [egui](https://github.com/emilk/egui) — no web engine, no JavaScript UI.
 One codebase builds a native **Windows** app and a **WebAssembly** app for the browser.
 
+## 5.5 — mobile release notes (increment on 5.4)
+* **Keyboard no longer flickers.** The hidden `<input>` that receives typing used to follow the caret *outside* the visible area when the block being edited sat below the screen / keyboard; focusing an input outside the viewport makes the browser scroll or resize the page, which closed and re-opened the keyboard in a loop. It is now `position: fixed` and clamped to the visible area (`vendor/eframe/src/web/text_agent.rs`), the blur grace period is 0.7 s, the viewport meta has `interactive-widget=resizes-content`, and the editor scrolls the caret (plus 72 pt of margin for the toolbar) into view while typing.
+* **Faster on phones.** The web canvas is capped at 2× pixel density on touch devices (`native_pixels_per_point`, 55 % fewer pixels than a 3× screen), the wasm profile is `opt-level = 2`, and popups that are taller than the screen scroll instead of running off it.
+* **Tap-and-hold is easier and no longer fights selection.** Hold time 0.36 s, jitter tolerance 22 pt (was 10), swipe threshold 10 pt. *Hold + lift* = right-click menu (with *Select word / Select block / Select all*), *hold + move* = drag / selection, *swipe* = scroll. The ⋮⋮ handle of the active block opens the block menu with a single tap, so no gesture is ever required for it.
+* **Page dashboards can be edited and removed** — visible *Edit* and *Remove* (tap twice) buttons in the dashboard header (the old *Remove* lived in a hidden menu).
+* **Dashboard widgets inside pages** (`src/inlinew.rs`) — `/widget` places any of the 33 widgets as a block anywhere in a page (no full dashboard needed). Always-visible settings and ⋯ buttons: settings, replace, width, height, plot type, delete.
+* **Page hierarchy popup** — tap the page title in the phone top bar (`hier_ui`): path chips, the whole page tree (expandable), *new sub-page here*.
+* **Undo · redo · ⋯ are always visible on phones** (`topbar_narrow`, laid out from computed widths so nothing is pushed off-screen); search / favourite / dark mode / lock moved into the ⋯ menu.
+* **Timeline on touch** — taller rows and bars, wide grab zones on both ends of a bar, claimed grab zones (a finger on a bar drags immediately instead of scrolling), a 40 pt ● link handle (drag onto a bar, or tap ● then tap a bar; *Cancel* button), pointer fallback so a lifting finger still completes a link.
+* **Templates** — one column of full-width, finger-sized cards in a scrolling list with a close button on phones.
+
 ## 5.4 — mobile release notes
 * **Scrolling never selects.** A swipe only scrolls. Root cause: browsers fire `pointerdown` *before* `touchstart`; eframe's web backend treated both as input, so the press reached the editor before `src/touch.rs` knew it was a finger and the scroll turned into a drag (marquee). `vendor/eframe` (patched 0.31.1, see `vendor/eframe/PATCHES.md`) now delivers a finger once and in order, and the gesture layer re-orders defensively (unit-tested).
 * **Tap-and-hold.** Hold ≈ 0.45 s (a ring grows, the phone buzzes). *Lift* → right-click menu of whatever is under the finger (blocks, text, database rows/cards, sidebar). *Drag* → real drag starting at the press point (marquee / text selection / drag & drop).

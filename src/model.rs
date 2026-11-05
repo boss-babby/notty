@@ -43,6 +43,8 @@ pub enum BlockKind {
     Column,
     /// A linked view of a database: `link` = the source database, its own layout / filters / sorts live in a hidden `View`.
     DbView,
+    /// A dashboard widget placed inside the page (`media` = id of the widget on the hidden store board, see `inlinew.rs`).
+    Widget,
 }
 
 impl BlockKind {
@@ -62,7 +64,7 @@ impl BlockKind {
     ];
 
     pub fn has_text(self) -> bool {
-        !matches!(self, BlockKind::Divider | BlockKind::Toc | BlockKind::PageLink | BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File | BlockKind::Columns | BlockKind::Column | BlockKind::DbView)
+        !matches!(self, BlockKind::Divider | BlockKind::Toc | BlockKind::PageLink | BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File | BlockKind::Columns | BlockKind::Column | BlockKind::DbView | BlockKind::Widget)
     }
 
     pub fn label(self) -> &'static str {
@@ -88,6 +90,7 @@ impl BlockKind {
             BlockKind::Columns => "Columns",
             BlockKind::Column => "Column",
             BlockKind::DbView => "Linked database view",
+            BlockKind::Widget => "Dashboard widget",
         }
     }
 
@@ -114,6 +117,7 @@ impl BlockKind {
             BlockKind::Columns => "Lay content out side by side.",
             BlockKind::Column => "A column.",
             BlockKind::DbView => "Show a filtered view of any database right here.",
+            BlockKind::Widget => "Place a dashboard widget (chart, number, tasks …) in the page.",
         }
     }
 
@@ -139,6 +143,7 @@ impl BlockKind {
             BlockKind::File => l::PAPERCLIP,
             BlockKind::Columns | BlockKind::Column => l::COLUMNS_2,
             BlockKind::DbView => l::TABLE_2,
+            BlockKind::Widget => l::CHART_PIE,
         }
     }
 
@@ -164,6 +169,7 @@ impl BlockKind {
             BlockKind::File => "file attachment upload pdf document",
             BlockKind::Columns | BlockKind::Column => "columns layout side by side split grid",
             BlockKind::DbView => "linked database view filter embed table inline",
+            BlockKind::Widget => "widget chart kpi number gauge stats dashboard",
         }
     }
 }

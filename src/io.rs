@@ -88,6 +88,7 @@ pub fn page_markdown(ws: &Workspace, id: u64) -> String {
             BlockKind::File => format!("{pad}📎 {}", if b.url.is_empty() { b.text.clone() } else { format!("[{}]({})", b.text, b.url) }),
             BlockKind::PageLink => format!("{pad}[{}]", b.link.map(|l| ws.display_title(l)).unwrap_or_else(|| "Missing page".into())),
             BlockKind::Columns | BlockKind::Column => String::new(),
+            BlockKind::Widget => format!("{pad}[Dashboard widget]"),
             BlockKind::DbView => format!("{pad}[Database view: {}]", b.link.map(|l| ws.display_title(l)).unwrap_or_else(|| "none".into())),
         };
         let tight = matches!(b.kind, BlockKind::Bullet | BlockKind::Numbered | BlockKind::Todo | BlockKind::Toggle);

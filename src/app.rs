@@ -127,6 +127,10 @@ pub struct LumenApp {
     templates_open: bool,
     help_open: bool,
     page_menu: Option<Pos2>,
+    /// Page-hierarchy popup (tap the page title on a phone): open flag, expanded nodes, "expand the current path" done.
+    hier: bool,
+    hier_exp: std::collections::HashSet<u64>,
+    hier_init: bool,
     focus_mode: bool,
     last_accent: usize,
     last_touch: bool,
@@ -192,6 +196,9 @@ impl LumenApp {
             templates_open: false,
             help_open: false,
             page_menu: None,
+            hier: false,
+            hier_exp: Default::default(),
+            hier_init: false,
             focus_mode: false,
             last_accent: usize::MAX,
             last_touch: false,
@@ -645,6 +652,10 @@ impl LumenApp {
         }
         let Some(cur) = self.ws.current else { return };
         let narrow = ui.ctx().screen_rect().width() < 720.0;
+        if narrow {
+            self.topbar_narrow(ui, pal, cur);
+            return;
+        }
         // room for the breadcrumb: the screen minus the menu button and the four right-hand buttons (phones: never overlap them)
         let btn = if crate::touch::touchy() { 38.0 } else { 28.0 };
         let crumb_w = if narrow { (ui.ctx().screen_rect().width() - 8.0 - btn * 5.0 - ui.spacing().item_spacing.x * 6.0 - 30.0).clamp(48.0, 260.0) } else { 260.0 };
@@ -1128,6 +1139,126 @@ impl LumenApp {
         }
     }
 
+    /// Phone top bar: ☰ · page title ▾ (opens the hierarchy popup) · undo · redo · ⋯ (page menu: search, favourite, theme, history …).
+    /// Every button is laid out from a computed width, so nothing is ever pushed off the screen.
+    fn topbar_narrow(&mut self, ui: &mut Ui, pal: &Palette, cur: u64) {
+        let sw = ui.ctx().screen_rect().width();
+        let sp = ui.spacing().item_spacing.x;
+        let btn = 38.0;
+        let title_w = (sw - 8.0 - btn * 4.0 - sp * 6.0 - 28.0).clamp(60.0, 520.0);
+        if let Some(p) = self.ws.page(cur) {
+            let title = if p.title.is_empty() { "Untitled".to_owned() } else { p.title.clone() };
+            let icon = p.icon.clone();
+            let cr = crumb(ui, pal, &icon, &title, true, title_w - 24.0);
+            let (cr2, ch) = ui.allocate_exact_size(vec2(24.0, 36.0), Sense::click());
+            ui.painter().text(cr2.center(), Align2::CENTER_CENTER, l::CHEVRON_DOWN, body(14.0), pal.muted);
+            if cr.clicked() || ch.clicked() {
+                self.hier = true;
+                self.hier_init = false;
+                reset_appear(ui.ctx(), Id::new("hier").with("a"));
+            }
+            if let Some(pos) = crate::widgets::right_clicked(ui, cr.rect) {
+                self.row_menu = Some((cur, pos));
+                self.fresh = true;
+            }
+        }
+        let (can_u, can_r) = (crate::history::can_undo(&self.ed, cur), crate::history::can_redo(&self.ed, cur));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add_space(4.0);
+            let r = icon_button(ui, pal, Icon::Dots, 18.0, "Page options");
+            if r.clicked() {
+                self.page_menu = Some(r.rect.left_bottom() + vec2(-230.0, 6.0));
+                self.fresh = true;
+            }
+            if ui.add_enabled_ui(can_r, |ui| icon_button(ui, pal, Icon::Redo, 18.0, "Redo")).inner.clicked() {
+                self.run(PalAct::Redo);
+            }
+            if ui.add_enabled_ui(can_u, |ui| icon_button(ui, pal, Icon::Undo, 18.0, "Undo")).inner.clicked() {
+                self.run(PalAct::Undo);
+            }
+        });
+    }
+
+    /// The page hierarchy as a popup: the path to the current page as chips, and the whole page tree (expanded along the path).
+    fn hier_ui(&mut self, ctx: &Context, pal: &Palette) {
+        if !self.hier {
+            return;
+        }
+        let Some(cur) = self.ws.current else {
+            self.hier = false;
+            return;
+        };
+        let path = self.ws.breadcrumb(cur);
+        if !self.hier_init {
+            self.hier_init = true;
+            for id in &path {
+                self.hier_exp.insert(*id);
+            }
+        }
+        let mut go: Option<u64> = None;
+        let mut tog: Option<u64> = None;
+        let mut new_child = false;
+        let max_h = (ctx.screen_rect().height() - 200.0).max(160.0);
+        let open = {
+            let ws = &self.ws;
+            let exp = &self.hier_exp;
+            modal(ctx, Id::new("hier"), pal, 460.0, if ctx.screen_rect().width() < 720.0 { 10.0 } else { 70.0 }, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Where you are").font(bold(17.0)).color(pal.text));
+                });
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(6.0);
+                    ui.spacing_mut().item_spacing = vec2(4.0, 6.0);
+                    for (i, id) in path.iter().enumerate() {
+                        let Some(p) = ws.page(*id) else { continue };
+                        let t = if p.title.is_empty() { "Untitled" } else { p.title.as_str() };
+                        if crate::database::pill(ui, pal, t, *id == cur, false).clicked() {
+                            go = Some(*id);
+                        }
+                        if i + 1 < path.len() {
+                            ui.label(RichText::new(l::CHEVRON_RIGHT).font(body(13.0)).color(pal.muted));
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().id_salt("hier_scroll").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                    hier_rows(ui, pal, ws, exp, cur, None, 0, &mut go, &mut tog);
+                });
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(6.0);
+                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                    if crate::database::pill(ui, pal, "+  New sub-page here", false, true).clicked() {
+                        new_child = true;
+                    }
+                });
+                ui.add_space(4.0);
+            })
+        };
+        if let Some(id) = tog {
+            if !self.hier_exp.remove(&id) {
+                self.hier_exp.insert(id);
+            }
+        }
+        if new_child {
+            self.new_page(Some(cur), PageKind::Doc);
+            self.hier = false;
+            reset_appear(ctx, Id::new("hier").with("a"));
+        } else if let Some(id) = go {
+            self.ws.current = Some(id);
+            self.hier = false;
+            reset_appear(ctx, Id::new("hier").with("a"));
+        } else if !open {
+            self.hier = false;
+            reset_appear(ctx, Id::new("hier").with("a"));
+        }
+    }
+
     fn page_menu_ui(&mut self, ctx: &Context, pal: &Palette) {
         let Some(pos) = self.page_menu else { return };
         let Some(cur) = self.ws.current else {
@@ -1142,8 +1273,30 @@ impl LumenApp {
         let has_dash = self.ws.dash.page_board(cur).is_some();
         let (words, chars) = (nio::word_count(page), nio::char_count(page));
         let mut act: Option<u8> = None;
+        let (fav, dark, has_pw) = (page.favorite, self.ws.dark, self.cred.is_some());
+        let phone = ctx.screen_rect().width() < 720.0;
         let open = popup_area(ctx, Id::new("page_menu"), pos, pal, &mut self.fresh, 262.0, |ui| {
+            if phone {
+                // the top bar of a phone only has room for undo / redo / this menu: everything else lives here
+                section_label(ui, pal, "QUICK ACTIONS");
+                if menu_item(ui, pal, l::SEARCH, "Search & commands", None, false, false).clicked() {
+                    act = Some(10);
+                }
+                if menu_item(ui, pal, l::STAR, if fav { "Remove from favorites" } else { "Add to favorites" }, None, fav, false).clicked() {
+                    act = Some(11);
+                }
+                if menu_item(ui, pal, if dark { l::SUN } else { l::MOON }, if dark { "Switch to light mode" } else { "Switch to dark mode" }, None, false, false).clicked() {
+                    act = Some(12);
+                }
+                if menu_item(ui, pal, l::LOCK, if has_pw { "Lock workspace" } else { "Set a password" }, None, false, false).clicked() {
+                    act = Some(13);
+                }
+                ui.add_space(3.0);
+                ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
+                ui.add_space(4.0);
+            }
             section_label(ui, pal, "PAGE STYLE");
+
             if menu_item(ui, pal, l::TYPE, if small { "Normal text size" } else { "Small text" }, None, false, false).clicked() {
                 act = Some(0);
             }
@@ -1218,6 +1371,14 @@ impl LumenApp {
                     self.toast("This page is now a dashboard — add widgets from the toolbar", None);
                 }
             }
+            Some(10) => self.palette = Some(PaletteState { query: String::new(), sel: 0, focused: false, pick: None }),
+            Some(11) => {
+                if let Some(p) = self.ws.page_mut(cur) {
+                    p.favorite = !p.favorite;
+                }
+            }
+            Some(12) => self.ws.dark = !self.ws.dark,
+            Some(13) => self.run(PalAct::Lock),
             Some(3) => self.export_md(),
             Some(4) => {
                 ctx.copy_text(nio::page_markdown(&self.ws, cur));
@@ -1239,40 +1400,59 @@ impl LumenApp {
             return;
         }
         let mut pick: Option<usize> = None;
-        let open = modal(ctx, Id::new("templates"), pal, 640.0, 90.0, |ui| {
-            ui.add_space(6.0);
+        let screen = ctx.screen_rect();
+        let phone = screen.width() < 720.0;
+        let max_h = (screen.height() - if phone { 130.0 } else { 220.0 }).max(180.0);
+        let mut close = false;
+        let open = modal(ctx, Id::new("templates"), pal, 640.0, if phone { 8.0 } else { 90.0 }, |ui| {
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.add_space(10.0);
-                ui.label(RichText::new("Templates").font(bold(20.0)));
-            });
-            ui.horizontal(|ui| {
-                ui.add_space(10.0);
-                ui.label(RichText::new("Start from a ready-made page or database. Everything is editable.").font(body(13.5)).color(pal.muted));
-            });
-            ui.add_space(10.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
-                for (i, (name, icon, desc)) in TEMPLATES.iter().enumerate() {
-                    let (r, resp) = ui.allocate_exact_size(vec2(296.0, 74.0), Sense::click());
-                    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
-                    ui.painter().rect_filled(r, 10.0, with_alpha(pal.hover, 0.5 + 0.5 * t));
-                    ui.painter().rect_stroke(r, 10.0, Stroke::new(1.2_f32, lerp_color(pal.border, pal.accent, t)), egui::StrokeKind::Inside);
-                    ui.painter().text(pos2(r.left() + 30.0, r.center().y), Align2::CENTER_CENTER, *icon, body(28.0), pal.text);
-                    ui.painter().text(pos2(r.left() + 62.0, r.center().y - 11.0), Align2::LEFT_CENTER, *name, bold(14.5), pal.text);
-                    ui.painter().with_clip_rect(r.shrink(6.0)).text(pos2(r.left() + 62.0, r.center().y + 10.0), Align2::LEFT_CENTER, *desc, body(12.0), pal.muted);
-                    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                        pick = Some(i);
+                ui.add_space(8.0);
+                ui.label(RichText::new("Templates").font(bold(if phone { 18.0 } else { 20.0 })));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if icon_button(ui, pal, Icon::Close, 16.0, "Close").clicked() {
+                        close = true;
                     }
-                }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.add(egui::Label::new(RichText::new("Start from a ready-made page or database. Everything is editable.").font(body(13.0)).color(pal.muted)).wrap());
             });
             ui.add_space(8.0);
+            // Phones: one column of full-width, finger-sized cards in a scrolling list (the fixed 296 pt grid used to run off the screen).
+            let avail = ui.available_width();
+            let (cw, ch) = if phone { (avail - 6.0, 78.0) } else { (296.0, 74.0) };
+            egui::ScrollArea::vertical().id_salt("templates_scroll").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
+                    for (i, (name, icon, desc)) in TEMPLATES.iter().enumerate() {
+                        let (r, resp) = ui.allocate_exact_size(vec2(cw, ch), Sense::click());
+                        let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || resp.is_pointer_button_down_on(), 0.12);
+                        ui.painter().rect_filled(r, 10.0, with_alpha(pal.hover, 0.5 + 0.5 * t));
+                        ui.painter().rect_stroke(r, 10.0, Stroke::new(1.2_f32, lerp_color(pal.border, pal.accent, t)), egui::StrokeKind::Inside);
+                        ui.painter().text(pos2(r.left() + 30.0, r.center().y), Align2::CENTER_CENTER, *icon, body(28.0), pal.text);
+                        let tx = r.left() + 62.0;
+                        let tw = (r.right() - 12.0 - tx).max(60.0);
+                        crate::widgets::text_fit(ui.painter(), pos2(tx, r.top() + 22.0), Align2::LEFT_CENTER, name, bold(14.5), pal.text, tw);
+                        let mut job = egui::text::LayoutJob::simple(desc.to_string(), body(12.0), pal.muted, tw);
+                        job.wrap.max_rows = 2;
+                        let g = ui.painter().layout_job(job);
+                        ui.painter().galley(pos2(tx, r.top() + 36.0), g, pal.muted);
+                        if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                            pick = Some(i);
+                        }
+                    }
+                });
+            });
+            ui.add_space(6.0);
         });
         if let Some(i) = pick {
             let id = self.ws.add_template(i, None);
             self.focus_title = Some(id);
             self.templates_open = false;
             reset_appear(ctx, Id::new("templates").with("a"));
-        } else if !open {
+        } else if !open || close {
             self.templates_open = false;
             reset_appear(ctx, Id::new("templates").with("a"));
         }
@@ -1915,6 +2095,7 @@ impl LumenApp {
         self.side_menu_ui(ctx, &pal);
         self.page_menu_ui(ctx, &pal);
         self.templates_ui(ctx, &pal);
+        self.hier_ui(ctx, &pal);
         self.import_ui(ctx, &pal);
         self.help_ui(ctx, &pal);
         self.ws_menu_ui(ctx, &pal);
@@ -1984,6 +2165,45 @@ pub(crate) fn modal(ctx: &Context, id: Id, pal: &Palette, width: f32, top: f32, 
         reset_appear(ctx, id.with("a"));
     }
     open
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hier_rows(ui: &mut Ui, pal: &Palette, ws: &Workspace, exp: &std::collections::HashSet<u64>, cur: u64, parent: Option<u64>, depth: usize, go: &mut Option<u64>, tog: &mut Option<u64>) {
+    for id in ws.children(parent) {
+        let Some(p) = ws.page(id) else { continue };
+        let has = ws.has_children(id);
+        let open = exp.contains(&id);
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 42.0), Sense::hover());
+        let row = ui.interact(rect, Id::new(("hier_row", id)), Sense::click());
+        let sel = id == cur;
+        let x0 = rect.left() + 4.0 + depth.min(8) as f32 * 18.0;
+        let arrow = Rect::from_min_size(pos2(x0, rect.top()), vec2(34.0, rect.height()));
+        let ar = ui.interact(arrow, Id::new(("hier_arrow", id)), Sense::click());
+        if sel {
+            ui.painter().rect_filled(rect.shrink2(vec2(2.0, 1.0)), 8.0, pal.accent_soft);
+        } else if row.is_pointer_button_down_on() || row.hovered() {
+            ui.painter().rect_filled(rect.shrink2(vec2(2.0, 1.0)), 8.0, pal.hover);
+        }
+        if has {
+            ui.painter().text(arrow.center(), Align2::CENTER_CENTER, if open { l::CHEVRON_DOWN } else { l::CHEVRON_RIGHT }, body(15.0), pal.muted);
+        }
+        let ic = pos2(x0 + 44.0, rect.center().y);
+        if p.icon.is_empty() {
+            icons::paint(ui.painter(), ic, 16.0, if p.kind == PageKind::Database { Icon::Board } else { Icon::Page }, pal.muted);
+        } else {
+            icons::paint_page_icon(ui, ic, &p.icon, 18.0, pal.text);
+        }
+        let title = if p.title.is_empty() { "Untitled" } else { p.title.as_str() };
+        crate::widgets::text_fit(ui.painter(), pos2(x0 + 62.0, rect.center().y), Align2::LEFT_CENTER, title, if sel { bold(14.5) } else { body(14.5) }, if sel { pal.accent } else { pal.text }, (rect.right() - 10.0 - (x0 + 62.0)).max(40.0));
+        if ar.clicked() && has {
+            *tog = Some(id);
+        } else if row.clicked() {
+            *go = Some(id);
+        }
+        if has && open {
+            hier_rows(ui, pal, ws, exp, cur, Some(id), depth + 1, go, tog);
+        }
+    }
 }
 
 fn crumb(ui: &mut Ui, pal: &Palette, icon: &str, title: &str, last: bool, max_w: f32) -> egui::Response {

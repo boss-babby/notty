@@ -385,6 +385,9 @@ pub fn page_html(ws: &Workspace, media: &MediaStore, id: u64, auto_print: bool) 
                 o.push_str(&format!("<div style=\"flex:{w} 1 0;min-width:0\">"));
                 open.push((b.indent, false));
             }
+            BlockKind::Widget => {
+                o.push_str(&format!("<p style=\"{pad};color:#888\"><em>[Dashboard widget]</em></p>"));
+            }
             BlockKind::DbView => {
                 if let Some(t) = b.link.and_then(|l| ws.page(l)).filter(|t| !t.trashed && t.db.is_some()) {
                     let tt = if t.title.is_empty() { "Untitled" } else { &t.title };

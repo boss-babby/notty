@@ -16,9 +16,7 @@ use crate::model::*;
 use crate::theme::{bold, body, lerp_color, tag_color, Palette};
 use crate::widgets::with_alpha;
 
-const ROW_H: f32 = 38.0;
 const HEAD_H: f32 = 46.0;
-const BAR_H: f32 = 24.0;
 const ZOOMS: [f32; 5] = [9.0, 16.0, 28.0, 44.0, 66.0];
 /// Empty days kept before the first / after the last scheduled day (gives room to drag bars outwards).
 const PAD_LEFT: i64 = 30;
@@ -45,6 +43,11 @@ enum Mode {
 pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, rows: &[u64], pal: &Palette, w: f32, acts: &mut Vec<A>) {
     let view = &db.views[vi];
     let ctx = ui.ctx().clone();
+    // Touch screens: taller rows / bars, wide grab zones around the ends of a bar and a big link handle. Every zone is *claimed*
+    // (touch.rs) so a finger that lands on it drags immediately instead of being turned into a scroll swipe.
+    let tch = crate::touch::touchy();
+    let row_h: f32 = if tch { 50.0 } else { 38.0 };
+    let bar_h: f32 = if tch { 32.0 } else { 24.0 };
     let Some(dp) = db.date_prop(view) else {
         ui.add_space(24.0);
         ui.label(egui::RichText::new("The timeline needs a Date property.").font(body(14.0)).color(pal.muted));
@@ -78,7 +81,18 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
         } else if pill(ui, pal, "Auto-schedule", false, false).on_hover_text("Moves rows so that none starts before the rows it depends on have finished").clicked() {
             acts.push(A::Reschedule);
         }
+        let linking: bool = ctx.data(|d| d.get_temp::<u64>(Id::new(("tl_pick", db_id)))).is_some();
+        if linking {
+            ui.label(egui::RichText::new("Now tap the task that should come after it").font(body(12.5)).color(pal.accent));
+            if pill(ui, pal, "Cancel", false, false).clicked() {
+                ctx.data_mut(|d| d.remove::<u64>(Id::new(("tl_pick", db_id))));
+            }
+        } else if tch {
+            ui.label(egui::RichText::new(if dep.is_some() { "Drag a bar to move it · drag its ends to resize · drag ● onto another bar (or tap ●, then tap a bar) to link" } else { "Drag a bar to move it · drag its ends to resize" }).font(body(12.0)).color(pal.muted));
+        } else
+        {
         ui.label(egui::RichText::new(if dep.is_some() { "Drag bars to move · edges to resize · ● (drag, or click then click a bar) to link" } else { "Drag bars to move · drag edges to resize" }).font(body(12.0)).color(pal.muted));
+        }
     });
     ui.add_space(4.0);
 
@@ -160,7 +174,7 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
     let n_days = (max_day - min_day + 1) as f32;
     let total_w = n_days * dw;
     let label_w = if w < 560.0 { 112.0 } else { 220.0 };
-    let height = HEAD_H + items.len() as f32 * ROW_H;
+    let height = HEAD_H + items.len() as f32 * row_h;
 
     let (outer, _) = ui.allocate_exact_size(vec2(w, height + 14.0), Sense::hover());
     let label_rect = Rect::from_min_size(outer.min, vec2(label_w, height));
@@ -174,7 +188,7 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
         p.hline(label_rect.x_range(), label_rect.top() + HEAD_H, Stroke::new(1.0_f32, pal.border));
     }
     for (i, it) in items.iter().enumerate() {
-        let r = Rect::from_min_size(pos2(label_rect.left(), label_rect.top() + HEAD_H + i as f32 * ROW_H), vec2(label_w, ROW_H));
+        let r = Rect::from_min_size(pos2(label_rect.left(), label_rect.top() + HEAD_H + i as f32 * row_h), vec2(label_w, row_h));
         let resp = ui.interact(r, Id::new(("tl_label", it.id)), Sense::click());
         let t = ctx.animate_bool_with_time(resp.id, resp.hovered(), 0.1);
         ui.painter().rect_filled(r, 0.0, with_alpha(pal.hover, t * 0.7));
@@ -249,7 +263,7 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
         }
         p.hline(content.x_range(), content.top() + HEAD_H, Stroke::new(1.0_f32, pal.border));
         for i in 0..items.len() {
-            let y = content.top() + HEAD_H + (i + 1) as f32 * ROW_H;
+            let y = content.top() + HEAD_H + (i + 1) as f32 * row_h;
             p.hline(content.x_range(), y, Stroke::new(1.0_f32, with_alpha(pal.border, 0.7)));
         }
         // today marker
@@ -260,8 +274,8 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
 
         // rows
         for (i, it) in items.iter().enumerate() {
-            let row_top = content.top() + HEAD_H + i as f32 * ROW_H;
-            let row_rect = Rect::from_min_size(pos2(content.left(), row_top), vec2(total_w, ROW_H));
+            let row_top = content.top() + HEAD_H + i as f32 * row_h;
+            let row_rect = Rect::from_min_size(pos2(content.left(), row_top), vec2(total_w, row_h));
             match span_of(it.id, it) {
                 None => {
                     // unscheduled: click a day to schedule, drag to create a range
@@ -270,10 +284,10 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
                     if resp.hovered() || resp.dragged() {
                         if let Some(pos) = ctx.pointer_hover_pos() {
                             let d = day_at(pos);
-                            let r = Rect::from_min_size(pos2(x_of(d), row_top + 6.0), vec2(dw, ROW_H - 12.0));
+                            let r = Rect::from_min_size(pos2(x_of(d), row_top + 6.0), vec2(dw, row_h - 12.0));
                             p.rect_filled(r, 5.0, with_alpha(it.color, 0.25));
                             if !resp.dragged() {
-                                p.text(pos2(pos.x + 12.0, row_top + ROW_H / 2.0), Align2::LEFT_CENTER, "click to schedule", body(11.5), pal.muted);
+                                p.text(pos2(pos.x + 12.0, row_top + row_h / 2.0), Align2::LEFT_CENTER, "click to schedule", body(11.5), pal.muted);
                             }
                         }
                     }
@@ -287,7 +301,7 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
                         if let (Some(s), Some(pos)) = (s, resp.interact_pointer_pos()) {
                             let e = day_at(pos);
                             let (a, b) = (s.min(e), s.max(e));
-                            p.rect_filled(Rect::from_min_max(pos2(x_of(a), row_top + 7.0), pos2(x_of(b + 1), row_top + ROW_H - 7.0)), 6.0, with_alpha(it.color, 0.5));
+                            p.rect_filled(Rect::from_min_max(pos2(x_of(a), row_top + 7.0), pos2(x_of(b + 1), row_top + row_h - 7.0)), 6.0, with_alpha(it.color, 0.5));
                         }
                     }
                     if resp.drag_stopped() {
@@ -304,14 +318,15 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
                 Some((s, e)) => {
                     let x0 = x_of(s);
                     let x1 = x_of(e + 1);
-                    let r = Rect::from_min_max(pos2(x0 + 1.0, row_top + (ROW_H - BAR_H) / 2.0), pos2((x1 - 1.0).max(x0 + 8.0), row_top + (ROW_H + BAR_H) / 2.0));
+                    let r = Rect::from_min_max(pos2(x0 + 1.0, row_top + (row_h - bar_h) / 2.0), pos2((x1 - 1.0).max(x0 + 8.0), row_top + (row_h + bar_h) / 2.0));
                     bar_rects.insert(it.id, r);
                     let dragging = preview.contains_key(&it.id);
                     // hit zones
-                    let grip = (r.width() * 0.3).clamp(3.0, 9.0);
-                    let left = Rect::from_min_max(r.min, pos2(r.left() + grip, r.bottom()));
-                    let right = Rect::from_min_max(pos2(r.right() - grip, r.top()), r.max);
-                    let mid = Rect::from_min_max(pos2(left.right(), r.top()), pos2(right.left(), r.bottom()));
+                    let grip = if tch { (r.width() * 0.28).clamp(9.0, 18.0) } else { (r.width() * 0.3).clamp(3.0, 9.0) };
+                    let (ext, vext) = if tch { (14.0, 6.0) } else { (0.0, 0.0) };
+                    let left = Rect::from_min_max(pos2(r.left() - ext, r.top() - vext), pos2(r.left() + grip, r.bottom() + vext));
+                    let right = Rect::from_min_max(pos2(r.right() - grip, r.top() - vext), pos2(r.right() + if tch { 8.0 } else { 0.0 }, r.bottom() + vext));
+                    let mid = Rect::from_min_max(pos2(left.right(), r.top() - vext), pos2(right.left(), r.bottom() + vext));
                     let mut hover = false;
                     for (zone, mode, cursor) in [(mid, Mode::Move, CursorIcon::Grab), (left, Mode::Left, CursorIcon::ResizeHorizontal), (right, Mode::Right, CursorIcon::ResizeHorizontal)] {
                         if zone.width() <= 0.0 {
@@ -319,6 +334,7 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
                         }
                         let id = Id::new(("tl_bar", it.id, mode as u8));
                         let resp = ui.interact(zone, id, Sense::click_and_drag());
+                        crate::touch::claim(zone);
                         hover |= resp.hovered() || resp.dragged();
                         if let Some(from) = pick {
                             if from != it.id && resp.hovered() {
@@ -390,9 +406,9 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
                     p.rect_filled(r.translate(vec2(0.0, 2.0)), 7.0, Color32::from_black_alpha(if dragging { 40 } else { 14 }));
                     p.rect_filled(r, 7.0, lerp_color(base, pal.bg, if hover || dragging { 0.0 } else { 0.12 }));
                     p.rect_stroke(r, 7.0, Stroke::new(1.0_f32, base.gamma_multiply(0.6)), egui::StrokeKind::Inside);
-                    if hover || dragging {
-                        for gx in [r.left() + 3.5, r.right() - 3.5] {
-                            p.rect_filled(Rect::from_center_size(pos2(gx, r.center().y), vec2(2.0, 10.0)), 1.0, Color32::from_white_alpha(200));
+                    if hover || dragging || tch {
+                        for gx in [r.left() + 3.5 + if tch { 2.0 } else { 0.0 }, r.right() - 3.5 - if tch { 2.0 } else { 0.0 }] {
+                            p.rect_filled(Rect::from_center_size(pos2(gx, r.center().y), vec2(if tch { 3.0 } else { 2.0 }, if tch { 16.0 } else { 10.0 })), 1.5, Color32::from_white_alpha(if tch { 230 } else { 200 }));
                         }
                     }
                     let (ps, pe) = preview.get(&it.id).copied().unwrap_or((s, e));
@@ -413,7 +429,7 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
                         // The connector must stay put while the pointer travels from the bar to it: it is shown for the bar *and*
                         // for the strip right of the bar (where the ● sits), and a faint dot is always visible. (It used to appear
                         // only while the bar itself was hovered, so it vanished the moment the pointer left the bar to reach it.)
-                        let near = ctx.pointer_hover_pos().map_or(false, |pp| Rect::from_min_max(pos2(r.left(), r.top() - 3.0), pos2(r.right() + 30.0, r.bottom() + 3.0)).contains(pp));
+                        let near = ctx.pointer_hover_pos().map_or(false, |pp| Rect::from_min_max(pos2(r.left(), r.top() - 3.0), pos2(r.right() + 46.0, r.bottom() + 3.0)).contains(pp));
                         let active = ctx.data(|d| d.get_temp::<bool>(Id::new(("tl_link_active", it.id)))).unwrap_or(false) || pick == Some(it.id);
                         to_draw_links.push((it.id, r, hover || near || active));
                     }
@@ -433,7 +449,7 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
                     pts.push(pos2(a.x + 10.0, a.y));
                     pts.push(pos2(a.x + 10.0, b.y));
                 } else {
-                    let mid_y = if b.y > a.y { from.bottom() + (ROW_H - BAR_H) / 2.0 } else { from.top() - (ROW_H - BAR_H) / 2.0 };
+                    let mid_y = if b.y > a.y { from.bottom() + (row_h - bar_h) / 2.0 } else { from.top() - (row_h - bar_h) / 2.0 };
                     pts.push(pos2(a.x + 8.0, a.y));
                     pts.push(pos2(a.x + 8.0, mid_y));
                     pts.push(pos2(b.x - 12.0, mid_y));
@@ -462,9 +478,10 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
 
         // connectors (drag to link)
         for (rid, r, hot) in &to_draw_links {
-            let c = pos2(r.right() + 11.0, r.center().y);
-            let cr = Rect::from_center_size(c, vec2(22.0, 26.0));
+            let c = pos2(r.right() + if tch { 26.0 } else { 11.0 }, r.center().y);
+            let cr = if tch { Rect::from_center_size(c, vec2(40.0, row_h)) } else { Rect::from_center_size(c, vec2(22.0, 26.0)) };
             let resp = ui.interact(cr, Id::new(("tl_conn", *rid)), Sense::click_and_drag());
+            crate::touch::claim(cr);
             let active = resp.dragged();
             ctx.data_mut(|d| d.insert_temp(Id::new(("tl_link_active", *rid)), active));
             let picked = pick == Some(*rid);
@@ -473,7 +490,7 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
             }
             let big = resp.hovered() || active || picked;
             let col = if *hot || big { pal.accent } else { with_alpha(pal.accent, 0.38) };
-            let rad = if big { 6.5 } else if *hot { 5.0 } else { 3.5 };
+            let rad = if tch { if big { 10.0 } else { 8.0 } } else if big { 6.5 } else if *hot { 5.0 } else { 3.5 };
             if picked {
                 p.circle_stroke(c, rad + 3.5, Stroke::new(2.0_f32, with_alpha(pal.accent, 0.5)));
             }
@@ -504,7 +521,8 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
                 }
             }
             if resp.drag_stopped() {
-                if let Some(pos) = ctx.pointer_hover_pos() {
+                // a finger that lifts also takes the pointer with it, so fall back to the last known position
+                if let Some(pos) = ctx.pointer_hover_pos().or(resp.interact_pointer_pos()).or(ctx.input(|i| i.pointer.latest_pos())) {
                     link_drop = Some((*rid, pos));
                 }
             }

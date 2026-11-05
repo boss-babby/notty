@@ -49,6 +49,8 @@ pub enum Req {
 pub struct EditorState {
     /// Set by the `/dashboard` command: the page gets a widget grid.
     pub want_dash: bool,
+    /// Set by the `/widget` command: open the widget gallery for this (new) widget block.
+    pub want_widget: Option<u64>,
     pub focus: Option<(u64, usize)>,
     /// The block the user is editing / last touched (touch devices keep its handle + toolbar visible; survives focus loss).
     pub active: Option<u64>,
@@ -158,6 +160,8 @@ enum Slash {
     Columns(u8),
     /// A linked, filterable view of any database.
     DbView,
+    /// A dashboard widget (chart, number, task list …) placed anywhere in the page.
+    Widget,
 }
 
 #[derive(Clone, Copy)]
@@ -196,6 +200,7 @@ fn slash_all() -> Vec<SlashItem> {
     v.push(SlashItem { act: Slash::NewPage, label: "Page", hint: "Embed a new sub-page inside this page.", glyph: l::FILE_PLUS, kw: "page subpage new child", sec: adv });
     v.push(SlashItem { act: Slash::Link, label: "Link to page", hint: "Link to an existing page.", glyph: l::LINK_2, kw: "link page mention reference", sec: adv });
     v.push(SlashItem { act: Slash::Dashboard, label: "Dashboard", hint: "Turn this page into a dashboard of charts, tables and widgets.", glyph: l::LAYOUT_DASHBOARD, kw: "dashboard widgets chart charts kpi board analytics overview", sec: adv });
+    v.push(SlashItem { act: Slash::Widget, label: "Dashboard widget", hint: "Place a chart, number, task list or timer anywhere in the page.", glyph: l::CHART_PIE, kw: "widget chart kpi number gauge stats metric dashboard graph plot timer tasks", sec: adv });
     v.push(SlashItem { act: Slash::Today, label: "Today's date", hint: "Insert the current date.", glyph: l::CALENDAR_DAYS, kw: "date today now time", sec: adv });
     v.push(SlashItem { act: Slash::DbView, label: "Linked view of database", hint: "Show a filtered view of any database on this page.", glyph: l::TABLE_2, kw: "linked view database embed inline filter table board calendar today week", sec: "DATABASES" });
     let dbs = [
@@ -687,6 +692,20 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
         changed = true;
         ui.ctx().request_repaint();
     }
+    if let Some(bid) = ed.want_widget.take() {
+        crate::inlinew::request_pick(ws, bid);
+        ui.ctx().request_repaint();
+    }
+    {
+        // menu / gallery / settings panel of the dashboard widgets placed inside this page
+        let o = crate::inlinew::overlays(ui.ctx(), ws, pal);
+        if let Some(op) = o.out.open {
+            ed.nav = Some(op);
+        }
+        if let Some(t) = o.toast {
+            crate::dashcfg::set_toast(&t);
+        }
+    }
     ui.add_space(80.0);
     {
         let Workspace { pages, next_id, .. } = &mut *ws;
@@ -1027,7 +1046,7 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
                 BlockKind::H2 => 12.0,
                 BlockKind::H3 => 8.0,
                 BlockKind::Callout | BlockKind::Code | BlockKind::Quote => 6.0,
-                BlockKind::Columns | BlockKind::DbView => 8.0,
+                BlockKind::Columns | BlockKind::DbView | BlockKind::Widget => 8.0,
                 _ => 1.0,
             });
         }
@@ -1072,6 +1091,18 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
                 ui.set_width(w - ind_px);
                 if kind == BlockKind::DbView {
                     cx.changed |= draw_dbview(ui, cx.ws, &mut page.blocks[cur], cx.ed, pal, w - ind_px);
+                } else if kind == BlockKind::Widget {
+                    let o = crate::inlinew::draw(ui, cx.ws, pal, &mut page.blocks[cur], w - ind_px);
+                    cx.changed |= o.changed;
+                    if o.remove {
+                        cx.act = Some(Act::Remove(cur));
+                    }
+                    if let Some(op) = o.nav.out.open {
+                        cx.ed.nav = Some(op);
+                    }
+                    if let Some(t) = o.nav.toast {
+                        crate::dashcfg::set_toast(&t);
+                    }
                 } else {
                     cx.changed |= draw_block(ui, &mut page.blocks[cur], cur, n, num, cx.ed, pal, w - ind_px, &mut cx.act, &cx.heads, cx.links);
                 }
@@ -1920,6 +1951,17 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
                     bl.push(nb);
                 }
             }
+            Slash::Widget => {
+                bl[i].kind = BlockKind::Widget;
+                bl[i].text.clear();
+                bl[i].media = 0;
+                ed.want_widget = Some(bl[i].id);
+                if i + 1 >= bl.len() {
+                    let ind = bl[i].indent;
+                    let nb = new_block(next_id, BlockKind::Text, String::new(), ind);
+                    bl.push(nb);
+                }
+            }
             Slash::Dashboard => {
                 bl[i].kind = BlockKind::Text;
                 bl[i].text.clear();
@@ -2105,7 +2147,7 @@ fn draw_block(
             ui.add_space(4.0);
         }
         // laid out by `draw_range` / `draw_columns` / `draw_dbview`, never by this function
-        BlockKind::Columns | BlockKind::Column | BlockKind::DbView => {}
+        BlockKind::Columns | BlockKind::Column | BlockKind::DbView | BlockKind::Widget => {}
         BlockKind::PageLink => {
             let info = b.link.and_then(|l| links.get(&l));
             let (rect, resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::click());
@@ -2392,6 +2434,15 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         let row = cr.primary.rcursor.row;
         let rows = out.galley.rows.len();
         ctx.data_mut(|d| d.insert_temp(id.with("rows"), (row, rows)));
+    }
+
+    // Phones: keep the caret visible above the on-screen keyboard / the toolbar while typing in a block that sits low on the screen.
+    // (The hidden text input follows the caret, see vendor/eframe text_agent.rs — it is clamped to the visible area.)
+    if crate::touch::touchy() && focused && out.response.changed() {
+        if let Some(cr) = out.cursor_range {
+            let r = out.galley.pos_from_cursor(&cr.primary).translate(out.galley_pos.to_vec2());
+            ui.scroll_to_rect(r.expand2(vec2(0.0, 72.0)), None);
+        }
     }
 
     if !ed.rc_frame {

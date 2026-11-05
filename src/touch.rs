@@ -24,13 +24,13 @@ use std::time::Duration;
 use egui::{Context, Event, Id, Modifiers, MouseWheelUnit, Pos2, RawInput, TouchPhase, Vec2};
 
 /// Seconds a finger must rest to count as a hold (right-click / start of a drag selection).
-pub const LONG_PRESS: f64 = 0.45;
+pub const LONG_PRESS: f64 = 0.36;
 /// After this many seconds of resting the "hold" ring starts to grow.
 const RING_AFTER: f64 = 0.12;
 /// Movement (points) of a *held* finger that turns the hold into a drag.
-const HOLD_SLOP: f32 = 10.0;
+const HOLD_SLOP: f32 = 22.0;
 /// Movement (points) that turns a press into a swipe.
-const SLOP: f32 = 9.0;
+const SLOP: f32 = 10.0;
 /// Fling friction (1/s) and the speed below which a fling stops (points/s).
 const FRICTION: f32 = 3.1;
 const MIN_FLING: f32 = 140.0;

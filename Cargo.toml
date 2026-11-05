@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "5.4.0"
+version = "5.5.0"
 edition = "2021"
 description = "Lumen — a free Notion + Obsidian alternative written entirely in Rust with egui (Windows + WebAssembly)"
 license = "MIT"
@@ -54,7 +54,7 @@ panic = "unwind"
 # Smaller, slower-to-build profile used by build-web.sh (download size matters in the browser).
 [profile.web]
 inherits = "release"
-opt-level = "s"
+opt-level = 2
 lto = "thin"
 codegen-units = 1
 panic = "abort"

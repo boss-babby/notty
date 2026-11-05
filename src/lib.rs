@@ -27,6 +27,7 @@ mod clip;
 mod model;
 mod platform;
 mod dashboard;
+mod inlinew;
 mod dashcfg;
 mod dashcharts;
 mod dashdata;
