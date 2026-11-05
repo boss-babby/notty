@@ -463,7 +463,7 @@ impl FilterOp {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Filter {
     /// 0 = the title column.
     pub prop: u64,
@@ -666,6 +666,9 @@ pub struct Workspace {
     /// PDF annotations (highlights, underlines, notes, drawings) per document key — see `pdf.rs`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pdf_annots: BTreeMap<u64, Vec<PdfAnnot>>,
+    /// Customisable dashboard: boards of widgets (see `dashcfg.rs`).
+    #[serde(default)]
+    pub dash: crate::dashcfg::Dash,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
@@ -1477,7 +1480,7 @@ impl Workspace {
     // ───────── first-run content ─────────
 
     pub fn seed() -> Self {
-        let mut ws = Workspace { name: "My Workspace".into(), pages: vec![], next_id: 0, current: None, dark: false, sidebar_open: true, accent: 0, icons_v2: false, pdf_annots: BTreeMap::new() };
+        let mut ws = Workspace { name: "My Workspace".into(), pages: vec![], next_id: 0, current: None, dark: false, sidebar_open: true, accent: 0, icons_v2: false, pdf_annots: BTreeMap::new(), dash: Default::default() };
         use BlockKind::*;
 
         let start = ws.add_page(None, PageKind::Doc);

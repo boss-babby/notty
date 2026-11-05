@@ -27,6 +27,11 @@ mod clip;
 mod model;
 mod platform;
 mod dashboard;
+mod dashcfg;
+mod dashcharts;
+mod dashdata;
+mod dashedit;
+mod dashwidgets;
 mod graph;
 mod smooth;
 mod views;
@@ -36,6 +41,8 @@ mod widgets;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod dashtests;
 
 pub use app::LumenApp;
 

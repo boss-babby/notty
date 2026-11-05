@@ -234,6 +234,9 @@ struct Reader {
     off: Vec2,
     vp: Rect,
     pending_off: Option<Vec2>,
+    /// Width of the reading view the current scroll offset belongs to (0 before the first frame).
+    /// Opening / closing the thumbnail or notes panel changes it; the offset is then re-based (see `reflow_offset`).
+    lay_w: f32,
     night: bool,
     thumbs: bool,
     tiles: HashMap<TileKey, Tile>,
@@ -309,6 +312,7 @@ impl Reader {
             off: Vec2::ZERO,
             vp: Rect::NOTHING,
             pending_off: None,
+            lay_w: 0.0,
             night: false,
             thumbs: false,
             tiles: HashMap::new(),
@@ -769,6 +773,24 @@ fn layout(dims: &[(f32, f32)], zoom: f32, view_w: f32) -> Lay {
         y += h * s + GAP;
     }
     Lay { s, ys, ws, hs, content_w: (max_w * s + 2.0 * MARGIN).max(view_w), content_h: y + TOP_PAD }
+}
+
+/// Re-bases a scroll offset when the width of the reading view changes (a side panel opened or closed, the window was
+/// resized). Page scale is derived from the view width, so the same pixel offset would point at a different page —
+/// with a long document the view used to jump several pages. The point at the top-left of the view (page + position
+/// inside the page, in PDF points) and the horizontal centre are kept instead.
+fn reflow_offset(dims: &[(f32, f32)], zoom: f32, old_w: f32, new_w: f32, off: Vec2) -> Vec2 {
+    if dims.is_empty() || old_w <= 0.0 || (old_w - new_w).abs() < 0.5 {
+        return off;
+    }
+    let old = layout(dims, zoom, old_w);
+    let new = layout(dims, zoom, new_w);
+    let i = page_at(&old, off.y);
+    let local = (off.y - old.ys[i]) / old.s;
+    let y = new.ys[i] + local * new.s;
+    let cx = (off.x + old_w / 2.0 - old.content_w / 2.0) / old.s;
+    let x = new.content_w / 2.0 + cx * new.s - new_w / 2.0;
+    vec2(x.max(0.0), y.max(0.0))
 }
 
 fn page_at(lay: &Lay, y: f32) -> usize {
@@ -1254,6 +1276,12 @@ fn reading_view(
 
     let Some(engine) = rd.engine.as_ref() else { return };
     let dims = engine.dims.clone();
+    // A side panel opened / closed (or the window was resized): keep the same page in view instead of the same pixel offset.
+    if rd.lay_w > 0.0 && (rd.lay_w - view.width()).abs() >= 0.5 {
+        let base = rd.pending_off.unwrap_or(rd.off);
+        rd.pending_off = Some(reflow_offset(&dims, rd.zoom, rd.lay_w, view.width(), base));
+    }
+    rd.lay_w = view.width();
     let lay = layout(&dims, rd.zoom, view.width());
     let night = rd.night;
     let frame = rd.frame;
@@ -1590,6 +1618,104 @@ mod tests {
         let _ = ctx.run(input, |ctx| {
             reader_ui(ctx, req, annots, &pal);
         });
+    }
+
+    /// A PDF with `n` identical portrait pages.
+    fn multi_pdf(n: usize) -> Vec<u8> {
+        let mut objs: Vec<String> = vec![String::new(), String::new()];
+        let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 3 + i * 2)).collect();
+        objs[0] = "<< /Type /Catalog /Pages 2 0 R >>".into();
+        objs[1] = format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids.join(" "), n);
+        for i in 0..n {
+            let c = format!("BT /F1 24 Tf 20 100 Td (Page {}) Tj ET", i + 1);
+            objs.push(format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents {} 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> >>", 4 + i * 2));
+            objs.push(format!("<< /Length {} >>\nstream\n{}\nendstream", c.len(), c));
+        }
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offs = vec![];
+        for (i, o) in objs.iter().enumerate() {
+            offs.push(out.len());
+            out.extend(format!("{} 0 obj\n{}\nendobj\n", i + 1, o).bytes());
+        }
+        let xref = out.len();
+        out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).bytes());
+        for o in offs {
+            out.extend(format!("{:010} 00000 n \n", o).bytes());
+        }
+        out.extend(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF", objs.len() + 1, xref).bytes());
+        out
+    }
+
+    #[test]
+    fn reflow_keeps_the_same_page_when_the_view_width_changes() {
+        let dims = vec![(595.0, 842.0); 40];
+        for zoom in [0.5_f32, 1.0, 2.0] {
+            for target in [0usize, 7, 19, 39] {
+                let lay = layout(&dims, zoom, 1200.0);
+                let off = vec2(0.0, lay.ys[target] + 40.0);
+                for (a, b) in [(1200.0, 1068.0), (1068.0, 748.0), (1200.0, 380.0), (380.0, 1200.0)] {
+                    let lay_a = layout(&dims, zoom, a);
+                    let off_a = vec2(0.0, lay_a.ys[target] + 40.0 * lay_a.s / lay.s);
+                    let o2 = reflow_offset(&dims, zoom, a, b, off_a);
+                    let lay_b = layout(&dims, zoom, b);
+                    assert_eq!(page_at(&lay_b, o2.y), target, "zoom {zoom}, page {target}, {a} -> {b}");
+                    // the same relative position inside the page is preserved
+                    let ra = (off_a.y - lay_a.ys[target]) / lay_a.s;
+                    let rb = (o2.y - lay_b.ys[target]) / lay_b.s;
+                    assert!((ra - rb).abs() < 0.01);
+                }
+                let _ = off;
+            }
+        }
+    }
+
+    #[test]
+    fn opening_thumbnails_and_notes_does_not_change_the_page() {
+        let ctx = Context::default();
+        crate::theme::setup_fonts(&ctx);
+        let mut req = Some(Request { key: 11, title: "long.pdf".into(), source: Some(Source::Local(multi_pdf(40).into())) });
+        let mut annots = BTreeMap::new();
+        let mut t = 0.0;
+        let size = vec2(1280.0, 800.0);
+        for _ in 0..6 {
+            run(&ctx, &mut req, &mut annots, &mut t, size, vec![]);
+        }
+        // scroll to page 30
+        READER.with(|c| {
+            let mut g = c.borrow_mut();
+            let r = g.as_mut().unwrap();
+            let lay = layout(&r.engine.as_ref().unwrap().dims, r.zoom, r.lay_w);
+            r.pending_off = Some(vec2(0.0, lay.ys[29] + 30.0));
+        });
+        for _ in 0..5 {
+            run(&ctx, &mut req, &mut annots, &mut t, size, vec![]);
+        }
+        let page = || READER.with(|c| c.borrow().as_ref().unwrap().page);
+        assert_eq!(page(), 29, "scrolled to page 30");
+        let toggle = |f: &dyn Fn(&mut Reader)| READER.with(|c| f(c.borrow_mut().as_mut().unwrap()));
+        let mut step = |n: usize| {
+            for _ in 0..n {
+                run(&ctx, &mut req, &mut annots, &mut t, size, vec![]);
+            }
+        };
+        toggle(&|r| r.thumbs = true);
+        step(5);
+        assert_eq!(page(), 29, "thumbnail panel opened");
+        toggle(&|r| {
+            r.notes.bar = true;
+            r.notes.panel = true;
+        });
+        step(5);
+        assert_eq!(page(), 29, "notes panel opened");
+        toggle(&|r| r.thumbs = false);
+        step(5);
+        assert_eq!(page(), 29, "thumbnail panel closed");
+        toggle(&|r| {
+            r.notes.panel = false;
+            r.notes.bar = false;
+        });
+        step(5);
+        assert_eq!(page(), 29, "notes panel closed");
     }
 
     #[test]

@@ -109,6 +109,10 @@ pub(crate) enum A {
     AddDep(u64, u64),
     AddDepProp,
     Reschedule,
+    /// Pin the view (index) of this database to the dashboard as a widget kind.
+    Pin(usize, &'static str),
+    /// Pin a chart / number of one property.
+    PinProp(u64, &'static str),
 }
 
 /// True when `row` (transitively) depends on `target` through the dependency property `dp`. Iterative and cycle-safe.
@@ -1251,6 +1255,14 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                     acts.push(A::RenameProp(prop, name));
                 }
                 ui.add_space(4.0);
+                if menu_item(ui, pal, l::CHART_PIE, "Pin chart to dashboard", Some("Breakdown by this property"), false, false).clicked() {
+                    acts.push(A::PinProp(prop, if matches!(p.kind, PropKind::Number | PropKind::Formula | PropKind::Rollup) { "bar" } else { "donut" }));
+                    next = Some(None);
+                }
+                if matches!(p.kind, PropKind::Number | PropKind::Formula | PropKind::Rollup) && menu_item(ui, pal, l::HASH, "Pin total to dashboard", Some("Sum as a number card"), false, false).clicked() {
+                    acts.push(A::PinProp(prop, "number"));
+                    next = Some(None);
+                }
                 section_label(ui, pal, "TYPE");
                 for k in PropKind::ALL {
                     if menu_item(ui, pal, k.glyph(), k.label(), None, k == p.kind, false).clicked() && k != p.kind {
@@ -1389,6 +1401,25 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                     acts.push(A::SetViewKind(vi, k));
                 }
             }
+            rule(ui, pal);
+            egui::CollapsingHeader::new(RichText::new(format!("{}  Pin to dashboard", l::LAYOUT_DASHBOARD)).font(body(13.5)).color(pal.text)).id_salt(("pin_dash", view.id)).show(ui, |ui| {
+                ui.label(RichText::new("This view's filters and sorts come along.").font(body(11.5)).color(pal.muted));
+                for (kind, glyph, name) in [
+                    ("table", l::TABLE, "Table"),
+                    ("list", l::LAYOUT_LIST, "List"),
+                    ("board", l::KANBAN, "Board"),
+                    ("calendar", l::CALENDAR_DAYS, "Calendar"),
+                    ("number", l::HASH, "Number (count)"),
+                    ("bar", l::CHART_COLUMN, "Bar chart"),
+                    ("donut", l::CHART_PIE, "Donut chart"),
+                    ("line", l::CHART_LINE, "Line chart"),
+                ] {
+                    if menu_item(ui, pal, glyph, name, None, false, false).clicked() {
+                        acts.push(A::Pin(vi, kind));
+                        next = Some(None);
+                    }
+                }
+            });
             if view.kind == ViewKind::Board {
                 let sels: Vec<&Prop> = db.props.iter().filter(|p| p.kind == PropKind::Select).collect();
                 if !sels.is_empty() {
@@ -1675,6 +1706,14 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
 
 fn apply(ws: &mut Workspace, db_id: u64, a: A, ed: &mut EditorState) {
     match a {
+        A::Pin(vi, kind) => {
+            crate::dashcfg::pin(ws, db_id, vi, kind);
+            crate::dashcfg::set_toast("Pinned to the dashboard (Ctrl+D)");
+        }
+        A::PinProp(prop, kind) => {
+            crate::dashcfg::pin_prop(ws, db_id, prop, kind);
+            crate::dashcfg::set_toast("Pinned to the dashboard (Ctrl+D)");
+        }
         A::SetVal(row, prop, v) => {
             if let Some(p) = ws.page_mut(row) {
                 match v {

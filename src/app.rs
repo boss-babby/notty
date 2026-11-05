@@ -1770,10 +1770,16 @@ impl LumenApp {
         }
 
         crate::views::sync(self.ws.current);
+        if let Some(t) = crate::dashcfg::take_toast() {
+            self.toast(t, None);
+        }
         egui::CentralPanel::default().frame(Frame::new().fill(pal.bg)).show(ctx, |ui| {
             match crate::views::mode() {
                 crate::views::Mode::Dashboard => {
                     let nav = crate::dashboard::show(ui, &mut self.ws, &pal);
+                    if let Some(t) = nav.toast.clone() {
+                        self.toast(t, None);
+                    }
                     if nav.new_page {
                         crate::views::set(crate::views::Mode::Page, None);
                         self.new_page(None, PageKind::Doc);
