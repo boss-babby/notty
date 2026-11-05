@@ -30,6 +30,54 @@ const MIN_FLING: f32 = 140.0;
 
 thread_local! {
     static PASS: Cell<bool> = const { Cell::new(false) };
+    /// A finger has been used (or the device reports a coarse pointer): bigger tap targets everywhere.
+    static TOUCHY: Cell<bool> = const { Cell::new(false) };
+    /// The window is phone-sized (set by the app shell every frame).
+    static NARROW: Cell<bool> = const { Cell::new(false) };
+    /// Zones where a finger must grab immediately (drag handles, resize grips) instead of scrolling the page.
+    static CLAIMS_NOW: std::cell::RefCell<Vec<egui::Rect>> = const { std::cell::RefCell::new(Vec::new()) };
+    static CLAIMS_PREV: std::cell::RefCell<Vec<egui::Rect>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SWIPE: Cell<Option<Swipe>> = const { Cell::new(None) };
+}
+
+/// A quick horizontal swipe recognised by the gesture layer (used to open / close the sidebar drawer).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Swipe {
+    /// Started at the left screen edge and moved right.
+    EdgeRight,
+    Left,
+    Right,
+}
+
+/// Registers a rectangle (this frame) in which a finger drags immediately: drag handles, column resizers, timeline bars.
+pub fn claim(r: egui::Rect) {
+    if !touchy() {
+        return;
+    }
+    CLAIMS_NOW.with(|c| c.borrow_mut().push(r));
+}
+
+/// Bigger tap targets / spacing (touch screen in use).
+pub fn touchy() -> bool {
+    TOUCHY.with(|t| t.get())
+}
+
+pub fn set_touchy(on: bool) {
+    TOUCHY.with(|t| t.set(on));
+}
+
+/// Phone-sized window: single-column layouts, compact gutters.
+pub fn compact() -> bool {
+    NARROW.with(|t| t.get())
+}
+
+pub fn set_narrow(on: bool) {
+    NARROW.with(|t| t.set(on));
+}
+
+/// A horizontal swipe happened since the last call (consumes it).
+pub fn take_swipe() -> Option<Swipe> {
+    SWIPE.with(|s| s.take())
 }
 
 /// A tool that needs raw finger input (pen / highlighter) calls this every frame it is active.
@@ -69,11 +117,13 @@ pub struct Gestures {
     frame_delta: Vec2,
     /// A touch screen has been used at least once.
     pub seen: bool,
+    /// Grab zones of the previous frame (see [`claim`]).
+    pub claims: Vec<egui::Rect>,
 }
 
 impl Default for Gestures {
     fn default() -> Self {
-        Gestures { mode: Mode::Idle, lock: Lock::Free, fingers: 0, start: Pos2::ZERO, last: Pos2::ZERO, t0: 0.0, last_t: 0.0, buf: vec![], vel: Vec2::ZERO, drop_tail: false, frame_delta: Vec2::ZERO, seen: false }
+        Gestures { mode: Mode::Idle, lock: Lock::Free, fingers: 0, start: Pos2::ZERO, last: Pos2::ZERO, t0: 0.0, last_t: 0.0, buf: vec![], vel: Vec2::ZERO, drop_tail: false, frame_delta: Vec2::ZERO, seen: false, claims: vec![] }
     }
 }
 
@@ -82,6 +132,7 @@ impl Default for Gestures {
 pub struct Outcome {
     pub long_press: Option<Pos2>,
     pub direct: bool,
+    pub swipe: Option<Swipe>,
 }
 
 impl Gestures {
@@ -104,7 +155,8 @@ impl Gestures {
                     match phase {
                         TouchPhase::Start => {
                             self.fingers += 1;
-                            if self.fingers >= 2 || passthrough {
+                            let claimed = self.fingers == 1 && self.claims.iter().any(|r| r.expand(4.0).contains(pos));
+                            if self.fingers >= 2 || passthrough || claimed {
                                 out.append(&mut self.buf);
                                 self.mode = Mode::Pass;
                             } else {
@@ -131,6 +183,15 @@ impl Gestures {
                                     } else {
                                         Lock::Free
                                     };
+                                    if d.x.abs() > 1.6 * d.y.abs() {
+                                        outcome.swipe = Some(if d.x > 0.0 && self.start.x < 28.0 {
+                                            Swipe::EdgeRight
+                                        } else if d.x < 0.0 {
+                                            Swipe::Left
+                                        } else {
+                                            Swipe::Right
+                                        });
+                                    }
                                 }
                                 if self.mode == Mode::Scroll {
                                     self.frame_delta += pos - self.last;
@@ -246,6 +307,17 @@ const DIRECT_ID: &str = "touch_direct";
 /// Call from `App::raw_input_hook`.
 pub fn hook(g: &mut Gestures, ctx: &Context, raw: &mut RawInput) {
     let now = raw.time.unwrap_or(0.0);
+    // grab zones registered during the previous frame
+    CLAIMS_PREV.with(|prev| {
+        CLAIMS_NOW.with(|now| {
+            let mut now = now.borrow_mut();
+            let mut prev = prev.borrow_mut();
+            std::mem::swap(&mut *prev, &mut *now);
+            now.clear();
+            g.claims.clear();
+            g.claims.extend(prev.iter().copied());
+        })
+    });
     let had_touch = raw.events.iter().any(|e| matches!(e, Event::Touch { .. }));
     // Nothing to do (and no cost) for mouse-only use.
     if !had_touch && !g.seen && g.mode == Mode::Idle {
@@ -253,6 +325,7 @@ pub fn hook(g: &mut Gestures, ctx: &Context, raw: &mut RawInput) {
     }
     if had_touch {
         mark_touch(ctx, true);
+        set_touchy(true);
     }
     let events = std::mem::take(&mut raw.events);
     let pass = PASS.with(|p| p.get());
@@ -260,6 +333,10 @@ pub fn hook(g: &mut Gestures, ctx: &Context, raw: &mut RawInput) {
     raw.events = events;
     if let Some(p) = outcome.long_press {
         ctx.data_mut(|d| d.insert_temp(Id::new(LP_ID), p));
+        ctx.request_repaint();
+    }
+    if let Some(sw) = outcome.swipe {
+        SWIPE.with(|s| s.set(Some(sw)));
         ctx.request_repaint();
     }
     ctx.data_mut(|d| d.insert_temp(Id::new(DIRECT_ID), outcome.direct));

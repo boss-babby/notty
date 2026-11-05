@@ -4,7 +4,7 @@
 
 use egui::{pos2, vec2, Align2, Context, CursorIcon, Event, Id, Key, Margin, Modifiers, Order, Pos2, Rect, Response, Sense, Stroke, Ui};
 
-use crate::editor::{swatches, EditorState, GUTTER};
+use crate::editor::{gutter, swatches, EditorState};
 use crate::icons::Icon;
 use crate::lucide as l;
 use crate::model::{Block, BlockKind, Page};
@@ -178,6 +178,32 @@ pub fn handle(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorSt
         }
     }
 
+    // Touch: while blocks are selected a plain tap on another block adds / removes it (no keyboard, no second long press).
+    let mut toggled = false;
+    if ed.touch_sel && !ed.sel.is_empty() && crate::touch::touchy() {
+        let tap = ctx.input(|i| if i.pointer.any_click() { i.pointer.interact_pos() } else { None });
+        if let Some(p) = tap {
+            let on_page = ctx.layer_id_at(p).map_or(true, |l| l.order == Order::Background);
+            if let (true, Some((i, _))) = (on_page, rects.iter().find(|(_, r)| r.expand2(vec2(60.0, 3.0)).contains(p))) {
+                let id = page.blocks[*i].id;
+                if let Some(k) = ed.sel.iter().position(|b| *b == id) {
+                    ed.sel.remove(k);
+                } else {
+                    ed.sel.push(id);
+                }
+                ed.touch_sel = !ed.sel.is_empty();
+                ed.focus = None;
+                ed.active = None;
+                toggled = true;
+                ctx.memory_mut(|m| {
+                    if let Some(f) = m.focused() {
+                        m.surrender_focus(f);
+                    }
+                });
+            }
+        }
+    }
+
     if bg.drag_started() {
         // egui lets a drag-sensing widget below receive drags that began on click-only widgets above it (toolbars, popups…):
         // only start a selection when the press was really on the page itself.
@@ -226,11 +252,11 @@ pub fn handle(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorSt
     if bg.drag_stopped() || !ctx.input(|i| i.pointer.primary_down()) {
         ed.marquee = None;
     }
-    if bg.clicked() {
+    if bg.clicked() && !toggled {
         ed.sel.clear();
     }
     let text_focus = ctx.memory(|m| m.focused().is_some());
-    if text_focus && ed.marquee.is_none() && !ed.sel.is_empty() {
+    if text_focus && ed.marquee.is_none() && !ed.sel.is_empty() && !toggled {
         ed.sel.clear();
     }
     if ed.sel.is_empty() {
@@ -241,7 +267,7 @@ pub fn handle(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorSt
     if !ed.sel.is_empty() {
         for (i, row) in rects {
             if ed.sel.contains(&page.blocks[*i].id) {
-                let r = Rect::from_min_max(pos2(row.left() + GUTTER - 8.0 + page.blocks[*i].indent as f32 * 28.0, row.top() - 1.0), pos2(row.right() + 6.0, row.bottom() + 1.0));
+                let r = Rect::from_min_max(pos2(row.left() + gutter() - 8.0 + page.blocks[*i].indent as f32 * 28.0, row.top() - 1.0), pos2(row.right() + 6.0, row.bottom() + 1.0));
                 ui.painter().rect_filled(r, 5.0, with_alpha(pal.accent, 0.16));
             }
         }
@@ -322,17 +348,28 @@ pub fn bar(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState
         return false;
     }
     let clip = ui.clip_rect();
-    let width = 468.0;
+    // phones: the bar is as wide as the screen, wraps onto a second row and sits at the bottom (thumb reach, never off-screen)
+    let narrow = clip.width() < 520.0;
+    let width = if narrow { (clip.width() - 16.0).max(200.0) } else { 468.0 };
     let pos = pos2((clip.center().x - width / 2.0).max(clip.left() + 8.0), clip.top() + 12.0);
     let mut op: Option<Op> = None;
     let mut menu = ed.sel_menu;
     let mut close = false;
     let (cur_c, cur_bg) = page.blocks.iter().find(|b| ed.sel.contains(&b.id)).map(|b| (b.color, b.bg)).unwrap_or((0, 0));
     let can_undo = ed.undo.iter().any(|(p, _)| *p == page.id);
-    let area = egui::Area::new(Id::new("sel_bar")).order(Order::Foreground).fixed_pos(pos).show(&ctx, |ui| {
+    let area_b = egui::Area::new(Id::new("sel_bar")).order(Order::Foreground);
+    let area_b = if narrow { area_b.anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -10.0)) } else { area_b.fixed_pos(pos) };
+    let area = area_b.show(&ctx, |ui| {
         widgets::popup_frame(pal).inner_margin(Margin::same(5)).show(ui, |ui| {
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-            ui.horizontal(|ui| {
+            if narrow {
+                ui.set_width(width - 10.0);
+            }
+            let row = |ui: &mut Ui| {
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                if narrow {
+                    ui.set_max_width(width - 10.0);
+                }
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new(format!("{n} selected")).font(bold(13.0)).color(pal.text));
                 ui.add_space(8.0);
@@ -376,7 +413,12 @@ pub fn bar(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState
                 if widgets::icon_button(ui, pal, Icon::Close, 15.0, "Clear selection  Esc").clicked() {
                     close = true;
                 }
-            });
+            };
+            if narrow {
+                ui.horizontal_wrapped(row);
+            } else {
+                ui.horizontal(row);
+            }
             if menu == 1 {
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {

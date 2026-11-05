@@ -5,11 +5,21 @@
   <title>Lumen — workspace</title>
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
   <meta name="theme-color" content="#ffffff" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="format-detection" content="telephone=no" />
   <meta name="description" content="Lumen — a Notion + Obsidian alternative written entirely in Rust (egui), running as WebAssembly." />
   <style>
-    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #ffffff; overscroll-behavior: none; touch-action: none; }
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #ffffff; overscroll-behavior: none; touch-action: none;
+      -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent; -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
     @media (prefers-color-scheme: dark) { html, body { background: #191919; } }
-    canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; outline: none; }
+    /* The stage follows the *visual* viewport (script below): when the on-screen keyboard opens it shrinks, so the editor and its toolbar sit above it.
+       Notch / home-bar insets become padding, so no UI is ever hidden under them. */
+    #stage { position: fixed; left: 0; top: var(--vvt, 0px); width: 100%; height: var(--vvh, 100%); box-sizing: border-box; background: inherit;
+      padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px); }
+    #stage.kb { padding-bottom: 0; }
+    canvas { display: block; width: 100%; height: 100%; outline: none; touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
     #loader { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px;
       font: 500 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; color: #555; background: inherit; z-index: 5; transition: opacity .3s; }
     @media (prefers-color-scheme: dark) { #loader { color: #aaa; } }
@@ -23,7 +33,7 @@
   </style>
 </head>
 <body>
-  <canvas id="lumen_canvas"></canvas>
+  <div id="stage"><canvas id="lumen_canvas" tabindex="0"></canvas></div>
   <div id="loader">
     <div class="logo">Lumen</div>
     <div id="msg">Loading workspace…</div>
@@ -32,6 +42,25 @@
   </div>
   <script type="module">
     import init, { LumenWeb } from "./lumen.js";
+
+    // ── mobile viewport plumbing ──────────────────────────────────────────────────────────────────────────────────
+    const stage = document.getElementById("stage");
+    const vv = window.visualViewport;
+    function fitViewport() {
+      const h = vv ? vv.height : window.innerHeight;
+      stage.style.setProperty("--vvh", h + "px");
+      stage.style.setProperty("--vvt", (vv ? vv.offsetTop : 0) + "px");
+      stage.classList.toggle("kb", !!vv && window.innerHeight - vv.height > 120);
+      if (window.scrollX || window.scrollY) window.scrollTo(0, 0);   // iOS pans the page when the keyboard opens
+    }
+    fitViewport();
+    if (vv) { vv.addEventListener("resize", fitViewport); vv.addEventListener("scroll", fitViewport); }
+    window.addEventListener("resize", fitViewport);
+    window.addEventListener("orientationchange", () => setTimeout(fitViewport, 250));
+    // no browser pinch-zoom / long-press menu / double-tap zoom: the app handles every gesture itself
+    for (const t of ["gesturestart", "gesturechange", "gestureend"]) document.addEventListener(t, (e) => e.preventDefault());
+    document.addEventListener("contextmenu", (e) => e.preventDefault());
+    document.addEventListener("touchmove", (e) => { if (e.touches.length > 1) e.preventDefault(); }, { passive: false });
 
     const msg = document.getElementById("msg");
     const bar = document.getElementById("bar");
@@ -76,6 +105,7 @@
       msg.textContent = "Starting…";
       const app = new LumenWeb();
       await app.start(document.getElementById("lumen_canvas"));
+      window.__lumenReady = true;
       loader.style.opacity = "0";
       setTimeout(() => loader.remove(), 350);
       window.addEventListener("pagehide", () => { try { app.destroy(); } catch (_) {} });

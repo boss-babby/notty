@@ -221,5 +221,18 @@ pub fn apply(ctx: &Context, p: &Palette, dark: bool) {
         s.interaction.selectable_labels = true;
         s.animation_time = 0.12;
         s.spacing.scroll = egui::style::ScrollStyle::floating();
+        if crate::touch::touchy() {
+            // finger-sized targets: ≥ 38 pt rows, roomier padding, bigger check boxes / radio buttons
+            s.spacing.interact_size = egui::vec2(40.0, 38.0);
+            s.spacing.button_padding = egui::vec2(14.0, 9.0);
+            s.spacing.item_spacing = egui::vec2(8.0, 8.0);
+            s.spacing.icon_width = 24.0;
+            s.spacing.icon_width_inner = 14.0;
+            s.spacing.icon_spacing = 8.0;
+            s.spacing.slider_rail_height = 8.0;
+            s.interaction.interact_radius = 10.0;
+            s.interaction.resize_grab_radius_side = 12.0;
+            s.interaction.resize_grab_radius_corner = 16.0;
+        }
     });
 }

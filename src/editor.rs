@@ -27,7 +27,14 @@ use crate::widgets::{
     slice_chars, with_alpha, CtxItem,
 };
 
-pub const GUTTER: f32 = 56.0;
+/// Width of the left gutter that holds the "+" / drag handle of a block. Phones get a slimmer one so text keeps its width.
+pub fn gutter() -> f32 {
+    if crate::touch::compact() {
+        38.0
+    } else {
+        56.0
+    }
+}
 const INDENT: f32 = 28.0;
 
 /// Requests the editor cannot fulfil itself (they need the whole workspace); handled by the app shell.
@@ -43,6 +50,12 @@ pub struct EditorState {
     /// Set by the `/dashboard` command: the page gets a widget grid.
     pub want_dash: bool,
     pub focus: Option<(u64, usize)>,
+    /// The block the user is editing / last touched (touch devices keep its handle + toolbar visible; survives focus loss).
+    pub active: Option<u64>,
+    /// Phone toolbar: 0 = closed, 1 = "turn into", 2 = "insert".
+    pub tool_menu: u8,
+    /// Time until which the phone toolbar stays up although the text field lost focus (a tap on a toolbar button does that).
+    pub bar_grace: f64,
     pub slash_sel: usize,
     pub slash_moved: bool,
     pub block_menu: Option<(u64, egui::Pos2)>,
@@ -229,6 +242,8 @@ enum Act {
     ColEqual(usize),
     ColUnwrap(usize),
     ColDelete(usize),
+    /// Insert an empty block after this one and turn *that* into a slash-menu item (phone toolbar "insert").
+    InsertSlash(usize, SlashItem),
 }
 
 fn slash_act(idx: usize, s: SlashItem) -> Act {
@@ -610,9 +625,11 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
 
     let dash_board = if kind == PageKind::Doc && !is_row { ws.dash.page_board(id) } else { None };
     let wide = kind == PageKind::Database || full || dash_board.is_some();
-    let col_w = if wide { (avail - 96.0).max(300.0) } else { (avail - 80.0).clamp(300.0, 900.0) };
-    let left = if wide { 48.0 } else { ((avail - col_w) / 2.0).max(24.0) };
-    let content_w = (col_w - GUTTER).max(200.0);
+    // phones: use (almost) the whole width, no 300 pt minimum that would push the page off-screen
+    let compact = avail < 640.0;
+    let col_w = if compact { (avail - 16.0).max(200.0) } else if wide { (avail - 96.0).max(300.0) } else { (avail - 80.0).clamp(300.0, 900.0) };
+    let left = if compact { 8.0 } else if wide { 48.0 } else { ((avail - col_w) / 2.0).max(24.0) };
+    let content_w = (col_w - gutter()).max(if compact { 140.0 } else { 200.0 });
 
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
@@ -688,14 +705,14 @@ fn backlinks(ui: &mut Ui, ws: &Workspace, id: u64, ed: &mut EditorState, pal: &P
     }
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        ui.add_space(GUTTER);
+        ui.add_space(gutter());
         ui.label(RichText::new(format!("LINKED FROM  ·  {}", links.len())).font(bold(11.5)).color(pal.muted));
     });
     for l in links {
         let Some(p) = ws.page(l) else { continue };
-        let (rect, resp) = ui.allocate_exact_size(vec2(w + GUTTER, 28.0), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(vec2(w + gutter(), 28.0), Sense::click());
         let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-        let r = Rect::from_min_max(pos2(rect.left() + GUTTER - 6.0, rect.top()), rect.right_bottom());
+        let r = Rect::from_min_max(pos2(rect.left() + gutter() - 6.0, rect.top()), rect.right_bottom());
         ui.painter().rect_filled(r, 6.0, with_alpha(pal.hover, t));
         let icon = if p.icon.is_empty() { l::FILE_TEXT } else { &p.icon };
         icons::paint_page_icon(ui, pos2(r.left() + 18.0, r.center().y), icon, 17.0, pal.text);
@@ -713,12 +730,12 @@ fn header(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, con
     ui.add_space(if has_cover { 0.0 } else { 40.0 });
 
     let icon_h = 76.0;
-    let (rect, _) = ui.allocate_exact_size(vec2(content_w + GUTTER, if has_cover { 44.0 } else { icon_h }), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(vec2(content_w + gutter(), if has_cover { 44.0 } else { icon_h }), Sense::hover());
     let hdr_top = rect.top();
     if !page.icon.is_empty() {
         let size = 68.0;
         let top = if has_cover { hdr_top - 34.0 } else { hdr_top };
-        let ir = Rect::from_min_size(pos2(rect.left() + GUTTER - 8.0, top), vec2(size + 16.0, size + 8.0));
+        let ir = Rect::from_min_size(pos2(rect.left() + gutter() - 8.0, top), vec2(size + 16.0, size + 8.0));
         let resp = ui.interact(ir, Id::new(("icon", page.id)), Sense::click());
         let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
         ui.painter().rect_filled(ir, 12.0, with_alpha(pal.hover, t));
@@ -730,10 +747,10 @@ fn header(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, con
     }
 
     let row_h = 30.0;
-    let (row, _) = ui.allocate_exact_size(vec2(content_w + GUTTER, row_h), Sense::hover());
+    let (row, _) = ui.allocate_exact_size(vec2(content_w + gutter(), row_h), Sense::hover());
     let hov = ui.rect_contains_pointer(Rect::from_min_max(pos2(row.left(), hdr_top - 10.0), pos2(row.right(), row.bottom() + 56.0)));
     let t = ui.ctx().animate_bool_with_time(Id::new(("hdr_h", page.id)), hov, 0.15);
-    let mut x = row.left() + GUTTER;
+    let mut x = row.left() + gutter();
     let mut buttons: Vec<(String, &str)> = vec![];
     if page.icon.is_empty() {
         buttons.push((format!("{}  Add icon", l::SMILE), "ai"));
@@ -763,7 +780,7 @@ fn header(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, con
     }
 
     ui.horizontal(|ui| {
-        ui.add_space(GUTTER);
+        ui.add_space(gutter());
         let tid = Id::new(("title", page.id));
         let title_focused = ui.memory(|m| m.has_focus(tid));
         let enter = title_focused && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
@@ -875,6 +892,16 @@ fn blocks(ui: &mut Ui, page: &mut Page, ws: &mut Workspace, ed: &mut EditorState
         ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
         let from_pos = page.blocks.iter().position(|b| b.id == did);
         if let (Some(p), Some(from), false) = (pointer, from_pos, rects.is_empty()) {
+            // long pages: dragging near the top / bottom edge scrolls (finger or mouse)
+            {
+                let clip = ui.clip_rect();
+                let edge = if crate::touch::touchy() { 80.0 } else { 44.0 };
+                if p.y < clip.top() + edge {
+                    ui.scroll_with_delta(vec2(0.0, 5.0 + 15.0 * ((clip.top() + edge - p.y) / edge).clamp(0.0, 1.0)));
+                } else if p.y > clip.bottom() - edge {
+                    ui.scroll_with_delta(vec2(0.0, -5.0 - 15.0 * ((p.y - (clip.bottom() - edge)) / edge).clamp(0.0, 1.0)));
+                }
+            }
             let bl = &page.blocks;
             let depth = col_depth(bl);
             let from_end = subtree_end(bl, from);
@@ -889,7 +916,7 @@ fn blocks(ui: &mut Ui, page: &mut Page, ws: &mut Workspace, ed: &mut EditorState
                     Some((i, r)) => (*i, r.top() - 1.0, bl[*i].indent),
                     None => (end, inside.last().map_or(cr.top(), |(_, r)| r.bottom()) + 1.0, bl[c].indent + 1),
                 };
-                drop = Some((target, y, cr.left() + GUTTER, (cr.width() - GUTTER).max(40.0), Some(ind)));
+                drop = Some((target, y, cr.left() + gutter(), (cr.width() - gutter()).max(40.0), Some(ind)));
             } else {
                 let cands: Vec<&(usize, Rect)> = rects.iter().filter(|(i, _)| depth[*i] == 0).collect();
                 if let (Some(first), Some(last)) = (cands.first(), cands.last()) {
@@ -898,7 +925,7 @@ fn blocks(ui: &mut Ui, page: &mut Page, ws: &mut Workspace, ed: &mut EditorState
                         None => (n, last.1.bottom() + 1.0),
                     };
                     let ind = if target < n { bl[target].indent } else { 0 };
-                    drop = Some((target, y, first.1.left() + GUTTER, w, if depth[from] > 0 { Some(ind) } else { None }));
+                    drop = Some((target, y, first.1.left() + gutter(), w, if depth[from] > 0 { Some(ind) } else { None }));
                 }
             }
             if let Some((target, y, x0, lw, ind)) = drop {
@@ -918,11 +945,14 @@ fn blocks(ui: &mut Ui, page: &mut Page, ws: &mut Workspace, ed: &mut EditorState
         }
     }
 
+    if bg.clicked() {
+        ed.active = None;
+    }
     // click below the last block to append
-    let (rest, _) = ui.allocate_exact_size(vec2(w + GUTTER, 150.0), Sense::hover());
+    let (rest, _) = ui.allocate_exact_size(vec2(w + gutter(), 150.0), Sense::hover());
     let tail_hover = ui.rect_contains_pointer(rest);
     let t = ui.ctx().animate_bool_with_time(Id::new(("tail", page.id)), tail_hover, 0.15);
-    ui.painter().text(pos2(rest.left() + GUTTER, rest.top() + 16.0), Align2::LEFT_CENTER, "Click to add a block", body(14.0), with_alpha(pal.muted, t * 0.8));
+    ui.painter().text(pos2(rest.left() + gutter(), rest.top() + 16.0), Align2::LEFT_CENTER, "Click to add a block", body(14.0), with_alpha(pal.muted, t * 0.8));
     if bg.clicked() && tail_hover && n > 0 {
         let last = &page.blocks[n - 1];
         if last.kind == BlockKind::Text && last.text.is_empty() {
@@ -936,12 +966,25 @@ fn blocks(ui: &mut Ui, page: &mut Page, ws: &mut Workspace, ed: &mut EditorState
         changed = true;
         act = None;
     }
+    let mut from_bar = false;
+    if act.is_none() {
+        if let Some(a) = mobile_bar(ui, page, ed, pal) {
+            act = Some(a);
+            from_bar = true;
+        }
+    }
     if let Some(a) = act {
         if !matches!(a, Act::FocusPrev(_) | Act::FocusNext(_)) {
             multisel::push_undo(ed, page);
         }
         apply(page, a, &mut ws.next_id, ed);
         changed = true;
+        if from_bar && ed.focus.is_none() {
+            // the toolbar press took the focus away: give it back so the keyboard stays up
+            if let Some(b) = ed.active {
+                ed.focus = Some((b, usize::MAX));
+            }
+        }
         ui.ctx().request_repaint();
     }
     if let Some((fid, _)) = ed.focus {
@@ -1015,7 +1058,7 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
                 let clip = ui.clip_rect();
                 let top = ui.cursor().top();
                 if k == key && (top + h < clip.top() - 800.0 || top > clip.bottom() + 800.0) {
-                    let (r, _) = ui.allocate_exact_size(vec2(w + GUTTER, h), Sense::hover());
+                    let (r, _) = ui.allocate_exact_size(vec2(w + gutter(), h), Sense::hover());
                     cx.rects.push((cur, r));
                     continue;
                 }
@@ -1024,7 +1067,7 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
         let bg_slot = ui.painter().add(Shape::Noop);
         let row = ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-            ui.add_space(GUTTER + ind_px);
+            ui.add_space(gutter() + ind_px);
             ui.vertical(|ui| {
                 ui.set_width(w - ind_px);
                 if kind == BlockKind::DbView {
@@ -1035,6 +1078,9 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
             });
         });
         let rect = row.response.rect;
+        if kind.has_text() && ui.ctx().memory(|m| m.has_focus(Id::new(("blk", bid)))) {
+            cx.ed.active = Some(bid);
+        }
         cx.rects.push((cur, rect));
         cx.ed.heights.insert(bid, (rect.height(), key));
         if !cx.ed.rc_frame {
@@ -1047,7 +1093,7 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
         }
         let bgc = page.blocks[cur].bg;
         if bgc > 0 && !matches!(kind, BlockKind::Divider | BlockKind::Callout | BlockKind::Code) {
-            let r = Rect::from_min_max(pos2(rect.left() + GUTTER + ind_px - 6.0, rect.top()), pos2(rect.right() + 4.0, rect.bottom()));
+            let r = Rect::from_min_max(pos2(rect.left() + gutter() + ind_px - 6.0, rect.top()), pos2(rect.right() + 4.0, rect.bottom()));
             ui.painter().set(bg_slot, Shape::rect_filled(r, 4.0, tag_color(bgc as usize - 1).gamma_multiply(0.16)));
         }
         if cx.ed.scroll_to == Some(bid) {
@@ -1059,7 +1105,8 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
         let hover_zone = Rect::from_min_max(pos2(rect.left(), rect.top() - 1.0), pos2(rect.right(), rect.bottom() + 1.0));
         let hovering = cx.pointer.map_or(false, |p| hover_zone.contains(p)) && cx.ed.dragging.is_none()
             || cx.ed.dragging == Some(bid)
-            || cx.ed.block_menu.map_or(false, |(b, _)| b == bid);
+            || cx.ed.block_menu.map_or(false, |(b, _)| b == bid)
+            || (crate::touch::touchy() && cx.ed.active == Some(bid) && cx.ed.sel.is_empty());
         let t = ui.ctx().animate_bool_with_time(Id::new(("gutter", bid)), hovering, 0.12);
         if t > 0.02 {
             let y = rect.top()
@@ -1071,16 +1118,27 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
                     BlockKind::Code => 14.0,
                     _ => 1.0,
                 };
-            let plus = Rect::from_min_size(pos2(rect.left() + 6.0, y), vec2(22.0, 24.0));
-            let grip = Rect::from_min_size(pos2(rect.left() + 29.0, y), vec2(20.0, 24.0));
+            let tiny = crate::touch::compact();
+            let (plus, grip) = if tiny {
+                // phones: one big handle (the "+" lives in the toolbar above the keyboard)
+                (Rect::from_min_size(pos2(rect.left() + 1.0, y - 5.0), vec2(0.0, 0.0)), Rect::from_min_size(pos2(rect.left() + 1.0, y - 5.0), vec2(34.0, 34.0)))
+            } else if crate::touch::touchy() {
+                (Rect::from_min_size(pos2(rect.left() + 3.0, y - 4.0), vec2(26.0, 32.0)), Rect::from_min_size(pos2(rect.left() + 29.0, y - 4.0), vec2(26.0, 32.0)))
+            } else {
+                (Rect::from_min_size(pos2(rect.left() + 6.0, y), vec2(22.0, 24.0)), Rect::from_min_size(pos2(rect.left() + 29.0, y), vec2(20.0, 24.0)))
+            };
             let pr = ui.interact(plus, Id::new(("plus", bid)), Sense::click());
             let gr = ui.interact(grip, Id::new(("grip", bid)), Sense::click_and_drag());
+            crate::touch::claim(grip);
             for (r, resp, icon) in [(plus, &pr, Icon::Plus), (grip, &gr, Icon::Grip)] {
-                let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+                if tiny && icon == Icon::Plus {
+                    continue;
+                }
+                let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || resp.is_pointer_button_down_on(), 0.1);
                 ui.painter().rect_filled(r, 5.0, with_alpha(pal.hover, h * t));
-                icons::paint(ui.painter(), r.center(), 15.0, icon, with_alpha(lerp_color(pal.muted, pal.text, h), t));
+                icons::paint(ui.painter(), r.center(), if tiny { 18.0 } else { 15.0 }, icon, with_alpha(lerp_color(pal.muted, pal.text, h), t));
             }
-            if pr.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Click to add a block below").clicked() {
+            if !tiny && pr.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Click to add a block below").clicked() {
                 cx.act = Some(Act::InsertAfter(cur, BlockKind::Text, "/".into()));
             }
             if gr.drag_started() {
@@ -1106,13 +1164,189 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
     }
 }
 
+/// Where `MoveTo` must put block `i` to swap it with its previous / next sibling (children travel with their parent).
+fn sibling_target(bl: &[Block], i: usize, up: bool) -> Option<usize> {
+    let ind = bl[i].indent;
+    if matches!(bl[i].kind, BlockKind::Column | BlockKind::Columns) {
+        return None;
+    }
+    if up {
+        let mut j = i;
+        while j > 0 {
+            j -= 1;
+            if bl[j].indent < ind {
+                return None;
+            }
+            if bl[j].indent == ind {
+                return Some(j);
+            }
+        }
+        None
+    } else {
+        let end = subtree_end(bl, i);
+        if end < bl.len() && bl[end].indent == ind && !matches!(bl[end].kind, BlockKind::Column) {
+            Some(subtree_end(bl, end))
+        } else {
+            None
+        }
+    }
+}
+
+/// Phone / tablet editing toolbar: a strip above the keyboard (add, block type, indent, move, duplicate, undo, delete, hide keyboard)
+/// plus the block-type bottom sheet. It scrolls sideways, so it can never run off a narrow screen.
+fn mobile_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) -> Option<Act> {
+    if !crate::touch::touchy() {
+        return None;
+    }
+    let ctx = ui.ctx().clone();
+    let bid = ed.active?;
+    if !ed.sel.is_empty() || ed.marquee.is_some() || ed.dragging.is_some() || ed.menu.is_some() || ed.block_menu.is_some() {
+        return None;
+    }
+    let idx = page.blocks.iter().position(|b| b.id == bid)?;
+    let now = ctx.input(|i| i.time);
+    let focused = ctx.memory(|m| m.focused().is_some());
+    if focused {
+        ed.bar_grace = now + 0.6;
+    }
+    if !(focused || ed.tool_menu != 0 || now < ed.bar_grace) {
+        return None;
+    }
+    if !focused && ed.tool_menu == 0 {
+        ctx.request_repaint_after(std::time::Duration::from_millis(650));
+    }
+    let screen = ctx.screen_rect();
+    let bar_h = 48.0;
+    let mut out: Option<Act> = None;
+    let mut dismiss = false;
+    let (can_up, can_down) = (sibling_target(&page.blocks, idx, true).is_some(), sibling_target(&page.blocks, idx, false).is_some());
+    let can_undo = ed.undo.iter().any(|(p, _)| *p == page.id);
+    let mut menu = ed.tool_menu;
+
+    let bar = egui::Area::new(Id::new("mobile_bar")).order(Order::Foreground).fixed_pos(pos2(screen.left(), screen.bottom() - bar_h)).show(&ctx, |ui| {
+        Frame::new().fill(pal.popup).stroke(Stroke::new(1.0_f32, pal.border)).show(ui, |ui| {
+            ui.set_width(screen.width() - 2.0);
+            ui.set_height(bar_h - 2.0);
+            ScrollArea::horizontal().id_salt("mobile_bar_scroll").scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
+                    ui.add_space(4.0);
+                    if widgets::icon_button(ui, pal, Icon::Plus, 18.0, "Insert a block below").clicked() {
+                        menu = if menu == 2 { 0 } else { 2 };
+                    }
+                    if widgets::icon_button(ui, pal, Icon::Type, 18.0, "Turn into").clicked() {
+                        menu = if menu == 1 { 0 } else { 1 };
+                    }
+                    ui.add_space(6.0);
+                    if widgets::icon_button(ui, pal, Icon::Outdent, 18.0, "Outdent").clicked() {
+                        out = Some(Act::Indent(idx, -1));
+                    }
+                    if widgets::icon_button(ui, pal, Icon::Indent, 18.0, "Indent").clicked() {
+                        out = Some(Act::Indent(idx, 1));
+                    }
+                    ui.add_space(6.0);
+                    if ui.add_enabled_ui(can_up, |ui| widgets::icon_button(ui, pal, Icon::MoveUp, 18.0, "Move up")).inner.clicked() {
+                        out = sibling_target(&page.blocks, idx, true).map(|t| Act::MoveTo(idx, t));
+                    }
+                    if ui.add_enabled_ui(can_down, |ui| widgets::icon_button(ui, pal, Icon::MoveDown, 18.0, "Move down")).inner.clicked() {
+                        out = sibling_target(&page.blocks, idx, false).map(|t| Act::MoveTo(idx, t));
+                    }
+                    ui.add_space(6.0);
+                    if widgets::icon_button(ui, pal, Icon::Duplicate, 18.0, "Duplicate").clicked() {
+                        out = Some(Act::Dup(idx));
+                    }
+                    if ui.add_enabled_ui(can_undo, |ui| widgets::icon_button(ui, pal, Icon::Undo, 18.0, "Undo")).inner.clicked() {
+                        ed.want_undo = true;
+                    }
+                    if widgets::icon_button(ui, pal, Icon::Trash, 18.0, "Delete block").clicked() {
+                        out = Some(Act::Remove(idx));
+                    }
+                    ui.add_space(6.0);
+                    if widgets::icon_button(ui, pal, Icon::ChevronDown, 18.0, "Hide keyboard").clicked() {
+                        dismiss = true;
+                    }
+                    ui.add_space(4.0);
+                });
+            });
+        });
+    });
+    ctx.move_to_top(bar.response.layer_id);
+    let mut covered = bar.response.rect;
+
+    if menu != 0 {
+        let cur_kind = page.blocks[idx].kind;
+        let w = (screen.width() - 16.0).min(520.0);
+        let max_h = (screen.height() * 0.5).clamp(160.0, 380.0);
+        let sheet = egui::Area::new(Id::new("mobile_sheet")).order(Order::Foreground).anchor(Align2::CENTER_BOTTOM, vec2(0.0, -(bar_h + 6.0))).show(&ctx, |ui| {
+            widgets::popup_frame(pal).show(ui, |ui| {
+                ui.set_width(w - 12.0);
+                ui.horizontal(|ui| {
+                    for (m, label) in [(1u8, "Turn into"), (2u8, "Insert below")] {
+                        let on = menu == m;
+                        let (r, resp) = ui.allocate_exact_size(vec2((w - 16.0) / 2.0, 36.0), Sense::click());
+                        ui.painter().rect_filled(r, 8.0, if on { pal.active } else { pal.hover.gamma_multiply(0.0) });
+                        ui.painter().text(r.center(), Align2::CENTER_CENTER, label, bold(13.5), if on { pal.text } else { pal.muted });
+                        if resp.clicked() {
+                            menu = m;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                ScrollArea::vertical().id_salt("mobile_sheet_scroll").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
+                    if menu == 1 {
+                        for k in BlockKind::TEXTY.iter().copied().chain(std::iter::once(BlockKind::Divider)) {
+                            if menu_item(ui, pal, k.glyph(), k.label(), None, k == cur_kind, false).clicked() {
+                                out = Some(Act::Convert(idx, k, false));
+                                menu = 0;
+                            }
+                        }
+                    } else {
+                        let mut sec = "";
+                        for it in slash_all() {
+                            if it.sec != sec {
+                                sec = it.sec;
+                                section_label(ui, pal, sec);
+                            }
+                            if menu_item(ui, pal, it.glyph, it.label, None, false, false).clicked() {
+                                out = Some(Act::InsertSlash(idx, it));
+                                menu = 0;
+                            }
+                        }
+                    }
+                });
+            });
+        });
+        ctx.move_to_top(sheet.response.layer_id);
+        covered = covered.union(sheet.response.rect);
+        // a tap outside the sheet and the toolbar closes it
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            if let Some(p) = ctx.pointer_interact_pos() {
+                if !covered.contains(p) {
+                    menu = 0;
+                }
+            }
+        }
+    }
+    ed.tool_menu = menu;
+    if dismiss {
+        ed.tool_menu = 0;
+        ed.active = None;
+        ctx.memory_mut(|m| {
+            if let Some(f) = m.focused() {
+                m.surrender_focus(f);
+            }
+        });
+    }
+    out
+}
+
 /// Draws one column layout (the `Columns` block `i` and its `Column` children up to `end`) side by side.
 /// Every column owns a gutter on its left, so each block keeps its "+" / drag handle; columns stack on narrow screens.
 fn draw_columns(ui: &mut Ui, page: &mut Page, cx: &mut Pass, i: usize, end: usize, base: u8, w: f32) {
     let pal = cx.pal;
     let k = page.blocks[i].indent;
     let ind_px = k.saturating_sub(base) as f32 * INDENT;
-    let total = w - ind_px + GUTTER;
+    let total = w - ind_px + gutter();
     let mut cols: Vec<(usize, usize)> = vec![];
     let mut j = i + 1;
     while j < end {
@@ -1128,7 +1362,7 @@ fn draw_columns(ui: &mut Ui, page: &mut Page, cx: &mut Pass, i: usize, end: usiz
     if m == 0 {
         return;
     }
-    let cw_all = total - GUTTER * m as f32;
+    let cw_all = total - gutter() * m as f32;
     let stacked = (cw_all / m as f32) < 150.0;
     // widths (permille weights; 0 = equal share)
     let wsum: f32 = cols.iter().map(|(c, _)| if page.blocks[*c].start == 0 { 1000.0 / m as f32 } else { page.blocks[*c].start as f32 }).sum::<f32>().max(1.0);
@@ -1150,11 +1384,11 @@ fn draw_columns(ui: &mut Ui, page: &mut Page, cx: &mut Pass, i: usize, end: usiz
             for (idx, (c, e)) in cols.iter().enumerate() {
                 let cw = widths[idx];
                 let r = ui.vertical(|ui| {
-                    ui.set_width(GUTTER + cw);
+                    ui.set_width(gutter() + cw);
                     draw_range(ui, page, cx, *c + 1, *e, k + 2, cw);
                 });
                 let mut rr = r.response.rect;
-                rr.set_width(GUTTER + cw);
+                rr.set_width(gutter() + cw);
                 cx.col_rects.push((*c, rr));
                 rights.push(rr.right());
             }
@@ -1539,6 +1773,12 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
             for (k, c) in copies.into_iter().enumerate() {
                 bl.insert(end + k, c);
             }
+        }
+        Act::InsertSlash(i, item) => {
+            let ind = bl[i].indent;
+            let nb = new_block(next_id, BlockKind::Text, String::new(), ind);
+            bl.insert(i + 1, nb);
+            apply(page, slash_act(i + 1, item), next_id, ed);
         }
         Act::InsertAfter(i, kind, text) => {
             let ind = bl[i].indent;

@@ -97,7 +97,8 @@ pub fn popup_area(
 }
 
 pub fn icon_button(ui: &mut Ui, pal: &Palette, icon: Icon, size: f32, tip: &str) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(size + 12.0, size + 12.0), Sense::click());
+    let side = if crate::touch::touchy() { (size + 12.0).max(38.0) } else { size + 12.0 };
+    let (rect, resp) = ui.allocate_exact_size(vec2(side, side), Sense::click());
     paint_icon_button(ui, pal, rect, &resp, icon, size);
     resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip)
 }
@@ -163,7 +164,8 @@ pub fn menu_item(
     selected: bool,
     danger: bool,
 ) -> Response {
-    let h = if sub.is_some() { 46.0 } else { 30.0 };
+    let tt = crate::touch::touchy();
+    let h = if sub.is_some() { if tt { 54.0 } else { 46.0 } } else if tt { 40.0 } else { 30.0 };
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
     let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || selected, 0.1);
     let p = ui.painter();

@@ -129,6 +129,7 @@ pub struct LumenApp {
     page_menu: Option<Pos2>,
     focus_mode: bool,
     last_accent: usize,
+    last_touch: bool,
     media: MediaStore,
     history: Option<crate::history::HistState>,
     last_calc: f64,
@@ -138,6 +139,9 @@ pub struct LumenApp {
 
 impl LumenApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        if crate::platform::coarse_pointer() {
+            crate::touch::set_touchy(true);
+        }
         theme::setup_fonts(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let saved: Option<Saved> = cc.storage.and_then(|s| eframe::get_value(s, STORAGE_KEY));
@@ -190,6 +194,7 @@ impl LumenApp {
             page_menu: None,
             focus_mode: false,
             last_accent: usize::MAX,
+            last_touch: false,
             media,
             history: None,
             last_calc: 0.0,
@@ -640,6 +645,9 @@ impl LumenApp {
         }
         let Some(cur) = self.ws.current else { return };
         let narrow = ui.ctx().screen_rect().width() < 720.0;
+        // room for the breadcrumb: the screen minus the menu button and the four right-hand buttons (phones: never overlap them)
+        let btn = if crate::touch::touchy() { 38.0 } else { 28.0 };
+        let crumb_w = if narrow { (ui.ctx().screen_rect().width() - 8.0 - btn * 5.0 - ui.spacing().item_spacing.x * 6.0 - 30.0).clamp(48.0, 260.0) } else { 260.0 };
         let crumbs = self.ws.breadcrumb(cur);
         let n = crumbs.len();
         let mut nav: Option<u64> = None;
@@ -650,7 +658,7 @@ impl LumenApp {
             }
             if let Some(p) = self.ws.page(*id) {
                 let title = if p.title.is_empty() { "Untitled" } else { &p.title };
-                let cr = crumb(ui, pal, &p.icon, title, i + 1 == n);
+                let cr = crumb(ui, pal, &p.icon, title, i + 1 == n, crumb_w);
                 if cr.clicked() {
                     nav = Some(*id);
                 }
@@ -1608,7 +1616,10 @@ impl LumenApp {
         let target = if self.locked || self.ws.dark { 1.0 } else { 0.0 };
         let t = ctx.animate_value_with_time(Id::new("theme_t"), target, 0.35);
         let pal = theme::with_accent(Palette::mix(t), self.ws.accent, t);
-        if !self.theme_applied || (t - self.last_theme_t).abs() > 1e-4 || self.last_accent != self.ws.accent {
+        let touchy = crate::touch::touchy();
+        crate::touch::set_narrow(ctx.screen_rect().width() < 720.0);
+        if !self.theme_applied || (t - self.last_theme_t).abs() > 1e-4 || self.last_accent != self.ws.accent || self.last_touch != touchy {
+            self.last_touch = touchy;
             theme::apply(ctx, &pal, t > 0.5);
             self.last_theme_t = t;
             self.last_accent = self.ws.accent;
@@ -1739,6 +1750,12 @@ impl LumenApp {
             self.ws.sidebar_open = false;
         }
         self.prev_sidebar_page = self.ws.current;
+        // swipe from the left edge opens the drawer, swipe left closes it
+        match crate::touch::take_swipe() {
+            Some(crate::touch::Swipe::EdgeRight) if narrow && !self.ws.sidebar_open => self.ws.sidebar_open = true,
+            Some(crate::touch::Swipe::Left) if narrow && self.ws.sidebar_open => self.ws.sidebar_open = false,
+            _ => {}
+        }
         let st = ctx.animate_bool_with_time_and_easing(Id::new("sidebar_t"), self.ws.sidebar_open && !self.focus_mode, 0.28, egui::emath::easing::cubic_out);
         if narrow {
             if st > 0.003 {
@@ -1968,12 +1985,12 @@ pub(crate) fn modal(ctx: &Context, id: Id, pal: &Palette, width: f32, top: f32, 
     open
 }
 
-fn crumb(ui: &mut Ui, pal: &Palette, icon: &str, title: &str, last: bool) -> egui::Response {
+fn crumb(ui: &mut Ui, pal: &Palette, icon: &str, title: &str, last: bool, max_w: f32) -> egui::Response {
     let col = if last { pal.text } else { pal.muted };
     let galley = ui.painter().layout_no_wrap(title.to_owned(), body(14.0), col);
     let iw = if icon.is_empty() { 0.0 } else { 22.0 };
-    let w = (galley.size().x + iw + 16.0).min(260.0);
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, 28.0), Sense::click());
+    let w = (galley.size().x + iw + 16.0).min(max_w.max(48.0));
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, if crate::touch::touchy() { 36.0 } else { 28.0 }), Sense::click());
     let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
     ui.painter().rect_filled(rect, 6.0, with_alpha(pal.hover, t));
     let mut x = rect.left() + 8.0;
@@ -1981,8 +1998,7 @@ fn crumb(ui: &mut Ui, pal: &Palette, icon: &str, title: &str, last: bool) -> egu
         icons::paint_page_icon(ui, pos2(x + 7.0, rect.center().y), icon, 16.0, pal.text);
         x += iw;
     }
-    let clip = Rect::from_min_max(pos2(x, rect.top()), pos2(rect.right() - 4.0, rect.bottom()));
-    ui.painter().with_clip_rect(clip).text(pos2(x, rect.center().y), Align2::LEFT_CENTER, title, body(14.0), col);
+    crate::widgets::text_fit(ui.painter(), pos2(x, rect.center().y), Align2::LEFT_CENTER, title, body(14.0), col, rect.right() - 6.0 - x);
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 

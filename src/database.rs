@@ -8,7 +8,7 @@ use egui::{pos2, vec2, Align, Align2, Color32, CornerRadius, CursorIcon, Frame, 
 
 use crate::auth::now_ms;
 use crate::dates;
-use crate::editor::{EditorState, GUTTER};
+use crate::editor::{gutter, EditorState};
 use crate::icons::{self, Icon};
 use crate::model::*;
 use crate::platform;
@@ -359,7 +359,7 @@ pub fn row_props(ui: &mut Ui, ws: &mut Workspace, row_id: u64, ed: &mut EditorSt
         for prop in &db.props {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-                ui.add_space(GUTTER);
+                ui.add_space(gutter());
                 let (lr, _) = ui.allocate_exact_size(vec2(150.0, 32.0), Sense::hover());
                 ui.painter().text(pos2(lr.left() + 2.0, lr.center().y), Align2::LEFT_CENTER, format!("{}  {}", prop.kind.glyph(), prop.name), body(14.0), pal.muted);
                 let (cr, _) = ui.allocate_exact_size(vec2((w - 150.0).max(120.0), 32.0), Sense::hover());
@@ -367,8 +367,8 @@ pub fn row_props(ui: &mut Ui, ws: &mut Workspace, row_id: u64, ed: &mut EditorSt
             });
         }
         ui.add_space(6.0);
-        let (lr, _) = ui.allocate_exact_size(vec2(w + GUTTER, 1.0), Sense::hover());
-        ui.painter().rect_filled(Rect::from_min_max(pos2(lr.left() + GUTTER, lr.top()), lr.right_bottom()), 0.0, pal.border);
+        let (lr, _) = ui.allocate_exact_size(vec2(w + gutter(), 1.0), Sense::hover());
+        ui.painter().rect_filled(Rect::from_min_max(pos2(lr.left() + gutter(), lr.top()), lr.right_bottom()), 0.0, pal.border);
         ui.add_space(6.0);
         popups(ui, wsr, db_id, &db, db.active, st, pal, &mut acts);
     }

@@ -403,3 +403,20 @@ pub fn open_html(name: &str, html: &str) -> String {
         }
     }
 }
+
+/// `true` when the primary input is a finger (phones / tablets): decided once at start-up on the web build via the
+/// `(pointer: coarse)` media query, so tap targets are big *before* the first touch.
+#[cfg(target_arch = "wasm32")]
+pub fn coarse_pointer() -> bool {
+    use wasm_bindgen::JsCast;
+    let Some(w) = web_sys::window() else { return false };
+    let Ok(f) = js_sys::Reflect::get(&w, &"matchMedia".into()) else { return false };
+    let Ok(f) = f.dyn_into::<js_sys::Function>() else { return false };
+    let Ok(mq) = f.call1(&w, &"(pointer: coarse)".into()) else { return false };
+    js_sys::Reflect::get(&mq, &"matches".into()).ok().and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn coarse_pointer() -> bool {
+    false
+}

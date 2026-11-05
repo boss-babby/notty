@@ -82,18 +82,27 @@ impl LockScreen {
             }
         }
 
+        // phones: the card never exceeds the screen (it used to be a fixed 330 pt + 2×34 pt margin) and scrolls when the keyboard leaves little room
+        let screen = ctx.screen_rect();
+        let small = screen.width() < 440.0;
+        let pad: i8 = if small { 20 } else { 34 };
+        let cw = (screen.width() - 2.0 * pad as f32 - 24.0).clamp(180.0, 330.0);
+        // centred by hand (an Area only offers the space below its anchor): remembers the card height of the previous frame
+        let card_h = ctx.data(|d| d.get_temp::<f32>(Id::new("lock_card_h"))).unwrap_or(430.0);
+        let top = ((screen.height() - card_h) / 2.0).max(12.0);
         Area::new(Id::new("lock_card"))
-            .anchor(Align2::CENTER_CENTER, vec2(dx, (1.0 - a) * 28.0))
+            .anchor(Align2::CENTER_TOP, vec2(dx, top + (1.0 - a) * 28.0))
             .show(ctx, |ui| {
                 ui.set_opacity(a);
-                Frame::new()
+                let mut card = |ui: &mut egui::Ui| {
+                let fr = Frame::new()
                     .fill(Color32::from_rgba_unmultiplied(24, 24, 29, 232))
                     .stroke(Stroke::new(1.0_f32, Color32::from_white_alpha(26)))
                     .corner_radius(CornerRadius::same(20))
-                    .inner_margin(Margin::same(34))
+                    .inner_margin(Margin::same(pad))
                     .shadow(egui::Shadow { offset: [0, 24], blur: 60, spread: 0, color: Color32::from_black_alpha(140) })
                     .show(ui, |ui| {
-                        ui.set_width(330.0);
+                        ui.set_width(cw);
                         ui.spacing_mut().item_spacing.y = 10.0;
                         ui.vertical_centered(|ui| {
                             // logo
@@ -124,18 +133,18 @@ impl LockScreen {
                         let fill = Color32::from_white_alpha(12);
                         let id1 = Id::new("lock_pw");
                         let id2 = Id::new("lock_pw2");
-                        let r1 = field(ui, &pal, fill, &mut self.pw, if setup { "New password" } else { "Password" }, !self.show, 330.0, id1);
+                        let r1 = field(ui, &pal, fill, &mut self.pw, if setup { "New password" } else { "Password" }, !self.show, cw, id1);
                         if self.focus_pending {
                             ctx.memory_mut(|m| m.request_focus(id1));
                             self.focus_pending = false;
                         }
                         let mut r2 = None;
                         if setup {
-                            r2 = Some(field(ui, &pal, fill, &mut self.pw2, "Confirm password", !self.show, 330.0, id2));
+                            r2 = Some(field(ui, &pal, fill, &mut self.pw2, "Confirm password", !self.show, cw, id2));
                             // strength meter
                             let (s, label) = auth::strength(&self.pw);
                             let v = ctx.animate_value_with_time(Id::new("strength"), s, 0.25);
-                            let (rect, _) = ui.allocate_exact_size(vec2(330.0, 14.0), Sense::hover());
+                            let (rect, _) = ui.allocate_exact_size(vec2(cw, 14.0), Sense::hover());
                             let bar = egui::Rect::from_min_size(rect.min + vec2(0.0, 2.0), vec2(rect.width() - 56.0, 4.0));
                             ui.painter().rect_filled(bar, 2.0, Color32::from_white_alpha(18));
                             let col = lerp_color(Color32::from_rgb(235, 80, 80), Color32::from_rgb(60, 210, 130), v);
@@ -159,7 +168,7 @@ impl LockScreen {
                             && (r1.has_focus() || r1.lost_focus() || r2.as_ref().map_or(false, |r| r.has_focus() || r.lost_focus()));
                         ui.add_space(4.0);
                         let label = if setup { "Create password" } else { "Unlock" };
-                        let clicked = primary_button(ui, &pal, label, 330.0).clicked();
+                        let clicked = primary_button(ui, &pal, label, cw).clicked();
                         if clicked || enter {
                             if setup {
                                 if self.pw.chars().count() < 4 {
@@ -213,17 +222,31 @@ impl LockScreen {
                             }
                         });
                     });
+                ctx.data_mut(|d| d.insert_temp(Id::new("lock_card_h"), fr.response.rect.height()));
+                };
+                // a card taller than the screen (landscape phone, keyboard open) scrolls; otherwise no scroll area at all
+                if card_h > screen.height() - 16.0 {
+                    egui::ScrollArea::vertical().max_height((screen.height() - top - 12.0).max(160.0)).show(ui, |ui| card(ui));
+                } else {
+                    card(ui);
+                }
+
+
             });
 
         // footer
         let _ = (ease(1.0), with_alpha(Color32::WHITE, 1.0));
+        // (hidden when the screen is too short: it used to be painted over the card's buttons)
+        if screen.height() > 640.0 {
         Area::new(Id::new("lock_footer")).anchor(Align2::CENTER_BOTTOM, vec2(0.0, -22.0)).show(ctx, |ui| {
+            ui.set_max_width((screen.width() - 32.0).max(120.0));
             ui.label(
                 RichText::new("Lumen · built with Rust & egui · your notes never leave this device")
                     .font(body(12.5))
                     .color(Color32::from_gray(105)),
             );
         });
+        }
         event
     }
 }
