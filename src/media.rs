@@ -440,8 +440,24 @@ pub fn frame_url(info: &Embed, opts: u8, start: u32) -> String {
         "Vimeo" => format!("{}?dnt=1&byline=0&portrait=0&title=0&autoplay={}&muted={}&loop={}#t={start}s", info.frame, b(auto), b(mute), b(lp)),
         "Loom" => format!("{}?hide_owner=true&hide_share=true&hideEmbedTopBar=true&autoplay={}{}", info.frame, b(auto), if start > 0 { format!("&t={start}") } else { String::new() }),
         "Video file" => if start > 0 { format!("{}#t={start}", info.frame) } else { info.frame.clone() },
+        // Generic websites go through the backend's preview proxy on the web build: many sites forbid framing
+        // (X-Frame-Options / CSP frame-ancestors) and showed up as broken boxes. The proxy removes those headers, injects a <base>
+        // tag and sandboxes the page. On Windows the native web view has no such restriction and loads the site directly.
+        _ if info.kind == EmbedKind::Web && cfg!(target_arch = "wasm32") => proxied(&info.frame),
         _ => info.frame.clone(),
     }
+}
+
+/// `/api/preview?url=…` — the Next.js backend that serves any http(s) page in a frameable form.
+pub fn proxied(url: &str) -> String {
+    let mut enc = String::with_capacity(url.len() + 16);
+    for b in url.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => enc.push(b as char),
+            _ => enc.push_str(&format!("%{b:02X}")),
+        }
+    }
+    format!("/api/preview?url={enc}")
 }
 
 /// Recognises well-known services and derives their embeddable URL.

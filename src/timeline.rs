@@ -78,7 +78,7 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
         } else if pill(ui, pal, "Auto-schedule", false, false).on_hover_text("Moves rows so that none starts before the rows it depends on have finished").clicked() {
             acts.push(A::Reschedule);
         }
-        ui.label(egui::RichText::new(if dep.is_some() { "Drag bars to move · edges to resize · ● onto another bar to link" } else { "Drag bars to move · drag edges to resize" }).font(body(12.0)).color(pal.muted));
+        ui.label(egui::RichText::new(if dep.is_some() { "Drag bars to move · edges to resize · ● (drag, or click then click a bar) to link" } else { "Drag bars to move · drag edges to resize" }).font(body(12.0)).color(pal.muted));
     });
     ui.add_space(4.0);
 
@@ -210,7 +210,13 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
         sa = sa.horizontal_scroll_offset((last_off + grew_left as f32 * dw + auto).max(0.0));
     }
     let mut bar_rects: HashMap<u64, Rect> = HashMap::new();
-    let mut to_draw_links: Vec<(u64, Rect)> = vec![];
+    let mut to_draw_links: Vec<(u64, Rect, bool)> = vec![];
+    // click-to-link mode: click a ● (source), then click the bar that should depend on it
+    let pick_id = Id::new(("tl_pick", db_id));
+    if ctx.data(|d| d.get_temp::<u64>(pick_id)).is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ctx.data_mut(|d| d.remove::<u64>(pick_id));
+    }
+    let pick: Option<u64> = ctx.data(|d| d.get_temp(pick_id));
     let mut link_drop: Option<(u64, Pos2)> = None;
     let mut ui_child = ui.new_child(egui::UiBuilder::new().max_rect(grid_outer).layout(egui::Layout::top_down(egui::Align::Min)));
     let scroll_out = sa.show(&mut ui_child, |ui| {
@@ -314,6 +320,15 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
                         let id = Id::new(("tl_bar", it.id, mode as u8));
                         let resp = ui.interact(zone, id, Sense::click_and_drag());
                         hover |= resp.hovered() || resp.dragged();
+                        if let Some(from) = pick {
+                            if from != it.id && resp.hovered() {
+                                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+                            }
+                            if from != it.id && resp.clicked() {
+                                acts.push(A::AddDep(it.id, from));
+                                ctx.data_mut(|d| d.remove::<u64>(pick_id));
+                            }
+                        }
                         let key = Id::new(("tl_drag", it.id));
                         if resp.hovered() || resp.dragged() {
                             ui.ctx().set_cursor_icon(if resp.dragged() && mode == Mode::Move { CursorIcon::Grabbing } else { cursor });
@@ -394,8 +409,13 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
                         p.rect_filled(tr, 6.0, Color32::from_black_alpha(210));
                         p.galley(tr.min + vec2(7.0, 4.0), g, Color32::WHITE);
                     }
-                    if dep.is_some() && (hover || ctx.data(|d| d.get_temp::<bool>(Id::new(("tl_link_active", it.id)))).unwrap_or(false)) {
-                        to_draw_links.push((it.id, r));
+                    if dep.is_some() {
+                        // The connector must stay put while the pointer travels from the bar to it: it is shown for the bar *and*
+                        // for the strip right of the bar (where the ● sits), and a faint dot is always visible. (It used to appear
+                        // only while the bar itself was hovered, so it vanished the moment the pointer left the bar to reach it.)
+                        let near = ctx.pointer_hover_pos().map_or(false, |pp| Rect::from_min_max(pos2(r.left(), r.top() - 3.0), pos2(r.right() + 30.0, r.bottom() + 3.0)).contains(pp));
+                        let active = ctx.data(|d| d.get_temp::<bool>(Id::new(("tl_link_active", it.id)))).unwrap_or(false) || pick == Some(it.id);
+                        to_draw_links.push((it.id, r, hover || near || active));
                     }
                 }
             }
@@ -441,16 +461,37 @@ pub fn timeline(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usiz
         }
 
         // connectors (drag to link)
-        for (rid, r) in &to_draw_links {
-            let c = pos2(r.right() + 9.0, r.center().y);
-            let cr = Rect::from_center_size(c, vec2(18.0, 18.0));
-            let resp = ui.interact(cr, Id::new(("tl_conn", *rid)), Sense::drag());
+        for (rid, r, hot) in &to_draw_links {
+            let c = pos2(r.right() + 11.0, r.center().y);
+            let cr = Rect::from_center_size(c, vec2(22.0, 26.0));
+            let resp = ui.interact(cr, Id::new(("tl_conn", *rid)), Sense::click_and_drag());
             let active = resp.dragged();
             ctx.data_mut(|d| d.insert_temp(Id::new(("tl_link_active", *rid)), active));
-            p.circle_filled(c, if resp.hovered() || active { 6.0 } else { 4.5 }, pal.accent);
-            p.circle_stroke(c, if resp.hovered() || active { 6.0 } else { 4.5 }, Stroke::new(1.5_f32, pal.bg));
+            let picked = pick == Some(*rid);
+            if resp.clicked() {
+                ctx.data_mut(|d| if picked { d.remove::<u64>(pick_id) } else { d.insert_temp(pick_id, *rid) });
+            }
+            let big = resp.hovered() || active || picked;
+            let col = if *hot || big { pal.accent } else { with_alpha(pal.accent, 0.38) };
+            let rad = if big { 6.5 } else if *hot { 5.0 } else { 3.5 };
+            if picked {
+                p.circle_stroke(c, rad + 3.5, Stroke::new(2.0_f32, with_alpha(pal.accent, 0.5)));
+            }
+            p.circle_filled(c, rad, col);
+            p.circle_stroke(c, rad, Stroke::new(1.5_f32, pal.bg));
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+                resp.clone().on_hover_text("Drag onto another bar — or click, then click the bar that depends on this one");
+            }
+            if picked {
+                if let Some(pos) = ctx.pointer_hover_pos() {
+                    p.add(Shape::line(vec![c, pos], Stroke::new(1.5_f32, with_alpha(pal.accent, 0.8))));
+                    for (oid, orect) in &bar_rects {
+                        if oid != rid && orect.expand(2.0).contains(pos) {
+                            p.rect_stroke(orect.expand(2.0), 8.0, Stroke::new(2.0_f32, pal.accent), egui::StrokeKind::Outside);
+                        }
+                    }
+                }
             }
             if active {
                 if let Some(pos) = ctx.pointer_hover_pos() {

@@ -28,6 +28,10 @@ env_logger = "0.11"
 arboard = { version = "3", default-features = false }
 webbrowser = "1"
 
+[target.'cfg(windows)'.dependencies]
+# Native web preview: WebView2 (Chromium-based, ships with Windows 10/11) in a child window that only exists while a preview is open.
+wry = { version = "0.53", default-features = false, features = ["os-webview"] }
+
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 rfd = { version = "0.15", default-features = false }
 

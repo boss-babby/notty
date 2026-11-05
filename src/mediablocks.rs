@@ -228,7 +228,7 @@ fn embed(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: f32
     let ctx = ui.ctx().clone();
     let mut changed = false;
     let info = media::embed_info(&b.url);
-    let web = cfg!(target_arch = "wasm32");
+    let web = platform::live_preview_supported();
     let live = web && b.checked;
     let h = match info.kind {
         EmbedKind::Video => {

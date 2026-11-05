@@ -439,3 +439,89 @@ mod tests {
         assert!(!r.toggle(0, 5, BOLD));
     }
 }
+
+
+/// Gives every section of `job` the baseline of the base font and the row height of the base font.
+///
+/// **Why:** egui places each glyph at `ascent_of_its_font + valign · (row_height − line_height_of_its_font)`. Monospace (0.88 ×
+/// size), bold and fallback fonts have different ascents / line heights than the body font, so as soon as a word was marked up
+/// its glyphs sat a pixel or more higher (or lower) than the neighbouring text, and the row height — and with it the whole block —
+/// changed. We measure the baseline and row height of every font used by the job with egui itself and give each section the
+/// `line_height` that makes its baseline coincide with the body font's. Plain text (all sections in the base font) is untouched.
+pub fn align_baselines(fonts: &egui::epaint::text::Fonts, job: &mut LayoutJob, base: &FontId) {
+    let mut others: Vec<(FontId, f32)> = vec![];
+    for sec in &job.sections {
+        let f = &sec.format.font_id;
+        if f != base && !others.iter().any(|(k, _)| k == f) {
+            others.push((f.clone(), fonts.row_height(base)));
+        }
+    }
+    if others.is_empty() {
+        return;
+    }
+    // Empirical calibration: lay out one "x" per font exactly as the real job will, compare the baselines (egui rounds them to whole
+    // pixels) and move each font's `line_height` by the whole-pixel error. Shifting by an integer keeps the rounding stable.
+    for _ in 0..3 {
+        let mut probe = LayoutJob::default();
+        probe.append("x", 0.0, TextFormat::simple(base.clone(), Color32::WHITE));
+        for (f, lh) in &others {
+            probe.append("x", 0.0, TextFormat { font_id: f.clone(), line_height: Some(*lh), valign: egui::Align::BOTTOM, ..Default::default() });
+        }
+        let g = fonts.layout_job(probe);
+        let ys: Vec<f32> = g.rows.first().map(|r| r.glyphs.iter().map(|x| x.pos.y).collect()).unwrap_or_default();
+        if ys.len() != others.len() + 1 {
+            return;
+        }
+        let mut done = true;
+        for (i, (_, lh)) in others.iter_mut().enumerate() {
+            let err = ys[i + 1] - ys[0];
+            if err.abs() > 0.01 {
+                *lh += err;
+                done = false;
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    for sec in job.sections.iter_mut() {
+        if let Some((_, lh)) = others.iter().find(|(k, _)| *k == sec.format.font_id) {
+            sec.format.valign = egui::Align::BOTTOM;
+            sec.format.line_height = Some(*lh);
+        }
+    }
+}
+
+#[cfg(test)]
+mod baseline_tests {
+    use super::*;
+    use egui::{Context, FontFamily};
+
+    /// Marking text up must neither move the baseline of any glyph nor change the height of the row.
+    #[test]
+    fn marked_text_keeps_baseline_and_row_height() {
+        let ctx = Context::default();
+        crate::theme::setup_fonts(&ctx);
+        ctx.run(Default::default(), |_| {});
+        for size in [13.0_f32, 14.0, 15.0, 16.0, 17.6, 20.0, 24.0, 30.0] {
+            let base = FontId::new(size, FontFamily::Proportional);
+            let build = |align: bool| {
+                let mut job = LayoutJob::default();
+                for (txt, f) in [("aaa", base.clone()), ("bbb", crate::theme::bold(size)), ("ccc", FontId::monospace(size * 0.88)), ("ddd", base.clone())] {
+                    job.append(txt, 0.0, TextFormat { font_id: f, ..Default::default() });
+                }
+                ctx.fonts(|f| {
+                    if align {
+                        align_baselines(f, &mut job, &base);
+                    }
+                    f.layout_job(job)
+                })
+            };
+            let plain = ctx.fonts(|f| f.layout_job(LayoutJob::single_section("aaa".into(), TextFormat::simple(base.clone(), Color32::WHITE))));
+            let g = build(true);
+            let ys: Vec<f32> = g.rows[0].glyphs.iter().map(|x| x.pos.y).collect();
+            assert!(ys.iter().all(|y| (*y - ys[0]).abs() < 0.01), "size {size}: one baseline, got {ys:?}");
+            assert!((g.rows[0].rect.height() - plain.rows[0].rect.height()).abs() < 0.01, "size {size}: row height {} vs plain {}", g.rows[0].rect.height(), plain.rows[0].rect.height());
+        }
+    }
+}

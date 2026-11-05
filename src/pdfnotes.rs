@@ -127,8 +127,20 @@ impl Notes {
             let col = color_of(a.color);
             let r = rect_of(a, prect);
             match a.kind {
+                AnnotKind::Highlight if !a.quads.is_empty() => {
+                    for q in &a.quads {
+                        p.rect_filled(quad_rect(*q, prect).expand2(vec2(1.0, 0.0)), 2.0, with_alpha(col, if night { 0.42 } else { 0.38 }));
+                    }
+                }
                 AnnotKind::Highlight => {
                     p.rect_filled(r, 2.0, with_alpha(col, if night { 0.42 } else { 0.38 }));
+                }
+                AnnotKind::Underline | AnnotKind::Strike if !a.quads.is_empty() => {
+                    for q in &a.quads {
+                        let qr = quad_rect(*q, prect);
+                        let y = if a.kind == AnnotKind::Underline { qr.top() + qr.height() * 0.92 } else { qr.top() + qr.height() * 0.52 };
+                        p.hline(qr.x_range(), y, Stroke::new(ink_w, col));
+                    }
                 }
                 AnnotKind::Underline | AnnotKind::Strike => {
                     p.hline(r.x_range(), r.center().y, Stroke::new(ink_w, col));
@@ -224,7 +236,7 @@ impl Notes {
                     if let Some((pg, r)) = pos.and_then(page_at) {
                         let n = norm(r, pos.unwrap_or(r.center()));
                         let id = self.next_id();
-                        self.list.push(PdfAnnot { id, page: pg as u32, kind: AnnotKind::Note, rect: [n[0], n[1], n[0], n[1]], pts: vec![], color: self.color, text: String::new(), created: now_ms() });
+                        self.list.push(PdfAnnot { id, page: pg as u32, kind: AnnotKind::Note, rect: [n[0], n[1], n[0], n[1]], pts: vec![], color: self.color, text: String::new(), created: now_ms(), quads: vec![], quote: String::new() });
                         self.selected = Some(id);
                         self.panel = true;
                         self.scroll_to = Some(id);
@@ -259,13 +271,42 @@ impl Notes {
         }
     }
 
+    /// Creates one text mark per page piece of a selection (`quads` are page fractions per line). Returns the id of the first mark.
+    pub fn add_text_marks(&mut self, kind: AnnotKind, pieces: &[crate::pdftext::Piece]) -> Option<u64> {
+        let mut first = None;
+        for pc in pieces {
+            let (w, h) = (pc.w.max(1.0), pc.h.max(1.0));
+            let quads: Vec<[f32; 4]> = pc.quads.iter().map(|q| [q[0] / w, q[1] / h, q[2] / w, q[3] / h]).collect();
+            if quads.is_empty() {
+                continue;
+            }
+            let rect = quads.iter().fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |r, q| [r[0].min(q[0]), r[1].min(q[1]), r[2].max(q[2]), r[3].max(q[3])]);
+            let id = self.next_id();
+            self.list.push(PdfAnnot { id, page: pc.page as u32, kind, rect, pts: vec![], color: self.color, text: String::new(), created: now_ms(), quads, quote: pc.text.clone() });
+            first.get_or_insert(id);
+        }
+        if let Some(id) = first {
+            self.selected = Some(id);
+            self.dirty = true;
+        }
+        first
+    }
+
+    /// Opens the notes panel on an annotation so its comment can be typed.
+    pub fn open_comment(&mut self, id: u64) {
+        self.bar = true;
+        self.panel = true;
+        self.selected = Some(id);
+        self.scroll_to = Some(id);
+    }
+
     fn finish(&mut self, d: Draft, prect: Rect) {
         let (w, h) = (prect.width().max(1.0), prect.height().max(1.0));
         let (dx, dy) = ((d.cur[0] - d.start[0]).abs() * w, (d.cur[1] - d.start[1]).abs() * h);
         let id = self.next_id();
         let page = d.page as u32;
         let color = self.color;
-        let mk = |kind, rect: [f32; 4], pts: Vec<[f32; 2]>| PdfAnnot { id, page, kind, rect, pts, color, text: String::new(), created: now_ms() };
+        let mk = |kind, rect: [f32; 4], pts: Vec<[f32; 2]>| PdfAnnot { id, page, kind, rect, pts, color, text: String::new(), created: now_ms(), quads: vec![], quote: String::new() };
         let a = match self.tool {
             Tool::Highlight | Tool::Underline | Tool::Strike => {
                 if dx < 5.0 && dy < 5.0 {
@@ -310,6 +351,7 @@ impl Notes {
                     pts.windows(2).any(|w| dist_to_segment(pos, w[0], w[1]) < 7.0)
                 }
                 AnnotKind::Note => Rect::from_center_size(pos_of([a.rect[0], a.rect[1]], *prect), vec2(28.0, 28.0)).contains(pos),
+                _ if !a.quads.is_empty() => a.quads.iter().any(|q| quad_rect(*q, *prect).expand(3.0).contains(pos)),
                 _ => bounds_of(a, *prect).expand(4.0).contains(pos),
             };
             if hit {
@@ -326,6 +368,9 @@ impl Notes {
         let mut out = format!("# Notes on {title}\n\n");
         for a in v {
             out.push_str(&format!("- **p. {}** · {}", a.page + 1, kind_name(a.kind)));
+            if !a.quote.trim().is_empty() {
+                out.push_str(&format!(": “{}”", a.quote.trim().replace('\n', " ")));
+            }
             if !a.text.trim().is_empty() {
                 out.push_str(&format!(" — {}", a.text.trim().replace('\n', " ")));
             }
@@ -346,6 +391,10 @@ fn kind_name(k: AnnotKind) -> &'static str {
 }
 
 // ───────────── geometry helpers ─────────────
+
+fn quad_rect(q: [f32; 4], prect: Rect) -> Rect {
+    Rect::from_min_max(pos_of([q[0], q[1]], prect), pos_of([q[2], q[3]], prect))
+}
 
 fn norm(prect: Rect, pos: Pos2) -> [f32; 2] {
     [((pos.x - prect.left()) / prect.width().max(1.0)).clamp(0.0, 1.0), ((pos.y - prect.top()) / prect.height().max(1.0)).clamp(0.0, 1.0)]
@@ -531,6 +580,10 @@ pub fn panel(ui: &mut Ui, ctx: &Context, pal: &Palette, rect: Rect, notes: &mut 
                 if hresp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                     select = Some((a.id, a.page as usize));
                 }
+                if !a.quote.is_empty() {
+                    let q = if a.quote.chars().count() > 180 { format!("{}…", a.quote.chars().take(180).collect::<String>()) } else { a.quote.clone() };
+                    ui.add(egui::Label::new(egui::RichText::new(format!("“{q}”")).font(body(12.5)).italics().color(pal.muted)).wrap());
+                }
                 let te = TextEdit::multiline(&mut a.text).id(Id::new(("pdfn_text", a.id))).desired_rows(2).desired_width(f32::INFINITY).font(body(13.5)).hint_text("Add a comment…");
                 let r = ui.add(te);
                 if r.changed() {
@@ -609,7 +662,7 @@ mod tests {
 
     #[test]
     fn annotations_survive_json() {
-        let a = PdfAnnot { id: 1, page: 0, kind: AnnotKind::Ink, rect: [0.0, 0.0, 1.0, 1.0], pts: vec![[0.0, 0.0], [1.0, 1.0]], color: 2, text: "x".into(), created: 1.0 };
+        let a = PdfAnnot { id: 1, page: 0, kind: AnnotKind::Ink, rect: [0.0, 0.0, 1.0, 1.0], pts: vec![[0.0, 0.0], [1.0, 1.0]], color: 2, text: "x".into(), created: 1.0, quads: vec![[0.1, 0.1, 0.5, 0.15]], quote: "q".into() };
         let mut m = std::collections::BTreeMap::new();
         m.insert(42_u64, vec![a.clone()]);
         let s = serde_json::to_string(&m).unwrap();

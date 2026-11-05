@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use egui::load::{BytesPoll, Bytes};
 use egui::{
-    pos2, vec2, Align2, Area, Color32, ColorImage, Context, CursorIcon, Id, Key, Order, Rect, ScrollArea, Sense, TextEdit,
+    pos2, Pos2, vec2, Align2, Area, Color32, ColorImage, Context, CursorIcon, Id, Key, Order, Rect, ScrollArea, Sense, TextEdit,
     TextureHandle, TextureOptions, Ui, Vec2,
 };
 use hayro::hayro_interpret::util::TransformExt;
@@ -41,7 +41,9 @@ use crate::auth::now_ms;
 use crate::icons;
 use crate::lucide as l;
 use crate::model::PdfAnnot;
+use crate::model::AnnotKind;
 use crate::pdfnotes::{self, Notes, Tool};
+use crate::pdftext::{self, PageText, Sel};
 use crate::theme::{bold, body, Palette};
 use crate::widgets::with_alpha;
 
@@ -69,6 +71,8 @@ const MAX_TILE_BYTES: usize = 96 << 20;
 /// After this long without input the cache is trimmed to the tiles that are on screen.
 const IDLE_TRIM_MS: f64 = 2500.0;
 const MAX_THUMBS: usize = 64;
+/// Pages whose text layer stays cached.
+const MAX_TEXT_PAGES: usize = 48;
 /// Rendering budget per frame (milliseconds); at least one tile is always rendered.
 const FRAME_BUDGET_MS: f64 = 12.0;
 
@@ -127,6 +131,8 @@ enum OpenErr {
 /// changes, is never mutated, and the field order guarantees `cache` is dropped first.
 struct Engine {
     cache: hayro::RenderCache<'static>,
+    /// Interpreter cache used by the text layer (fonts are parsed once per document).
+    tcache: hayro::hayro_interpret::InterpreterCache<'static>,
     pdf: Box<Pdf>,
     dims: Arc<[(f32, f32)]>,
 }
@@ -145,13 +151,19 @@ impl Engine {
         if dims.is_empty() {
             return Err(OpenErr::Invalid("This PDF has no pages.".into()));
         }
-        Ok(Engine { cache: hayro::RenderCache::new(), pdf, dims })
+        Ok(Engine { cache: hayro::RenderCache::new(), tcache: hayro::hayro_interpret::InterpreterCache::new(), pdf, dims })
     }
 
     fn page(&self, i: usize) -> Option<&'static Page<'static>> {
         let p = self.pdf.pages().get(i)?;
         // SAFETY: see the type documentation.
         Some(unsafe { std::mem::transmute::<&Page<'_>, &'static Page<'static>>(p) })
+    }
+
+    /// Reads the text layer of page `i` (no rasterisation).
+    fn extract(&self, i: usize) -> Option<PageText> {
+        let page = self.page(i)?;
+        guarded(|| pdftext::extract(page, &self.tcache))
     }
 
     /// Rasterises the pixel rectangle `(x, y, w, h)` of page `i` rendered at `scale` pixels per PDF point.
@@ -230,6 +242,33 @@ struct Reader {
     /// Time of the last user input / render activity (for the idle trim).
     active_at: f64,
     trim_armed: bool,
+    // ── text layer ──
+    texts: HashMap<usize, (Arc<PageText>, u64)>,
+    /// Pages whose text could not be read (scanned documents without OCR, damaged fonts).
+    no_text: HashSet<usize>,
+    sel: Option<Sel>,
+    /// A text selection drag is in progress (started on text).
+    text_drag: bool,
+    /// The press started outside text: the drag pans the page.
+    pan: bool,
+    /// A touch screen is in use: dragging pans, text is selected with double tap / the Select tool.
+    touch: bool,
+    find: Option<Find>,
+    find_open: bool,
+    find_text: String,
+    /// Screen rectangle of the last selected line (anchor for the floating toolbar).
+    sel_anchor: Option<Rect>,
+    #[cfg(test)]
+    dbg_shown: Vec<(usize, Rect)>,
+}
+
+/// Search state: hits are collected page by page, a little each frame.
+struct Find {
+    needle: Vec<char>,
+    next: usize,
+    hits: Vec<Sel>,
+    cur: usize,
+    jump: bool,
 }
 
 thread_local! {
@@ -275,6 +314,18 @@ impl Reader {
             open_ms: 0.0,
             active_at: now_ms(),
             trim_armed: false,
+            texts: HashMap::new(),
+            no_text: HashSet::new(),
+            sel: None,
+            text_drag: false,
+            pan: false,
+            touch: false,
+            find: None,
+            find_open: false,
+            find_text: String::new(),
+            sel_anchor: None,
+            #[cfg(test)]
+            dbg_shown: vec![],
         };
         r
     }
@@ -292,8 +343,395 @@ impl Reader {
         }
     }
 
+    /// Text of page `i`, extracted on first use.
+    fn text_of(&mut self, i: usize) -> Option<Arc<PageText>> {
+        if let Some((t, used)) = self.texts.get_mut(&i) {
+            *used = self.frame;
+            return Some(t.clone());
+        }
+        if self.no_text.contains(&i) {
+            return None;
+        }
+        let t = self.engine.as_ref().and_then(|e| e.extract(i));
+        match t {
+            Some(t) => {
+                let t = Arc::new(t);
+                self.texts.insert(i, (t.clone(), self.frame));
+                if self.texts.len() > MAX_TEXT_PAGES {
+                    let keep = self.sel.map(|s| s.ordered());
+                    let cur = self.page;
+                    let mut v: Vec<(usize, u64)> = self.texts.iter().map(|(k, (_, u))| (*k, *u)).collect();
+                    v.sort_by_key(|x| x.1);
+                    for (k, _) in v.into_iter().take(self.texts.len() - MAX_TEXT_PAGES) {
+                        let in_sel = keep.map_or(false, |(a, b)| k >= a.page && k <= b.page);
+                        if !in_sel && k != cur && k != i {
+                            self.texts.remove(&k);
+                        }
+                    }
+                }
+                Some(t)
+            }
+            None => {
+                self.no_text.insert(i);
+                None
+            }
+        }
+    }
+
+    fn selection_text(&mut self) -> String {
+        let Some(sel) = self.sel else { return String::new() };
+        sel.text(|p| self.text_of(p))
+    }
+
+    fn set_find(&mut self, q: &str) {
+        let needle = pdftext::needle_of(q);
+        self.find = if needle.is_empty() { None } else { Some(Find { needle, next: 0, hits: vec![], cur: 0, jump: true }) };
+    }
+
+    /// Scans a few pages per frame (extraction is cheap, nothing is rendered). Returns true while more pages remain.
+    fn step_find(&mut self) -> bool {
+        let Some(n) = self.engine.as_ref().map(|e| e.dims.len()) else { return false };
+        let Some(mut f) = self.find.take() else { return false };
+        let t0 = now_ms();
+        while f.next < n && now_ms() - t0 < 6.0 {
+            let i = f.next;
+            f.next += 1;
+            let known = self.texts.contains_key(&i);
+            if let Some(t) = self.text_of(i) {
+                f.hits.extend(t.find(i, &f.needle));
+                if !known && (i + 8 < self.page || i > self.page + 8) {
+                    self.texts.remove(&i); // keep the cache for what the user looks at, not for what the search passes by
+                }
+            }
+        }
+        let more = f.next < n;
+        self.find = Some(f);
+        more
+    }
+
     fn mem_bytes(&self) -> usize {
         self.tiles.values().map(|t| t.bytes).sum::<usize>() + self.thumb_tex.values().map(|t| t.bytes).sum::<usize>()
+    }
+}
+
+// ───────────────────────────── text layer: selection, marks, search ─────────────────────────────
+
+impl Reader {
+    fn page_hit(&self, pos: Pos2, shown: &[(usize, Rect)]) -> Option<(usize, Rect)> {
+        shown.iter().find(|(_, r)| r.expand(GAP / 2.0).contains(pos)).copied()
+    }
+
+    /// Page point of a screen position (with the page text).
+    fn to_pt(&self, page: usize, r: Rect, pos: Pos2) -> Option<(Arc<PageText>, f32, f32)> {
+        let (t, _) = self.texts.get(&page)?;
+        Some((t.clone(), (pos.x - r.left()) / r.width().max(1.0) * t.w, (pos.y - r.top()) / r.height().max(1.0) * t.h))
+    }
+
+    fn over_text_at(&self, pos: Pos2, shown: &[(usize, Rect)]) -> bool {
+        let Some((pg, r)) = self.page_hit(pos, shown) else { return false };
+        self.to_pt(pg, r, pos).map_or(false, |(t, x, y)| t.over_text(x, y, 3.0 * t.w / r.width().max(1.0)))
+    }
+
+    /// Caret for a pointer position; outside the pages the nearest page / line is used (so dragging past the text still extends).
+    fn caret_from(&self, pos: Pos2, shown: &[(usize, Rect)]) -> Option<pdftext::Caret> {
+        let (pg, r) = self.page_hit(pos, shown).or_else(|| {
+            shown
+                .iter()
+                .min_by(|a, b| {
+                    let d = |r: &Rect| if pos.y < r.top() { r.top() - pos.y } else if pos.y > r.bottom() { pos.y - r.bottom() } else { 0.0 };
+                    d(&a.1).partial_cmp(&d(&b.1)).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .copied()
+        })?;
+        let (t, x, y) = self.to_pt(pg, r, pos)?;
+        t.caret_at(pg, x, y, None)
+    }
+
+    /// Pointer handling of the text layer. Returns true while it owns the pointer (the drawing tools must then stay idle).
+    fn text_input(&mut self, ctx: &Context, ui: &Ui, resp: &egui::Response, shown: &[(usize, Rect)], view: Rect) -> bool {
+        let tool = self.notes.tool;
+        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Touch { .. }))) {
+            self.touch = true;
+        }
+        if !matches!(tool, Tool::Hand | Tool::Highlight | Tool::Underline | Tool::Strike) {
+            self.text_drag = false;
+            self.pan = false;
+            return false;
+        }
+        let mark = match tool {
+            Tool::Highlight => Some(AnnotKind::Highlight),
+            Tool::Underline => Some(AnnotKind::Underline),
+            Tool::Strike => Some(AnnotKind::Strike),
+            _ => None,
+        };
+        let mut handled = self.text_drag;
+        if resp.drag_started() {
+            let origin = ctx.input(|i| i.pointer.press_origin());
+            let on_text = origin.map_or(false, |o| self.over_text_at(o, shown));
+            if on_text && !(self.touch && tool == Tool::Hand) {
+                if let Some(c) = origin.and_then(|o| self.caret_from(o, shown)) {
+                    self.sel = Some(Sel { a: c, b: c });
+                    self.text_drag = true;
+                    handled = true;
+                }
+            } else if tool == Tool::Hand {
+                self.pan = true;
+            }
+        }
+        if self.text_drag && resp.dragged() {
+            if let Some(pos) = ctx.pointer_latest_pos() {
+                if let Some(c) = self.caret_from(pos, shown) {
+                    if let Some(s) = self.sel.as_mut() {
+                        s.b = c;
+                    }
+                }
+                // auto-scroll while the pointer is near the top / bottom edge
+                if pos.y < view.top() + 36.0 {
+                    ui.scroll_with_delta(vec2(0.0, 12.0));
+                } else if pos.y > view.bottom() - 36.0 {
+                    ui.scroll_with_delta(vec2(0.0, -12.0));
+                }
+            }
+            ctx.request_repaint();
+        }
+        if self.pan && resp.dragged() {
+            ui.scroll_with_delta(resp.drag_delta());
+        }
+        if resp.drag_stopped() {
+            if self.text_drag {
+                self.text_drag = false;
+                handled = true;
+                match self.sel {
+                    Some(s) if s.is_empty() => self.sel = None,
+                    Some(_) => {
+                        if let Some(k) = mark {
+                            self.mark_selection(k, false);
+                        }
+                    }
+                    None => {}
+                }
+            }
+            self.pan = false;
+        }
+        if resp.clicked() {
+            self.sel = None;
+        }
+        if resp.double_clicked() || resp.triple_clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                if let Some((pg, r)) = self.page_hit(pos, shown) {
+                    if let Some((t, x, y)) = self.to_pt(pg, r, pos) {
+                        let s = if resp.triple_clicked() { t.line_at(pg, y) } else { t.word_at(pg, x, y) };
+                        if let Some(s) = s.filter(|s| !s.is_empty()) {
+                            self.sel = Some(s);
+                            handled = true;
+                            if let Some(k) = mark {
+                                self.mark_selection(k, false);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        handled
+    }
+
+    fn text_cursor(&self, ctx: &Context, resp: &egui::Response, shown: &[(usize, Rect)]) {
+        let tool = self.notes.tool;
+        if self.touch || !matches!(tool, Tool::Hand | Tool::Highlight | Tool::Underline | Tool::Strike) {
+            return;
+        }
+        if resp.hovered() || self.text_drag {
+            if let Some(h) = ctx.pointer_hover_pos() {
+                if self.text_drag || self.over_text_at(h, shown) {
+                    ctx.set_cursor_icon(CursorIcon::Text);
+                }
+            }
+        }
+    }
+
+    /// Turns the current selection into annotations (one per page) and clears it.
+    fn mark_selection(&mut self, kind: AnnotKind, comment: bool) {
+        let Some(sel) = self.sel else { return };
+        let pieces = sel.pieces(|p| self.text_of(p));
+        if let Some(id) = self.notes.add_text_marks(kind, &pieces) {
+            if comment {
+                self.notes.open_comment(id);
+            }
+        }
+        self.sel = None;
+    }
+
+    /// Selection and search-hit rectangles of page `i`.
+    fn paint_text_marks(&mut self, p: &egui::Painter, prect: Rect, i: usize, accent: Color32) {
+        let Some((pt, _)) = self.texts.get(&i) else { return };
+        let pt = pt.clone();
+        let k = prect.width() / pt.w.max(1.0);
+        let to_screen = |q: &[f32; 4]| Rect::from_min_max(pos2(prect.left() + q[0] * k, prect.top() + q[1] * k), pos2(prect.left() + q[2] * k, prect.top() + q[3] * k));
+        if let Some(f) = &self.find {
+            let from = f.hits.partition_point(|h| h.a.page < i);
+            for (n, h) in f.hits[from..].iter().take_while(|h| h.a.page == i).enumerate() {
+                let Some(l) = pt.lines.get(h.a.line as usize) else { continue };
+                let (a, b) = (h.a.ch as usize, (h.b.ch as usize).min(l.chars.len()));
+                if a >= b {
+                    continue;
+                }
+                let q = [l.chars[a].x0, l.y0, l.chars[b - 1].x1, l.y1];
+                let cur = from + n == f.cur;
+                p.rect_filled(to_screen(&q), 2.0, if cur { Color32::from_rgba_unmultiplied(255, 140, 0, 150) } else { Color32::from_rgba_unmultiplied(255, 214, 0, 110) });
+            }
+        }
+        if let Some(sel) = self.sel.filter(|s| !s.is_empty()) {
+            let (s, e) = sel.ordered();
+            if i < s.page || i > e.page {
+                return;
+            }
+            let only = pt.clone();
+            let pieces = sel.pieces(|pg| if pg == i { Some(only.clone()) } else { None });
+            for pc in pieces {
+                for q in &pc.quads {
+                    p.rect_filled(to_screen(q), 1.0, with_alpha(accent, 0.38));
+                }
+                if i == e.page {
+                    if let Some(q) = pc.quads.last() {
+                        self.sel_anchor = Some(to_screen(q));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Floating toolbar next to a finished selection: copy, highlight, underline, strike-through, comment, colour.
+    fn sel_toolbar(&mut self, ui: &mut Ui, pal: &Palette, view: Rect) {
+        let (Some(anchor), Some(_)) = (self.sel_anchor, self.sel.filter(|s| !s.is_empty())) else { return };
+        if self.text_drag {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        let bw = 34.0;
+        let acts: [(&str, &str); 5] = [("copy", l::COPY), ("hl", l::HIGHLIGHTER), ("ul", l::UNDERLINE), ("st", l::STRIKETHROUGH), ("cm", l::MESSAGE_SQUARE)];
+        let w = acts.len() as f32 * bw + 10.0 + pdfnotes::COLORS.len() as f32 * 20.0 + 14.0;
+        let h = 40.0;
+        let mut x = (anchor.right() - w / 2.0).clamp(view.left() + 6.0, (view.right() - w - 6.0).max(view.left() + 6.0));
+        let mut y = anchor.bottom() + 10.0;
+        if y + h > view.bottom() - 4.0 {
+            y = (anchor.top() - h - 10.0).max(view.top() + 4.0);
+        }
+        x = x.max(view.left() + 4.0);
+        let bar = Rect::from_min_size(pos2(x, y), vec2(w, h));
+        ui.painter().rect_filled(bar.translate(vec2(0.0, 2.0)).expand(1.0), 12.0, Color32::from_black_alpha(60));
+        ui.painter().rect_filled(bar, 12.0, pal.bg);
+        ui.painter().rect_stroke(bar, 12.0, egui::Stroke::new(1.0_f32, pal.border), egui::StrokeKind::Inside);
+        let mut cx = bar.left() + 5.0;
+        let mut act: Option<&str> = None;
+        for (id, glyph) in acts {
+            let r = Rect::from_min_size(pos2(cx, bar.top() + 4.0), vec2(bw, h - 8.0));
+            cx += bw;
+            let resp = ui.interact(r, Id::new(("pdf_seltb", id)), Sense::click());
+            let hv = ctx.animate_bool_with_time(resp.id, resp.hovered(), 0.08);
+            ui.painter().rect_filled(r, 8.0, with_alpha(pal.active, hv));
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, glyph, icons::font(16.0), pal.text);
+            let tip = match id {
+                "copy" => "Copy  (Ctrl+C)",
+                "hl" => "Highlight",
+                "ul" => "Underline",
+                "st" => "Strike through",
+                _ => "Highlight and comment",
+            };
+            if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip).clicked() {
+                act = Some(id);
+            }
+        }
+        cx += 10.0;
+        for (i, c) in pdfnotes::COLORS.iter().enumerate() {
+            let r = Rect::from_center_size(pos2(cx + 10.0, bar.center().y), vec2(20.0, 20.0));
+            cx += 20.0;
+            let resp = ui.interact(r, Id::new(("pdf_selcol", i)), Sense::click());
+            ui.painter().circle_filled(r.center(), if resp.hovered() { 7.5 } else { 6.5 }, *c);
+            if self.notes.color as usize == i {
+                ui.painter().circle_stroke(r.center(), 9.0, egui::Stroke::new(1.5_f32, pal.text));
+            }
+            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                self.notes.color = i as u8;
+            }
+        }
+        match act {
+            Some("copy") => {
+                let t = self.selection_text();
+                ctx.copy_text(t);
+                self.sel = None;
+            }
+            Some("hl") => self.mark_selection(AnnotKind::Highlight, false),
+            Some("ul") => self.mark_selection(AnnotKind::Underline, false),
+            Some("st") => self.mark_selection(AnnotKind::Strike, false),
+            Some(_) => self.mark_selection(AnnotKind::Highlight, true),
+            None => {}
+        }
+    }
+
+    /// Find-in-document bar (Ctrl+F).
+    fn find_bar(&mut self, ui: &mut Ui, ctx: &Context, pal: &Palette, view: Rect) {
+        if !self.find_open {
+            return;
+        }
+        let w = 330.0f32.min(view.width() - 16.0);
+        let bar = Rect::from_min_size(pos2(view.right() - w - 22.0, view.top() + 10.0), vec2(w, 40.0));
+        ui.painter().rect_filled(bar.translate(vec2(0.0, 2.0)).expand(1.0), 12.0, Color32::from_black_alpha(70));
+        ui.painter().rect_filled(bar, 12.0, pal.bg);
+        ui.painter().rect_stroke(bar, 12.0, egui::Stroke::new(1.0_f32, pal.border), egui::StrokeKind::Inside);
+        let id = Id::new("pdf_find_input");
+        let input = Rect::from_min_size(bar.min + vec2(10.0, 6.0), vec2(w - 150.0, 28.0));
+        let mut q = self.find_text.clone();
+        let resp = ui.put(input, TextEdit::singleline(&mut q).id(id).hint_text("Find in document").font(body(14.0)).desired_width(input.width()));
+        if resp.changed() {
+            self.find_text = q.clone();
+            self.set_find(&q);
+        }
+        let (enter, shift, esc) = ctx.input(|i| (i.key_pressed(Key::Enter), i.modifiers.shift, i.key_pressed(Key::Escape)));
+        let n = self.find.as_ref().map_or(0, |f| f.hits.len());
+        let scanning = self.find.as_ref().map_or(false, |f| self.engine.as_ref().map_or(false, |e| f.next < e.dims.len()));
+        let label = if self.find.is_none() {
+            String::new()
+        } else if n == 0 {
+            if scanning { "…".into() } else { "No results".into() }
+        } else {
+            format!("{}/{}{}", self.find.as_ref().map_or(0, |f| f.cur + 1), n, if scanning { "+" } else { "" })
+        };
+        ui.painter().text(pos2(bar.right() - 112.0, bar.center().y), Align2::RIGHT_CENTER, label, body(12.5), pal.muted);
+        let mut step: i32 = 0;
+        if resp.lost_focus() && enter {
+            step = if shift { -1 } else { 1 };
+            resp.request_focus();
+        }
+        for (k, (glyph, tip, d)) in [(l::CHEVRON_UP, "Previous", -1), (l::CHEVRON_DOWN, "Next", 1), (l::X, "Close  (Esc)", 0)].into_iter().enumerate() {
+            let r = Rect::from_min_size(pos2(bar.right() - 104.0 + k as f32 * 32.0 + 6.0, bar.top() + 6.0), vec2(28.0, 28.0));
+            let rr = ui.interact(r, Id::new(("pdf_findb", k)), Sense::click());
+            let hv = ctx.animate_bool_with_time(rr.id, rr.hovered(), 0.08);
+            ui.painter().rect_filled(r, 7.0, with_alpha(pal.active, hv));
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, glyph, icons::font(14.0), pal.text);
+            if rr.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip).clicked() {
+                if d == 0 {
+                    self.find_open = false;
+                    self.find = None;
+                } else {
+                    step = d;
+                }
+            }
+        }
+        if esc && resp.has_focus() {
+            self.find_open = false;
+            self.find = None;
+        }
+        if step != 0 {
+            if let Some(f) = self.find.as_mut().filter(|f| !f.hits.is_empty()) {
+                let n = f.hits.len() as i32;
+                f.cur = ((f.cur as i32 + step).rem_euclid(n)) as usize;
+                f.jump = true;
+            }
+        }
+        if self.find_open && !resp.has_focus() && self.find_text.is_empty() {
+            // first frame after opening: focus the field
+            ctx.memory_mut(|m| m.request_focus(id));
+        }
     }
 }
 
@@ -757,9 +1195,26 @@ fn reading_view(
                 i.modifiers.shift,
             )
         });
+        let (copy, find_key) = ctx.input(|i| (i.events.iter().any(|e| matches!(e, egui::Event::Copy)), i.modifiers.command && i.key_pressed(Key::F)));
+        if copy && rd.sel.is_some() {
+            let t = rd.selection_text();
+            if !t.is_empty() {
+                ctx.copy_text(t);
+            }
+        }
+        if find_key {
+            rd.find_open = true;
+            ctx.memory_mut(|m| m.request_focus(Id::new("pdf_find_input")));
+        }
         let esc_used = rd.notes.keys(ctx, editing);
         if esc && !esc_used {
-            *keep = false;
+            if rd.sel.is_some() || rd.find_open {
+                rd.sel = None;
+                rd.find_open = false;
+                rd.find = None;
+            } else {
+                *keep = false;
+            }
         }
         if pgdn || (space && !shift) {
             *scroll_by = Some(vh * 0.9);
@@ -795,7 +1250,23 @@ fn reading_view(
     let now = now_ms();
     let debounce = now - rd.zoom_changed < 160.0;
 
-    let mut sa = ScrollArea::both().id_salt("pdf_scroll").auto_shrink([false, false]).drag_to_scroll(!rd.notes.capturing());
+    rd.sel_anchor = None;
+    if rd.step_find() {
+        ctx.request_repaint();
+    }
+    // jump to the current search hit
+    if let Some(f) = rd.find.as_mut().filter(|f| f.jump && !f.hits.is_empty()) {
+        f.jump = false;
+        let h = f.hits[f.cur.min(f.hits.len() - 1)];
+        let (pg, li) = (h.a.page.min(dims.len() - 1), h.a.line as usize);
+        if let Some((t, _)) = rd.texts.get(&pg) {
+            if let Some(l) = t.lines.get(li) {
+                let y = lay.ys[pg] + l.y0 * lay.s - view.height() * 0.35;
+                rd.pending_off = Some(vec2(rd.pending_off.map_or(rd.off.x, |o| o.x), y.max(0.0)));
+            }
+        }
+    }
+    let mut sa = ScrollArea::both().id_salt("pdf_scroll").auto_shrink([false, false]).drag_to_scroll(false);
     if let Some(o) = rd.pending_off.take() {
         sa = sa.scroll_offset(o);
     }
@@ -809,10 +1280,7 @@ fn reading_view(
     child.set_clip_rect(view.intersect(ui.clip_rect()));
     let out = sa.show_viewport(&mut child, |ui, viewport| {
         let capturing = rd.notes.capturing();
-        let (content, resp) = ui.allocate_exact_size(vec2(lay.content_w, lay.content_h), if capturing { Sense::click_and_drag() } else { Sense::click() });
-        if !capturing && resp.double_clicked() {
-            *zoom_req = Some((if rd.zoom < 1.6 { 2.0 } else { 1.0 }, resp.interact_pointer_pos().unwrap_or(view.center())));
-        }
+        let (content, resp) = ui.allocate_exact_size(vec2(lay.content_w, lay.content_h), Sense::click_and_drag());
         let p = ui.painter().clone();
         let vp_top = viewport.top() - 300.0;
         let vp_bot = viewport.bottom() + 300.0;
@@ -906,11 +1374,34 @@ fn reading_view(
             }
             // 4. annotations on top of the page
             rd.notes.paint_page(&p, prect, i, night, accent);
+            rd.paint_text_marks(&p, prect, i, accent);
         }
-        if capturing || rd.notes.bar || !rd.notes.list.is_empty() {
+        // the text layer of the page in the middle of the screen is read first, one page per frame
+        let missing: Vec<usize> = shown.iter().map(|s| s.0).filter(|i| !rd.texts.contains_key(i) && !rd.no_text.contains(i)).collect();
+        if let Some(i) = missing.iter().copied().min_by_key(|i| i.abs_diff(cur)) {
+            rd.text_of(i);
+            if missing.len() > 1 {
+                ctx.request_repaint();
+            }
+        }
+        #[cfg(test)]
+        {
+            rd.dbg_shown = shown.clone();
+        }
+        let handled = rd.text_input(ctx, ui, &resp, &shown, view);
+        if !handled && (capturing || rd.notes.bar || !rd.notes.list.is_empty()) {
             rd.notes.input(ctx, &resp, &shown);
         }
+        rd.text_cursor(ctx, &resp, &shown);
+        if !capturing && resp.double_clicked() && rd.sel.is_none() {
+            let at = resp.interact_pointer_pos().unwrap_or(view.center());
+            if !rd.over_text_at(at, &shown) {
+                *zoom_req = Some((if rd.zoom < 1.6 { 2.0 } else { 1.0 }, at));
+            }
+        }
     });
+    rd.sel_toolbar(ui, pal, view);
+    rd.find_bar(ui, ctx, pal, view);
     rd.off = out.state.offset;
     rd.vp = out.inner_rect;
 
@@ -1150,5 +1641,96 @@ mod tests {
             run(&ctx, &mut req, &mut annots, &mut t, size, vec![]);
         }
         assert_eq!(READER.with(|c| c.borrow().as_ref().map(|r| r.notes.list.len())), Some(1));
+    }
+
+    #[test]
+    fn text_layer_reads_the_page() {
+        let Ok(e) = Engine::new(tiny_pdf().into(), "") else { panic!("pdf did not open") };
+        let t = e.extract(0).expect("text layer");
+        assert_eq!(t.lines.len(), 1);
+        let plain: String = t.lines[0].chars.iter().map(|c| c.ch).collect();
+        assert_eq!(plain, "Hello PDF");
+        let l = &t.lines[0];
+        // the text starts at x = 20 pt and its baseline is 60 pt from the top of the 100 pt page
+        assert!((l.chars[0].x0 - 20.0).abs() < 1.5, "x0 = {}", l.chars[0].x0);
+        assert!(l.y0 < 60.0 && l.y1 > 60.0 && l.y1 - l.y0 < 30.0, "line box {} .. {}", l.y0, l.y1);
+        assert!(l.chars.windows(2).all(|w| w[1].x0 >= w[0].x0), "characters are ordered left to right");
+    }
+
+    fn drag(ctx: &Context, req: &mut Option<Request>, annots: &mut BTreeMap<u64, Vec<PdfAnnot>>, t: &mut f64, size: Vec2, a: egui::Pos2, b: egui::Pos2) {
+        let btn = |p, pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        run(ctx, req, annots, t, size, vec![egui::Event::PointerMoved(a)]);
+        run(ctx, req, annots, t, size, vec![btn(a, true)]);
+        run(ctx, req, annots, t, size, vec![egui::Event::PointerMoved(pos2((a.x + b.x) / 2.0, a.y))]);
+        run(ctx, req, annots, t, size, vec![egui::Event::PointerMoved(b)]);
+        run(ctx, req, annots, t, size, vec![btn(b, false)]);
+        for _ in 0..2 {
+            run(ctx, req, annots, t, size, vec![]);
+        }
+    }
+
+    #[test]
+    fn text_can_be_selected_copied_and_highlighted() {
+        let ctx = Context::default();
+        crate::theme::setup_fonts(&ctx);
+        let mut req = Some(Request { key: 9, title: "t.pdf".into(), source: Some(Source::Local(tiny_pdf().into())) });
+        let mut annots = BTreeMap::new();
+        let mut t = 0.0;
+        let size = vec2(1280.0, 800.0);
+        for _ in 0..8 {
+            run(&ctx, &mut req, &mut annots, &mut t, size, vec![]);
+        }
+        // screen position of the text line
+        let geom = |end: bool| {
+            READER.with(|c| {
+                let g = c.borrow();
+                let r = g.as_ref().unwrap();
+                let (_, prect) = r.dbg_shown[0];
+                let (pt, _) = r.texts.get(&0).expect("text layer extracted for the visible page");
+                let k = prect.width() / pt.w;
+                let l = &pt.lines[0];
+                let y = prect.top() + (l.y0 + l.y1) / 2.0 * k;
+                let x = if end { prect.left() + l.chars.last().unwrap().x1 * k + 2.0 } else { prect.left() + l.chars[0].x0 * k + 1.0 };
+                pos2(x, y)
+            })
+        };
+        // 1. plain drag with the default (select / scroll) tool selects the text
+        let (a, b) = (geom(false), geom(true));
+        drag(&ctx, &mut req, &mut annots, &mut t, size, a, b);
+        let copied = READER.with(|c| c.borrow_mut().as_mut().unwrap().selection_text());
+        assert_eq!(copied, "Hello PDF", "dragging over text selects it");
+        // a click elsewhere clears the selection
+        let blank = pos2(700.0, 200.0);
+        let btn = |p, pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        run(&ctx, &mut req, &mut annots, &mut t, size, vec![egui::Event::PointerMoved(blank)]);
+        run(&ctx, &mut req, &mut annots, &mut t, size, vec![btn(blank, true)]);
+        run(&ctx, &mut req, &mut annots, &mut t, size, vec![btn(blank, false)]);
+        assert!(READER.with(|c| c.borrow().as_ref().unwrap().sel.is_none()), "click clears the selection");
+        // 2. with the highlighter armed, the same drag stores a text-anchored highlight
+        READER.with(|c| {
+            let mut g = c.borrow_mut();
+            let r = g.as_mut().unwrap();
+            r.notes.bar = true;
+            r.notes.tool = Tool::Highlight;
+        });
+        for _ in 0..3 {
+            run(&ctx, &mut req, &mut annots, &mut t, size, vec![]);
+        }
+        let (a, b) = (geom(false), geom(true));
+        drag(&ctx, &mut req, &mut annots, &mut t, size, a, b);
+        let list = annots.get(&9).cloned().unwrap_or_default();
+        assert_eq!(list.len(), 1, "one highlight stored");
+        assert_eq!(list[0].quote, "Hello PDF");
+        assert_eq!(list[0].quads.len(), 1);
+        let q = list[0].quads[0];
+        assert!(q[0] > 0.05 && q[2] < 0.95 && q[1] < 0.6 && q[3] > 0.55, "quad hugs the text line: {q:?}");
+        // 3. search finds the word
+        READER.with(|c| {
+            let mut g = c.borrow_mut();
+            let r = g.as_mut().unwrap();
+            r.set_find("pdf");
+            while r.step_find() {}
+            assert_eq!(r.find.as_ref().unwrap().hits.len(), 1);
+        });
     }
 }

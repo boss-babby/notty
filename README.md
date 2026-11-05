@@ -91,3 +91,14 @@ cargo test --lib                                   # 50+ headless tests
 WASM_OPT=0 ./build-web.sh                          # → ../public/webapp   (needs wasm-bindgen-cli 0.2.130)
 ./build-windows.sh                                 # → ../public/downloads (mingw-w64) or `cargo build --release` on Windows
 ```
+
+## v3 — what changed in this round
+
+| Area | Change |
+|---|---|
+| **Gantt links** | The ● connector is now permanent (faint when idle, bright near the bar) and lives in a strip right of the bar that counts as "hover", so it cannot disappear on the way to it. It supports drag-to-link *and* click-to-link (click ●, then click the dependent bar; Esc cancels). Root cause: the dot was only registered while the bar itself was hovered, and egui hit-tests against last frame's widgets. |
+| **PDF text layer** (`src/pdftext.rs`) | hayro only rasterised pages, so there was no text. A recording `Device` now runs hayro's interpreter per page and stores every glyph (Unicode + exact box, incl. invisible OCR text) in page points. On top: drag-select, double-click word, triple-click line, Ctrl+C, floating toolbar (copy / highlight / underline / strike / comment / colour), text-anchored annotations (`quads` + `quote`, exported in the Markdown notes), Ctrl+F search with highlights. Extraction is lazy, LRU-capped (48 pages) and dropped when the reader closes. Touch devices pan with drag. |
+| **Website preview** | Web: `/api/preview` proxy (Next.js) strips X-Frame-Options / CSP, injects `<base>`, sandboxes the page, reader-view fallback, SSRF guard. Windows: native WebView2 child window (`wry`), created when a preview starts and **dropped immediately when it stops** (max 2 alive). The PDF reader follows the same rule: engine, text cache and textures are released on close. |
+| **Inline marks** | `rich::align_baselines` calibrates every font used in a block to the body baseline and row height; focused and unfocused blocks share the same geometry. Test: `marked_text_keeps_baseline_and_row_height` (8 sizes). |
+| **CRM** | Templates *Sales CRM* (Contacts + Deals pipeline, relation, probability, weighted-forecast formula, board/table/calendar) and *Support tickets*. |
+| **Build** | Fonts regenerated (see above). Windows: `cargo build --release --target x86_64-pc-windows-gnu` (mingw or `zig cc` as linker). Web: `build-web.sh` → `public/webapp`, served by Next.js at `/webapp/index.html`. |

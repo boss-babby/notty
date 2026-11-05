@@ -290,8 +290,8 @@ impl LumenApp {
         }
     }
 
-    /// Web: draws live iframes over embed blocks (hidden while a modal / palette is open).
-    fn sync_embeds(&mut self) {
+    /// Web: draws live iframes over embed blocks; Windows: native WebView2 child windows (hidden while a modal / palette is open).
+    fn sync_embeds(&mut self, frame: &eframe::Frame) {
         let overlay = self.locked
             || self.ed.pdf_req.is_some()
             || self.history.is_some()
@@ -307,8 +307,10 @@ impl LumenApp {
             || self.ed.cover_picker.is_some();
         if overlay {
             platform::sync_iframes(&[]);
+            platform::sync_native_previews(frame, &[]);
         } else {
             platform::sync_iframes(&self.ed.embed_rects);
+            platform::sync_native_previews(frame, &self.ed.embed_rects);
         }
     }
 
@@ -1562,10 +1564,10 @@ impl eframe::App for LumenApp {
         crate::widgets::filter_raw_input(ctx, raw_input);
     }
 
-    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
         self.ed.embed_rects.clear();
         self.frame(ctx);
-        self.sync_embeds();
+        self.sync_embeds(frame);
         crate::widgets::end_frame(ctx);
     }
 }

@@ -299,6 +299,71 @@ pub fn sync_iframes(items: &[EmbedRect]) {
     }
 }
 
+/// True when websites can be previewed inside the app: iframes on the web, the native WebView2 child window on Windows.
+pub fn live_preview_supported() -> bool {
+    cfg!(any(windows, target_arch = "wasm32"))
+}
+
+/// Desktop counterpart of [`sync_iframes`]: the system web view (WebView2 on Windows) is created when a preview starts, moved over the
+/// block while it is shown, and **destroyed as soon as the preview stops**, which gives its memory back to the system.
+pub fn sync_native_previews(frame: &eframe::Frame, items: &[EmbedRect]) {
+    #[cfg(windows)]
+    native::sync(frame, items);
+    #[cfg(not(windows))]
+    {
+        let _ = (frame, items);
+    }
+}
+
+#[cfg(windows)]
+mod native {
+    use super::EmbedRect;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use wry::dpi::{LogicalPosition, LogicalSize};
+    use wry::{Rect, WebView, WebViewBuilder};
+
+    /// At most this many native views exist at once (each one is a whole browser process tree).
+    const MAX_VIEWS: usize = 2;
+
+    thread_local! {
+        static VIEWS: RefCell<HashMap<u64, (String, WebView)>> = RefCell::new(HashMap::new());
+    }
+
+    pub fn sync(frame: &eframe::Frame, items: &[EmbedRect]) {
+        VIEWS.with(|v| {
+            let mut v = v.borrow_mut();
+            // dropping a WebView closes it and frees its memory
+            v.retain(|id, _| items.iter().any(|i| i.id == *id));
+            for it in items.iter().take(MAX_VIEWS) {
+                let count = v.len();
+                let vis = it.rect.intersect(it.clip);
+                let fully_visible = vis.width() >= it.rect.width() - 1.0 && vis.height() >= it.rect.height() - 1.0;
+                let bounds = Rect {
+                    position: LogicalPosition::new(it.rect.left() as f64, it.rect.top() as f64).into(),
+                    size: LogicalSize::new(it.rect.width().max(1.0) as f64, it.rect.height().max(1.0) as f64).into(),
+                };
+                match v.get_mut(&it.id) {
+                    Some((url, wv)) => {
+                        if *url != it.url {
+                            let _ = wv.load_url(&it.url);
+                            *url = it.url.clone();
+                        }
+                        let _ = wv.set_bounds(bounds);
+                        let _ = wv.set_visible(fully_visible);
+                    }
+                    None if fully_visible && count < MAX_VIEWS => {
+                        if let Ok(wv) = WebViewBuilder::new().with_url(&it.url).with_bounds(bounds).build_as_child(frame) {
+                            v.insert(it.id, (it.url.clone(), wv));
+                        }
+                    }
+                    None => {}
+                }
+            }
+        });
+    }
+}
+
 // ───────────────────────────── printing ─────────────────────────────
 
 /// Shows a self-contained HTML document in the browser (new tab on the web, system browser on desktop) so the user can print

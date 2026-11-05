@@ -1429,9 +1429,13 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
     if !focus_request && b.kind != BlockKind::Code && has_marks(&b.text) && !ctx.memory(|m| m.has_focus(id)) {
         let mut job = rt.job(&font, color, pal);
         job.wrap.max_width = width;
+        ui.fonts(|f| rich::align_baselines(f, &mut job, &font));
         let galley = ui.painter().layout_job(job);
-        ui.add_space(3.0);
-        let (rect, resp) = ui.allocate_exact_size(vec2(width, galley.size().y.max(font.size + 4.0)), Sense::click());
+        // Same geometry as the focused `TextEdit` below (3 px margin, at least one row of the body font) so that a block does not
+        // move when it gains / loses focus or when text in it is marked up.
+        let row_h = ui.fonts(|f| f.row_height(&font));
+        let (outer, resp) = ui.allocate_exact_size(vec2(width, galley.size().y.max(row_h) + 6.0), Sense::click());
+        let rect = Rect::from_min_size(outer.min + vec2(0.0, 3.0), vec2(width, outer.height() - 6.0));
         ui.painter().galley(rect.min, galley.clone(), color);
         // hovering a link shows a hand cursor; clicking it opens it
         let mut link_hit: Option<String> = None;
@@ -1445,7 +1449,6 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         if link_hit.is_some() && resp.hovered() {
             ctx.set_cursor_icon(CursorIcon::PointingHand);
         }
-        ui.add_space(3.0);
         let resp = resp.on_hover_cursor(CursorIcon::Text);
         if resp.clicked() {
             match link_hit {
@@ -1601,7 +1604,12 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
             r.job(&font2, color, &pal2)
         };
         job.wrap.max_width = wrap;
-        ui.fonts(|f| f.layout_job(job))
+        ui.fonts(|f| {
+            if !is_code {
+                rich::align_baselines(f, &mut job, &font2);
+            }
+            f.layout_job(job)
+        })
     };
     let out = TextEdit::multiline(&mut buf)
         .id(id)

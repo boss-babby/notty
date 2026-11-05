@@ -691,6 +691,12 @@ pub struct PdfAnnot {
     pub text: String,
     #[serde(default)]
     pub created: f64,
+    /// Text marks made on real text: one `[x0, y0, x1, y1]` rectangle (page fractions) per selected line. Empty for free marks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quads: Vec<[f32; 4]>,
+    /// The text under a text mark (shown in the notes panel and exported with the Markdown notes).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub quote: String,
 }
 
 pub const ICONS: [&str; 36] = [
@@ -698,7 +704,7 @@ pub const ICONS: [&str; 36] = [
     "🎵", "🌍", "📊", "📁", "🎬", "🛠", "📌", "💬", "🏆", "🎓", "💰", "🔍", "📖", "📷",
 ];
 
-pub const TEMPLATES: [(&str, &str, &str); 8] = [
+pub const TEMPLATES: [(&str, &str, &str); 10] = [
     ("Meeting notes", "📝", "Agenda, notes and action items."),
     ("Weekly planner", "📅", "Plan every day of the week."),
     ("Project tracker", "🎯", "Database with table, board and calendar views."),
@@ -707,6 +713,8 @@ pub const TEMPLATES: [(&str, &str, &str); 8] = [
     ("Journal entry", "📖", "Daily reflection prompts."),
     ("Team wiki", "🏠", "Docs home with contents and FAQ."),
     ("Product spec", "📋", "Problem, goals, requirements, launch plan."),
+    ("Sales CRM", "💼", "Contacts + deals pipeline: stages, value, win probability, weighted forecast, relations."),
+    ("Support tickets", "🎧", "Ticket board with priority, customer, assignee and due-date calendar."),
 ];
 
 fn blank_page(id: u64, parent: Option<u64>, kind: PageKind) -> Page {
@@ -1244,12 +1252,128 @@ impl Workspace {
                 self.finish_template(db, name, icon);
                 db
             }
+            8 => {
+                // A CRM hub: a Contacts database and a Deals pipeline that points at it through a relation.
+                let hub = self.add_page(parent, PageKind::Doc);
+                let contacts = self.add_database(Some(hub), ViewKind::Table);
+                self.clear_rows(contacts);
+                let stage = self.db(contacts).and_then(|d| d.first_of(PropKind::Select)).unwrap_or(0);
+                let last = self.db(contacts).and_then(|d| d.first_of(PropKind::Date)).unwrap_or(0);
+                self.retag(contacts, stage, "Stage", &["Lead", "Contacted", "Qualified", "Customer", "Churned"]);
+                self.rename_prop(contacts, last, "Last contact");
+                let company = self.add_prop(contacts, "Company", PropKind::Text, &[]);
+                let email = self.add_prop(contacts, "Email", PropKind::Text, &[]);
+                let phone = self.add_prop(contacts, "Phone", PropKind::Text, &[]);
+                let owner = self.add_prop(contacts, "Owner", PropKind::Text, &[]);
+                self.add_prop(contacts, "Profile", PropKind::Url, &[]);
+                self.add_view(contacts, ViewKind::Board);
+                if let Some(d) = self.db_mut(contacts) {
+                    d.active = 0;
+                }
+                let mut ids = vec![];
+                for (n, c, e, ph, st, ago) in [
+                    ("Ada Lovelace", "Analytical Engines", "ada@analytical.io", "+44 20 7946 0001", "Customer", -3),
+                    ("Grace Hopper", "Navy Labs", "grace@navylabs.com", "+1 202 555 0112", "Qualified", -1),
+                    ("Linus T.", "Kernel Co", "linus@kernel.co", "+358 9 555 0100", "Contacted", -9),
+                    ("Margaret H.", "Apollo Software", "mh@apollo.dev", "+1 617 555 0145", "Lead", -14),
+                    ("Alan Turing", "Bletchley Ltd", "alan@bletchley.uk", "+44 1908 555 010", "Customer", -6),
+                ] {
+                    let sid = self.opt_id(contacts, stage, st).unwrap_or(0);
+                    ids.push(self.titled_row(contacts, n, vec![(stage, Val::Sel(sid)), (last, Self::day_val(ago)), (company, Val::Text(c.into())), (email, Val::Text(e.into())), (phone, Val::Text(ph.into())), (owner, Val::Text("Me".into()))]));
+                }
+                let deals = self.add_database(Some(hub), ViewKind::Board);
+                self.clear_rows(deals);
+                let dstage = self.db(deals).and_then(|d| d.first_of(PropKind::Select)).unwrap_or(0);
+                let close = self.db(deals).and_then(|d| d.first_of(PropKind::Date)).unwrap_or(0);
+                self.retag(deals, dstage, "Stage", &["Prospecting", "Proposal", "Negotiation", "Won", "Lost"]);
+                self.rename_prop(deals, close, "Close date");
+                let value = self.add_prop(deals, "Value", PropKind::Number, &[]);
+                let prob = self.add_prop(deals, "Probability", PropKind::Number, &[]);
+                let weighted = self.add_prop(deals, "Weighted", PropKind::Formula, &[]);
+                let contact = self.add_prop(deals, "Contact", PropKind::Relation, &[]);
+                self.add_prop(deals, "Owner", PropKind::Text, &[]);
+                if let Some(d) = self.db_mut(deals) {
+                    for p in d.props.iter_mut() {
+                        if p.id == weighted {
+                            p.cfg.formula = "prop(\"Value\") * prop(\"Probability\") / 100".into();
+                        } else if p.id == contact {
+                            p.cfg.relation = contacts;
+                        }
+                    }
+                }
+                self.add_view(deals, ViewKind::Table);
+                self.add_view(deals, ViewKind::Calendar);
+                if let Some(d) = self.db_mut(deals) {
+                    d.active = 0;
+                }
+                for (n, st, v, p, c, days) in [
+                    ("Analytical Engines — annual plan", "Won", 48000.0, 100.0, 0, -4),
+                    ("Navy Labs — pilot", "Negotiation", 25000.0, 70.0, 1, 9),
+                    ("Kernel Co — support contract", "Proposal", 12000.0, 40.0, 2, 21),
+                    ("Apollo Software — onboarding", "Prospecting", 8000.0, 20.0, 3, 35),
+                    ("Bletchley — expansion", "Negotiation", 31000.0, 60.0, 4, 14),
+                    ("Legacy migration", "Lost", 9000.0, 0.0, 2, -11),
+                ] {
+                    let sid = self.opt_id(deals, dstage, st).unwrap_or(0);
+                    self.titled_row(deals, n, vec![(dstage, Val::Sel(sid)), (close, Self::day_val(days)), (value, Val::Num(v)), (prob, Val::Num(p)), (contact, Val::Multi(vec![ids[c]]))]);
+                }
+                let (b1, b2, b3) = (self.blk(BlockKind::Callout, "Your sales CRM. Move deals across the pipeline board; the Weighted column forecasts revenue (value × probability).", 0), self.blk(BlockKind::Text, "Contacts live in the Contacts database. Each deal links to its contact through the Contact relation.", 0), self.blk(BlockKind::Todo, "Add your first real contact and deal", 0));
+                if let Some(pg) = self.page_mut(hub) {
+                    pg.blocks = vec![b1, b2, b3];
+                    pg.expanded = true;
+                }
+                self.finish_template(hub, name, icon);
+                hub
+            }
+            9 => {
+                let db = self.add_database(parent, ViewKind::Board);
+                self.clear_rows(db);
+                let st = self.db(db).and_then(|d| d.first_of(PropKind::Select)).unwrap_or(0);
+                let due = self.db(db).and_then(|d| d.first_of(PropKind::Date)).unwrap_or(0);
+                self.retag(db, st, "Status", &["New", "Open", "Waiting", "Resolved"]);
+                self.rename_prop(db, due, "Due");
+                let prio = self.add_prop(db, "Priority", PropKind::Select, &["Low", "Normal", "High", "Urgent"]);
+                let cust = self.add_prop(db, "Customer", PropKind::Text, &[]);
+                let who = self.add_prop(db, "Assignee", PropKind::Text, &[]);
+                self.add_view(db, ViewKind::Table);
+                self.add_view(db, ViewKind::Calendar);
+                if let Some(d) = self.db_mut(db) {
+                    d.active = 0;
+                }
+                for (t, s, p, c, n) in [
+                    ("Cannot export report to PDF", "Open", "High", "Navy Labs", 1),
+                    ("SSO login loop", "New", "Urgent", "Kernel Co", 0),
+                    ("Invoice address change", "Waiting", "Low", "Bletchley Ltd", 6),
+                    ("Dark mode request", "New", "Normal", "Apollo Software", 12),
+                    ("Password reset email delayed", "Resolved", "Normal", "Analytical Engines", -2),
+                ] {
+                    let (sid, pid) = (self.opt_id(db, st, s).unwrap_or(0), self.opt_id(db, prio, p).unwrap_or(0));
+                    self.titled_row(db, t, vec![(st, Val::Sel(sid)), (prio, Val::Sel(pid)), (cust, Val::Text(c.into())), (who, Val::Text("Me".into())), (due, Self::day_val(n))]);
+                }
+                self.finish_template(db, name, icon);
+                db
+            }
             _ => {
                 let id = self.add_page(parent, PageKind::Doc);
                 self.fill_template_doc(id, tpl);
                 self.finish_template(id, name, icon);
                 id
             }
+        }
+    }
+
+    /// Renames a property and replaces its select options.
+    fn retag(&mut self, db: u64, prop: u64, name: &str, opts: &[&str]) {
+        let ids: Vec<u64> = opts.iter().map(|_| self.id()).collect();
+        if let Some(p) = self.db_mut(db).and_then(|d| d.props.iter_mut().find(|p| p.id == prop)) {
+            p.name = name.into();
+            p.opts = opts.iter().zip(ids).enumerate().map(|(i, (n, id))| Opt { id, name: (*n).into(), color: i % 9 }).collect();
+        }
+    }
+
+    fn rename_prop(&mut self, db: u64, prop: u64, name: &str) {
+        if let Some(p) = self.db_mut(db).and_then(|d| d.props.iter_mut().find(|p| p.id == prop)) {
+            p.name = name.into();
         }
     }
 
