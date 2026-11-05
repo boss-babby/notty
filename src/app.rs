@@ -1606,6 +1606,7 @@ impl eframe::App for LumenApp {
         self.ed.embed_rects.clear();
         self.frame(ctx);
         self.sync_embeds(frame);
+        crate::touch::paint_hold(ctx);
         crate::widgets::end_frame(ctx);
     }
 }

@@ -2500,6 +2500,33 @@ fn toggle_format(rt: &mut Rich, ed: &mut EditorState, bid: u64, a: usize, b: usi
     }
 }
 
+/// The word around char index `at` (or the closest one) as a `(start, end)` char range.
+fn word_range(text: &str, at: usize) -> (usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return (0, 0);
+    }
+    let is_w = |c: char| c.is_alphanumeric() || c == '_' || c == '\'' || c == '-';
+    let mut i = at.min(chars.len().saturating_sub(1));
+    if !is_w(chars[i]) {
+        if i > 0 && is_w(chars[i - 1]) {
+            i -= 1;
+        } else if let Some(k) = (i..chars.len()).find(|&k| is_w(chars[k])) {
+            i = k;
+        } else {
+            return (at.min(chars.len()), at.min(chars.len()));
+        }
+    }
+    let (mut a, mut b) = (i, i + 1);
+    while a > 0 && is_w(chars[a - 1]) {
+        a -= 1;
+    }
+    while b < chars.len() && is_w(chars[b]) {
+        b += 1;
+    }
+    (a, b)
+}
+
 fn open_text_menu(ed: &mut EditorState, ctx: &Context, id: Id, bid: u64, nchars: usize, p: egui::Pos2) {
     let (a, b) = widgets::selection(ctx, id).unwrap_or((nchars, nchars));
     let (a, b) = (a.min(nchars), b.min(nchars));
@@ -2516,6 +2543,8 @@ enum Cmd {
     Copy,
     Paste,
     SelAll,
+    SelWord,
+    SelBlock,
     Fmt(&'static str),
     Style,
     Dup,
@@ -2546,6 +2575,9 @@ fn ed_menu(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState
             list.push((CtxItem::new(l::SCISSORS, "Cut").hint("Ctrl+X").enabled(has_sel), Cmd::Cut));
             list.push((CtxItem::new(l::COPY, "Copy").hint("Ctrl+C").enabled(has_sel), Cmd::Copy));
             list.push((CtxItem::new(l::CLIPBOARD_PASTE, "Paste").hint("Ctrl+V"), Cmd::Paste));
+            if !has_sel && crate::touch::touchy() {
+                list.push((CtxItem::new(l::TEXT_SELECT, "Select word"), Cmd::SelWord));
+            }
             list.push((CtxItem::new(l::TEXT_SELECT, "Select all").hint("Ctrl+A"), Cmd::SelAll));
             if kind != BlockKind::Code {
                 list.push((CtxItem::new(l::BOLD, "Bold").hint("Ctrl+B").enabled(has_sel).sep(), Cmd::Fmt("**")));
@@ -2558,6 +2590,7 @@ fn ed_menu(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState
         }
     }
     list.push((CtxItem::new(l::REPLACE, if has_text { "Turn into & colour…" } else { "Style…" }).sep(), Cmd::Style));
+    list.push((CtxItem::new(l::SQUARE_CHECK, "Select block"), Cmd::SelBlock));
     list.push((CtxItem::new(l::COPY_PLUS, "Duplicate").hint("Ctrl+D"), Cmd::Dup));
     list.push((CtxItem::new(l::ARROW_UP, "Move up").enabled(idx > 0), Cmd::Up));
     list.push((CtxItem::new(l::ARROW_DOWN, "Move down").enabled(subtree_end(&page.blocks, idx) < page.blocks.len()), Cmd::Down));
@@ -2599,6 +2632,24 @@ fn ed_menu(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState
                 ed.restore_sel = Some((bid, a, b));
             }
             Cmd::SelAll => ed.restore_sel = Some((bid, 0, nchars)),
+            Cmd::SelWord => {
+                let (wa, wb) = word_range(&rt.plain, a.min(nchars));
+                ed.restore_sel = Some((bid, wa, wb));
+            }
+            Cmd::SelBlock => {
+                if !ed.sel.contains(&bid) {
+                    ed.sel.push(bid);
+                }
+                ed.touch_sel = true;
+                ed.focus = None;
+                ed.active = None;
+                ed.fmt_bar = None;
+                ctx.memory_mut(|m| {
+                    if let Some(f) = m.focused() {
+                        m.surrender_focus(f);
+                    }
+                });
+            }
             Cmd::Fmt(mark) => {
                 rt.toggle(a, b, rich::flag_for(mark));
                 page.blocks[idx].text = rt.markup();
@@ -2743,8 +2794,15 @@ fn fmt_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) ->
     }
     let t = appear(&ctx, appear_id, 0.12);
     let screen = ctx.screen_rect();
-    let (w, h) = (9.0 * 27.0 + 2.0 * 9.0 + 12.0, 40.0);
+    // Phones: the buttons are finger-sized (38 px), 9 of them do not fit a 360 px screen — the bar wraps onto a second row instead of
+    // running off the edge.
+    let btn: f32 = if crate::touch::touchy() { 38.0 } else { 27.0 };
+    let full_w = 9.0 * btn + 2.0 * 9.0 + 12.0;
+    let w = full_w.min((screen.width() - 16.0).max(120.0));
+    let wrap = full_w > w;
+    let h = if wrap { 2.0 * btn + 12.0 } else { 40.0 };
     let x = (bar.pos.x - 10.0).clamp(8.0, (screen.right() - w - 8.0).max(8.0));
+    // on touch screens the finger / selection handles / keyboard hide the area under the selection: prefer the space above
     let above = bar.pos.y - h - 8.0 > screen.top() + 6.0;
     let y = if above { bar.pos.y - h - 8.0 } else { bar.pos.y + 32.0 };
     let mut clicked: Option<Cmd> = None;
@@ -2753,7 +2811,10 @@ fn fmt_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) ->
         ui.set_opacity(t);
         crate::widgets::popup_frame(pal).inner_margin(Margin::same(4)).corner_radius(CornerRadius::same(9)).show(ui, |ui| {
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-            ui.horizontal(|ui| {
+            if wrap {
+                ui.set_width(w - 8.0);
+            }
+            let row = |ui: &mut Ui| {
                 let sep = |ui: &mut Ui| {
                     let (r, _) = ui.allocate_exact_size(vec2(9.0, 26.0), Sense::hover());
                     ui.painter().vline(r.center().x, r.y_range().shrink(4.0), Stroke::new(1.0_f32, pal.border));
@@ -2791,7 +2852,12 @@ fn fmt_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) ->
                 if widgets::icon_button(ui, pal, Icon::Palette, 15.0, "Colour & background").clicked() {
                     clicked = Some(Cmd::Style);
                 }
-            });
+            };
+            if wrap {
+                ui.horizontal_wrapped(row);
+            } else {
+                ui.horizontal(row);
+            }
         });
     });
     ctx.move_to_top(area.response.layer_id);

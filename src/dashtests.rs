@@ -314,3 +314,31 @@ fn any_page_can_be_a_dashboard() {
     ws.dash.drop_page_board(dp);
     assert!(ws.dash.page_board(dp).is_none() && ws.page(dp).is_some());
 }
+
+/// Phones: nothing on the Home dashboard may be wider than the screen (it used to be cropped on the right), in normal and edit mode.
+#[test]
+fn home_dashboard_fits_a_phone_screen() {
+    crate::dashboard::testing::reset();
+    let ctx = test_ctx();
+    let mut ws = dash_ws();
+    let pal = Palette::light();
+    crate::dashcfg::ensure_seeded(&mut ws);
+    ws.dash.boards[0].widgets.clear();
+    for d in crate::dashwidgets::all() {
+        crate::dashedit::create(&mut ws, d.kind, 0);
+    }
+    let mut t = 0.0;
+    for width in [320.0_f32, 360.0, 390.0, 430.0, 600.0] {
+        for edit in [false, true] {
+            crate::dashboard::testing::set(edit, None, false);
+            crate::dashboard::testing::OVERFLOW.with(|o| o.borrow_mut().clear());
+            for _ in 0..4 {
+                frame(&ctx, &mut ws, &pal, vec2(width, 9000.0), &mut t, vec![]);
+            }
+            let (content, visible) = crate::dashboard::testing::CONTENT_W.with(|c| c.get());
+            assert!(content <= visible + 0.5, "{width}px edit={edit}: content is {content}px wide but only {visible}px are visible");
+            let over: Vec<(String, f32)> = crate::dashboard::testing::OVERFLOW.with(|o| o.borrow().clone());
+            assert!(over.is_empty(), "{width}px edit={edit}: widgets running past their card: {over:?}");
+        }
+    }
+}

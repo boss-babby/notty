@@ -988,67 +988,100 @@ fn new_row_button(ui: &mut Ui, pal: &Palette, acts: &mut Vec<A>) {
     }
 }
 
+/// Cards per row and card width of the gallery for a content width `w`. Pure layout maths (unit-tested): the cards always fill the
+/// width exactly, so the gallery never grows sideways.
+fn gallery_grid(w: f32, gap: f32) -> (usize, f32) {
+    let w = w.max(120.0);
+    let cols = (((w + gap) / (236.0 + gap)).floor() as usize).max(1);
+    let cw = ((w - gap * (cols as f32 - 1.0)) / cols as f32).max(120.0);
+    (cols, cw)
+}
+
 fn gallery(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], pal: &Palette, w: f32, acts: &mut Vec<A>) {
-    let cw = 236.0;
-    ui.horizontal_wrapped(|ui| {
-        ui.set_width(w);
-        ui.spacing_mut().item_spacing = vec2(14.0, 14.0);
-        for rid in rows {
-            let Some(row) = ws.page(*rid) else { continue };
-            let prev = ui.ctx().data(|d| d.get_temp::<bool>(sid(("galh", row.id)))).unwrap_or(false);
-            let t = ui.ctx().animate_bool_with_time(sid(("galt", row.id)), prev, 0.12);
-            let f = Frame::new()
-                .fill(pal.card)
-                .stroke(Stroke::new(1.0_f32, lerp_color(pal.border, pal.accent.gamma_multiply(0.7), t * 0.6)))
-                .corner_radius(CornerRadius::same(10))
-                .shadow(egui::Shadow { offset: [0, 2], blur: (3.0 + 8.0 * t) as u8, spread: 0, color: Color32::from_black_alpha((12.0 + 18.0 * t) as u8) })
-                .show(ui, |ui| {
-                    ui.set_width(cw);
-                    ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-                    let (cr, _) = ui.allocate_exact_size(vec2(cw, 110.0), Sense::hover());
-                    let (a, b) = COVERS[(row.cover.unwrap_or(row.id as usize)) % COVERS.len()];
-                    let top_r = CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 };
-                    ui.painter().rect_filled(cr, top_r, Color32::from_rgb(a.0, a.1, a.2));
-                    gradient_rect(ui, Rect::from_min_max(cr.min + vec2(0.0, 10.0), cr.max), Color32::from_rgb(a.0, a.1, a.2), Color32::from_rgb(b.0, b.1, b.2));
-                    if !row.cover_img.is_empty() {
-                        crate::icons::paint_cover(ui, cr, &crate::media::src_uri(&row.cover_img), row.cover_pos);
-                    }
-                    if !row.icon.is_empty() {
-                        crate::icons::paint_page_icon(ui, cr.center(), &row.icon, 40.0, pal.text);
-                    }
-                    Frame::new().inner_margin(Margin::symmetric(12, 10)).show(ui, |ui| {
-                        ui.set_width(cw - 24.0);
-                        ui.label(RichText::new(title_of(row)).font(bold(14.5)).color(if row.title.is_empty() { pal.muted } else { pal.text }));
-                        card_chips(ui, db, row, 0, pal);
-                        for p in db.props.iter().filter(|p| matches!(p.kind, PropKind::Text | PropKind::Number)) {
-                            if let Some(v) = row.props.get(&p.id) {
-                                let s = db.val_text(p.id, v);
-                                if !s.is_empty() {
-                                    ui.label(RichText::new(format!("{}: {}", p.name, s)).font(body(12.0)).color(pal.muted));
-                                }
+    // The old version used `horizontal_wrapped` + fixed-width frames: egui cannot wrap a `Frame` whose width is only known after its
+    // content is laid out, so every card landed in ONE row that ran off the right edge and could not be scrolled. Rows are laid out
+    // explicitly now (as many cards as fit, the rest on the next row), on phones as well as on the desktop.
+    let gap = 14.0;
+    let w = w.min(ui.available_width().max(120.0));
+    let (cols, cw) = gallery_grid(w, gap);
+    // one extra slot for the "+ New" tile
+    let total = rows.len() + 1;
+    for chunk_start in (0..total).step_by(cols) {
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing = vec2(gap, gap);
+            for slot in chunk_start..(chunk_start + cols).min(total) {
+                if slot == rows.len() {
+                    new_tile(ui, pal, cw, acts);
+                    continue;
+                }
+                let rid = rows[slot];
+                let Some(row) = ws.page(rid) else { continue };
+                gallery_card(ui, ws, db, row, pal, cw, acts);
+            }
+        });
+        ui.add_space(gap);
+    }
+}
+
+fn new_tile(ui: &mut Ui, pal: &Palette, cw: f32, acts: &mut Vec<A>) {
+    let (r, resp) = ui.allocate_exact_size(vec2(cw, 90.0), Sense::click());
+    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+    ui.painter().rect_stroke(r, 10.0, Stroke::new(1.2_f32, lerp_color(pal.border, pal.accent, t)), egui::StrokeKind::Inside);
+    ui.painter().text(r.center(), Align2::CENTER_CENTER, "+  New", body(14.0), lerp_color(pal.muted, pal.accent, t));
+    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+        acts.push(A::AddRow(None));
+    }
+}
+
+fn gallery_card(ui: &mut Ui, ws: &Workspace, db: &Database, row: &Page, pal: &Palette, cw: f32, acts: &mut Vec<A>) {
+    let _ = ws;
+    let prev = ui.ctx().data(|d| d.get_temp::<bool>(sid(("galh", row.id)))).unwrap_or(false);
+    let t = ui.ctx().animate_bool_with_time(sid(("galt", row.id)), prev, 0.12);
+    // the frame adds 1 px of stroke on every side: size its content so the *outer* width is exactly `cw`
+    let inner_w = (cw - 2.0).max(60.0);
+    let f = Frame::new()
+        .fill(pal.card)
+        .stroke(Stroke::new(1.0_f32, lerp_color(pal.border, pal.accent.gamma_multiply(0.7), t * 0.6)))
+        .corner_radius(CornerRadius::same(10))
+        .shadow(egui::Shadow { offset: [0, 2], blur: (3.0 + 8.0 * t) as u8, spread: 0, color: Color32::from_black_alpha((12.0 + 18.0 * t) as u8) })
+        .show(ui, |ui| {
+            ui.set_width(inner_w);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                let (cr, _) = ui.allocate_exact_size(vec2(inner_w, 110.0), Sense::hover());
+                let (a, b) = COVERS[(row.cover.unwrap_or(row.id as usize)) % COVERS.len()];
+                let top_r = CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 };
+                ui.painter().rect_filled(cr, top_r, Color32::from_rgb(a.0, a.1, a.2));
+                gradient_rect(ui, Rect::from_min_max(cr.min + vec2(0.0, 10.0), cr.max), Color32::from_rgb(a.0, a.1, a.2), Color32::from_rgb(b.0, b.1, b.2));
+                if !row.cover_img.is_empty() {
+                    crate::icons::paint_cover(ui, cr, &crate::media::src_uri(&row.cover_img), row.cover_pos);
+                }
+                if !row.icon.is_empty() {
+                    crate::icons::paint_page_icon(ui, cr.center(), &row.icon, 40.0, pal.text);
+                }
+                Frame::new().inner_margin(Margin::symmetric(12, 10)).show(ui, |ui| {
+                    ui.set_width(inner_w - 24.0);
+                    ui.label(RichText::new(title_of(row)).font(bold(14.5)).color(if row.title.is_empty() { pal.muted } else { pal.text }));
+                    card_chips(ui, db, row, 0, pal);
+                    for p in db.props.iter().filter(|p| matches!(p.kind, PropKind::Text | PropKind::Number)) {
+                        if let Some(v) = row.props.get(&p.id) {
+                            let s = db.val_text(p.id, v);
+                            if !s.is_empty() {
+                                ui.label(RichText::new(format!("{}: {}", p.name, s)).font(body(12.0)).color(pal.muted));
                             }
                         }
-                    });
-                    });
+                    }
                 });
-            if let Some(p) = right_clicked(ui, f.response.rect) {
-                acts.push(A::RowMenu(row.id, p));
-            }
-            let resp = ui.interact(f.response.rect, sid(("gal", row.id)), Sense::click());
-            ui.ctx().data_mut(|d| d.insert_temp(sid(("galh", row.id)), resp.hovered()));
-            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                acts.push(A::Open(row.id));
-            }
-        }
-        let (r, resp) = ui.allocate_exact_size(vec2(cw, 90.0), Sense::click());
-        let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-        ui.painter().rect_stroke(r, 10.0, Stroke::new(1.2_f32, lerp_color(pal.border, pal.accent, t)), egui::StrokeKind::Inside);
-        ui.painter().text(r.center(), Align2::CENTER_CENTER, "+  New", body(14.0), lerp_color(pal.muted, pal.accent, t));
-        if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-            acts.push(A::AddRow(None));
-        }
-    });
+            });
+        });
+    if let Some(p) = right_clicked(ui, f.response.rect) {
+        acts.push(A::RowMenu(row.id, p));
+    }
+    let resp = ui.interact(f.response.rect, sid(("gal", row.id)), Sense::click());
+    ui.ctx().data_mut(|d| d.insert_temp(sid(("galh", row.id)), resp.hovered()));
+    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+        acts.push(A::Open(row.id));
+    }
 }
 
 // ───────────────────────────── calendar ─────────────────────────────

@@ -8,8 +8,11 @@
 //! * **swipe** — moves further than a few pixels before the hold time: the pointer events are swallowed and replaced by mouse-wheel
 //!   events, so *every* scroll area (page, tables, sidebar, PDF reader, graph) pans natively. When the finger lifts the content keeps
 //!   gliding (fling with friction).
-//! * **long press** — held still for [`LONG_PRESS`] seconds: the press is delivered and the gesture becomes a normal *drag*
-//!   (marquee / multi-select, drag & drop, text selection). [`take_long_press`] tells the editor to select the block under the finger.
+//! * **hold** — held still for [`LONG_PRESS`] seconds (a ring grows under the finger, the phone buzzes). The press is *still held back*:
+//!   * lift the finger without moving → it is a **right-click**: [`Outcome::context`] / `widgets::inject_rclick` open the context menu
+//!     of whatever is under the finger (block menu, text menu, database row menu, sidebar menu …);
+//!   * move the finger → it is **hold-and-drag**: the press is delivered at the spot where the finger went down and the gesture becomes
+//!     a normal drag (marquee selection, text selection, drag & drop). A plain swipe never does that — it scrolls.
 //! * **two fingers** — always passed through untouched (pinch zoom, rotate).
 //! * [`set_passthrough`] — a drawing tool (PDF pen) can ask for raw pointer events.
 //!
@@ -20,8 +23,12 @@ use std::time::Duration;
 
 use egui::{Context, Event, Id, Modifiers, MouseWheelUnit, Pos2, RawInput, TouchPhase, Vec2};
 
-/// Seconds a finger must rest to start a drag / selection.
-pub const LONG_PRESS: f64 = 0.42;
+/// Seconds a finger must rest to count as a hold (right-click / start of a drag selection).
+pub const LONG_PRESS: f64 = 0.45;
+/// After this many seconds of resting the "hold" ring starts to grow.
+const RING_AFTER: f64 = 0.12;
+/// Movement (points) of a *held* finger that turns the hold into a drag.
+const HOLD_SLOP: f32 = 10.0;
 /// Movement (points) that turns a press into a swipe.
 const SLOP: f32 = 9.0;
 /// Fling friction (1/s) and the speed below which a fling stops (points/s).
@@ -89,6 +96,8 @@ pub fn set_passthrough(on: bool) {
 enum Mode {
     Idle,
     Pending,
+    /// The finger rested for `LONG_PRESS`: release = right-click, move = drag.
+    Held,
     Scroll,
     Fling,
     Pass,
@@ -130,12 +139,47 @@ impl Default for Gestures {
 /// What the gesture layer decided this frame (besides rewriting the events).
 #[derive(Default, Debug, PartialEq)]
 pub struct Outcome {
+    /// A held finger started moving: the press was delivered at this (start) position and a real drag begins.
     pub long_press: Option<Pos2>,
+    /// The finger reached the hold time (haptic feedback).
+    pub held: Option<Pos2>,
+    /// A held finger was lifted without moving: a right-click at this position.
+    pub context: Option<Pos2>,
     pub direct: bool,
     pub swipe: Option<Swipe>,
 }
 
 impl Gestures {
+    /// Web browsers (and some backends) report the pointer press of a finger *before* the touch event. The gesture layer must know a
+    /// finger is down before it sees the press, so touch-start events are moved in front of the pointer events that precede them.
+    fn touch_first(mut events: Vec<Event>) -> Vec<Event> {
+        let Some(ts) = events.iter().position(|e| matches!(e, Event::Touch { phase: TouchPhase::Start, .. })) else { return events };
+        if ts == 0 {
+            return events;
+        }
+        let before: Vec<Event> = events.drain(..ts).collect();
+        let (mut ptr, other): (Vec<Event>, Vec<Event>) = before.into_iter().partition(|e| matches!(e, Event::PointerMoved(_) | Event::PointerButton { pressed: true, .. }));
+        // [other…, Touch…(start), pointer…, rest]
+        let mut touches: Vec<Event> = vec![];
+        while matches!(events.first(), Some(Event::Touch { phase: TouchPhase::Start, .. })) {
+            touches.push(events.remove(0));
+        }
+        let mut out = other;
+        out.append(&mut touches);
+        out.append(&mut ptr);
+        out.append(&mut events);
+        out
+    }
+
+    /// `(finger position, progress 0..1)` while a finger rests and the hold ring should be drawn.
+    pub fn hold_ring(&self, now: f64) -> Option<(Pos2, f32)> {
+        match self.mode {
+            Mode::Pending if now - self.t0 > RING_AFTER => Some((self.start, (((now - self.t0 - RING_AFTER) / (LONG_PRESS - RING_AFTER)) as f32).clamp(0.0, 0.98))),
+            Mode::Held => Some((self.start, 1.0)),
+            _ => None,
+        }
+    }
+
     pub fn is_scrolling(&self) -> bool {
         matches!(self.mode, Mode::Scroll | Mode::Fling)
     }
@@ -147,6 +191,7 @@ impl Gestures {
         let mut out: Vec<Event> = Vec::with_capacity(events.len() + 4);
         let mut outcome = Outcome::default();
         self.frame_delta = Vec2::ZERO;
+        let events = Self::touch_first(events);
 
         for ev in events {
             match ev {
@@ -172,6 +217,13 @@ impl Gestures {
                         }
                         TouchPhase::Move => {
                             if self.fingers == 1 {
+                                if self.mode == Mode::Held && (pos - self.start).length() > HOLD_SLOP {
+                                    // hold-and-drag: deliver the held press (at the spot where the finger went down), then follow it
+                                    out.append(&mut self.buf);
+                                    out.push(Event::PointerMoved(pos));
+                                    self.mode = Mode::Pass;
+                                    outcome.long_press = Some(self.start);
+                                }
                                 if self.mode == Mode::Pending && (pos - self.start).length() > SLOP {
                                     self.mode = Mode::Scroll;
                                     self.buf.clear();
@@ -209,6 +261,15 @@ impl Gestures {
                                     self.buf.clear();
                                     self.mode = Mode::Idle;
                                 }
+                                Mode::Held if self.fingers == 0 => {
+                                    // held and lifted without moving = right-click; the press is never delivered
+                                    self.buf.clear();
+                                    self.mode = Mode::Idle;
+                                    out.push(Event::PointerGone);
+                                    if phase == TouchPhase::End {
+                                        outcome.context = Some(self.start);
+                                    }
+                                }
                                 Mode::Scroll if self.fingers == 0 => {
                                     self.drop_tail = true;
                                     self.mode = if phase == TouchPhase::End && self.vel.length() > MIN_FLING { Mode::Fling } else { Mode::Idle };
@@ -225,7 +286,7 @@ impl Gestures {
                     out.push(ev);
                 }
                 Event::PointerMoved(_) | Event::PointerButton { .. } | Event::PointerGone => match self.mode {
-                    Mode::Pending => self.buf.push(ev),
+                    Mode::Pending | Mode::Held => self.buf.push(ev),
                     Mode::Scroll => {}
                     _ => {
                         let tail = matches!(ev, Event::PointerGone | Event::PointerButton { pressed: false, .. });
@@ -242,11 +303,10 @@ impl Gestures {
             }
         }
 
-        // long press: the press that was held back is delivered now and the finger becomes a normal pointer
+        // hold: still no press delivered — lifting now is a right-click, moving is a drag (see the Touch Move arm)
         if self.mode == Mode::Pending && self.fingers == 1 && now - self.t0 >= LONG_PRESS {
-            out.append(&mut self.buf);
-            self.mode = Mode::Pass;
-            outcome.long_press = Some(self.start);
+            self.mode = Mode::Held;
+            outcome.held = Some(self.start);
         }
 
         // swipe: pointer position (so the scroll area under the finger gets it) + wheel
@@ -303,6 +363,18 @@ pub fn on_raw_input(ctx: &Context, raw: &mut RawInput) {
 
 const LP_ID: &str = "touch_long_press";
 const DIRECT_ID: &str = "touch_direct";
+const RING_ID: &str = "touch_hold_ring";
+
+/// Paints the "hold" feedback (a ring that grows under the finger while it rests). Call at the end of every frame.
+pub fn paint_hold(ctx: &Context) {
+    let Some((p, t)) = ctx.data(|d| d.get_temp::<(Pos2, f32)>(Id::new(RING_ID))) else { return };
+    let accent = egui::Color32::from_rgb(35, 131, 226);
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::new("touch_hold_ring_layer")));
+    let ease = 1.0 - (1.0 - t) * (1.0 - t);
+    let r = 12.0 + 20.0 * ease;
+    painter.circle_filled(p, r, accent.gamma_multiply(0.10 + 0.14 * ease));
+    painter.circle_stroke(p, r, egui::Stroke::new(if t >= 1.0 { 2.5 } else { 1.8 }, accent.gamma_multiply(0.35 + 0.65 * ease)));
+}
 
 /// Call from `App::raw_input_hook`.
 pub fn hook(g: &mut Gestures, ctx: &Context, raw: &mut RawInput) {
@@ -335,13 +407,29 @@ pub fn hook(g: &mut Gestures, ctx: &Context, raw: &mut RawInput) {
         ctx.data_mut(|d| d.insert_temp(Id::new(LP_ID), p));
         ctx.request_repaint();
     }
+    if outcome.held.is_some() {
+        crate::platform::haptic(ctx, 18);
+        ctx.request_repaint();
+    }
+    if let Some(p) = outcome.context {
+        crate::widgets::inject_rclick(ctx, p);
+    }
+    let ring = g.hold_ring(now);
+    ctx.data_mut(|d| match ring {
+        Some(r) => d.insert_temp(Id::new(RING_ID), r),
+        None => {
+            d.remove::<(Pos2, f32)>(Id::new(RING_ID));
+        }
+    });
     if let Some(sw) = outcome.swipe {
         SWIPE.with(|s| s.set(Some(sw)));
         ctx.request_repaint();
     }
     ctx.data_mut(|d| d.insert_temp(Id::new(DIRECT_ID), outcome.direct));
     match g.mode {
-        Mode::Pending => ctx.request_repaint_after(Duration::from_millis((LONG_PRESS * 1000.0) as u64 + 15)),
+        Mode::Pending if now - g.t0 > RING_AFTER => ctx.request_repaint(),
+        Mode::Pending => ctx.request_repaint_after(Duration::from_millis((RING_AFTER * 1000.0) as u64 + 5)),
+        Mode::Held => ctx.request_repaint(),
         Mode::Fling | Mode::Scroll => ctx.request_repaint(),
         _ => {}
     }
@@ -437,18 +525,47 @@ mod tests {
     }
 
     #[test]
-    fn long_press_starts_a_real_drag() {
+    fn hold_then_drag_starts_a_real_drag_at_the_press_point() {
         let mut g = Gestures::default();
         let p = pos2(10.0, 10.0);
         g.process(0.0, false, vec![touch(TouchPhase::Start, p), Event::PointerMoved(p), press(p, true)]);
         let (o, oc) = g.process(0.1, false, vec![]);
-        assert!(oc.long_press.is_none() && o.is_empty());
+        assert!(oc.held.is_none() && o.is_empty());
         let (o, oc) = g.process(LONG_PRESS + 0.05, false, vec![]);
-        assert_eq!(oc.long_press, Some(p));
-        assert!(o.iter().any(|e| matches!(e, Event::PointerButton { pressed: true, .. })), "press delivered");
+        assert_eq!(oc.held, Some(p));
+        assert!(!o.iter().any(|e| matches!(e, Event::PointerButton { .. })), "press is still held back while the finger rests");
         let q = pos2(80.0, 90.0);
-        let (o, _) = g.process(LONG_PRESS + 0.1, false, vec![touch(TouchPhase::Move, q), Event::PointerMoved(q)]);
+        let (o, oc) = g.process(LONG_PRESS + 0.1, false, vec![touch(TouchPhase::Move, q), Event::PointerMoved(q)]);
+        assert_eq!(oc.long_press, Some(p));
+        assert!(o.iter().any(|e| matches!(e, Event::PointerButton { pressed: true, pos, .. } if *pos == p)), "press delivered at the start point");
         assert!(has_wheel(&o).is_none() && o.iter().any(|e| matches!(e, Event::PointerMoved(_))));
+    }
+
+    #[test]
+    fn hold_and_release_is_a_right_click() {
+        let mut g = Gestures::default();
+        let p = pos2(40.0, 50.0);
+        g.process(0.0, false, vec![touch(TouchPhase::Start, p), Event::PointerMoved(p), press(p, true)]);
+        g.process(LONG_PRESS + 0.05, false, vec![]);
+        let (o, oc) = g.process(LONG_PRESS + 0.2, false, vec![press(p, false), Event::PointerGone, touch(TouchPhase::End, p)]);
+        assert_eq!(oc.context, Some(p));
+        assert!(!o.iter().any(|e| matches!(e, Event::PointerButton { .. })), "no primary click is produced: {o:?}");
+        assert!(!g.is_scrolling());
+    }
+
+    #[test]
+    fn a_swipe_never_becomes_a_drag_even_when_the_press_arrives_first() {
+        // browsers report the pointer press *before* the touch start
+        let mut g = Gestures::default();
+        let p = pos2(100.0, 400.0);
+        let (o, _) = g.process(0.0, false, vec![press(p, true), touch(TouchPhase::Start, p)]);
+        assert!(!o.iter().any(|e| matches!(e, Event::PointerButton { .. })), "press must be held back: {o:?}");
+        let q = pos2(100.0, 360.0);
+        let (o, oc) = g.process(0.05, false, vec![Event::PointerMoved(q), touch(TouchPhase::Move, q)]);
+        assert!(oc.direct && has_wheel(&o).is_some());
+        assert!(!o.iter().any(|e| matches!(e, Event::PointerButton { .. })));
+        let (o, _) = g.process(0.1, false, vec![press(q, false), Event::PointerGone, touch(TouchPhase::End, q)]);
+        assert!(!o.iter().any(|e| matches!(e, Event::PointerButton { .. })), "no release without a press");
     }
 
     #[test]

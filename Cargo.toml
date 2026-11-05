@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "5.3.0"
+version = "5.4.0"
 edition = "2021"
 description = "Lumen — a free Notion + Obsidian alternative written entirely in Rust with egui (Windows + WebAssembly)"
 license = "MIT"
@@ -61,3 +61,8 @@ panic = "abort"
 
 [profile.dev]
 opt-level = 1
+
+# eframe 0.31.1 with a patched web backend (vendor/eframe/src/web): touch events are no longer delivered twice / out of order
+# (that made a scroll swipe look like a drag-selection) and the soft keyboard no longer flickers (see vendor/eframe/PATCHES.md).
+[patch.crates-io]
+eframe = { path = "vendor/eframe" }

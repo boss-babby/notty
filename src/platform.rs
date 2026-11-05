@@ -114,6 +114,17 @@ pub fn open_url(ctx: &egui::Context, url: &str) {
     ctx.open_url(egui::OpenUrl::new_tab(url));
 }
 
+/// A short vibration (phones, web build only) — confirms a press-and-hold. Silently does nothing elsewhere.
+pub fn haptic(ctx: &egui::Context, ms: u32) {
+    let _ = ctx;
+    #[cfg(target_arch = "wasm32")]
+    if let Some(w) = web_sys::window() {
+        let _ = w.navigator().vibrate_with_duration(ms);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = ms;
+}
+
 // ───────────────────────────── file picking ─────────────────────────────
 
 /// Where a picked file goes once the (asynchronous) dialog returns.

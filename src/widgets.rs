@@ -288,6 +288,13 @@ pub fn filter_raw_input(ctx: &Context, raw: &mut RawInput) {
     }
 }
 
+/// A press-and-hold on a touch screen counts as a right-click at `p` (see `touch.rs`): every context menu that reacts to
+/// [`right_clicked`] opens, exactly as for a mouse.
+pub fn inject_rclick(ctx: &Context, p: Pos2) {
+    ctx.data_mut(|d| d.insert_temp(Id::new(RC_KEY), p));
+    ctx.request_repaint();
+}
+
 /// Position of a right-click that happened this frame.
 pub fn rclick(ctx: &Context) -> Option<Pos2> {
     ctx.data(|d| d.get_temp::<Pos2>(Id::new(RC_KEY)))

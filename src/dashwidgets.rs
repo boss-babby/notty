@@ -400,8 +400,8 @@ fn draw_recent(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
 fn draw_subpages(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
     let parent = w.cfg.pages.first().copied().filter(|p| cx.ws.page(*p).map_or(false, |p| !p.trashed));
     let mut open: Option<u64> = None;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
         if pill(ui, cx.pal, l::FILE_PLUS, "New page", true) {
             let id = cx.ws.add_page(parent, PageKind::Doc);
             open = Some(id);
@@ -1388,7 +1388,7 @@ fn draw_quickadd(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
     ui.label(RichText::new(target).font(body(12.0)).color(cx.pal.muted));
     let resp = ui.add(egui::TextEdit::singleline(&mut text).id(Id::new(("dash_qa_edit", cx.wid))).hint_text("Type a title and press Enter").desired_width(width).font(body(14.0)));
     let mut add = resp.lost_focus() && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter));
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui.add(egui::Button::new(RichText::new(format!("{} Add", l::PLUS)).font(bold(12.5)).color(Color32::WHITE)).fill(cx.pal.accent).corner_radius(14)).on_hover_cursor(CursorIcon::PointingHand).clicked() {
             add = true;
         }

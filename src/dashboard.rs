@@ -207,7 +207,10 @@ fn greeting_icon() -> &'static str {
 }
 
 /// Toolbar: Add widget · Customize · time window (Home) or layouts (page dashboards).
-fn toolbar(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, scope: Scope) {
+///
+/// `flat`: the caller is a `horizontal_wrapped` row (phones). egui cannot wrap a nested `ui.horizontal`, so in that mode the time-window
+/// chips are laid out directly in the caller's row and wrap with everything else instead of running off the screen.
+fn toolbar(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, scope: Scope, flat: bool) {
     ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
     if action(ui, pal, l::PLUS, "Add widget", true, false).clicked() {
         st.gallery = Some(gallery_for(scope));
@@ -226,8 +229,7 @@ fn toolbar(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, sco
     };
     let cur = ws.dash.scope_range(bid);
     // the chips are laid out left-to-right even when the toolbar itself is right-to-left
-    let more_clicked = ui
-        .horizontal(|ui| {
+    let mut chips = |ui: &mut Ui| {
             ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
             for (r, t) in [(Range::All, "All"), (Range::Today, "Today"), (Range::ThisWeek, "Week"), (Range::ThisMonth, "Month")] {
                 if chip(ui, pal, t, cur == r)
@@ -252,9 +254,12 @@ fn toolbar(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, sco
             }
             r.on_hover_text("Time window for every widget on this dashboard that has none of its own");
             c
-        })
-        .inner;
-    let _ = more_clicked;
+    };
+    if flat {
+        chips(ui);
+    } else {
+        ui.horizontal(|ui| chips(ui));
+    }
     if let Scope::Page(b) = scope {
         let r = action(ui, pal, l::LAYOUT_TEMPLATE, "Layouts", false, false);
         if r.clicked() {
@@ -300,8 +305,8 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                     ui.add_space(6.0);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 1.0;
-                        ui.label(RichText::new(if ws.name.is_empty() { "Home".to_owned() } else { ws.name.clone() }).font(bold(if w < 520.0 { 22.0 } else { 28.0 })).color(pal.text));
-                        ui.label(RichText::new(dates::long_today()).font(body(13.5)).color(pal.muted));
+                        ui.add(egui::Label::new(RichText::new(if ws.name.is_empty() { "Home".to_owned() } else { ws.name.clone() }).font(bold(if w < 520.0 { 22.0 } else { 28.0 })).color(pal.text)).truncate());
+                        ui.add(egui::Label::new(RichText::new(dates::long_today()).font(body(13.5)).color(pal.muted)).truncate());
                     });
                 });
                 ui.add_space(14.0);
@@ -367,12 +372,12 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                 if wide {
                     ui.horizontal(|ui| {
                         tabs(ui, st, ws);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| toolbar(ui, ws, pal, st, scope));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| toolbar(ui, ws, pal, st, scope, false));
                     });
                 } else {
                     ui.horizontal_wrapped(|ui| tabs(ui, st, ws));
                     ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| toolbar(ui, ws, pal, st, scope));
+                    ui.horizontal_wrapped(|ui| toolbar(ui, ws, pal, st, scope, true));
                 }
             } else {
                 // ── page dashboard header ──
@@ -392,11 +397,11 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                 };
                 if narrow {
                     ui.horizontal(|ui| head(ui));
-                    ui.horizontal_wrapped(|ui| toolbar(ui, ws, pal, st, scope));
+                    ui.horizontal_wrapped(|ui| toolbar(ui, ws, pal, st, scope, true));
                 } else {
                     ui.horizontal(|ui| {
                         head(ui);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| toolbar(ui, ws, pal, st, scope));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| toolbar(ui, ws, pal, st, scope, false));
                     });
                 }
             }
@@ -405,7 +410,7 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                 egui::Frame::new().fill(pal.accent_soft).corner_radius(10).inner_margin(egui::Margin::symmetric(12, 7)).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(l::SLIDERS_HORIZONTAL).font(body(14.0)).color(pal.accent));
-                        ui.label(RichText::new("Customize: drag a widget by its grip to move it · drag the corner to resize · gear for settings").font(body(12.0)).color(pal.accent));
+                        ui.add(egui::Label::new(RichText::new(if gw0 < 520.0 { "Customize: grip = move · corner = resize · gear = settings" } else { "Customize: drag a widget by its grip to move it · drag the corner to resize · gear for settings" }).font(body(12.0)).color(pal.accent)).wrap());
                     });
                 });
             }
@@ -547,6 +552,13 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                                 st.edit = true;
                             }
                         }
+                        #[cfg(test)]
+                        {
+                            let over = child.min_rect().right() - content.right();
+                            if over > 1.0 {
+                                testing::OVERFLOW.with(|o| o.borrow_mut().push((wd.kind.to_string(), over)));
+                            }
+                        }
                         if copy != *wd {
                             if let Some(slot) = ws.dash.widget_mut(wd.id) {
                                 *slot = copy;
@@ -624,7 +636,9 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
         });
     };
     if home {
-        crate::smooth::scroll_area(ui, key, sa, over, draw_body);
+        let _out = crate::smooth::scroll_area(ui, key, sa, over, draw_body);
+        #[cfg(test)]
+        testing::CONTENT_W.with(|c| c.set((_out.content_size.x, _out.inner_rect.width())));
     } else {
         draw_body(ui);
     }
@@ -907,6 +921,13 @@ pub mod testing {
             st.inspect = inspect;
             st.gallery = if gallery { Some(Gallery::default()) } else { None };
         });
+    }
+
+    thread_local! {
+        /// (widget kind, pixels its content ran past the right edge of its card) — filled while drawing.
+        pub static OVERFLOW: std::cell::RefCell<Vec<(String, f32)>> = const { std::cell::RefCell::new(Vec::new()) };
+        /// (content width, visible width) of the Home dashboard scroll area.
+        pub static CONTENT_W: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((0.0, 0.0)) };
     }
 
     pub fn rects() -> Vec<(u64, Rect)> {

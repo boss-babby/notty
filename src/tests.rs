@@ -895,3 +895,31 @@ fn columns_and_linked_database_views_render_and_stay_independent() {
     ws.prune_linked_views();
     assert!(ws.db(db).unwrap().linked_index(dvid).is_none());
 }
+
+/// Gallery view: cards wrap into rows that always fit the width (it used to grow sideways in one endless row that could not be scrolled).
+#[test]
+fn gallery_wraps_into_rows_instead_of_growing_sideways() {
+    let ctx = test_ctx();
+    let mut ws = Workspace::seed();
+    let db = ws.add_database(None, ViewKind::Gallery);
+    for _ in 0..40 {
+        ws.add_row(db, None);
+    }
+    assert_eq!(ws.db(db).unwrap().views[ws.db(db).unwrap().active_tab()].kind, ViewKind::Gallery);
+    let mut ed = EditorState::default();
+    let pal = Palette::light();
+    let mut t = 0.0;
+    for width in [320.0_f32, 390.0, 700.0, 1280.0, 2400.0] {
+        let mut used = (0.0_f32, 0.0_f32, 0.0_f32);
+        for _ in 0..3 {
+            t += 0.05;
+            frame_sized(&ctx, vec2(width, 3000.0), t, vec![], |ui| {
+                let w = (ui.available_width() - 40.0).max(200.0);
+                crate::database::show(ui, &mut ws, db, &mut ed, &pal, w);
+                used = (ui.min_rect().width(), w, ui.min_rect().height());
+            });
+        }
+        assert!(used.0 <= used.1 + 40.5, "{width}px: the gallery is {}px wide inside {}px", used.0, used.1);
+        assert!(used.2 > 300.0, "{width}px: 40 cards need several rows (height {})", used.2);
+    }
+}

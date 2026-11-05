@@ -157,26 +157,10 @@ pub fn handle(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorSt
     let pointer = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
     let mods = ctx.input(|i| i.modifiers);
 
-    // Touch: a long press selects the block under the finger (and a drag that follows extends it into a marquee).
-    // Further long presses add blocks, so several blocks can be picked without a keyboard.
-    if let Some(p) = crate::touch::take_long_press(&ctx) {
-        if let Some((i, _)) = rects.iter().find(|(_, r)| r.expand2(vec2(60.0, 3.0)).contains(p)) {
-            let id = page.blocks[*i].id;
-            if let Some(k) = ed.sel.iter().position(|b| *b == id) {
-                ed.sel.remove(k);
-            } else {
-                ed.sel.push(id);
-            }
-            ed.touch_sel = !ed.sel.is_empty();
-            ed.focus = None;
-            ed.fmt_bar = None;
-            ctx.memory_mut(|m| {
-                if let Some(f) = m.focused() {
-                    m.surrender_focus(f);
-                }
-            });
-        }
-    }
+    // Touch: tap-and-hold, then drag, is what starts a selection (marquee on the page, text selection inside a block). The hold itself
+    // is consumed here; holding *without* dragging opens the context menu instead (touch.rs → right-click), whose "Select block"
+    // entry starts block selection. A plain swipe only scrolls.
+    let _ = crate::touch::take_long_press(&ctx);
 
     // Touch: while blocks are selected a plain tap on another block adds / removes it (no keyboard, no second long press).
     let mut toggled = false;
