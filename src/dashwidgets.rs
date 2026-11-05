@@ -89,8 +89,46 @@ pub fn def(kind: &str) -> Option<Def> {
     all().into_iter().find(|d| d.kind == kind)
 }
 
-/// Chart-like kinds that can be switched between each other without touching the settings.
-pub const CHART_KINDS: [&str; 10] = ["bar", "hbar", "stacked", "line", "area", "pie", "donut", "funnel", "radar", "histogram"];
+/// Plot types of the unified Chart widget, in the order the plot picker shows them.
+pub const CHART_KINDS: [&str; 14] = ["bar", "hbar", "stacked", "line", "area", "pie", "donut", "funnel", "radar", "histogram", "scatter", "heatmap", "gauge", "number"];
+
+/// Every setting any plot type understands — the Chart widget shows the subset of its current plot type.
+const CHART_OPTS: &[Opt] = &[Db, View, Filters, Group, Stack, Value, Agg, Bucket, Axes, Date, Range, Limit, Goal, Cumulative, HideEmpty, Labels, Legend, Palette];
+
+/// The registry entry that describes (name, icon, settings, drawing of) widget `w`: for a Chart widget that is the entry of its plot type.
+pub fn def_for(w: &Widget) -> Option<Def> {
+    match crate::dashcfg::plot_of(w) {
+        Some(k) => def(&k),
+        None => def(&w.kind),
+    }
+}
+
+/// Short name of a plot type for the plot picker.
+pub fn plot_label(kind: &str) -> &'static str {
+    match kind {
+        "bar" => "Bar",
+        "hbar" => "H-bar",
+        "stacked" => "Stacked",
+        "line" => "Line",
+        "area" => "Area",
+        "pie" => "Pie",
+        "donut" => "Donut",
+        "funnel" => "Funnel",
+        "radar" => "Radar",
+        "histogram" => "Histogram",
+        "scatter" => "Scatter",
+        "heatmap" => "Heat-map",
+        "gauge" => "Gauge",
+        "number" => "Number",
+        _ => "Chart",
+    }
+}
+
+fn draw_chart(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
+    if let Some(d) = def_for(w) {
+        (d.draw)(cx, w, ui);
+    }
+}
 
 use Opt::*;
 
@@ -106,7 +144,9 @@ pub static DEFS: &[Def] = &[
     Def { kind: "recent", name: "Recently edited", desc: "The pages you worked on last", cat: Cat::Overview, glyph: l::HISTORY, span: 4, rows: 3, opts: &[Limit], draw: draw_recent },
     Def { kind: "favorites", name: "Favorites", desc: "Starred pages, one click away", cat: Cat::Overview, glyph: l::STAR, span: 4, rows: 3, opts: &[], draw: draw_favorites },
     Def { kind: "activity", name: "Activity", desc: "Pages edited per day, last 14 days — click a bar to see which", cat: Cat::Overview, glyph: l::CHART_COLUMN, span: 4, rows: 3, opts: &[Labels, Palette], draw: draw_activity },
+    Def { kind: "subpages", name: "Pages", desc: "Browse the sub-pages of any page — and create new pages or dashboards right here", cat: Cat::Overview, glyph: l::FILES, span: 4, rows: 3, opts: &[Pages], draw: draw_subpages },
     // ── charts ──
+    Def { kind: "chart", name: "Chart", desc: "One widget for every plot — bar, line, pie, funnel, radar, gauge, scatter … Pick the plot type in its settings", cat: Cat::Charts, glyph: l::CHART_COLUMN, span: 6, rows: 3, opts: CHART_OPTS, draw: draw_chart },
     Def { kind: "number", name: "Number", desc: "One big figure: count, sum, average … with goal and trend", cat: Cat::Charts, glyph: l::HASH, span: 3, rows: 1, opts: &[Db, View, Filters, Value, Agg, Date, Range, Goal], draw: draw_number },
     Def { kind: "gauge", name: "Gauge", desc: "Progress towards a goal on a dial", cat: Cat::Charts, glyph: l::GAUGE, span: 3, rows: 2, opts: &[Db, View, Filters, Value, Agg, Date, Range, Goal], draw: draw_gauge },
     Def { kind: "bar", name: "Bar chart", desc: "Compare groups side by side", cat: Cat::Charts, glyph: l::CHART_COLUMN, span: 6, rows: 3, opts: SERIES, draw: draw_bar },
@@ -357,6 +397,63 @@ fn draw_recent(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
     }
 }
 
+fn draw_subpages(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
+    let parent = w.cfg.pages.first().copied().filter(|p| cx.ws.page(*p).map_or(false, |p| !p.trashed));
+    let mut open: Option<u64> = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        if pill(ui, cx.pal, l::FILE_PLUS, "New page", true) {
+            let id = cx.ws.add_page(parent, PageKind::Doc);
+            open = Some(id);
+        }
+        if pill(ui, cx.pal, l::LAYOUT_DASHBOARD, "New dashboard", false) {
+            open = Some(crate::dashcfg::new_dashboard_page(cx.ws, parent, "starter"));
+        }
+    });
+    ui.add_space(4.0);
+    let ids = cx.ws.children(parent);
+    if ids.is_empty() {
+        note(ui, cx.pal, if parent.is_some() { "No sub-pages yet — create the first one." } else { "No pages yet — create the first one." });
+    }
+    let fit = fit_rows(ui, 0.0, ROW_H - 2.0);
+    for id in ids.into_iter().take(fit) {
+        let (title, icon, dash) = match cx.ws.page(id) {
+            Some(p) => (title_of(cx.ws, id), p.icon.clone(), cx.ws.dash.page_board(id).is_some()),
+            None => continue,
+        };
+        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H - 2.0), Sense::click());
+        if resp.hovered() {
+            ui.painter().rect_filled(r, 7.0, cx.pal.hover);
+        }
+        let icon = if icon.is_empty() { l::FILE_TEXT.to_owned() } else { icon };
+        crate::icons::paint_page_icon(ui, pos2(r.left() + 16.0, r.center().y), &icon, 15.0, cx.pal.muted);
+        let rw = if dash { 22.0 } else { 0.0 };
+        text_fit(ui.painter(), pos2(r.left() + 32.0, r.center().y), Align2::LEFT_CENTER, &title, body(13.5), cx.pal.text, r.width() - 40.0 - rw);
+        if dash {
+            ui.painter().text(pos2(r.right() - 12.0, r.center().y), Align2::CENTER_CENTER, l::LAYOUT_DASHBOARD, body(13.0), cx.pal.accent);
+        }
+        if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+            open = Some(id);
+        }
+    }
+    if let Some(id) = open {
+        cx.nav.out.open = Some(id);
+    }
+}
+
+/// Small rounded button with a Lucide glyph (used inside widgets).
+pub fn pill(ui: &mut Ui, pal: &Palette, glyph: &str, text: &str, primary: bool) -> bool {
+    let font = if primary { bold(12.5) } else { body(12.5) };
+    let g = ui.painter().layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE);
+    let (r, resp) = ui.allocate_exact_size(vec2(g.size().x + 44.0, 28.0), Sense::click());
+    let fill = if primary { if resp.hovered() { pal.accent.gamma_multiply(0.85) } else { pal.accent } } else if resp.hovered() { pal.active } else { pal.hover };
+    let fg = if primary { Color32::WHITE } else { pal.text };
+    ui.painter().rect_filled(r, 14.0, fill);
+    ui.painter().text(pos2(r.left() + 16.0, r.center().y), Align2::CENTER_CENTER, glyph, body(14.0), fg);
+    ui.painter().text(pos2(r.left() + 29.0, r.center().y), Align2::LEFT_CENTER, text, font, fg);
+    resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
+}
+
 fn draw_favorites(cx: &mut Cx, _w: &mut Widget, ui: &mut Ui) {
     let fit = fit_rows(ui, 0.0, ROW_H - 2.0);
     let list: Vec<(u64, String)> = cx.ws.pages.iter().filter(|p| p.favorite && !p.trashed).take(fit).map(|p| (p.id, if p.title.is_empty() { "Untitled".into() } else { p.title.clone() })).collect();
@@ -425,7 +522,7 @@ fn draw_number(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
     if let Some(prev) = n.prev {
         let (txt, up) = if prev == 0.0 { (if n.value > 0.0 { "new".to_owned() } else { "no change".to_owned() }, n.value > 0.0) } else { (format!("{:+.0}%", (n.value - prev) / prev.abs() * 100.0), n.value >= prev) };
         let col = if n.value == prev { cx.pal.muted } else if up { tag_color(2) } else { cx.pal.danger };
-        let tx = format!("{} {txt} vs previous", if n.value == prev { "•" } else if up { "▲" } else { "▼" });
+        let tx = format!("{} {txt} vs previous", if n.value == prev { l::MINUS } else if up { l::TRENDING_UP } else { l::TRENDING_DOWN });
         text_fit(&p, pos2(r.left() + 2.0, y), Align2::LEFT_TOP, &tx, bold(12.0), col, r.width() - 4.0);
         y += 18.0;
     }
@@ -699,7 +796,7 @@ fn draw_table(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
     for (id, name, r, right) in head {
         let resp = ui.interact(r, Id::new(("dash_th", cx.wid, id)), Sense::click());
         let active = w.cfg.sort == id;
-        let label = if active { format!("{name} {}", if w.cfg.asc { "↑" } else { "↓" }) } else { name };
+        let label = if active { format!("{name} {}", if w.cfg.asc { l::ARROW_UP } else { l::ARROW_DOWN }) } else { name };
         let col = if active { cx.pal.text } else { cx.pal.muted };
         if resp.hovered() {
             p.rect_filled(r.shrink2(vec2(0.0, 2.0)), 5.0, cx.pal.hover);
@@ -1096,7 +1193,7 @@ fn draw_checklist(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
     // add field
     let nid = Id::new(("dash_cl_new", cx.wid));
     let mut text: String = ui.ctx().data(|d| d.get_temp(nid)).unwrap_or_default();
-    let resp = ui.add(egui::TextEdit::singleline(&mut text).id(Id::new(("dash_cl_edit", cx.wid))).hint_text("＋ Add an item").desired_width(width).font(body(13.0)));
+    let resp = ui.add(egui::TextEdit::singleline(&mut text).id(Id::new(("dash_cl_edit", cx.wid))).hint_text(format!("{} Add an item", l::PLUS)).desired_width(width).font(body(13.0)));
     if resp.lost_focus() && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter)) && !text.trim().is_empty() {
         w.cfg.items.push(Item { text: text.trim().to_owned(), done: false });
         text.clear();
@@ -1173,7 +1270,7 @@ fn draw_timer(cx: &mut Cx, _w: &mut Widget, ui: &mut Ui) {
     }
     y += 32.0;
     let finished = elapsed >= total;
-    for (k, (label, primary)) in [(if finished { "Done ✓" } else if st.running { "Pause" } else { "Start" }, true), ("Reset", false)].into_iter().enumerate() {
+    for (k, (label, primary)) in [(if finished { "Done" } else if st.running { "Pause" } else { "Start" }, true), ("Reset", false)].into_iter().enumerate() {
         let br = Rect::from_min_size(pos2(bx + (bw / 2.0) * k as f32, y), vec2(bw / 2.0 - 4.0, 28.0));
         let resp = ui.interact(br, Id::new(("dash_tb", cx.wid, k)), Sense::click());
         p.rect_filled(br, 14.0, if primary { if resp.hovered() { cx.pal.accent.gamma_multiply(0.85) } else { cx.pal.accent } } else if resp.hovered() { cx.pal.active } else { cx.pal.hover });
@@ -1263,7 +1360,7 @@ fn draw_pagepreview(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
         };
         let prefix = match b.kind {
             BlockKind::Bullet => "• ",
-            BlockKind::Todo => if b.checked { "☑ " } else { "☐ " },
+            BlockKind::Todo => if b.checked { "\u{e559} " } else { "\u{e167} " },
             _ => "",
         };
         let plain = crate::rich::strip(&b.text);
@@ -1292,10 +1389,10 @@ fn draw_quickadd(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
     let resp = ui.add(egui::TextEdit::singleline(&mut text).id(Id::new(("dash_qa_edit", cx.wid))).hint_text("Type a title and press Enter").desired_width(width).font(body(14.0)));
     let mut add = resp.lost_focus() && ui.ctx().input(|i| i.key_pressed(egui::Key::Enter));
     ui.horizontal(|ui| {
-        if ui.add(egui::Button::new(RichText::new("＋ Add").font(bold(12.5)).color(Color32::WHITE)).fill(cx.pal.accent).corner_radius(14)).on_hover_cursor(CursorIcon::PointingHand).clicked() {
+        if ui.add(egui::Button::new(RichText::new(format!("{} Add", l::PLUS)).font(bold(12.5)).color(Color32::WHITE)).fill(cx.pal.accent).corner_radius(14)).on_hover_cursor(CursorIcon::PointingHand).clicked() {
             add = true;
         }
-        if db_ok && ui.add(egui::Button::new(RichText::new("＋ Page").font(body(12.5))).corner_radius(14)).on_hover_cursor(CursorIcon::PointingHand).clicked() {
+        if db_ok && ui.add(egui::Button::new(RichText::new(format!("{} Page", l::FILE_PLUS)).font(body(12.5))).corner_radius(14)).on_hover_cursor(CursorIcon::PointingHand).clicked() {
             let id = cx.ws.add_page(None, PageKind::Doc);
             if let Some(p) = cx.ws.page_mut(id) {
                 p.title = text.trim().to_owned();
@@ -1304,7 +1401,7 @@ fn draw_quickadd(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
             text.clear();
         }
         if now - flash < 2.5 {
-            ui.label(RichText::new("Added ✓").font(bold(12.5)).color(tag_color(2)));
+            ui.label(RichText::new(format!("{} Added", l::CHECK)).font(bold(12.5)).color(tag_color(2)));
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
         }
     });

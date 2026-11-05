@@ -40,6 +40,8 @@ pub enum Req {
 
 #[derive(Default)]
 pub struct EditorState {
+    /// Set by the `/dashboard` command: the page gets a widget grid.
+    pub want_dash: bool,
     pub focus: Option<(u64, usize)>,
     pub slash_sel: usize,
     pub slash_moved: bool,
@@ -135,6 +137,8 @@ enum Slash {
     NewDb(ViewKind),
     Link,
     Today,
+    /// Turn the page into a dashboard (adds the widget grid to the page).
+    Dashboard,
 }
 
 #[derive(Clone, Copy)]
@@ -169,6 +173,7 @@ fn slash_all() -> Vec<SlashItem> {
     v.push(SlashItem { act: Slash::Block(BlockKind::Toc), label: "Table of contents", hint: "Jump links to every heading.", glyph: l::TABLE_OF_CONTENTS, kw: "table of contents toc outline", sec: adv });
     v.push(SlashItem { act: Slash::NewPage, label: "Page", hint: "Embed a new sub-page inside this page.", glyph: l::FILE_PLUS, kw: "page subpage new child", sec: adv });
     v.push(SlashItem { act: Slash::Link, label: "Link to page", hint: "Link to an existing page.", glyph: l::LINK_2, kw: "link page mention reference", sec: adv });
+    v.push(SlashItem { act: Slash::Dashboard, label: "Dashboard", hint: "Turn this page into a dashboard of charts, tables and widgets.", glyph: l::LAYOUT_DASHBOARD, kw: "dashboard widgets chart charts kpi board analytics overview", sec: adv });
     v.push(SlashItem { act: Slash::Today, label: "Today's date", hint: "Insert the current date.", glyph: l::CALENDAR_DAYS, kw: "date today now time", sec: adv });
     let dbs = [
         (ViewKind::Table, "Table database", "Spreadsheet-style database."),
@@ -585,7 +590,8 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
     let bg = ui.interact(bg_rect, Id::new(("page_bg", id)), Sense::click_and_drag());
     changed |= pickers::cover(ui, &mut ws.pages[idx], ed, pal, avail);
 
-    let wide = kind == PageKind::Database || full;
+    let dash_board = if kind == PageKind::Doc && !is_row { ws.dash.page_board(id) } else { None };
+    let wide = kind == PageKind::Database || full || dash_board.is_some();
     let col_w = if wide { (avail - 96.0).max(300.0) } else { (avail - 80.0).clamp(300.0, 900.0) };
     let left = if wide { 48.0 } else { ((avail - col_w) / 2.0).max(24.0) };
     let content_w = (col_w - GUTTER).max(200.0);
@@ -599,6 +605,17 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
             changed |= header(ui, &mut ws.pages[idx], ed, pal, content_w);
             if is_row {
                 changed |= database::row_props(ui, ws, id, ed, pal, content_w);
+            }
+            if let Some(b) = dash_board {
+                // this page is a dashboard: the widget grid sits between the header and the blocks
+                let nav = crate::dashboard::embedded(ui, ws, pal, b);
+                if let Some(o) = nav.out.open {
+                    ed.nav = Some(o);
+                }
+                if let Some(t) = nav.toast {
+                    crate::dashcfg::set_toast(&t);
+                }
+                ui.add_space(16.0);
             }
             match kind {
                 PageKind::Database => changed |= database::show(ui, ws, id, ed, pal, col_w),
@@ -619,6 +636,14 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
         });
     });
 
+    if std::mem::take(&mut ed.want_dash) && kind == PageKind::Doc {
+        ws.dash.ensure_page_board(id, "Dashboard");
+        if let Some(p) = ws.pages.get_mut(idx) {
+            p.full_width = true;
+        }
+        changed = true;
+        ui.ctx().request_repaint();
+    }
     ui.add_space(80.0);
     {
         let Workspace { pages, next_id, .. } = &mut *ws;
@@ -1185,6 +1210,12 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
                     let nb = new_block(next_id, BlockKind::Text, String::new(), ind);
                     bl.push(nb);
                 }
+            }
+            Slash::Dashboard => {
+                bl[i].kind = BlockKind::Text;
+                bl[i].text.clear();
+                ed.want_dash = true;
+                ed.focus = Some((bl[i].id, usize::MAX));
             }
             Slash::Today => {
                 bl[i].kind = BlockKind::Text;

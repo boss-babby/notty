@@ -1131,6 +1131,7 @@ impl LumenApp {
             return;
         };
         let (small, full, is_db) = (page.small_text, page.full_width, page.db.is_some());
+        let has_dash = self.ws.dash.page_board(cur).is_some();
         let (words, chars) = (nio::word_count(page), nio::char_count(page));
         let mut act: Option<u8> = None;
         let open = popup_area(ctx, Id::new("page_menu"), pos, pal, &mut self.fresh, 262.0, |ui| {
@@ -1140,6 +1141,9 @@ impl LumenApp {
             }
             if menu_item(ui, pal, l::MAXIMIZE, if full { "Standard page width" } else { "Full width" }, None, false, false).clicked() {
                 act = Some(1);
+            }
+            if !is_db && menu_item(ui, pal, l::LAYOUT_DASHBOARD, if has_dash { "Remove dashboard" } else { "Make this page a dashboard" }, Some(if has_dash { "Keeps the page text" } else { "Adds a grid of widgets and charts" }), has_dash, false).clicked() {
+                act = Some(9);
             }
             ui.add_space(3.0);
             ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
@@ -1193,6 +1197,18 @@ impl LumenApp {
             }
             Some(2) => {
                 self.ws.duplicate(cur);
+            }
+            Some(9) => {
+                if has_dash {
+                    self.ws.dash.drop_page_board(cur);
+                    self.toast("Dashboard removed from this page", None);
+                } else {
+                    self.ws.dash.ensure_page_board(cur, "Dashboard");
+                    if let Some(p) = self.ws.page_mut(cur) {
+                        p.full_width = true;
+                    }
+                    self.toast("This page is now a dashboard — add widgets from the toolbar", None);
+                }
             }
             Some(3) => self.export_md(),
             Some(4) => {

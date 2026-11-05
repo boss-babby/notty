@@ -15,8 +15,10 @@ use crate::widgets::{popup_frame, section_label, text_fit, with_alpha};
 
 // ───────────────────────────── creating widgets ─────────────────────────────
 
-/// Adds a widget of `kind` to the active board with settings chosen from what the workspace contains.
-pub fn create(ws: &mut Workspace, kind: &str) -> Option<u64> {
+/// Adds a widget of `kind` to board `board` (0 = the active Home board) with settings chosen from what the workspace contains.
+/// `"chart"` (or any plot type such as `"line"`) creates the unified Chart widget with that plot type.
+pub fn create(ws: &mut Workspace, kind: &str, board: u64) -> Option<u64> {
+    let kind = if kind == "chart" { "bar" } else { kind };
     let d = dw::def(kind)?;
     let mut c = Cfg::default();
     if d.opts.contains(&Opt::Db) {
@@ -24,24 +26,8 @@ pub fn create(ws: &mut Workspace, kind: &str) -> Option<u64> {
             cfg::autofill(ws, &mut c, db);
         }
     }
-    let props = ws.db(c.db).map(|x| x.props.clone()).unwrap_or_default();
+    tune(ws, &mut c, kind);
     match kind {
-        "line" | "area" => {
-            if let Some(p) = props.iter().find(|p| p.kind == PropKind::Date) {
-                c.group = p.id;
-                c.bucket = Bucket::Month;
-            }
-        }
-        "stacked" => {
-            if let Some(p) = props.iter().find(|p| matches!(p.kind, PropKind::Select | PropKind::MultiSelect) && p.id != c.group) {
-                c.stack = p.id;
-            }
-        }
-        "gauge" => {
-            let v = dd::number(ws, &c, Range::All).value;
-            c.goal = if c.agg.is_percent() { 100.0 } else { crate::dashcharts::nice_scale((v * 1.25).max(4.0)).0 };
-        }
-        "progress" => c.goal = 100.0,
         "heatmap" => c.group = 0,
         "countdown" => c.target = dates_in(30),
         "pagepreview" | "quicklinks" => {
@@ -53,7 +39,50 @@ pub fn create(ws: &mut Workspace, kind: &str) -> Option<u64> {
         "notes" => c.text = String::new(),
         _ => {}
     }
-    Some(ws.dash.add_widget(cfg::new_widget(kind, d.span, d.rows, c)))
+    Some(ws.dash.add_widget_to(board, cfg::new_widget(kind, d.span, d.rows, c)))
+}
+
+/// Gives the settings a plot type needs a sensible value (only fills what is still empty, so it is safe when the user switches plots).
+pub fn tune(ws: &Workspace, c: &mut Cfg, plot: &str) {
+    let props = ws.db(c.db).map(|x| x.props.clone()).unwrap_or_default();
+    match plot {
+        "line" | "area" => {
+            if !props.iter().any(|p| p.id == c.group && p.kind == PropKind::Date) {
+                if let Some(p) = props.iter().find(|p| p.kind == PropKind::Date) {
+                    c.group = p.id;
+                    c.bucket = Bucket::Month;
+                }
+            }
+        }
+        "stacked" => {
+            if c.stack == 0 {
+                if let Some(p) = props.iter().find(|p| matches!(p.kind, PropKind::Select | PropKind::MultiSelect) && p.id != c.group) {
+                    c.stack = p.id;
+                }
+            }
+        }
+        "gauge" => {
+            if c.goal <= 0.0 {
+                let v = dd::number(ws, c, Range::All).value;
+                c.goal = if c.agg.is_percent() { 100.0 } else { crate::dashcharts::nice_scale((v * 1.25).max(4.0)).0 };
+            }
+        }
+        "progress" => {
+            if c.goal <= 0.0 {
+                c.goal = 100.0
+            }
+        }
+        "scatter" => {
+            if c.x == 0 && c.y == 0 {
+                let nums: Vec<u64> = props.iter().filter(|p| numeric(p.kind)).map(|p| p.id).collect();
+                if nums.len() >= 2 {
+                    c.x = nums[0];
+                    c.y = nums[1];
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn dates_in(days: i64) -> String {
@@ -66,7 +95,9 @@ fn dates_in(days: i64) -> String {
 pub struct Gallery {
     pub q: String,
     pub cat: Option<Cat>,
-    opened: bool,
+    /// Board that receives the widget (0 = the active Home board; otherwise the board of the page being edited).
+    pub board: u64,
+    pub opened: bool,
 }
 
 pub enum GalleryResult {
@@ -89,7 +120,8 @@ pub fn gallery(ctx: &egui::Context, ws: &mut Workspace, pal: &Palette, g: &mut G
     let t = crate::widgets::appear(ctx, Id::new("dash_gallery_in"), 0.18);
     let first = !g.opened;
     g.opened = true;
-    let defs: Vec<Def> = dw::all();
+    // the individual plot types live inside the unified Chart widget
+    let defs: Vec<Def> = dw::all().into_iter().filter(|d| !cfg::PLOT_KINDS.contains(&d.kind)).collect();
     Area::new(Id::new("dash_gallery")).order(Order::Foreground).fixed_pos(screen.min).constrain(false).show(ctx, |ui| {
         ui.set_clip_rect(screen);
         let (full, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
@@ -188,7 +220,7 @@ pub fn gallery(ctx: &egui::Context, ws: &mut Workspace, pal: &Palette, g: &mut G
             }
         });
         if let Some(kind) = pick {
-            if let Some(id) = create(ws, kind) {
+            if let Some(id) = create(ws, kind, g.board) {
                 result = GalleryResult::Added(id);
             }
         }
@@ -244,7 +276,8 @@ fn check(ui: &mut Ui, value: &mut bool, text: &str) {
 /// Docked settings panel for widget `id`. Returns false when it was closed.
 pub fn inspector(ctx: &egui::Context, ws: &mut Workspace, pal: &Palette, id: u64, area: Rect) -> bool {
     let Some(orig) = ws.dash.widget(id).cloned() else { return false };
-    let def = dw::def(&orig.kind);
+    let def = dw::def_for(&orig);
+    let plot = cfg::plot_of(&orig);
     let opts: &[Opt] = def.as_ref().map_or(&[], |d| d.opts);
     let mut w: Widget = orig.clone();
     let mut keep = true;
@@ -259,7 +292,7 @@ pub fn inspector(ctx: &egui::Context, ws: &mut Workspace, pal: &Palette, id: u64
             ui.set_width(width - 28.0);
             ui.set_height(h - 28.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new(def.as_ref().map_or("Widget", |d| d.name)).font(bold(16.0)).color(pal.text));
+                ui.label(RichText::new(if plot.is_some() { "Chart" } else { def.as_ref().map_or("Widget", |d| d.name) }).font(bold(16.0)).color(pal.text));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
                     if resp.hovered() {
@@ -277,13 +310,44 @@ pub fn inspector(ctx: &egui::Context, ws: &mut Workspace, pal: &Palette, id: u64
             ui.add_space(4.0);
             ScrollArea::vertical().id_salt("dash_insp_scroll").auto_shrink([false, false]).max_height(h - 100.0).show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                // ── plot type (unified Chart widget) ──
+                if let Some(cur) = &plot {
+                    section_label(ui, pal, "PLOT TYPE");
+                    let cols = 3usize;
+                    let gap = 6.0;
+                    let tw_ = (ui.available_width() - 6.0 - gap * (cols as f32 - 1.0)) / cols as f32;
+                    for row in dw::CHART_KINDS.chunks(cols) {
+                        let (rr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 50.0), Sense::hover());
+                        for (ci, k) in row.iter().enumerate() {
+                            let r = Rect::from_min_size(rr.min + vec2((tw_ + gap) * ci as f32, 0.0), vec2(tw_, 46.0));
+                            let on = cur == k;
+                            let resp = ui.interact(r, Id::new(("dash_plot", *k)), Sense::click());
+                            let p = ui.painter();
+                            p.rect_filled(r, 10.0, if on { pal.accent_soft } else if resp.hovered() { pal.hover } else { with_alpha(pal.muted, 0.07) });
+                            if on {
+                                p.rect_stroke(r, 10.0, Stroke::new(1.5_f32, pal.accent), egui::StrokeKind::Inside);
+                            }
+                            let g = dw::def(k).map_or(l::CHART_COLUMN, |d| d.glyph);
+                            p.text(pos2(r.center().x, r.top() + 15.0), Align2::CENTER_CENTER, g, body(17.0), if on { pal.accent } else { pal.text });
+                            p.text(pos2(r.center().x, r.bottom() - 11.0), Align2::CENTER_CENTER, dw::plot_label(k), if on { bold(11.5) } else { body(11.5) }, if on { pal.accent } else { pal.muted });
+                            if resp.on_hover_text(dw::def(k).map_or("", |d| d.desc)).on_hover_cursor(CursorIcon::PointingHand).clicked() && !on {
+                                w.cfg.extra.insert("plot".into(), (*k).to_owned());
+                                tune(ws, &mut w.cfg, k);
+                                if let Some(d) = dw::def(k) {
+                                    w.span = d.span;
+                                    w.rows = d.rows;
+                                }
+                            }
+                        }
+                    }
+                }
                 // ── title & size ──
                 section_label(ui, pal, "GENERAL");
                 ui.add(egui::TextEdit::singleline(&mut w.title).hint_text("Title (automatic)").desired_width(ui.available_width() - 6.0).font(body(14.0)));
                 ui.add_space(6.0);
                 ui.label(RichText::new("Width").font(body(12.0)).color(pal.muted));
                 ui.horizontal_wrapped(|ui| {
-                    for (n, s) in [("¼", 3u8), ("⅓", 4), ("½", 6), ("⅔", 8), ("Full", 12)] {
+                    for (n, s) in [("1/4", 3u8), ("1/3", 4), ("1/2", 6), ("2/3", 8), ("Full", 12)] {
                         if size_chip(ui, pal, n, w.span == s) {
                             w.span = s;
                         }
@@ -363,7 +427,7 @@ pub fn inspector(ctx: &egui::Context, ws: &mut Workspace, pal: &Palette, id: u64
                         if let Some(i) = del {
                             w.cfg.filters.remove(i);
                         }
-                        if ui.add(egui::Button::new(RichText::new("＋ Add filter").font(body(12.5)).color(pal.accent)).frame(false)).on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                        if ui.add(egui::Button::new(RichText::new(format!("{}  Add filter", l::PLUS)).font(body(12.5)).color(pal.accent)).frame(false)).on_hover_cursor(CursorIcon::PointingHand).clicked() {
                             w.cfg.filters.push(Filter { prop: 0, op: FilterOp::Contains, value: String::new() });
                         }
                     }
@@ -488,7 +552,7 @@ pub fn inspector(ctx: &egui::Context, ws: &mut Workspace, pal: &Palette, id: u64
                     ui.add(egui::TextEdit::singleline(&mut w.cfg.target).hint_text("YYYY-MM-DD").desired_width(ui.available_width() - 6.0).font(body(14.0)));
                 }
                 if has(Opt::Pages) {
-                    section_label(ui, pal, if w.kind == "pagepreview" { "PAGE" } else { "PAGES" });
+                    section_label(ui, pal, if w.kind == "subpages" { "PARENT PAGE (EMPTY = TOP LEVEL)" } else if w.kind == "pagepreview" { "PAGE" } else { "PAGES" });
                     let mut del = None;
                     for (i, pid) in w.cfg.pages.iter().enumerate() {
                         ui.horizontal(|ui| {
@@ -508,8 +572,8 @@ pub fn inspector(ctx: &egui::Context, ws: &mut Workspace, pal: &Palette, id: u64
                         let ql = q.to_lowercase();
                         let found: Vec<(u64, String)> = ws.pages.iter().filter(|p| !p.trashed && !w.cfg.pages.contains(&p.id) && p.title.to_lowercase().contains(&ql)).take(6).map(|p| (p.id, if p.title.is_empty() { "Untitled".into() } else { p.title.clone() })).collect();
                         for (pid, name) in found {
-                            if ui.add(egui::Button::new(RichText::new(format!("＋ {name}")).font(body(13.0))).frame(false)).on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                                if w.kind == "pagepreview" {
+                            if ui.add(egui::Button::new(RichText::new(format!("{}  {name}", l::PLUS)).font(body(13.0))).frame(false)).on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                if w.kind == "pagepreview" || w.kind == "subpages" {
                                     w.cfg.pages = vec![pid];
                                 } else {
                                     w.cfg.pages.push(pid);

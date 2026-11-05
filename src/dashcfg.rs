@@ -397,6 +397,10 @@ pub struct Board {
     pub name: String,
     #[serde(default)]
     pub widgets: Vec<Widget>,
+    /// 0 = a tab of the Home dashboard. Otherwise the id of the **page** that hosts this board: in Lumen (as in Notion) *any*
+    /// page can be a dashboard — the page keeps its blocks and gains a grid of widgets.
+    #[serde(default)]
+    pub page: u64,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug, Default)]
@@ -506,20 +510,20 @@ impl Dash {
 
     pub fn add_board(&mut self, name: &str, widgets: Vec<Widget>) -> usize {
         let id = self.new_id();
-        self.boards.push(Board { id, name: name.to_owned(), widgets });
+        self.boards.push(Board { id, name: name.to_owned(), widgets, page: 0 });
         self.active = self.boards.len() - 1;
         self.active
     }
 
     /// Adds a widget to the active board (a board is created when there is none). Returns the widget id.
     pub fn add_widget(&mut self, mut w: Widget) -> u64 {
-        if self.boards.is_empty() {
+        if self.home_count() == 0 {
             self.add_board("Overview", vec![]);
         }
+        self.fix_active();
         w.id = self.new_id();
         let id = w.id;
-        let i = self.active.min(self.boards.len() - 1);
-        self.active = i;
+        let i = self.active;
         self.boards[i].widgets.push(w);
         id
     }
@@ -559,16 +563,71 @@ impl Dash {
         b.widgets.insert(if after { at + 1 } else { at }, w);
     }
 
+    /// Number of boards shown as tabs on the Home dashboard.
+    pub fn home_count(&self) -> usize {
+        self.boards.iter().filter(|b| b.page == 0).count()
+    }
+
     pub fn remove_board(&mut self, i: usize) {
-        if self.boards.len() > 1 && i < self.boards.len() {
+        if self.home_count() > 1 && i < self.boards.len() && self.boards[i].page == 0 {
             self.boards.remove(i);
-            self.active = self.active.min(self.boards.len() - 1);
+            self.fix_active();
         }
+    }
+
+    /// Keeps `active` pointing at a Home tab (page boards are never tabs).
+    pub fn fix_active(&mut self) {
+        self.active = self.active.min(self.boards.len().saturating_sub(1));
+        if self.boards.get(self.active).map_or(true, |b| b.page != 0) {
+            self.active = self.boards.iter().position(|b| b.page == 0).unwrap_or(0);
+        }
+    }
+
+    pub fn board_index(&self, id: u64) -> Option<usize> {
+        self.boards.iter().position(|b| b.id == id)
+    }
+
+    /// The board that turns page `page` into a dashboard, if it has one.
+    pub fn page_board(&self, page: u64) -> Option<u64> {
+        self.boards.iter().find(|b| b.page == page && page != 0).map(|b| b.id)
+    }
+
+    /// Gives `page` a dashboard (idempotent) and returns the board id.
+    pub fn ensure_page_board(&mut self, page: u64, name: &str) -> u64 {
+        if let Some(b) = self.page_board(page) {
+            return b;
+        }
+        let id = self.new_id();
+        self.boards.push(Board { id, name: name.to_owned(), widgets: vec![], page });
+        id
+    }
+
+    /// Adds a widget to board `board` (0 = the active Home board). Returns the widget id.
+    pub fn add_widget_to(&mut self, board: u64, mut w: Widget) -> u64 {
+        if board == 0 {
+            return self.add_widget(w);
+        }
+        w.id = self.new_id();
+        let id = w.id;
+        if let Some(i) = self.board_index(board) {
+            self.boards[i].widgets.push(w);
+        }
+        id
+    }
+
+    /// Removes the dashboard of a page (the page and its blocks stay).
+    pub fn drop_page_board(&mut self, page: u64) {
+        self.boards.retain(|b| b.page != page || page == 0);
     }
 }
 
-pub fn new_widget(kind: &str, span: u8, rows: u8, cfg: Cfg) -> Widget {
-    Widget { id: 0, kind: kind.to_owned(), title: String::new(), span, rows, cfg }
+pub fn new_widget(kind: &str, span: u8, rows: u8, mut cfg: Cfg) -> Widget {
+    let mut kind = kind.to_owned();
+    if PLOT_KINDS.contains(&kind.as_str()) {
+        cfg.extra.insert("plot".into(), kind);
+        kind = "chart".into();
+    }
+    Widget { id: 0, kind, title: String::new(), span, rows, cfg }
 }
 
 // ───────────────────────────── smart defaults ─────────────────────────────
@@ -731,15 +790,66 @@ pub fn personal_widgets() -> Vec<Widget> {
 
 /// Creates the first board for a workspace that has none (also upgrades workspaces saved before dashboards were customisable).
 pub fn ensure_seeded(ws: &mut Workspace) {
-    if ws.dash.boards.is_empty() {
+    migrate_plots(&mut ws.dash);
+    if ws.dash.home_count() == 0 {
         let w = overview_widgets(ws);
         ws.dash.add_board("Overview", vec![]);
         for x in w {
             ws.dash.add_widget(x);
         }
-        ws.dash.active = 0;
     }
-    ws.dash.active = ws.dash.active.min(ws.dash.boards.len().saturating_sub(1));
+    ws.dash.fix_active();
+}
+
+/// Every plot type that now lives inside the single unified **Chart** widget.
+pub const PLOT_KINDS: [&str; 14] = ["bar", "hbar", "stacked", "line", "area", "pie", "donut", "funnel", "radar", "histogram", "scatter", "heatmap", "gauge", "number"];
+
+/// The plot type of a widget: `Some(kind)` for a Chart widget (or a legacy per-plot widget), `None` for everything else.
+pub fn plot_of(w: &Widget) -> Option<String> {
+    if w.kind == "chart" {
+        return Some(w.cfg.extra.get("plot").cloned().filter(|k| PLOT_KINDS.contains(&k.as_str())).unwrap_or_else(|| "bar".into()));
+    }
+    PLOT_KINDS.contains(&w.kind.as_str()).then(|| w.kind.clone())
+}
+
+/// Old workspaces stored one widget kind per plot type; they become Chart widgets whose plot type is a setting.
+pub fn migrate_plots(d: &mut Dash) {
+    for b in &mut d.boards {
+        for w in &mut b.widgets {
+            if w.kind != "chart" && PLOT_KINDS.contains(&w.kind.as_str()) {
+                w.cfg.extra.insert("plot".into(), w.kind.clone());
+                w.kind = "chart".into();
+            }
+        }
+    }
+}
+
+/// Creates a page that is a dashboard: a normal page (icon, cover, sub-pages, blocks below the widgets) whose body is a widget grid.
+/// `preset` is `blank`, `starter`, `overview`, `analytics` or `personal`. Returns the page id.
+pub fn new_dashboard_page(ws: &mut Workspace, parent: Option<u64>, preset: &str) -> u64 {
+    let id = ws.add_page(parent, crate::model::PageKind::Doc);
+    if let Some(p) = ws.page_mut(id) {
+        p.title = "New dashboard".into();
+        p.icon = crate::lucide::LAYOUT_DASHBOARD.into();
+        p.full_width = true;
+    }
+    let b = ws.dash.ensure_page_board(id, "Dashboard");
+    let key = if preset == "starter" { "overview" } else { preset };
+    fill_board(ws, b, key);
+    id
+}
+
+/// Fills board `board` with the widgets of a preset (`overview`, `analytics`, `personal`).
+pub fn fill_board(ws: &mut Workspace, board: u64, preset: &str) {
+    let widgets = match preset {
+        "overview" => overview_widgets(ws),
+        "analytics" => analytics_widgets(ws),
+        "personal" => personal_widgets(),
+        _ => vec![],
+    };
+    for w in widgets {
+        ws.dash.add_widget_to(board, w);
+    }
 }
 
 pub fn add_preset(ws: &mut Workspace, preset: &str) {
