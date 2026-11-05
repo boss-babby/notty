@@ -76,6 +76,8 @@ pub(crate) enum A {
     DelRow(u64),
     Open(u64),
     SetActive(usize),
+    /// View index, property id (0 = name column), width (0 = reset).
+    SetColW(usize, u64, f32),
     AddView(ViewKind),
     DelView(usize),
     RenameView(usize, String),
@@ -193,7 +195,7 @@ fn field_btn(ui: &mut Ui, pal: &Palette, label: &str, width: f32) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 30.0), Sense::click());
     let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
     ui.painter().rect_filled(rect, 7.0, lerp_color(pal.hover, pal.active, t));
-    ui.painter().with_clip_rect(rect.shrink2(vec2(4.0, 0.0))).text(pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, label, body(13.5), pal.text);
+    crate::widgets::text_fit(ui.painter(), pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, label, body(13.5), pal.text, (rect.width() - 18.0).max(10.0));
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
@@ -238,7 +240,7 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState, pal:
         let rows = wsr.query(id, vi);
         let view = &db.views[vi];
         match view.kind {
-            ViewKind::Table => table(ui, wsr, &db, &rows, st, pal, w, &mut acts),
+            ViewKind::Table => table(ui, wsr, &db, vi, &rows, st, pal, w, &mut acts),
             ViewKind::Board => board(ui, wsr, &db, view, &rows, st, pal, &mut acts),
             ViewKind::List => list(ui, wsr, &db, &rows, pal, w, &mut acts),
             ViewKind::Gallery => gallery(ui, wsr, &db, &rows, pal, w, &mut acts),
@@ -319,59 +321,85 @@ pub fn row_props(ui: &mut Ui, ws: &mut Workspace, row_id: u64, ed: &mut EditorSt
 
 // ───────────────────────────── toolbar ─────────────────────────────
 
-fn toolbar(ui: &mut Ui, db: &Database, vi: usize, st: &mut DbState, pal: &Palette, w: f32, acts: &mut Vec<A>) {
-    let view = &db.views[vi];
-    ui.horizontal(|ui| {
-        ui.set_width(w);
-        ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
-        for (i, v) in db.views.iter().enumerate() {
-            let r = pill(ui, pal, &format!("{}  {}", v.kind.glyph(), v.name), i == vi, false);
-            if let Some(p) = right_clicked(ui, r.rect) {
-                if i != vi {
-                    acts.push(A::SetActive(i));
-                }
-                st.popup = Some(Popup::ViewMenu(p));
-                st.fresh = true;
+fn views_ui(ui: &mut Ui, db: &Database, vi: usize, st: &mut DbState, pal: &Palette, acts: &mut Vec<A>) {
+    ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
+    for (i, v) in db.views.iter().enumerate() {
+        let r = pill(ui, pal, &format!("{}  {}", v.kind.glyph(), v.name), i == vi, false);
+        if let Some(p) = right_clicked(ui, r.rect) {
+            if i != vi {
+                acts.push(A::SetActive(i));
             }
-            if r.clicked() {
-                if i == vi {
-                    st.popup = Some(Popup::ViewMenu(r.rect.left_bottom() + vec2(0.0, 6.0)));
-                    st.fresh = true;
-                } else {
-                    acts.push(A::SetActive(i));
-                }
-            }
-        }
-        let r = pill(ui, pal, l::PLUS, false, false).on_hover_text("Add a view");
-        if r.clicked() {
-            st.popup = Some(Popup::AddView(r.rect.left_bottom() + vec2(0.0, 6.0)));
+            st.popup = Some(Popup::ViewMenu(p));
             st.fresh = true;
         }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
-            if pill(ui, pal, &format!("{}  New", l::PLUS), false, true).clicked() {
-                acts.push(A::AddRow(None));
-            }
-            ui.add_space(6.0);
-            let r = pill(ui, pal, &format!("{}  Properties", l::SLIDERS_HORIZONTAL), false, false);
-            if r.clicked() {
-                st.popup = Some(Popup::Props(pos2(r.rect.right() - 280.0, r.rect.bottom() + 6.0)));
+        if r.clicked() {
+            if i == vi {
+                st.popup = Some(Popup::ViewMenu(r.rect.left_bottom() + vec2(0.0, 6.0)));
                 st.fresh = true;
+            } else {
+                acts.push(A::SetActive(i));
             }
-            let fl = if view.filters.is_empty() { format!("{}  Filter", l::FILTER) } else { format!("{}  Filter · {}", l::FILTER, view.filters.len()) };
-            let r = pill(ui, pal, &fl, !view.filters.is_empty(), false);
-            if r.clicked() {
-                st.popup = Some(Popup::Filter(pos2(r.rect.right() - 440.0, r.rect.bottom() + 6.0)));
-                st.fresh = true;
-            }
-            let sl = if view.sorts.is_empty() { format!("{}  Sort", l::ARROW_UP_DOWN) } else { format!("{}  Sort · {}", l::ARROW_UP_DOWN, view.sorts.len()) };
-            let r = pill(ui, pal, &sl, !view.sorts.is_empty(), false);
-            if r.clicked() {
-                st.popup = Some(Popup::Sort(pos2(r.rect.right() - 340.0, r.rect.bottom() + 6.0)));
-                st.fresh = true;
-            }
+        }
+    }
+    let r = pill(ui, pal, l::PLUS, false, false).on_hover_text("Add a view");
+    if r.clicked() {
+        st.popup = Some(Popup::AddView(r.rect.left_bottom() + vec2(0.0, 6.0)));
+        st.fresh = true;
+    }
+}
+
+/// Filter / Sort / Properties / New (right to left). `short` = icons only (phones).
+fn tools_ui(ui: &mut Ui, view: &View, st: &mut DbState, pal: &Palette, acts: &mut Vec<A>, short: bool) {
+    ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
+    let new_t = if short { l::PLUS.to_string() } else { format!("{}  New", l::PLUS) };
+    if pill(ui, pal, &new_t, false, true).clicked() {
+        acts.push(A::AddRow(None));
+    }
+    ui.add_space(6.0);
+    let pt = if short { l::SLIDERS_HORIZONTAL.to_string() } else { format!("{}  Properties", l::SLIDERS_HORIZONTAL) };
+    let r = pill(ui, pal, &pt, false, false);
+    if r.clicked() {
+        st.popup = Some(Popup::Props(pos2(r.rect.right() - 280.0, r.rect.bottom() + 6.0)));
+        st.fresh = true;
+    }
+    let cnt = |n: usize| if n == 0 { String::new() } else { format!(" · {n}") };
+    let fl = if short { format!("{}{}", l::FILTER, cnt(view.filters.len())) } else { format!("{}  Filter{}", l::FILTER, cnt(view.filters.len())) };
+    let r = pill(ui, pal, &fl, !view.filters.is_empty(), false);
+    if r.clicked() {
+        st.popup = Some(Popup::Filter(pos2(r.rect.right() - 440.0, r.rect.bottom() + 6.0)));
+        st.fresh = true;
+    }
+    let sl = if short { format!("{}{}", l::ARROW_UP_DOWN, cnt(view.sorts.len())) } else { format!("{}  Sort{}", l::ARROW_UP_DOWN, cnt(view.sorts.len())) };
+    let r = pill(ui, pal, &sl, !view.sorts.is_empty(), false);
+    if r.clicked() {
+        st.popup = Some(Popup::Sort(pos2(r.rect.right() - 340.0, r.rect.bottom() + 6.0)));
+        st.fresh = true;
+    }
+}
+
+/// The view tabs and the tools never share a row unless both fit: otherwise the tabs scroll sideways on their own row and
+/// the tools get a second row (this is what used to overlap on narrow windows and phones).
+fn toolbar(ui: &mut Ui, db: &Database, vi: usize, st: &mut DbState, pal: &Palette, w: f32, acts: &mut Vec<A>) {
+    let view = &db.views[vi];
+    let tabs_w: f32 = db.views.iter().map(|v| 44.0 + v.name.chars().count() as f32 * 7.6).sum::<f32>() + 40.0;
+    let short = w < 480.0;
+    let tools_w = if short { 200.0 } else { 372.0 };
+    if tabs_w + tools_w + 16.0 <= w {
+        ui.horizontal(|ui| {
+            ui.set_width(w);
+            views_ui(ui, db, vi, st, pal, acts);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| tools_ui(ui, view, st, pal, acts, false));
         });
-    });
+    } else {
+        ScrollArea::horizontal().id_salt("db_tabs").auto_shrink([false, true]).max_width(w).show(ui, |ui| {
+            ui.horizontal(|ui| views_ui(ui, db, vi, st, pal, acts));
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.set_width(w);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| tools_ui(ui, view, st, pal, acts, short));
+        });
+    }
     ui.add_space(4.0);
 }
 
@@ -533,12 +561,14 @@ fn cell(ui: &mut Ui, db: &Database, row: &Page, prop: &Prop, rect: Rect, pal: &P
 // ───────────────────────────── table ─────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
-fn table(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], st: &mut DbState, pal: &Palette, w: f32, acts: &mut Vec<A>) {
+fn table(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, rows: &[u64], st: &mut DbState, pal: &Palette, w: f32, acts: &mut Vec<A>) {
     // Phones: a narrower name column, the hover buttons shrink to "OPEN" only — nothing overlaps the title text.
     let compact = w < 560.0;
-    let title_w: f32 = if compact { (w * 0.5).clamp(150.0, 230.0) } else { TITLE_W };
+    let view = &db.views[vi];
+    let title_w: f32 = view.widths.get(&0).copied().unwrap_or(if compact { (w * 0.5).clamp(150.0, 230.0) } else { TITLE_W }).clamp(130.0, 640.0);
     let btn_w: f32 = if compact { 62.0 } else { 92.0 };
-    let total: f32 = title_w + db.props.iter().map(|p| col_w(p.kind)).sum::<f32>() + 44.0;
+    let cw_of = |p: &Prop| view.widths.get(&p.id).copied().unwrap_or_else(|| col_w(p.kind)).clamp(70.0, 700.0);
+    let total: f32 = title_w + db.props.iter().map(|p| cw_of(p)).sum::<f32>() + 44.0;
     ScrollArea::horizontal().id_salt("table_scroll").auto_shrink([false, true]).show(ui, |ui| {
         ui.set_min_width(w.max(total.min(w)));
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
@@ -546,9 +576,10 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], st: &mut DbSt
         let (hr, _) = ui.allocate_exact_size(vec2(total, 32.0), Sense::hover());
         let mut x = hr.left();
         ui.painter().text(pos2(x + 8.0, hr.center().y), Align2::LEFT_CENTER, "Aa  Name", body(13.0), pal.muted);
+        resize_handle(ui, pal, Rect::from_min_size(pos2(x + title_w - 6.0, hr.top()), vec2(12.0, 32.0)), Id::new(("thr", vi, 0u64)), title_w, vi, 0, acts);
         x += title_w;
         for p in &db.props {
-            let cw = col_w(p.kind);
+            let cw = cw_of(p);
             let r = Rect::from_min_size(pos2(x, hr.top()), vec2(cw, 32.0));
             let resp = ui.interact(r, Id::new(("th", p.id)), Sense::click());
             let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
@@ -557,6 +588,7 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], st: &mut DbSt
             if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                 open_popup_at(st, Popup::PropMenu { prop: p.id, pos: r.left_bottom() + vec2(0.0, 4.0) });
             }
+            resize_handle(ui, pal, Rect::from_min_size(pos2(x + cw - 6.0, hr.top()), vec2(12.0, 32.0)), Id::new(("thr", vi, p.id)), cw, vi, p.id, acts);
             x += cw;
         }
         let ar = Rect::from_min_size(pos2(x, hr.top()), vec2(40.0, 32.0));
@@ -627,7 +659,7 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], st: &mut DbSt
             // props
             let mut x = rr.left() + title_w;
             for p in &db.props {
-                let cw = col_w(p.kind);
+                let cw = cw_of(p);
                 let cr = Rect::from_min_size(pos2(x, rr.top()), vec2(cw, ROW_H));
                 ui.painter().vline(cr.left(), cr.y_range(), Stroke::new(1.0_f32, with_alpha(pal.border, 0.7)));
                 cell(ui, db, row, p, cr, pal, st, acts);
@@ -689,6 +721,27 @@ fn card_chips(ui: &mut Ui, db: &Database, row: &Page, skip: u64, pal: &Palette) 
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Drag handle on the right edge of a header cell: resizes the column (stored per view; key 0 = the name column).
+#[allow(clippy::too_many_arguments)]
+fn resize_handle(ui: &mut Ui, pal: &Palette, r: Rect, id: Id, cur: f32, vi: usize, key: u64, acts: &mut Vec<A>) {
+    let resp = ui.interact(r, id, Sense::click_and_drag());
+    let active = resp.hovered() || resp.dragged();
+    if active {
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+        let x = r.center().x;
+        ui.painter().vline(x, r.y_range(), Stroke::new(2.0_f32, pal.accent));
+    }
+    if resp.dragged() {
+        let dx = resp.drag_delta().x;
+        if dx != 0.0 {
+            acts.push(A::SetColW(vi, key, (cur + dx).clamp(70.0, 700.0)));
+        }
+    }
+    if resp.double_clicked() {
+        acts.push(A::SetColW(vi, key, 0.0));
+    }
+}
+
 fn board(ui: &mut Ui, ws: &Workspace, db: &Database, view: &View, rows: &[u64], st: &mut DbState, pal: &Palette, acts: &mut Vec<A>) {
     let Some(gp) = db.group_prop(view) else {
         ui.add_space(20.0);
@@ -1067,6 +1120,26 @@ fn prop_choices(db: &Database) -> Vec<(u64, String, PropKind)> {
     v
 }
 
+#[allow(clippy::too_many_arguments)]
+fn filter_value(ui: &mut Ui, db: &Database, pal: &Palette, f: &Filter, kind: PropKind, vi: usize, fi: usize, w: f32, acts: &mut Vec<A>) {
+    if matches!(kind, PropKind::Select | PropKind::MultiSelect) {
+        let opts = db.prop(f.prop).map(|p| p.opts.clone()).unwrap_or_default();
+        let label = if f.value.is_empty() { "Choose…".to_owned() } else { f.value.clone() };
+        if field_btn(ui, pal, &label, w).clicked() && !opts.is_empty() {
+            let pos = opts.iter().position(|o| o.name == f.value).map(|p| p + 1).unwrap_or(0);
+            let name = opts[pos % opts.len()].name.clone();
+            acts.push(A::SetFilter(vi, fi, Filter { value: name, ..f.clone() }));
+        }
+    } else {
+        let mut v = f.value.clone();
+        let hint = if kind == PropKind::Date { "YYYY-MM-DD" } else { "Value" };
+        let r = field(ui, pal, pal.bg, &mut v, hint, false, w, Id::new(("fv", vi, fi)));
+        if r.changed() {
+            acts.push(A::SetFilter(vi, fi, Filter { value: v, ..f.clone() }));
+        }
+    }
+}
+
 fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st: &mut DbState, pal: &Palette, acts: &mut Vec<A>) {
     let Some(pop) = st.popup.clone() else { return };
     let ctx = ui.ctx().clone();
@@ -1083,45 +1156,40 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
             let choices = prop_choices(db);
             for (fi, f) in view.filters.iter().enumerate() {
                 let kind = db.kind_of(f.prop);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
-                    let pname = choices.iter().find(|c| c.0 == f.prop).map(|c| c.1.clone()).unwrap_or_else(|| "Name".into());
-                    if field_btn(ui, pal, &pname, 112.0).clicked() {
-                        let pos = choices.iter().position(|c| c.0 == f.prop).unwrap_or(0);
-                        let nx = &choices[(pos + 1) % choices.len()];
-                        let op = FilterOp::for_kind(nx.2)[0];
-                        acts.push(A::SetFilter(vi, fi, Filter { prop: nx.0, op, value: String::new() }));
-                    }
-                    if field_btn(ui, pal, f.op.label(kind), 104.0).clicked() {
-                        let ops = FilterOp::for_kind(kind);
-                        let pos = ops.iter().position(|o| *o == f.op).unwrap_or(0);
-                        acts.push(A::SetFilter(vi, fi, Filter { op: ops[(pos + 1) % ops.len()], ..f.clone() }));
-                    }
-                    if f.op.needs_value() {
-                        if matches!(kind, PropKind::Select | PropKind::MultiSelect) {
-                            let opts = db.prop(f.prop).map(|p| p.opts.clone()).unwrap_or_default();
-                            let label = if f.value.is_empty() { "Choose…".to_owned() } else { f.value.clone() };
-                            if field_btn(ui, pal, &label, 130.0).clicked() && !opts.is_empty() {
-                                let pos = opts.iter().position(|o| o.name == f.value).map(|p| p + 1).unwrap_or(0);
-                                let name = opts[pos % opts.len()].name.clone();
-                                acts.push(A::SetFilter(vi, fi, Filter { value: name, ..f.clone() }));
-                            }
-                        } else {
-                            let mut v = f.value.clone();
-                            let hint = if kind == PropKind::Date { "YYYY-MM-DD" } else { "Value" };
-                            let r = field(ui, pal, pal.bg, &mut v, hint, false, 130.0, Id::new(("fv", vi, fi)));
-                            if r.changed() {
-                                acts.push(A::SetFilter(vi, fi, Filter { value: v, ..f.clone() }));
-                            }
+                let avail = ui.available_width();
+                let wide = avail >= 430.0;
+                let half = ((avail - 30.0 - 8.0) * 0.5).max(70.0);
+                let (pw, ow, vw) = if wide { (120.0, 108.0, (avail - 120.0 - 108.0 - 16.0 - 30.0).max(90.0)) } else { (half, half, (avail - 4.0).max(90.0)) };
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
+                        let pname = choices.iter().find(|c| c.0 == f.prop).map(|c| c.1.clone()).unwrap_or_else(|| "Name".into());
+                        if field_btn(ui, pal, &pname, pw).clicked() {
+                            let pos = choices.iter().position(|c| c.0 == f.prop).unwrap_or(0);
+                            let nx = &choices[(pos + 1) % choices.len()];
+                            let op = FilterOp::for_kind(nx.2)[0];
+                            acts.push(A::SetFilter(vi, fi, Filter { prop: nx.0, op, value: String::new() }));
                         }
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if icon_button(ui, pal, Icon::Close, 11.0, "Remove filter").clicked() {
-                            acts.push(A::DelFilter(vi, fi));
+                        if field_btn(ui, pal, f.op.label(kind), ow).clicked() {
+                            let ops = FilterOp::for_kind(kind);
+                            let pos = ops.iter().position(|o| *o == f.op).unwrap_or(0);
+                            acts.push(A::SetFilter(vi, fi, Filter { op: ops[(pos + 1) % ops.len()], ..f.clone() }));
                         }
+                        if wide && f.op.needs_value() {
+                            filter_value(ui, db, pal, f, kind, vi, fi, vw, acts);
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if icon_button(ui, pal, Icon::Close, 11.0, "Remove filter").clicked() {
+                                acts.push(A::DelFilter(vi, fi));
+                            }
+                        });
                     });
+                    if !wide && f.op.needs_value() {
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| filter_value(ui, db, pal, f, kind, vi, fi, vw, acts));
+                    }
                 });
-                ui.add_space(4.0);
+                ui.add_space(6.0);
             }
             if menu_item(ui, pal, "+", "Add a filter", None, false, false).clicked() {
                 acts.push(A::AddFilter(vi));
@@ -1137,11 +1205,11 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
                     let pname = choices.iter().find(|c| c.0 == s.prop).map(|c| c.1.clone()).unwrap_or_else(|| "Name".into());
-                    if field_btn(ui, pal, &pname, 140.0).clicked() {
+                    if field_btn(ui, pal, &pname, ((ui.available_width() - 30.0 - 8.0) * 0.55).max(80.0)).clicked() {
                         let pos = choices.iter().position(|c| c.0 == s.prop).unwrap_or(0);
                         acts.push(A::SetSort(vi, si, Sort { prop: choices[(pos + 1) % choices.len()].0, asc: s.asc }));
                     }
-                    if field_btn(ui, pal, &format!("{} {}", if s.asc { l::ARROW_UP } else { l::ARROW_DOWN }, if s.asc { "Ascending" } else { "Descending" }), 110.0).clicked() {
+                    if field_btn(ui, pal, &format!("{} {}", if s.asc { l::ARROW_UP } else { l::ARROW_DOWN }, if s.asc { "Ascending" } else { "Descending" }), ((ui.available_width() - 30.0).max(80.0)).min(120.0)).clicked() {
                         acts.push(A::SetSort(vi, si, Sort { prop: s.prop, asc: !s.asc }));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1639,6 +1707,15 @@ fn apply(ws: &mut Workspace, db_id: u64, a: A, ed: &mut EditorState) {
             ed.db.rmenu_fresh = true;
         }
         A::Open(r) => ed.nav = Some(r),
+        A::SetColW(vi, key, w) => {
+            if let Some(v) = ws.db_mut(db_id).and_then(|d| d.views.get_mut(vi)) {
+                if w <= 0.0 {
+                    v.widths.remove(&key);
+                } else {
+                    v.widths.insert(key, w);
+                }
+            }
+        }
         A::SetActive(i) => {
             if let Some(d) = ws.db_mut(db_id) {
                 d.active = i.min(d.views.len().saturating_sub(1));

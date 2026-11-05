@@ -106,3 +106,57 @@ Legend: ✅ done · 🟡 partial · 🛠 next · 🗓 planned · 💡 idea
 | Mobile / responsive | ✅ | native Android / iOS targets 💡 |
 | Collaboration, cloud sync, comments, permissions | 🗓 | needs the Next.js/PostgreSQL backend |
 | Synced blocks, equations, columns, buttons | 🗓 | |
+
+---
+
+# v4.0 — root causes, sector playbooks and roadmap
+
+## 1. What was wrong and how it was fixed
+
+| Report | Root cause | Fix (file) |
+|---|---|---|
+| PDF highlights look poor, text looks brown / washed out | Highlights were translucent rectangles painted *over* the page (`alpha-over`). A 38 % yellow over black text gives dark brown text and a milky page; adjacent line boxes overlapped and showed darker stripes. Real viewers use a **multiply** blend. | `pdfnotes::bake` multiplies the highlighter ink into the page raster of each 512 px tile (anti-aliased rounded boxes, line boxes separated so nothing is multiplied twice). The tile cache key carries a signature of the page's highlights, so edits re-render only that page and the old tiles stay on screen until the new ones are ready. Night mode tints instead of multiplying. Underline / strike use text-height-relative stroke widths with round caps; pen strokes are Chaikin-smoothed (`pdfnotes.rs`, `pdf.rs`). |
+| Drawings could not be moved | Only click-to-select existed; a drag on a mark panned the page. | `Notes::drag_edit`: drag the body to move, corner handles to scale (ink, free marks, notes move). Clamped inside the page, never flips, covered by unit tests. |
+| Windows touchpad scrolling not smooth (web is fine) | The browser feeds egui pre-smoothed, inertial deltas; on Windows a precision touchpad delivers bursts of tiny `WM_MOUSEWHEEL` steps. The old code eased with a *first-order* filter (`x += (t-x)·k`) whose **velocity jumps on every event** — visible as steps. | `smooth.rs`: wheel input moves a target, the view follows with a **critically damped spring** (closed form, stable at any frame time, no overshoot, continuous velocity). Unit tests check convergence at 30–240 Hz and velocity continuity. |
+| Touch: selection fights scrolling | A finger is a mouse drag, so a drag always meant *marquee / text selection / card move* and the page could not scroll. | `touch.rs`, a gesture layer in front of egui (`raw_input_hook`): **tap** is replayed unchanged, **swipe** becomes wheel events (every scroll area pans natively, with momentum), **long press** (0.42 s) starts a real drag — marquee, multi-select (further long presses add blocks), drag & drop, text selection — and **two fingers** pass through (pinch zoom). Drawing tools request raw input. State machine is unit-tested. |
+| Table: overlapping text, filter popup overflow | Toolbar tabs and the right-hand tools shared one row regardless of width; filter rows used fixed 112 + 104 + 130 px fields in a 440 px popup; columns had fixed widths. | Toolbar wraps (tabs scroll, tools get a second row, icon-only below 480 pt); filter rows stack on narrow screens; popups never exceed the screen; **resizable columns** (per view, double-click resets). Headless tests sweep clicks at 1280 / 700 / 390 / 320 pt. |
+
+## 2. Research: what productivity users expect, by sector
+
+Compared: Notion, Obsidian (+ Canvas, Dataview), Airtable, Coda, ClickUp, Monday, Capacities, Anytype, AppFlowy, AFFiNE, HubSpot / Pipedrive (CRM).
+
+| Sector | Core jobs | What Lumen has now | Highest-value additions |
+|---|---|---|---|
+| **Sales / CRM** | pipeline, contacts, forecasts, follow-ups | Sales CRM template (contacts ↔ deals relation, weighted forecast formula), board / table / calendar views, **dashboard pipeline charts** | activity timeline per contact, forecast report by month / owner, e-mail + calendar sync, forms for lead capture, duplicate detection |
+| **Project management** | tasks, roadmaps, sprints | tracker template, Timeline view with dependencies + auto-schedule, board, calendar, dashboard task inbox | grouped tables + sub-totals, sprints / burndown, recurring tasks, rules & buttons |
+| **Support / Ops** | tickets, SLAs, inventory | tickets template (priority, assignee, due), dashboard by status | SLA timers, forms, automations (assign, escalate), inventory template with stock rollups |
+| **Marketing / content** | calendar, approvals | content calendar template, calendar view | approvals, channel analytics, linked views in campaign pages |
+| **HR / recruiting** | pipeline, interviews | recruiting template (stage, rating, next step) | scorecards, offer letters from templates, e-mail templates |
+| **Strategy** | OKRs, reviews | OKR template (status, quarter, progress) charted on the dashboard | roll-up of key results to objectives, review cadences |
+| **Research / study** | reading, PDFs, flashcards | PDF reader with highlights / notes / export, reading list, **graph view** | `[[` autocomplete, tags, spaced repetition cards from highlights, citations |
+| **Personal knowledge (Obsidian-style)** | links, graph, daily notes | page links, backlinks, `[[wiki links]]` in the graph, daily journal, **graph view with local graph** | `[[` autocomplete + unlinked mentions, Canvas (infinite whiteboard), tags as graph clusters, vault import |
+| **Teams** | share, comment, co-edit | local password lock, history | CRDT real-time sync (small Rust server), comments + mentions, share links, roles |
+
+## 3. Cross-cutting platform capabilities (ranked)
+
+1. **Linked views + grouped tables with aggregates** — makes every page a dashboard; low risk, builds on `Workspace::query`.
+2. **Rules & buttons** (trigger → action on database rows) and **recurring tasks** — the biggest productivity multiplier after views.
+3. **Forms** → database rows (lead capture, tickets, applications).
+4. **Canvas** — Obsidian's second pillar; reuse the graph's camera / hit-testing code.
+5. **`[[` autocomplete, unlinked mentions, tags** — turns the graph from a viewer into the way you link.
+6. **Real-time sync + comments** — requires a server; keep local-first (CRDT), end-to-end encrypted.
+7. **Import** from Notion exports and Obsidian vaults to remove switching cost.
+8. **PWA / offline cache**, push reminders (web) and toast notifications (Windows).
+9. **Local-first AI assistant** (summaries, Q&A over the workspace; on-device model, nothing leaves the machine).
+10. **REST API / webhooks** for integrations.
+
+All of these are listed, with votes, at `/roadmap` in the web project.
+
+## 4. Shipped in 4.0
+
+* PDF: multiply highlights, smooth ink, move / resize drawings.
+* Physics scrolling (spring) and touch gesture layer.
+* Responsive database toolbar / filter / sort, resizable table columns, popups clamp to the screen.
+* **Graph view** (`graph.rs`) — nodes: pages, databases, rows; edges: page links, `[[wiki links]]`, relations, hierarchy; force layout that sleeps when settled; zoom / pan / drag; hover focus; search; local graph depth 1-5; orphans / hierarchy / rows toggles; info card with links; Ctrl+G.
+* **Dashboard** (`dashboard.rs`) — KPIs, per-database charts, task inbox with tick-off, upcoming / overdue, recent, favourites, activity; Ctrl+D.
+* Templates: Recruiting pipeline, Content calendar, OKRs & goals (13 in total).

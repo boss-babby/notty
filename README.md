@@ -46,6 +46,16 @@ Limits: no real-time collaboration / cloud sync / comments / history yet; web bu
 - **Responsive** — slide-over sidebar and compact top bar below 720 pt, horizontally scrolling tables / calendar, touch panning, mobile viewport + loading progress in `web/index.html`.
 - **WebAssembly** — `build-web.sh` uses the size-optimised `web` profile (`opt-level = "s"`, thin LTO, `panic = "abort"`) and `wasm-opt -O3`.
 
+## What's new in 4.0
+- **PDF annotations** — highlights are *multiplied* into the page (true marker look, text keeps full contrast), pen strokes are smoothed, and drawings / notes can be **moved and resized** (drag the body or a corner handle).
+- **Physics scrolling** (`smooth.rs`) — critically damped spring for wheel / touchpad (fixes the stepped Windows touchpad feel) and 1:1 finger panning with momentum.
+- **Touch** (`touch.rs`) — tap = click, swipe = scroll with fling, **long press = drag / multi-select** (marquee, drag & drop, text selection), two fingers = pinch. Works in every view.
+- **Databases** — resizable table columns (double-click a header edge to reset), responsive toolbar, stacked filter rows on phones, popups clamp to the screen.
+- **Graph view** (`graph.rs`, Ctrl+G) — Obsidian-style map of pages, databases, `[[wiki links]]` and relations with local graph, search, hover focus.
+- **Dashboard** (`dashboard.rs`, Ctrl+D) — KPIs, pipeline / revenue charts for any database with a Select (+ Number) property, task inbox, upcoming & overdue, activity.
+- **Templates** — Recruiting pipeline, Content calendar, OKRs & goals (13 total). See `ANALYSIS.md` §v4.0 for the sector playbooks and roadmap.
+- The Inter / Lucide font files (missing from the repository) are regenerated: Inter v4.0 without its private-use alternates, Lucide 0.577 subset to the private-use range.
+
 ## Shortcuts
 `Ctrl/Cmd+K` palette · `N` new page · `J` journal · `\` sidebar · `.` focus · `L` lock · `Shift+L` theme · `Shift+E` export · `/` all shortcuts
 

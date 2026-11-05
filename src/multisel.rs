@@ -157,14 +157,36 @@ pub fn handle(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorSt
     let pointer = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
     let mods = ctx.input(|i| i.modifiers);
 
+    // Touch: a long press selects the block under the finger (and a drag that follows extends it into a marquee).
+    // Further long presses add blocks, so several blocks can be picked without a keyboard.
+    if let Some(p) = crate::touch::take_long_press(&ctx) {
+        if let Some((i, _)) = rects.iter().find(|(_, r)| r.expand2(vec2(60.0, 3.0)).contains(p)) {
+            let id = page.blocks[*i].id;
+            if let Some(k) = ed.sel.iter().position(|b| *b == id) {
+                ed.sel.remove(k);
+            } else {
+                ed.sel.push(id);
+            }
+            ed.touch_sel = !ed.sel.is_empty();
+            ed.focus = None;
+            ed.fmt_bar = None;
+            ctx.memory_mut(|m| {
+                if let Some(f) = m.focused() {
+                    m.surrender_focus(f);
+                }
+            });
+        }
+    }
+
     if bg.drag_started() {
         // egui lets a drag-sensing widget below receive drags that began on click-only widgets above it (toolbars, popups…):
         // only start a selection when the press was really on the page itself.
         let on_page = ctx.input(|i| i.pointer.press_origin()).map_or(false, |p| ctx.layer_id_at(p).map_or(true, |l| l.order == Order::Background));
         if let (true, Some(p)) = (on_page, ctx.input(|i| i.pointer.press_origin())) {
             ed.marquee = Some(p - origin);
-            ed.sel_base = if mods.shift || mods.command { ed.sel.clone() } else { vec![] };
-            if !(mods.shift || mods.command) {
+            let additive = mods.shift || mods.command || (ed.touch_sel && !ed.sel.is_empty());
+            ed.sel_base = if additive { ed.sel.clone() } else { vec![] };
+            if !additive {
                 ed.sel.clear();
             }
             ed.sel_menu = 0;
@@ -210,6 +232,9 @@ pub fn handle(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorSt
     let text_focus = ctx.memory(|m| m.focused().is_some());
     if text_focus && ed.marquee.is_none() && !ed.sel.is_empty() {
         ed.sel.clear();
+    }
+    if ed.sel.is_empty() {
+        ed.touch_sel = false;
     }
 
     // highlight

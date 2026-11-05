@@ -53,6 +53,8 @@ pub fn popup_area(
 ) -> bool {
     let t = appear(ctx, id.with("appear"), 0.16);
     let screen = ctx.screen_rect();
+    // phones: a popup can never be wider than the screen
+    let width = width.min((screen.width() - 16.0).max(180.0));
     let x = pos.x.min(screen.right() - width - 12.0).max(8.0);
     // Keep the whole popup on screen: use the size measured on the previous frame.
     let h = ctx.data(|d| d.get_temp::<f32>(id.with("h"))).unwrap_or(0.0);

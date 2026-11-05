@@ -168,7 +168,14 @@ impl Engine {
 
     /// Rasterises the pixel rectangle `(x, y, w, h)` of page `i` rendered at `scale` pixels per PDF point.
     fn render(&self, i: usize, scale: f32, x: u32, y: u32, w: u32, h: u32, night: bool) -> Option<ColorImage> {
+        self.render_marked(i, scale, x, y, w, h, night, &[])
+    }
+
+    /// Like [`Engine::render`], with the page's highlights multiplied into the pixels (see `pdfnotes::bake`).
+    #[allow(clippy::too_many_arguments)]
+    fn render_marked(&self, i: usize, scale: f32, x: u32, y: u32, w: u32, h: u32, night: bool, marks: &[pdfnotes::Mark]) -> Option<ColorImage> {
         let page = self.page(i)?;
+        let page_px = [(self.dims[i].0 * scale).round().max(1.0), (self.dims[i].1 * scale).round().max(1.0)];
         guarded(|| {
             let mut ctx = RenderContext::new(w as u16, h as u16);
             let transform = Affine::translate((-(x as f64), -(y as f64))) * Affine::scale(scale as f64) * page.initial_transform(true).to_kurbo();
@@ -181,13 +188,16 @@ impl Engine {
                 RasterizerSettings { target_init: TargetInit::Clear(hayro::vello_cpu::color::palette::css::WHITE), ..Default::default() },
             );
             let (iw, ih) = (pix.width() as usize, pix.height() as usize);
-            let mut rgba = Vec::with_capacity(iw * ih * 4);
+            let mut rgba: Vec<u8> = Vec::with_capacity(iw * ih * 4);
             for px in pix.data() {
                 if night {
                     rgba.extend_from_slice(&[255 - px.r, 255 - px.g, 255 - px.b, 255]);
                 } else {
                     rgba.extend_from_slice(&[px.r, px.g, px.b, px.a]);
                 }
+            }
+            if !marks.is_empty() {
+                pdfnotes::bake(&mut rgba, [iw, ih], [x, y], page_px, marks, night);
             }
             ColorImage::from_rgba_premultiplied([iw, ih], &rgba)
         })
@@ -211,8 +221,8 @@ struct Tile {
     bytes: usize,
 }
 
-/// (page, scale·64, tile x, tile y, night)
-type TileKey = (usize, u32, u16, u16, bool);
+/// (page, scale·4096, tile x, tile y, night, highlight signature of the page when the tile was rendered)
+type TileKey = (usize, u32, u16, u16, bool, u32);
 
 struct Reader {
     key: u64,
@@ -1275,7 +1285,7 @@ fn reading_view(
     }
     let mut want: Vec<(f32, TileKey, usize, f32, u32, u32, u32, u32)> = vec![];
     let mut want_thumb: Vec<usize> = vec![];
-    let mut completed: Vec<(usize, u32)> = vec![];
+    let mut completed: Vec<(usize, u32, u32)> = vec![];
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(view).layout(egui::Layout::top_down(egui::Align::Min)));
     child.set_clip_rect(view.intersect(ui.clip_rect()));
     let out = sa.show_viewport(&mut child, |ui, viewport| {
@@ -1323,10 +1333,12 @@ fn reading_view(
             }
             // 2. tiles of the previously completed zoom level (stretched) while sharp ones render
             let best = rd.best.get(&i).copied();
-            if let Some(bq) = best.filter(|b| *b != qs) {
+            let sig = rd.notes.marks_sig(i);
+            if let Some(bq) = best {
                 let brs = bq as f32 / SCALE_Q;
                 let f = rs_q / brs / ppp; // screen points per old pixel
-                for (k, t) in rd.tiles.iter_mut().filter(|(k, _)| k.0 == i && k.1 == bq && k.4 == night) {
+                // (tiles of the previous zoom level, or of the same level before a highlight changed, stay visible until the new ones are ready)
+                for (k, t) in rd.tiles.iter_mut().filter(|(k, _)| k.0 == i && k.1 == bq && k.4 == night && (bq != qs || k.5 != sig)) {
                     t.used = frame;
                     let (x0, y0) = (k.2 as f32 * TILE as f32 * f, k.3 as f32 * TILE as f32 * f);
                     let [tw, th] = t.tex.size();
@@ -1353,7 +1365,7 @@ fn reading_view(
                         continue;
                     }
                     total += 1;
-                    let key: TileKey = (i, qs, tx as u16, ty as u16, night);
+                    let key: TileKey = (i, qs, tx as u16, ty as u16, night, sig);
                     let (tw, th) = (TILE.min(wp - px), TILE.min(hp - py));
                     let r = Rect::from_min_size(prect.min + vec2(px as f32 / ppp, py as f32 / ppp), vec2(tw as f32 / ppp, th as f32 / ppp));
                     if let Some(t) = rd.tiles.get_mut(&key) {
@@ -1367,13 +1379,13 @@ fn reading_view(
                 }
             }
             if have == total && total > 0 {
-                completed.push((i, qs));
+                completed.push((i, qs, sig));
             }
             if rd.failed.contains(&(i, qs)) {
                 p.text(prect.center(), Align2::CENTER_CENTER, "This page could not be rendered", body(14.0), Color32::GRAY);
             }
             // 4. annotations on top of the page
-            rd.notes.paint_page(&p, prect, i, night, accent);
+            rd.notes.paint_page(&p, prect, i, night, accent, rd.failed.iter().any(|(pg, _)| *pg == i));
             rd.paint_text_marks(&p, prect, i, accent);
         }
         // the text layer of the page in the middle of the screen is read first, one page per frame
@@ -1388,7 +1400,10 @@ fn reading_view(
         {
             rd.dbg_shown = shown.clone();
         }
-        let handled = rd.text_input(ctx, ui, &resp, &shown, view);
+        // drawing tools get the raw finger (otherwise a swipe scrolls the page, see touch.rs)
+        crate::touch::set_passthrough(capturing);
+        let editing_mark = rd.notes.drag_edit(ctx, &resp, &shown);
+        let handled = editing_mark || rd.text_input(ctx, ui, &resp, &shown, view);
         if !handled && (capturing || rd.notes.bar || !rd.notes.list.is_empty()) {
             rd.notes.input(ctx, &resp, &shown);
         }
@@ -1406,9 +1421,9 @@ fn reading_view(
     rd.vp = out.inner_rect;
 
     // retire stale scales of completed pages
-    for (i, qs) in completed {
+    for (i, qs, sig) in completed {
         rd.best.insert(i, qs);
-        let stale: Vec<TileKey> = rd.tiles.keys().filter(|k| k.0 == i && k.1 != qs).copied().collect();
+        let stale: Vec<TileKey> = rd.tiles.keys().filter(|k| k.0 == i && (k.1 != qs || k.5 != sig)).copied().collect();
         for k in stale {
             rd.tiles.remove(&k);
         }
@@ -1424,7 +1439,7 @@ fn reading_view(
     }
     for (_, key, i, rs_q, px, py, tw, th) in want {
         if let Some(e) = rd.engine.as_ref() {
-            match e.render(i, rs_q, px, py, tw, th, night) {
+            match e.render_marked(i, rs_q, px, py, tw, th, night, &rd.notes.marks_on(i)) {
                 Some(img) => {
                     let bytes = img.pixels.len() * 4;
                     let tex = ctx.load_texture(format!("pdf-{}-{i}-{}-{}", rd.key, key.2, key.3), img, TextureOptions::LINEAR);

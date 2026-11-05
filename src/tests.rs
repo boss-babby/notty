@@ -686,3 +686,91 @@ fn gantt_drag_past_the_edge_stays_bounded_and_commits() {
     assert!(b - a < 2000, "the chart range stays bounded ({} days)", b - a);
     assert!(e1 <= b, "the bar stays inside the chart");
 }
+
+fn frame_sized(ctx: &egui::Context, size: egui::Vec2, t: f64, events: Vec<Event>, f: impl FnOnce(&mut egui::Ui)) {
+    let mut f = Some(f);
+    let mut input = RawInput::default();
+    input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), size));
+    input.time = Some(t);
+    input.events = events;
+    let _ = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if let Some(f) = f.take() {
+                f(ui);
+            }
+        });
+    });
+}
+
+#[test]
+fn graph_and_dashboard_render_on_desktop_and_phone_without_panicking() {
+    let ctx = test_ctx();
+    let mut ws = Workspace::seed();
+    for i in 0..TEMPLATES.len() {
+        ws.add_template(i, None);
+    }
+    // a page that links to another one
+    let (a, b) = (ws.pages[0].id, ws.pages[1].id);
+    let mut link = ws.blk(BlockKind::PageLink, "", 0);
+    link.link = Some(b);
+    ws.page_mut(a).unwrap().blocks.push(link);
+    let pal = Palette::light();
+    let mut t = 0.0;
+    for size in [vec2(1280.0, 800.0), vec2(390.0, 780.0), vec2(320.0, 560.0)] {
+        for _ in 0..4 {
+            t += 0.05;
+            frame_sized(&ctx, size, t, vec![Event::PointerMoved(pos2(100.0, 300.0))], |ui| {
+                let _ = crate::dashboard::show(ui, &mut ws, &pal);
+            });
+        }
+        for k in 0..60 {
+            t += 0.05;
+            let p = pos2(150.0 + k as f32 * 3.0, 300.0);
+            let ev = if k == 10 {
+                vec![Event::PointerMoved(p), Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }]
+            } else if k == 12 {
+                vec![Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }]
+            } else {
+                vec![Event::PointerMoved(p), Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -3.0), modifiers: Modifiers::NONE }]
+            };
+            frame_sized(&ctx, size, t, ev, |ui| {
+                let _ = crate::graph::show(ui, &ws, &pal);
+            });
+        }
+    }
+}
+
+#[test]
+fn database_toolbar_filters_and_resizable_columns_fit_a_phone() {
+    let ctx = test_ctx();
+    let mut ws = Workspace::seed();
+    let road = ws.pages.iter().find(|p| p.title == "Roadmap").unwrap().id;
+    let mut ed = EditorState::default();
+    let pal = Palette::light();
+    ws.db_mut(road).unwrap().active = 0;
+    let mut t = 0.0;
+    for w in [1280.0_f32, 700.0, 390.0, 320.0] {
+        // open the filter and sort popups through the toolbar buttons by sweeping clicks over the header area
+        for y in [70.0_f32, 100.0, 130.0] {
+            for x in (10..w as i32).step_by(30) {
+                t += 0.02;
+                let p = pos2(x as f32, y);
+                let evs = vec![
+                    Event::PointerMoved(p),
+                    Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE },
+                    Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE },
+                ];
+                frame_sized(&ctx, vec2(w, 700.0), t, evs, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        crate::database::show(ui, &mut ws, road, &mut ed, &pal, (w - 24.0).max(200.0));
+                    });
+                });
+            }
+        }
+    }
+    // column widths are stored per view and survive JSON
+    ws.db_mut(road).unwrap().views[0].widths.insert(0, 333.0);
+    let s = serde_json::to_string(&ws).unwrap();
+    let back: Workspace = serde_json::from_str(&s).unwrap();
+    assert_eq!(back.db(road).unwrap().views[0].widths.get(&0), Some(&333.0));
+}

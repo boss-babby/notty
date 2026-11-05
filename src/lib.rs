@@ -26,7 +26,12 @@ mod rich;
 mod clip;
 mod model;
 mod platform;
+mod dashboard;
+mod graph;
+mod smooth;
+mod views;
 mod theme;
+mod touch;
 mod widgets;
 
 #[cfg(test)]

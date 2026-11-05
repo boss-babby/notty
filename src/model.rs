@@ -498,6 +498,9 @@ pub struct View {
     pub filters: Vec<Filter>,
     #[serde(default)]
     pub sorts: Vec<Sort>,
+    /// Table: custom column widths (property id → points; 0 = the name column).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub widths: BTreeMap<u64, f32>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -704,7 +707,7 @@ pub const ICONS: [&str; 36] = [
     "🎵", "🌍", "📊", "📁", "🎬", "🛠", "📌", "💬", "🏆", "🎓", "💰", "🔍", "📖", "📷",
 ];
 
-pub const TEMPLATES: [(&str, &str, &str); 10] = [
+pub const TEMPLATES: [(&str, &str, &str); 13] = [
     ("Meeting notes", "📝", "Agenda, notes and action items."),
     ("Weekly planner", "📅", "Plan every day of the week."),
     ("Project tracker", "🎯", "Database with table, board and calendar views."),
@@ -715,6 +718,9 @@ pub const TEMPLATES: [(&str, &str, &str); 10] = [
     ("Product spec", "📋", "Problem, goals, requirements, launch plan."),
     ("Sales CRM", "💼", "Contacts + deals pipeline: stages, value, win probability, weighted forecast, relations."),
     ("Support tickets", "🎧", "Ticket board with priority, customer, assignee and due-date calendar."),
+    ("Recruiting pipeline", "👥", "Candidates through screening, interview and offer, with rating, role and source."),
+    ("Content calendar", "📣", "Ideas to published posts by channel, with board, table and calendar views."),
+    ("OKRs & goals", "🏆", "Objectives with quarter, owner, status and progress — charted on the dashboard."),
 ];
 
 fn blank_page(id: u64, parent: Option<u64>, kind: PageKind) -> Page {
@@ -854,7 +860,7 @@ impl Workspace {
         if let Some(d) = self.db_mut(db) {
             let same = d.views.iter().filter(|v| v.kind == kind).count();
             let name = if same == 0 { format!("{} view", kind.label()) } else { format!("{} view {}", kind.label(), same + 1) };
-            d.views.push(View { id: vid, name, kind, group: 0, date: 0, dep: 0, zoom: 0, filters: vec![], sorts: vec![] });
+            d.views.push(View { id: vid, name, kind, group: 0, date: 0, dep: 0, zoom: 0, filters: vec![], sorts: vec![], widths: BTreeMap::new() });
             d.active = d.views.len() - 1;
         }
         vid
@@ -1349,6 +1355,89 @@ impl Workspace {
                 ] {
                     let (sid, pid) = (self.opt_id(db, st, s).unwrap_or(0), self.opt_id(db, prio, p).unwrap_or(0));
                     self.titled_row(db, t, vec![(st, Val::Sel(sid)), (prio, Val::Sel(pid)), (cust, Val::Text(c.into())), (who, Val::Text("Me".into())), (due, Self::day_val(n))]);
+                }
+                self.finish_template(db, name, icon);
+                db
+            }
+            10 => {
+                let db = self.add_database(parent, ViewKind::Board);
+                self.clear_rows(db);
+                let st = self.db(db).and_then(|d| d.first_of(PropKind::Select)).unwrap_or(0);
+                let when = self.db(db).and_then(|d| d.first_of(PropKind::Date)).unwrap_or(0);
+                self.retag(db, st, "Stage", &["Applied", "Screening", "Interview", "Offer", "Hired", "Rejected"]);
+                self.rename_prop(db, when, "Next step");
+                let role = self.add_prop(db, "Role", PropKind::Text, &[]);
+                let src = self.add_prop(db, "Source", PropKind::Select, &["Referral", "LinkedIn", "Website", "Agency"]);
+                let rate = self.add_prop(db, "Rating", PropKind::Number, &[]);
+                let mail = self.add_prop(db, "Email", PropKind::Text, &[]);
+                self.add_view(db, ViewKind::Table);
+                self.add_view(db, ViewKind::Calendar);
+                if let Some(d) = self.db_mut(db) {
+                    d.active = 0;
+                }
+                for (n, r, s, so, rt, days) in [
+                    ("Priya Nair", "Backend engineer", "Interview", "Referral", 4.0, 3),
+                    ("Tomás Silva", "Product designer", "Screening", "LinkedIn", 3.0, 1),
+                    ("Mei Chen", "Backend engineer", "Offer", "Website", 5.0, 6),
+                    ("Sam Okafor", "Data analyst", "Applied", "Agency", 0.0, 8),
+                    ("Lena Fischer", "Product designer", "Hired", "Referral", 5.0, -5),
+                ] {
+                    let (sid, soid) = (self.opt_id(db, st, s).unwrap_or(0), self.opt_id(db, src, so).unwrap_or(0));
+                    self.titled_row(db, n, vec![(st, Val::Sel(sid)), (src, Val::Sel(soid)), (role, Val::Text(r.into())), (rate, Val::Num(rt)), (when, Self::day_val(days)), (mail, Val::Text(String::new()))]);
+                }
+                self.finish_template(db, name, icon);
+                db
+            }
+            11 => {
+                let db = self.add_database(parent, ViewKind::Board);
+                self.clear_rows(db);
+                let st = self.db(db).and_then(|d| d.first_of(PropKind::Select)).unwrap_or(0);
+                let when = self.db(db).and_then(|d| d.first_of(PropKind::Date)).unwrap_or(0);
+                self.retag(db, st, "Status", &["Idea", "Drafting", "Review", "Scheduled", "Published"]);
+                self.rename_prop(db, when, "Publish date");
+                let ch = self.add_prop(db, "Channel", PropKind::Select, &["Blog", "Newsletter", "YouTube", "Social"]);
+                let who = self.add_prop(db, "Author", PropKind::Text, &[]);
+                self.add_prop(db, "Link", PropKind::Url, &[]);
+                self.add_view(db, ViewKind::Calendar);
+                self.add_view(db, ViewKind::Table);
+                if let Some(d) = self.db_mut(db) {
+                    d.active = 0;
+                }
+                for (t, s, c, days) in [
+                    ("Launch announcement", "Scheduled", "Blog", 2),
+                    ("Customer story: Navy Labs", "Drafting", "Newsletter", 9),
+                    ("Product walkthrough video", "Idea", "YouTube", 20),
+                    ("Weekly tips thread", "Review", "Social", 4),
+                    ("Release notes", "Published", "Blog", -3),
+                ] {
+                    let (sid, cid) = (self.opt_id(db, st, s).unwrap_or(0), self.opt_id(db, ch, c).unwrap_or(0));
+                    self.titled_row(db, t, vec![(st, Val::Sel(sid)), (ch, Val::Sel(cid)), (who, Val::Text("Me".into())), (when, Self::day_val(days))]);
+                }
+                self.finish_template(db, name, icon);
+                db
+            }
+            12 => {
+                let db = self.add_database(parent, ViewKind::Table);
+                self.clear_rows(db);
+                let st = self.db(db).and_then(|d| d.first_of(PropKind::Select)).unwrap_or(0);
+                let due = self.db(db).and_then(|d| d.first_of(PropKind::Date)).unwrap_or(0);
+                self.retag(db, st, "Status", &["On track", "At risk", "Off track", "Done"]);
+                self.rename_prop(db, due, "Due");
+                let q = self.add_prop(db, "Quarter", PropKind::Select, &["Q1", "Q2", "Q3", "Q4"]);
+                let prog = self.add_prop(db, "Progress %", PropKind::Number, &[]);
+                let own = self.add_prop(db, "Owner", PropKind::Text, &[]);
+                self.add_view(db, ViewKind::Board);
+                if let Some(d) = self.db_mut(db) {
+                    d.active = 0;
+                }
+                for (t, s, qq, p, days) in [
+                    ("Reach 100 paying customers", "On track", "Q2", 64.0, 60),
+                    ("Cut support response time to < 2h", "At risk", "Q2", 35.0, 45),
+                    ("Ship mobile app", "Off track", "Q3", 12.0, 120),
+                    ("Publish 12 case studies", "Done", "Q1", 100.0, -10),
+                ] {
+                    let (sid, qid) = (self.opt_id(db, st, s).unwrap_or(0), self.opt_id(db, q, qq).unwrap_or(0));
+                    self.titled_row(db, t, vec![(st, Val::Sel(sid)), (q, Val::Sel(qid)), (prog, Val::Num(p)), (own, Val::Text("Me".into())), (due, Self::day_val(days))]);
                 }
                 self.finish_template(db, name, icon);
                 db

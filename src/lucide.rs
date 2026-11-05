@@ -1,6 +1,8 @@
 //! Lucide icon font (ISC licence, https://lucide.dev) — private-use code points registered as a fallback font.
 #![allow(dead_code)]
 
+pub const NETWORK: &str = "\u{e125}";
+pub const LAYOUT_DASHBOARD: &str = "\u{e1c1}";
 pub const UNDERLINE: &str = "\u{e19a}";
 pub const IMAGES: &str = "\u{e5c4}";
 pub const PAPERCLIP: &str = "\u{e12d}";

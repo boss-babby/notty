@@ -68,6 +68,8 @@ pub struct EditorState {
     /// Multi-block selection (ids) and the marquee drag state (start point in content space).
     pub sel: Vec<u64>,
     pub sel_base: Vec<u64>,
+    /// Blocks were picked with a touch long-press (selection mode: the next long press adds to it).
+    pub touch_sel: bool,
     pub marquee: Option<egui::Vec2>,
     /// 0 = none, 1 = "turn into" panel, 2 = colour panel of the selection toolbar.
     pub sel_menu: u8,

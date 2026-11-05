@@ -71,6 +71,8 @@ enum PalAct {
     History,
     Undo,
     Redo,
+    Dashboard,
+    Graph,
 }
 
 struct PaletteState {
@@ -434,6 +436,8 @@ impl LumenApp {
             PalAct::NewPage => self.new_page(None, PageKind::Doc),
             PalAct::NewDb => self.new_page(None, PageKind::Database),
             PalAct::Journal => self.ws.open_today(),
+            PalAct::Dashboard => crate::views::toggle(crate::views::Mode::Dashboard, self.ws.current),
+            PalAct::Graph => crate::views::toggle(crate::views::Mode::Graph, self.ws.current),
             PalAct::Templates => self.templates_open = true,
             PalAct::Import => self.import = Some(ImportDialog::default()),
             PalAct::ExportMd => self.export_md(),
@@ -522,6 +526,12 @@ impl LumenApp {
         }
         if simple_row(ui, pal, "sr_tpl", w, Icon::Duplicate, "Templates", None) {
             self.templates_open = true;
+        }
+        if simple_row(ui, pal, "sr_home", w, Icon::Board, "Dashboard", Some("Ctrl D")) {
+            self.run(PalAct::Dashboard);
+        }
+        if simple_row(ui, pal, "sr_graph", w, Icon::Link, "Graph view", Some("Ctrl G")) {
+            self.run(PalAct::Graph);
         }
         ui.add_space(8.0);
 
@@ -755,7 +765,9 @@ impl LumenApp {
             scored.sort_by_key(|s| s.0);
             out.extend(scored.into_iter().take(8).map(|(_, a, i, t, s)| (a, i, t, s)));
         }
-        let actions: [(PalAct, &str, &str, &str); 18] = [
+        let actions: [(PalAct, &str, &str, &str); 20] = [
+            (PalAct::Dashboard, l::LAYOUT_DASHBOARD, "Dashboard", "KPIs, pipeline charts, tasks and deadlines  (Ctrl+D)"),
+            (PalAct::Graph, l::NETWORK, "Graph view", "Map of how your notes connect  (Ctrl+G)"),
             (PalAct::Undo, l::UNDO_2, "Undo", "Undo the last block change  (Ctrl+Z)"),
             (PalAct::Redo, l::REDO_2, "Redo", "Redo  (Ctrl+Shift+Z)"),
             (PalAct::History, l::HISTORY, "Page history", "Browse, name and restore earlier versions"),
@@ -1562,6 +1574,8 @@ impl eframe::App for LumenApp {
     fn raw_input_hook(&mut self, ctx: &Context, raw_input: &mut egui::RawInput) {
         // Right-clicks are handled by us (context menus) and never reach egui's text fields.
         crate::widgets::filter_raw_input(ctx, raw_input);
+        // Finger gestures: tap / swipe-to-scroll with fling / long-press to drag (touch.rs).
+        crate::touch::on_raw_input(ctx, raw_input);
     }
 
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
@@ -1652,6 +1666,12 @@ impl LumenApp {
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Period)) {
             self.run(PalAct::Focus);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::G)) {
+            self.run(PalAct::Graph);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::D)) && self.ed.sel.is_empty() {
+            self.run(PalAct::Dashboard);
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::E)) {
             self.export_md();
@@ -1749,7 +1769,42 @@ impl LumenApp {
                 });
         }
 
+        crate::views::sync(self.ws.current);
         egui::CentralPanel::default().frame(Frame::new().fill(pal.bg)).show(ctx, |ui| {
+            match crate::views::mode() {
+                crate::views::Mode::Dashboard => {
+                    let nav = crate::dashboard::show(ui, &mut self.ws, &pal);
+                    if nav.new_page {
+                        crate::views::set(crate::views::Mode::Page, None);
+                        self.new_page(None, PageKind::Doc);
+                    } else if nav.new_db {
+                        crate::views::set(crate::views::Mode::Page, None);
+                        self.new_page(None, PageKind::Database);
+                    } else if nav.journal {
+                        crate::views::set(crate::views::Mode::Page, None);
+                        self.ws.open_today();
+                    } else if nav.graph {
+                        crate::views::set(crate::views::Mode::Graph, self.ws.current);
+                    }
+                    if let Some(id) = nav.out.open {
+                        crate::views::set(crate::views::Mode::Page, None);
+                        self.ws.current = Some(id);
+                    }
+                    return;
+                }
+                crate::views::Mode::Graph => {
+                    let out = crate::graph::show(ui, &self.ws, &pal);
+                    if out.close {
+                        crate::views::set(crate::views::Mode::Page, None);
+                    }
+                    if let Some(id) = out.open {
+                        crate::views::set(crate::views::Mode::Page, None);
+                        self.ws.current = Some(id);
+                    }
+                    return;
+                }
+                crate::views::Mode::Page => {}
+            }
             let Some(cur) = self.ws.current.filter(|id| self.ws.page(*id).map_or(false, |p| !p.trashed)) else {
                 ui.add_space(ui.available_height() * 0.3);
                 ui.vertical_centered(|ui| {
@@ -1781,55 +1836,12 @@ impl LumenApp {
             let ws = &mut self.ws;
             let ed = &mut self.ed;
             let mut changed = false;
-            // Eased ("inertial") wheel / touchpad scrolling: the raw deltas move a target offset and the view glides towards it,
-            // which hides the uneven chunks touchpads deliver. Scrollbar drags and jumps (TOC, scroll_to) resync the target.
-            let ctx2 = ui.ctx().clone();
-            let sk = Id::new(("smooth_scroll", cur));
-            let (mut target, mut curr, last_actual, max_off): (f32, f32, f32, f32) = ctx2.data(|d| d.get_temp(sk)).unwrap_or((0.0, 0.0, 0.0, f32::MAX));
+            // Physics scrolling (critically damped spring for wheel / touchpad, 1:1 + fling for fingers) — see smooth.rs / touch.rs.
             let over = ui.rect_contains_pointer(ui.max_rect()) && ed.menu.is_none() && ed.block_menu.is_none() && ed.link_edit.is_none();
-            let wheel = if over && !ctx2.input(|i| i.modifiers.command) {
-                ctx2.input_mut(|i| {
-                    let d = i.raw_scroll_delta.y + i.smooth_scroll_delta.y.min(0.0) * 0.0;
-                    if d != 0.0 {
-                        i.raw_scroll_delta.y = 0.0;
-                        i.smooth_scroll_delta.y = 0.0;
-                    }
-                    d
-                })
-            } else {
-                0.0
-            };
-            if (last_actual - curr).abs() > 1.0 {
-                // something else moved the view
-                curr = last_actual;
-                target = last_actual;
-            }
-            if wheel != 0.0 {
-                target = (target - wheel).clamp(0.0, max_off.max(0.0));
-            }
-            let animating = (target - curr).abs() > 0.3;
-            if animating {
-                let dt = ctx2.input(|i| i.stable_dt).clamp(0.001, 0.05);
-                curr += (target - curr) * (1.0 - (-dt * 16.0).exp());
-                if (target - curr).abs() <= 0.3 {
-                    curr = target;
-                }
-                ctx2.request_repaint();
-            }
-            let mut sa = ScrollArea::vertical().id_salt(("page_scroll", cur)).drag_to_scroll(false).auto_shrink([false, false]);
-            if animating || wheel != 0.0 {
-                sa = sa.vertical_scroll_offset(curr);
-            }
-            let out = sa.show(ui, |ui| {
+            let sa = ScrollArea::vertical().id_salt(("page_scroll", cur)).drag_to_scroll(false).auto_shrink([false, false]);
+            crate::smooth::scroll_area(ui, Id::new(("smooth_scroll", cur)), sa, over, |ui| {
                 changed = editor::show_page(ui, ws, cur, ed, &pal);
             });
-            let actual = out.state.offset.y;
-            let max_off = (out.content_size.y - out.inner_rect.height()).max(0.0);
-            if !animating && wheel == 0.0 {
-                target = actual;
-                curr = actual;
-            }
-            ctx2.data_mut(|d| d.insert_temp(sk, (target, curr, actual, max_off)));
             if changed {
                 ws.touch(cur);
             }
