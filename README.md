@@ -56,6 +56,23 @@ Limits: no real-time collaboration / cloud sync / comments / history yet; web bu
 - **Templates** — Recruiting pipeline, Content calendar, OKRs & goals (13 total). See `ANALYSIS.md` §v4.0 for the sector playbooks and roadmap.
 - The Inter / Lucide font files (missing from the repository) are regenerated: Inter v4.0 without its private-use alternates, Lucide 0.577 subset to the private-use range.
 
+## What's new in 5.2 — pages that behave like Notion pages
+**Research summary (what makes a Notion page "interactive")** — a Notion page is a tree of blocks; the interactive parts are (1) *layout blocks*
+(column lists, toggles, callouts, synced blocks), (2) *databases as blocks* — an inline database or a **linked view** of any database, each with its own
+layout / filter / sort / group, and (3) *dashboards* = ordinary pages that combine linked views, charts and columns. Lumen already had (3) in 5.1;
+5.2 adds (1) and (2) and fixes the missing time window.
+
+- **Dashboard pages get the date window** — the *Today · Week · Month* chips and the full *time window* menu (Last 7/30/90 days, This quarter/year, Next 7/30 days …)
+  are now in the toolbar of **page dashboards**, not just Home. The window is stored per page board (`Board.range`, `dashcfg::Dash::scope_range`) and applies to every widget without its own window.
+- **Column layouts** (`/2 columns` … `/5 columns`, `editor::draw_columns`) — stored as plain blocks (`Columns` → `Column` → content, two indent levels deeper) so undo, copy / paste,
+  history, export and multi-select keep working. Drag the divider to resize (double-click = equal widths), drop any block into any column, hover toolbar: add / remove column, equal widths, unwrap, delete.
+  Columns stack automatically on narrow screens. `editor::normalize_layout` repairs the structure after every edit (stray blocks, empty or single columns, page ending inside a layout).
+- **Linked database views** (`/linked view`, `BlockKind::DbView`) — pick any database; the block gets its own hidden `View` (`View::linked = block id`) with its own layout (table / board / list /
+  gallery / calendar / timeline), filters and sorts, so *"tasks due this week"* can sit next to *"done"* on the same page while the source database is unchanged. Hidden views never show up as tabs of the database.
+- **Relative date filters** — `is today`, `this week`, `this month`, `next 7 days`, `past 7 days`, `overdue` for every date property (date ranges count when they touch the window) and a *Quick date filters* row in the filter popup.
+- Markdown export flattens columns, print export lays them out side by side, linked views print as tables.
+- Tests: `cargo test --lib` → 101 tests (15 new: layout repair, column actions, drag into columns, merge guard, date filters, page time window, headless render of columns + linked views on desktop / tablet / phone).
+
 ## Shortcuts
 `Ctrl/Cmd+K` palette · `N` new page · `J` journal · `\` sidebar · `.` focus · `L` lock · `Shift+L` theme · `Shift+E` export · `/` all shortcuts
 

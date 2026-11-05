@@ -774,3 +774,124 @@ fn database_toolbar_filters_and_resizable_columns_fit_a_phone() {
     let back: Workspace = serde_json::from_str(&s).unwrap();
     assert_eq!(back.db(road).unwrap().views[0].widths.get(&0), Some(&333.0));
 }
+
+// ───────────────────────────── v5.2: dashboard range, date filters, columns, linked views ─────────────────────────────
+
+fn new_db(ws: &mut Workspace) -> u64 {
+    ws.pages.iter().find(|p| p.db.as_ref().map_or(false, |d| d.first_of(PropKind::Date).is_some()) && !p.row).map(|p| p.id).expect("a database with a date property")
+}
+
+#[test]
+fn relative_date_filters_match_today_week_and_overdue() {
+    let mut ws = Workspace::seed();
+    let db = new_db(&mut ws);
+    let dp = ws.db(db).unwrap().first_of(PropKind::Date).unwrap();
+    let today = dates::today_day();
+    let mk = |ws: &mut Workspace, off: i64| {
+        let r = ws.add_row(db, None);
+        ws.page_mut(r).unwrap().props.insert(dp, Val::Text(dates::iso_of_day(today + off)));
+        r
+    };
+    let (r_today, r_past, r_next3, r_far) = (mk(&mut ws, 0), mk(&mut ws, -3), mk(&mut ws, 3), mk(&mut ws, 400));
+    let count = |ws: &Workspace, r: u64, op: FilterOp| {
+        let d = ws.db(db).unwrap();
+        row_matches(ws.page(r).unwrap(), d, &Filter { prop: dp, op, value: String::new() })
+    };
+    assert!(count(&ws, r_today, FilterOp::Today));
+    assert!(!count(&ws, r_past, FilterOp::Today));
+    assert!(count(&ws, r_past, FilterOp::Overdue));
+    assert!(!count(&ws, r_today, FilterOp::Overdue));
+    assert!(count(&ws, r_next3, FilterOp::Next7));
+    assert!(!count(&ws, r_far, FilterOp::Next7));
+    assert!(count(&ws, r_past, FilterOp::Past7));
+    assert!(count(&ws, r_today, FilterOp::ThisWeek));
+    assert!(!count(&ws, r_far, FilterOp::ThisMonth));
+    // a filter on a view applies through the normal query
+    let vi = 0;
+    let before = ws.query(db, vi).len();
+    ws.db_mut(db).unwrap().views[vi].filters.push(Filter { prop: dp, op: FilterOp::Today, value: String::new() });
+    let after = ws.query(db, vi);
+    assert!(after.contains(&r_today) && !after.contains(&r_far) && after.len() < before);
+}
+
+#[test]
+fn page_dashboards_have_their_own_time_window() {
+    let mut ws = Workspace::seed();
+    let page = ws.pages.iter().find(|p| p.kind == PageKind::Doc && !p.row).unwrap().id;
+    ws.dash.ensure_page_board(page, "Dashboard");
+    let b = ws.dash.page_board(page).unwrap();
+    assert_eq!(ws.dash.scope_range(b), crate::dashcfg::Range::All);
+    ws.dash.set_scope_range(b, crate::dashcfg::Range::Today);
+    assert_eq!(ws.dash.scope_range(b), crate::dashcfg::Range::Today);
+    assert_eq!(ws.dash.scope_range(0), crate::dashcfg::Range::All, "Home keeps its own window");
+    // the window survives a save / load
+    let json = serde_json::to_string(&ws).unwrap();
+    let back: Workspace = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.dash.scope_range(b), crate::dashcfg::Range::Today);
+    // and renders (toolbar with the Today / Week / Month chips) on desktop and phone
+    let ctx = test_ctx();
+    let pal = Palette::light();
+    for (k, size) in [vec2(1280.0, 800.0), vec2(390.0, 780.0)].into_iter().enumerate() {
+        for f in 0..3 {
+            frame_sized(&ctx, size, 0.1 * (k * 3 + f) as f64 + 0.1, vec![], |ui| {
+                let _ = crate::dashboard::embedded(ui, &mut ws, &pal, b);
+            });
+        }
+    }
+}
+
+#[test]
+fn columns_and_linked_database_views_render_and_stay_independent() {
+    let ctx = test_ctx();
+    let mut ws = Workspace::seed();
+    let db = new_db(&mut ws);
+    let pid = ws.pages.iter().find(|p| p.kind == PageKind::Doc && !p.row).unwrap().id;
+    let mut bl = vec![ws.blk(BlockKind::H1, "Layouts", 0), ws.blk(BlockKind::Columns, "", 0)];
+    for t in ["left", "right", "third"] {
+        bl.push(ws.blk(BlockKind::Column, "", 1));
+        bl.push(ws.blk(BlockKind::Text, t, 2));
+        bl.push(ws.blk(BlockKind::Bullet, "item", 2));
+    }
+    let mut dv = ws.blk(BlockKind::DbView, "", 0);
+    dv.link = Some(db);
+    let dvid = dv.id;
+    bl.push(dv);
+    bl.push(ws.blk(BlockKind::Text, "after", 0));
+    ws.page_mut(pid).unwrap().blocks = bl;
+    let tabs_before = ws.db(db).unwrap().tabs().len();
+    let mut ed = EditorState::default();
+    let mut t = 0.0;
+    for (k, size) in [vec2(1280.0, 820.0), vec2(900.0, 700.0), vec2(390.0, 780.0)].into_iter().enumerate() {
+        for f in 0..6 {
+            t += 0.05;
+            let mut input = RawInput::default();
+            input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), size));
+            input.time = Some(t);
+            input.events = vec![Event::PointerMoved(pos2(300.0 + 40.0 * f as f32, 220.0 + 20.0 * k as f32))];
+            let pal = Palette::light();
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        editor::show_page(ui, &mut ws, pid, &mut ed, &pal);
+                    });
+                });
+            });
+        }
+    }
+    // the linked view exists, is hidden from the database's own tabs, and has its own filters
+    let d = ws.db(db).unwrap();
+    let vi = d.linked_index(dvid).expect("linked view was created");
+    assert_eq!(d.tabs().len(), tabs_before);
+    assert!(d.views[vi].linked == dvid);
+    let dp = d.first_of(PropKind::Date).unwrap();
+    let all = ws.query(db, vi).len();
+    ws.db_mut(db).unwrap().views[vi].filters.push(Filter { prop: dp, op: FilterOp::Today, value: String::new() });
+    assert!(ws.query(db, vi).len() <= all);
+    assert_eq!(ws.query(db, ws.db(db).unwrap().active_tab()).len(), all, "the source view is untouched");
+    // the layout is intact
+    assert!(ws.page(pid).unwrap().blocks.iter().filter(|b| b.kind == BlockKind::Column).count() == 3);
+    // deleting the block prunes its hidden view
+    ws.page_mut(pid).unwrap().blocks.retain(|b| b.kind != BlockKind::DbView);
+    ws.prune_linked_views();
+    assert!(ws.db(db).unwrap().linked_index(dvid).is_none());
+}

@@ -57,7 +57,8 @@ enum Menu {
     Layouts(u64),
     Boards,
     BoardTab(usize),
-    Range,
+    /// Time-window menu of the board with this id (0 = Home).
+    Range(u64),
 }
 
 #[derive(Default)]
@@ -218,25 +219,49 @@ fn toolbar(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, sco
             st.inspect = None;
         }
     }
-    match scope {
-        Scope::Home => {
-            let on = ws.dash.range != Range::All;
-            let label = if on { ws.dash.range.label().to_owned() } else { "All time".to_owned() };
-            let r = action(ui, pal, l::CALENDAR_DAYS, &label, false, on);
-            if r.clicked() {
-                st.menu = Some((Menu::Range, r.rect.left_bottom() + vec2(0.0, 6.0)));
+    // Time window — available on Home AND on every page dashboard: quick chips (All / Today / Week / Month) + a full menu.
+    let bid = match scope {
+        Scope::Home => 0,
+        Scope::Page(b) => b,
+    };
+    let cur = ws.dash.scope_range(bid);
+    // the chips are laid out left-to-right even when the toolbar itself is right-to-left
+    let more_clicked = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+            for (r, t) in [(Range::All, "All"), (Range::Today, "Today"), (Range::ThisWeek, "Week"), (Range::ThisMonth, "Month")] {
+                if chip(ui, pal, t, cur == r)
+                    .on_hover_text(match r {
+                        Range::All => "Show every record",
+                        Range::Today => "Only today's records",
+                        Range::ThisWeek => "Only this week's records",
+                        _ => "Only this month's records",
+                    })
+                    .clicked()
+                {
+                    ws.dash.set_scope_range(bid, r);
+                }
+            }
+            let other = !matches!(cur, Range::All | Range::Today | Range::ThisWeek | Range::ThisMonth);
+            let label = if other { cur.label().to_owned() } else { "More".to_owned() };
+            let r = action(ui, pal, l::CALENDAR_DAYS, &label, false, other);
+            let c = r.clicked();
+            if c {
+                st.menu = Some((Menu::Range(bid), r.rect.left_bottom() + vec2(0.0, 6.0)));
                 st.fresh = true;
             }
-            r.on_hover_text("Time window for every widget that has none of its own");
+            r.on_hover_text("Time window for every widget on this dashboard that has none of its own");
+            c
+        })
+        .inner;
+    let _ = more_clicked;
+    if let Scope::Page(b) = scope {
+        let r = action(ui, pal, l::LAYOUT_TEMPLATE, "Layouts", false, false);
+        if r.clicked() {
+            st.menu = Some((Menu::Layouts(b), r.rect.left_bottom() + vec2(-120.0, 6.0)));
+            st.fresh = true;
         }
-        Scope::Page(b) => {
-            let r = action(ui, pal, l::LAYOUT_TEMPLATE, "Layouts", false, false);
-            if r.clicked() {
-                st.menu = Some((Menu::Layouts(b), r.rect.left_bottom() + vec2(-120.0, 6.0)));
-                st.fresh = true;
-            }
-            r.on_hover_text("Fill this dashboard with a ready-made set of widgets, or remove it");
-        }
+        r.on_hover_text("Fill this dashboard with a ready-made set of widgets, or remove it");
     }
 }
 
@@ -250,7 +275,7 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
     let sa = ScrollArea::vertical().id_salt("dash_scroll_area").auto_shrink([false, false]);
     let over = ui.rect_contains_pointer(ui.max_rect()) && st.drag.is_none() && st.resize.is_none();
     let mut acts: Vec<Act> = vec![];
-    let global = ws.dash.range;
+    let global = ws.dash.scope_range(match scope { Scope::Home => 0, Scope::Page(b) => b });
     st.rects.clear();
     // the board that is drawn
     let bidx: Option<usize> = match scope {
@@ -739,12 +764,12 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                     }
                 });
             }
-            Menu::Range => {
+            Menu::Range(rb) => {
                 keep = popup_area(&ctx, pid, pos, pal, &mut st.fresh, 230.0, |ui| {
                     section_label(ui, pal, "DASHBOARD TIME WINDOW");
                     for r in Range::ALL {
-                        if menu_item(ui, pal, if r == Range::All { l::CLOCK } else { l::CALENDAR_DAYS }, r.label(), None, ws.dash.range == r, false).clicked() {
-                            ws.dash.range = r;
+                        if menu_item(ui, pal, if r == Range::All { l::CLOCK } else { l::CALENDAR_DAYS }, r.label(), None, ws.dash.scope_range(*rb) == r, false).clicked() {
+                            ws.dash.set_scope_range(*rb, r);
                             close = true;
                         }
                     }

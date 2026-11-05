@@ -55,6 +55,8 @@ pub struct EditorState {
     pub scroll_to: Option<u64>,
     pub scale: f32,
     pub db: DbState,
+    /// Database UI state of every linked-view block on the page (block id → state).
+    pub dbv: HashMap<u64, DbState>,
     /// Right-click menu (text selection / block).
     pub menu: Option<EdMenu>,
     pub menu_fresh: bool,
@@ -139,6 +141,10 @@ enum Slash {
     Today,
     /// Turn the page into a dashboard (adds the widget grid to the page).
     Dashboard,
+    /// A column layout with this many columns.
+    Columns(u8),
+    /// A linked, filterable view of any database.
+    DbView,
 }
 
 #[derive(Clone, Copy)]
@@ -169,12 +175,16 @@ fn slash_all() -> Vec<SlashItem> {
     ] {
         v.push(SlashItem { act: Slash::Block(k), label, hint, glyph, kw, sec: med });
     }
+    for (n, label, glyph) in [(2u8, "2 columns", l::COLUMNS_2), (3, "3 columns", l::COLUMNS_3), (4, "4 columns", l::LAYOUT_GRID), (5, "5 columns", l::LAYOUT_GRID)] {
+        v.push(SlashItem { act: Slash::Columns(n), label, hint: "Lay content out side by side.", glyph, kw: "column columns layout side by side split grid", sec: "LAYOUT" });
+    }
     let adv = "ADVANCED";
     v.push(SlashItem { act: Slash::Block(BlockKind::Toc), label: "Table of contents", hint: "Jump links to every heading.", glyph: l::TABLE_OF_CONTENTS, kw: "table of contents toc outline", sec: adv });
     v.push(SlashItem { act: Slash::NewPage, label: "Page", hint: "Embed a new sub-page inside this page.", glyph: l::FILE_PLUS, kw: "page subpage new child", sec: adv });
     v.push(SlashItem { act: Slash::Link, label: "Link to page", hint: "Link to an existing page.", glyph: l::LINK_2, kw: "link page mention reference", sec: adv });
     v.push(SlashItem { act: Slash::Dashboard, label: "Dashboard", hint: "Turn this page into a dashboard of charts, tables and widgets.", glyph: l::LAYOUT_DASHBOARD, kw: "dashboard widgets chart charts kpi board analytics overview", sec: adv });
     v.push(SlashItem { act: Slash::Today, label: "Today's date", hint: "Insert the current date.", glyph: l::CALENDAR_DAYS, kw: "date today now time", sec: adv });
+    v.push(SlashItem { act: Slash::DbView, label: "Linked view of database", hint: "Show a filtered view of any database on this page.", glyph: l::TABLE_2, kw: "linked view database embed inline filter table board calendar today week", sec: "DATABASES" });
     let dbs = [
         (ViewKind::Table, "Table database", "Spreadsheet-style database."),
         (ViewKind::Board, "Board database", "Kanban board grouped by status."),
@@ -211,6 +221,14 @@ enum Act {
     UrlBlock(usize),
     /// Paste the exact blocks that were copied (kind, indent, colours, media … preserved).
     PasteBlocks(usize, Vec<Block>),
+    /// Move a block (with its children) and adopt the nesting level of its new place (used when it enters / leaves a column).
+    MoveAs(usize, usize, u8),
+    /// Column layouts: add a column after the column block, remove a column, equal widths, unwrap, delete.
+    ColAdd(usize),
+    ColDel(usize),
+    ColEqual(usize),
+    ColUnwrap(usize),
+    ColDelete(usize),
 }
 
 fn slash_act(idx: usize, s: SlashItem) -> Act {
@@ -627,8 +645,16 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
                         }
                     }
                     {
-                        let Workspace { pages, next_id, .. } = &mut *ws;
-                        changed |= blocks(ui, &mut pages[idx], next_id, ed, pal, content_w, &links, &bg);
+                        // the page's own blocks are lent to the block renderer so that linked database views can use the whole workspace
+                        let dv_before = ws.pages[idx].blocks.iter().filter(|b| b.kind == BlockKind::DbView).count();
+                        let shell = ws.pages[idx].shell();
+                        let mut page = std::mem::replace(&mut ws.pages[idx], shell);
+                        changed |= blocks(ui, &mut page, ws, ed, pal, content_w, &links, &bg);
+                        let dv_after = page.blocks.iter().filter(|b| b.kind == BlockKind::DbView).count();
+                        ws.pages[idx] = page;
+                        if dv_after < dv_before {
+                            ws.prune_linked_views();
+                        }
                     }
                     backlinks(ui, ws, id, ed, pal, content_w);
                 }
@@ -648,6 +674,9 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
     {
         let Workspace { pages, next_id, .. } = &mut *ws;
         changed |= popups(ui, &mut pages[idx], next_id, ed, pal);
+        if changed {
+            normalize_layout(&mut pages[idx].blocks, next_id);
+        }
     }
     changed
 }
@@ -771,13 +800,42 @@ fn font_for(kind: BlockKind, scale: f32) -> FontId {
     }
 }
 
-fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState, pal: &Palette, w: f32, links: &Links, bg: &egui::Response) -> bool {
+/// Everything one render pass over the page's blocks shares (the blocks of a column are drawn by the same code as the page body).
+struct Pass<'a> {
+    ws: &'a mut Workspace,
+    ed: &'a mut EditorState,
+    pal: &'a Palette,
+    links: &'a Links,
+    heads: Vec<(u64, u8, String)>,
+    visible: Vec<bool>,
+    rects: Vec<(usize, Rect)>,
+    /// Rectangles of the columns drawn this frame (index of the `Column` block).
+    col_rects: Vec<(usize, Rect)>,
+    nums: [usize; 8],
+    act: Option<Act>,
+    changed: bool,
+    pointer: Option<egui::Pos2>,
+}
+
+/// Number of column layouts each block sits in (0 = the block is part of the page body).
+fn col_depth(bl: &[Block]) -> Vec<u8> {
+    let mut out = vec![0u8; bl.len()];
+    let mut stack: Vec<u8> = vec![]; // indents of the open Columns blocks
+    for (i, b) in bl.iter().enumerate() {
+        while stack.last().map_or(false, |k| b.indent <= *k) {
+            stack.pop();
+        }
+        out[i] = stack.len() as u8;
+        if b.kind == BlockKind::Columns {
+            stack.push(b.indent);
+        }
+    }
+    out
+}
+
+fn blocks(ui: &mut Ui, page: &mut Page, ws: &mut Workspace, ed: &mut EditorState, pal: &Palette, w: f32, links: &Links, bg: &egui::Response) -> bool {
     let origin = ui.cursor().min;
-    let mut changed = false;
     let n = page.blocks.len();
-    let mut act: Option<Act> = None;
-    let mut rects: Vec<(usize, Rect)> = Vec::with_capacity(n);
-    let mut nums = [0usize; 8];
     let pointer = ui.ctx().pointer_hover_pos();
     let has_toc = page.blocks.iter().any(|b| b.kind == BlockKind::Toc);
     let heads: Vec<(u64, u8, String)> = page
@@ -807,151 +865,52 @@ fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
         }
     }
 
-    for i in 0..n {
-        let kind = page.blocks[i].kind;
-        let bid = page.blocks[i].id;
-        let indent = page.blocks[i].indent.min(6);
-        let ind = indent as usize;
-        for d in nums.iter_mut().skip(ind + 1) {
-            *d = 0;
-        }
-        if kind == BlockKind::Numbered {
-            nums[ind] += 1;
-        } else {
-            nums[ind] = 0;
-        }
-        let num = nums[ind];
-        if !visible[i] {
-            continue;
-        }
-        if !rects.is_empty() {
-            ui.add_space(match kind {
-                BlockKind::H1 => 18.0,
-                BlockKind::H2 => 12.0,
-                BlockKind::H3 => 8.0,
-                BlockKind::Callout | BlockKind::Code | BlockKind::Quote => 6.0,
-                _ => 1.0,
-            });
-        }
-        let ind_px = indent as f32 * INDENT;
-        // Performance: blocks far outside the viewport are not laid out at all — we just reserve their last known height.
-        let key = {
-            use std::hash::{Hash, Hasher};
-            let b = &page.blocks[i];
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            (b.kind as u8, &b.text, b.indent, b.collapsed, b.checked, w.to_bits(), ed.scale.to_bits(), heads.len(), b.bg, b.size, b.url.len(), b.media).hash(&mut h);
-            h.finish()
-        };
-        if ed.dragging.is_none()
-            && ed.focus.map_or(true, |(f, _)| f != bid)
-            && ed.restore_sel.map_or(true, |r| r.0 != bid)
-            && ed.scroll_to != Some(bid)
-            && !ui.ctx().memory(|m| m.has_focus(Id::new(("blk", bid))))
-        {
-            if let Some(&(h, k)) = ed.heights.get(&bid) {
-                let clip = ui.clip_rect();
-                let top = ui.cursor().top();
-                if k == key && (top + h < clip.top() - 800.0 || top > clip.bottom() + 800.0) {
-                    let (r, _) = ui.allocate_exact_size(vec2(w + GUTTER, h), Sense::hover());
-                    rects.push((i, r));
-                    continue;
-                }
-            }
-        }
-        let bg_slot = ui.painter().add(Shape::Noop);
-        let row = ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-            ui.add_space(GUTTER + ind_px);
-            ui.vertical(|ui| {
-                ui.set_width(w - ind_px);
-                changed |= draw_block(ui, &mut page.blocks[i], i, n, num, ed, pal, w - ind_px, &mut act, &heads, links);
-            });
-        });
-        let rect = row.response.rect;
-        rects.push((i, rect));
-        ed.heights.insert(bid, (rect.height(), key));
-        if !ed.rc_frame {
-            if let Some(p) = right_clicked(ui, rect) {
-                ed.menu = Some(EdMenu::Block { bid, pos: p });
-                ed.menu_fresh = true;
-                ed.rc_frame = true;
-                ed.block_menu = None;
-            }
-        }
-        let bgc = page.blocks[i].bg;
-        if bgc > 0 && !matches!(kind, BlockKind::Divider | BlockKind::Callout | BlockKind::Code) {
-            let r = Rect::from_min_max(pos2(rect.left() + GUTTER + ind_px - 6.0, rect.top()), pos2(rect.right() + 4.0, rect.bottom()));
-            ui.painter().set(bg_slot, Shape::rect_filled(r, 4.0, tag_color(bgc as usize - 1).gamma_multiply(0.16)));
-        }
-        if ed.scroll_to == Some(bid) {
-            ui.scroll_to_rect(rect, Some(Align::TOP));
-            ed.scroll_to = None;
-        }
+    let mut cx = Pass { ws, ed, pal, links, heads, visible, rects: Vec::with_capacity(n), col_rects: vec![], nums: [0; 8], act: None, changed: false, pointer };
+    draw_range(ui, page, &mut cx, 0, n, 0, w);
+    let Pass { ws, ed, rects, col_rects, mut act, mut changed, .. } = cx;
 
-        // gutter controls
-        let hover_zone = Rect::from_min_max(pos2(rect.left(), rect.top() - 1.0), pos2(rect.right(), rect.bottom() + 1.0));
-        let hovering = pointer.map_or(false, |p| hover_zone.contains(p)) && ed.dragging.is_none()
-            || ed.dragging == Some(bid)
-            || ed.block_menu.map_or(false, |(b, _)| b == bid);
-        let t = ui.ctx().animate_bool_with_time(Id::new(("gutter", bid)), hovering, 0.12);
-        if t > 0.02 {
-            let y = rect.top()
-                + match kind {
-                    BlockKind::H1 => 8.0,
-                    BlockKind::H2 => 5.0,
-                    BlockKind::H3 => 3.0,
-                    BlockKind::Callout => 11.0,
-                    BlockKind::Code => 14.0,
-                    _ => 1.0,
-                };
-            let plus = Rect::from_min_size(pos2(rect.left() + 6.0, y), vec2(22.0, 24.0));
-            let grip = Rect::from_min_size(pos2(rect.left() + 29.0, y), vec2(20.0, 24.0));
-            let pr = ui.interact(plus, Id::new(("plus", bid)), Sense::click());
-            let gr = ui.interact(grip, Id::new(("grip", bid)), Sense::click_and_drag());
-            for (r, resp, icon) in [(plus, &pr, Icon::Plus), (grip, &gr, Icon::Grip)] {
-                let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-                ui.painter().rect_filled(r, 5.0, with_alpha(pal.hover, h * t));
-                icons::paint(ui.painter(), r.center(), 15.0, icon, with_alpha(lerp_color(pal.muted, pal.text, h), t));
-            }
-            if pr.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Click to add a block below").clicked() {
-                act = Some(Act::InsertAfter(i, BlockKind::Text, "/".into()));
-            }
-            if gr.drag_started() {
-                ed.dragging = Some(bid);
-            }
-            if gr.clicked() {
-                if ui.input(|i| i.modifiers.command || i.modifiers.shift) {
-                    // Ctrl/Shift + click on the handle adds the block to the multi-selection
-                    if let Some(pos) = ed.sel.iter().position(|x| *x == bid) {
-                        ed.sel.remove(pos);
-                    } else {
-                        ed.sel.push(bid);
-                    }
-                } else {
-                    ed.block_menu = Some((bid, grip.left_bottom() + vec2(-4.0, 6.0)));
-                    ed.fresh = true;
-                }
-            }
-            if gr.hovered() || gr.dragged() {
-                ui.ctx().set_cursor_icon(if gr.dragged() { CursorIcon::Grabbing } else { CursorIcon::Grab });
-            }
-        }
-    }
-
-    // drag & drop reorder (children travel with their parent)
+    // drag & drop reorder (children travel with their parent; blocks can be dropped into any column)
     if let Some(did) = ed.dragging {
         ui.ctx().request_repaint();
         ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-        if let (Some(p), Some(from), false) = (pointer, page.blocks.iter().position(|b| b.id == did), rects.is_empty()) {
-            let slot = rects.iter().position(|(_, r)| p.y < r.center().y);
-            let (target, y) = match slot {
-                Some(s) => (rects[s].0, rects[s].1.top() - 1.0),
-                None => (n, rects[rects.len() - 1].1.bottom() + 1.0),
-            };
-            let x0 = rects[0].1.left() + GUTTER;
-            ui.painter().rect_filled(Rect::from_min_size(pos2(x0, y - 1.5), vec2(w, 3.0)), 2.0, pal.accent);
-            if !ui.input(|i| i.pointer.primary_down()) {
-                act = Some(Act::MoveTo(from, target));
+        let from_pos = page.blocks.iter().position(|b| b.id == did);
+        if let (Some(p), Some(from), false) = (pointer, from_pos, rects.is_empty()) {
+            let bl = &page.blocks;
+            let depth = col_depth(bl);
+            let from_end = subtree_end(bl, from);
+            // (target index, line y, line x, line width, indent to adopt)
+            let mut drop: Option<(usize, f32, f32, f32, Option<u8>)> = None;
+            let into = col_rects.iter().find(|(c, r)| r.contains(p) && bl[from].kind != BlockKind::Columns && !(*c >= from && *c < from_end)).copied();
+            if let Some((c, cr)) = into {
+                let end = subtree_end(bl, c);
+                let inside: Vec<&(usize, Rect)> = rects.iter().filter(|(i, _)| *i > c && *i < end).collect();
+                let slot = inside.iter().find(|(_, r)| p.y < r.center().y);
+                let (target, y, ind) = match slot {
+                    Some((i, r)) => (*i, r.top() - 1.0, bl[*i].indent),
+                    None => (end, inside.last().map_or(cr.top(), |(_, r)| r.bottom()) + 1.0, bl[c].indent + 1),
+                };
+                drop = Some((target, y, cr.left() + GUTTER, (cr.width() - GUTTER).max(40.0), Some(ind)));
+            } else {
+                let cands: Vec<&(usize, Rect)> = rects.iter().filter(|(i, _)| depth[*i] == 0).collect();
+                if let (Some(first), Some(last)) = (cands.first(), cands.last()) {
+                    let (target, y) = match cands.iter().find(|(_, r)| p.y < r.center().y) {
+                        Some((i, r)) => (*i, r.top() - 1.0),
+                        None => (n, last.1.bottom() + 1.0),
+                    };
+                    let ind = if target < n { bl[target].indent } else { 0 };
+                    drop = Some((target, y, first.1.left() + GUTTER, w, if depth[from] > 0 { Some(ind) } else { None }));
+                }
+            }
+            if let Some((target, y, x0, lw, ind)) = drop {
+                ui.painter().rect_filled(Rect::from_min_size(pos2(x0, y - 1.5), vec2(lw, 3.0)), 2.0, pal.accent);
+                if !ui.input(|i| i.pointer.primary_down()) {
+                    act = Some(match ind {
+                        Some(ind) => Act::MoveAs(from, target, ind),
+                        None => Act::MoveTo(from, target),
+                    });
+                    ed.dragging = None;
+                }
+            } else if !ui.input(|i| i.pointer.primary_down()) {
                 ed.dragging = None;
             }
         } else if !ui.input(|i| i.pointer.primary_down()) {
@@ -973,7 +932,7 @@ fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
         }
     }
 
-    if multisel::handle(ui, page, next_id, ed, pal, bg, &rects, origin) {
+    if multisel::handle(ui, page, &mut ws.next_id, ed, pal, bg, &rects, origin) {
         changed = true;
         act = None;
     }
@@ -981,7 +940,7 @@ fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
         if !matches!(a, Act::FocusPrev(_) | Act::FocusNext(_)) {
             multisel::push_undo(ed, page);
         }
-        apply(page, a, next_id, ed);
+        apply(page, a, &mut ws.next_id, ed);
         changed = true;
         ui.ctx().request_repaint();
     }
@@ -991,6 +950,431 @@ fn blocks(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
         }
     }
     changed
+}
+
+/// Draws the blocks `from..to` of the page. `base` is the indent of the first nesting level (2 levels deeper inside every column).
+#[allow(clippy::too_many_arguments)]
+fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usize, base: u8, w: f32) {
+    let pal = cx.pal;
+    let n = page.blocks.len();
+    let mut i = from;
+    let mut drawn = false;
+    while i < to {
+        let cur = i;
+        i += 1;
+        let kind = page.blocks[cur].kind;
+        let bid = page.blocks[cur].id;
+        let indent = page.blocks[cur].indent.min(6);
+        let ind = indent as usize;
+        for d in cx.nums.iter_mut().skip(ind + 1) {
+            *d = 0;
+        }
+        if kind == BlockKind::Numbered {
+            cx.nums[ind] += 1;
+        } else {
+            cx.nums[ind] = 0;
+        }
+        let num = cx.nums[ind];
+        if !cx.visible[cur] || kind == BlockKind::Column {
+            continue;
+        }
+        if drawn {
+            ui.add_space(match kind {
+                BlockKind::H1 => 18.0,
+                BlockKind::H2 => 12.0,
+                BlockKind::H3 => 8.0,
+                BlockKind::Callout | BlockKind::Code | BlockKind::Quote => 6.0,
+                BlockKind::Columns | BlockKind::DbView => 8.0,
+                _ => 1.0,
+            });
+        }
+        drawn = true;
+        if kind == BlockKind::Columns {
+            let end = subtree_end(&page.blocks, cur).min(to);
+            draw_columns(ui, page, cx, cur, end, base, w);
+            i = end.max(i);
+            continue;
+        }
+        let ind_px = indent.saturating_sub(base) as f32 * INDENT;
+        // Performance: blocks far outside the viewport are not laid out at all — we just reserve their last known height.
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let b = &page.blocks[cur];
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (b.kind as u8, &b.text, b.indent, b.collapsed, b.checked, w.to_bits(), cx.ed.scale.to_bits(), cx.heads.len(), b.bg, b.size, b.url.len(), b.media).hash(&mut h);
+            h.finish()
+        };
+        if cx.ed.dragging.is_none()
+            && cx.ed.focus.map_or(true, |(f, _)| f != bid)
+            && cx.ed.restore_sel.map_or(true, |r| r.0 != bid)
+            && cx.ed.scroll_to != Some(bid)
+            && kind != BlockKind::DbView
+            && !ui.ctx().memory(|m| m.has_focus(Id::new(("blk", bid))))
+        {
+            if let Some(&(h, k)) = cx.ed.heights.get(&bid) {
+                let clip = ui.clip_rect();
+                let top = ui.cursor().top();
+                if k == key && (top + h < clip.top() - 800.0 || top > clip.bottom() + 800.0) {
+                    let (r, _) = ui.allocate_exact_size(vec2(w + GUTTER, h), Sense::hover());
+                    cx.rects.push((cur, r));
+                    continue;
+                }
+            }
+        }
+        let bg_slot = ui.painter().add(Shape::Noop);
+        let row = ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+            ui.add_space(GUTTER + ind_px);
+            ui.vertical(|ui| {
+                ui.set_width(w - ind_px);
+                if kind == BlockKind::DbView {
+                    cx.changed |= draw_dbview(ui, cx.ws, &mut page.blocks[cur], cx.ed, pal, w - ind_px);
+                } else {
+                    cx.changed |= draw_block(ui, &mut page.blocks[cur], cur, n, num, cx.ed, pal, w - ind_px, &mut cx.act, &cx.heads, cx.links);
+                }
+            });
+        });
+        let rect = row.response.rect;
+        cx.rects.push((cur, rect));
+        cx.ed.heights.insert(bid, (rect.height(), key));
+        if !cx.ed.rc_frame {
+            if let Some(p) = right_clicked(ui, rect) {
+                cx.ed.menu = Some(EdMenu::Block { bid, pos: p });
+                cx.ed.menu_fresh = true;
+                cx.ed.rc_frame = true;
+                cx.ed.block_menu = None;
+            }
+        }
+        let bgc = page.blocks[cur].bg;
+        if bgc > 0 && !matches!(kind, BlockKind::Divider | BlockKind::Callout | BlockKind::Code) {
+            let r = Rect::from_min_max(pos2(rect.left() + GUTTER + ind_px - 6.0, rect.top()), pos2(rect.right() + 4.0, rect.bottom()));
+            ui.painter().set(bg_slot, Shape::rect_filled(r, 4.0, tag_color(bgc as usize - 1).gamma_multiply(0.16)));
+        }
+        if cx.ed.scroll_to == Some(bid) {
+            ui.scroll_to_rect(rect, Some(Align::TOP));
+            cx.ed.scroll_to = None;
+        }
+
+        // gutter controls
+        let hover_zone = Rect::from_min_max(pos2(rect.left(), rect.top() - 1.0), pos2(rect.right(), rect.bottom() + 1.0));
+        let hovering = cx.pointer.map_or(false, |p| hover_zone.contains(p)) && cx.ed.dragging.is_none()
+            || cx.ed.dragging == Some(bid)
+            || cx.ed.block_menu.map_or(false, |(b, _)| b == bid);
+        let t = ui.ctx().animate_bool_with_time(Id::new(("gutter", bid)), hovering, 0.12);
+        if t > 0.02 {
+            let y = rect.top()
+                + match kind {
+                    BlockKind::H1 => 8.0,
+                    BlockKind::H2 => 5.0,
+                    BlockKind::H3 => 3.0,
+                    BlockKind::Callout => 11.0,
+                    BlockKind::Code => 14.0,
+                    _ => 1.0,
+                };
+            let plus = Rect::from_min_size(pos2(rect.left() + 6.0, y), vec2(22.0, 24.0));
+            let grip = Rect::from_min_size(pos2(rect.left() + 29.0, y), vec2(20.0, 24.0));
+            let pr = ui.interact(plus, Id::new(("plus", bid)), Sense::click());
+            let gr = ui.interact(grip, Id::new(("grip", bid)), Sense::click_and_drag());
+            for (r, resp, icon) in [(plus, &pr, Icon::Plus), (grip, &gr, Icon::Grip)] {
+                let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+                ui.painter().rect_filled(r, 5.0, with_alpha(pal.hover, h * t));
+                icons::paint(ui.painter(), r.center(), 15.0, icon, with_alpha(lerp_color(pal.muted, pal.text, h), t));
+            }
+            if pr.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Click to add a block below").clicked() {
+                cx.act = Some(Act::InsertAfter(cur, BlockKind::Text, "/".into()));
+            }
+            if gr.drag_started() {
+                cx.ed.dragging = Some(bid);
+            }
+            if gr.clicked() {
+                if ui.input(|i| i.modifiers.command || i.modifiers.shift) {
+                    // Ctrl/Shift + click on the handle adds the block to the multi-selection
+                    if let Some(pos) = cx.ed.sel.iter().position(|x| *x == bid) {
+                        cx.ed.sel.remove(pos);
+                    } else {
+                        cx.ed.sel.push(bid);
+                    }
+                } else {
+                    cx.ed.block_menu = Some((bid, grip.left_bottom() + vec2(-4.0, 6.0)));
+                    cx.ed.fresh = true;
+                }
+            }
+            if gr.hovered() || gr.dragged() {
+                ui.ctx().set_cursor_icon(if gr.dragged() { CursorIcon::Grabbing } else { CursorIcon::Grab });
+            }
+        }
+    }
+}
+
+/// Draws one column layout (the `Columns` block `i` and its `Column` children up to `end`) side by side.
+/// Every column owns a gutter on its left, so each block keeps its "+" / drag handle; columns stack on narrow screens.
+fn draw_columns(ui: &mut Ui, page: &mut Page, cx: &mut Pass, i: usize, end: usize, base: u8, w: f32) {
+    let pal = cx.pal;
+    let k = page.blocks[i].indent;
+    let ind_px = k.saturating_sub(base) as f32 * INDENT;
+    let total = w - ind_px + GUTTER;
+    let mut cols: Vec<(usize, usize)> = vec![];
+    let mut j = i + 1;
+    while j < end {
+        if page.blocks[j].kind == BlockKind::Column && page.blocks[j].indent == k + 1 {
+            let e = subtree_end(&page.blocks, j).min(end);
+            cols.push((j, e));
+            j = e;
+        } else {
+            j += 1;
+        }
+    }
+    let m = cols.len();
+    if m == 0 {
+        return;
+    }
+    let cw_all = total - GUTTER * m as f32;
+    let stacked = (cw_all / m as f32) < 150.0;
+    // widths (permille weights; 0 = equal share)
+    let wsum: f32 = cols.iter().map(|(c, _)| if page.blocks[*c].start == 0 { 1000.0 / m as f32 } else { page.blocks[*c].start as f32 }).sum::<f32>().max(1.0);
+    let widths: Vec<f32> = cols.iter().map(|(c, _)| (if page.blocks[*c].start == 0 { 1000.0 / m as f32 } else { page.blocks[*c].start as f32 }) / wsum * cw_all).collect();
+    let first_col_idx = cx.col_rects.len();
+    let mut rights: Vec<f32> = vec![];
+    let row = ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+        ui.add_space(ind_px);
+        if stacked {
+            ui.vertical(|ui| {
+                ui.set_width(total - ind_px);
+                for (c, e) in cols.iter() {
+                    draw_range(ui, page, cx, *c + 1, *e, k + 2, w - ind_px);
+                    ui.add_space(6.0);
+                }
+            });
+        } else {
+            for (idx, (c, e)) in cols.iter().enumerate() {
+                let cw = widths[idx];
+                let r = ui.vertical(|ui| {
+                    ui.set_width(GUTTER + cw);
+                    draw_range(ui, page, cx, *c + 1, *e, k + 2, cw);
+                });
+                let mut rr = r.response.rect;
+                rr.set_width(GUTTER + cw);
+                cx.col_rects.push((*c, rr));
+                rights.push(rr.right());
+            }
+        }
+    });
+    let rect = row.response.rect;
+    let bid = page.blocks[i].id;
+
+    // drag the divider between two columns to resize them
+    if !stacked && cx.ed.dragging.is_none() {
+        for idx in 1..m {
+            let x = rights[idx - 1];
+            let hr = Rect::from_min_max(pos2(x - 2.0, rect.top()), pos2(x + 8.0, rect.bottom()));
+            let resp = ui.interact(hr, Id::new(("colsz", page.blocks[cols[idx].0].id)), Sense::drag());
+            let hot = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || resp.dragged(), 0.1);
+            if hot > 0.01 {
+                ui.painter().rect_filled(Rect::from_center_size(pos2(x + 3.0, rect.center().y), vec2(3.0, (rect.height() - 4.0).max(12.0))), 2.0, with_alpha(pal.accent, hot * 0.8));
+            }
+            if resp.hovered() || resp.dragged() {
+                ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+            }
+            if resp.dragged() {
+                let dx = resp.drag_delta().x.clamp(-(widths[idx - 1] - 90.0).max(0.0), (widths[idx] - 90.0).max(0.0));
+                let mut nw = widths.clone();
+                nw[idx - 1] += dx;
+                nw[idx] -= dx;
+                let s: f32 = nw.iter().sum::<f32>().max(1.0);
+                for (q, (c, _)) in cols.iter().enumerate() {
+                    page.blocks[*c].start = (nw[q] / s * 1000.0).round().max(1.0) as u32;
+                }
+                cx.changed = true;
+            }
+            if resp.double_clicked() {
+                cx.act = Some(Act::ColEqual(i));
+            }
+        }
+    }
+
+    // hover toolbar: add / remove a column, equal widths, unwrap, delete layout
+    let zone = Rect::from_min_max(pos2(rect.left(), rect.top() - 26.0), pos2(rect.right(), rect.bottom()));
+    let hot = cx.pointer.map_or(false, |p| zone.contains(p)) && cx.ed.dragging.is_none() && cx.ed.marquee.is_none();
+    let t = ui.ctx().animate_bool_with_time(Id::new(("colbar", bid)), hot, 0.12);
+    if t > 0.02 {
+        let hovered_col = cx.col_rects[first_col_idx..].iter().find(|(_, r)| cx.pointer.map_or(false, |p| r.x_range().contains(p.x))).map(|(c, _)| *c).unwrap_or(cols[m - 1].0);
+        let items: [(&str, &str, Option<Act>); 5] = [
+            (l::PLUS, if m < 6 { "Add a column after this one" } else { "Up to 6 columns" }, if m < 6 { Some(Act::ColAdd(hovered_col)) } else { None }),
+            (l::MINUS, "Remove this column and its content", Some(Act::ColDel(hovered_col))),
+            (l::BETWEEN_HORIZONTAL_START, "Equal column widths (or double-click a divider)", Some(Act::ColEqual(i))),
+            (l::LAYOUT_LIST, "Unwrap — stack the columns, keep the content", Some(Act::ColUnwrap(i))),
+            (l::TRASH_2, "Delete the whole layout", Some(Act::ColDelete(i))),
+        ];
+        let bw = 24.0;
+        let x0 = rect.right() - bw * items.len() as f32 - 4.0;
+        let y0 = rect.top() - 24.0;
+        ui.painter().rect_filled(Rect::from_min_size(pos2(x0 - 3.0, y0 - 1.0), vec2(bw * items.len() as f32 + 6.0, 26.0)), 8.0, with_alpha(pal.popup, t));
+        ui.painter().rect_stroke(Rect::from_min_size(pos2(x0 - 3.0, y0 - 1.0), vec2(bw * items.len() as f32 + 6.0, 26.0)), 8.0, Stroke::new(1.0, with_alpha(pal.border, t)), egui::StrokeKind::Inside);
+        for (q, (glyph, tip, a)) in items.into_iter().enumerate() {
+            let r = Rect::from_min_size(pos2(x0 + bw * q as f32, y0), vec2(bw, 24.0));
+            let resp = ui.interact(r, Id::new(("colbtn", bid, q)), Sense::click());
+            let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() && a.is_some(), 0.1);
+            ui.painter().rect_filled(r.shrink(1.0), 6.0, with_alpha(pal.hover, h * t));
+            let col = if q == 4 && h > 0.0 { pal.danger } else if a.is_some() { pal.text } else { pal.muted };
+            ui.painter().text(r.center(), Align2::CENTER_CENTER, glyph, body(14.0), with_alpha(col, t));
+            if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip).clicked() {
+                if let Some(a) = a {
+                    cx.act = Some(a);
+                }
+            }
+        }
+    }
+}
+
+/// A linked view of a database: the source stays unchanged, this block has its own layout, filters and sorts.
+fn draw_dbview(ui: &mut Ui, ws: &mut Workspace, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: f32) -> bool {
+    let mut changed = false;
+    let src = b.link.filter(|l| ws.page(*l).map_or(false, |p| p.db.is_some() && !p.trashed));
+    let Some(db_id) = src else {
+        // pick the source database
+        egui::Frame::new().fill(with_alpha(pal.hover, 0.5)).stroke(Stroke::new(1.0, pal.border)).corner_radius(8.0).inner_margin(Margin::same(12)).show(ui, |ui| {
+            ui.set_width(w - 26.0);
+            ui.label(RichText::new(format!("{}  Linked view of a database", l::TABLE_2)).font(bold(15.0)).color(pal.text));
+            ui.label(RichText::new(if b.link.is_some() { "The source database was deleted. Pick another one:" } else { "Pick a database. This block shows its own filtered view — the original stays untouched." }).font(body(13.0)).color(pal.muted));
+            ui.add_space(6.0);
+            let dbs: Vec<(u64, String)> = ws.pages.iter().filter(|p| p.db.is_some() && !p.trashed && !p.row).map(|p| (p.id, ws.display_title(p.id))).collect();
+            if dbs.is_empty() {
+                ui.label(RichText::new("No databases yet — create one with /table database or from the sidebar.").font(body(13.0)).color(pal.muted));
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                for (id, t) in dbs {
+                    if database::pill(ui, pal, &format!("{}  {}", l::DATABASE, t), false, false).clicked() {
+                        b.link = Some(id);
+                        changed = true;
+                    }
+                }
+            });
+        });
+        return changed;
+    };
+    let title = ws.display_title(db_id);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing = vec2(6.0, 0.0);
+        let r = ui.add(egui::Label::new(RichText::new(format!("{}  {}", l::DATABASE, title)).font(bold(15.0)).color(pal.text)).sense(Sense::click()));
+        if r.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Open the source database").clicked() {
+            ed.nav = Some(db_id);
+        }
+        ui.label(RichText::new("linked view").font(body(11.5)).color(pal.muted));
+        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+            if crate::widgets::icon_button(ui, pal, Icon::Close, 11.0, "Choose another database").clicked() {
+                b.link = None;
+                changed = true;
+            }
+        });
+    });
+    ui.add_space(2.0);
+    if b.link.is_none() {
+        return changed;
+    }
+    let Some(vi) = ws.ensure_linked_view(db_id, b.id, ViewKind::Table) else { return changed };
+    let mut st = ed.dbv.remove(&b.id).unwrap_or_default();
+    std::mem::swap(&mut ed.db, &mut st);
+    changed |= database::show_linked(ui, ws, db_id, vi, b.id, ed, pal, w);
+    std::mem::swap(&mut ed.db, &mut st);
+    ed.dbv.insert(b.id, st);
+    changed
+}
+
+/// Repairs the column structure after any edit: a `Columns` block holds `Column` blocks (one level deeper), every column holds at
+/// least one block, a layout with fewer than two columns dissolves, and the page never ends inside a layout (so you can keep typing).
+fn normalize_layout(bl: &mut Vec<Block>, next_id: &mut u64) {
+    if !bl.iter().any(|b| matches!(b.kind, BlockKind::Columns | BlockKind::Column)) {
+        return;
+    }
+    let mut guard = 0;
+    'again: loop {
+        guard += 1;
+        if guard > 500 {
+            break;
+        }
+        for i in 0..bl.len() {
+            match bl[i].kind {
+                BlockKind::Column => {
+                    let ok = bl[i].indent > 0 && (0..i).rev().find(|j| bl[*j].indent < bl[i].indent).map_or(false, |j| bl[j].kind == BlockKind::Columns && bl[j].indent + 1 == bl[i].indent);
+                    if !ok {
+                        bl[i].kind = BlockKind::Text;
+                        bl[i].text.clear();
+                        bl[i].start = 0;
+                        continue 'again;
+                    }
+                }
+                BlockKind::Columns => {
+                    let k = bl[i].indent;
+                    if k > 4 {
+                        bl[i].kind = BlockKind::Text;
+                        bl[i].text.clear();
+                        continue 'again;
+                    }
+                    let end = subtree_end(bl, i);
+                    if end > i + 1 && bl[i + 1].indent > k + 1 {
+                        let c = new_block(next_id, BlockKind::Column, String::new(), k + 1);
+                        bl.insert(i + 1, c);
+                        continue 'again;
+                    }
+                    for j in i + 1..end {
+                        if bl[j].indent == k + 1 && bl[j].kind != BlockKind::Column {
+                            let prev_is_col = (i + 1..j).rev().find(|q| bl[*q].indent == k + 1).map_or(false, |q| bl[q].kind == BlockKind::Column);
+                            if prev_is_col {
+                                let e = subtree_end(bl, j);
+                                for b in bl[j..e].iter_mut() {
+                                    b.indent = (b.indent + 1).min(6);
+                                }
+                            } else {
+                                let c = new_block(next_id, BlockKind::Column, String::new(), k + 1);
+                                bl.insert(j, c);
+                            }
+                            continue 'again;
+                        }
+                    }
+                    let cols: Vec<usize> = (i + 1..end).filter(|q| bl[*q].indent == k + 1 && bl[*q].kind == BlockKind::Column).collect();
+                    if cols.len() < 2 {
+                        dissolve(bl, i);
+                        continue 'again;
+                    }
+                    for c in cols {
+                        if subtree_end(bl, c) == c + 1 {
+                            let t = new_block(next_id, BlockKind::Text, String::new(), k + 2);
+                            bl.insert(c + 1, t);
+                            continue 'again;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // the page must not end inside a layout
+        if let Some(r) = (0..bl.len()).rev().find(|i| bl[*i].kind == BlockKind::Columns && subtree_end(bl, *i) == bl.len()) {
+            let t = new_block(next_id, BlockKind::Text, String::new(), bl[r].indent);
+            bl.push(t);
+        }
+        break;
+    }
+    if bl.is_empty() {
+        bl.push(new_block(next_id, BlockKind::Text, String::new(), 0));
+    }
+}
+
+/// Removes the `Columns` block `i` and its `Column` markers; the content stays, two levels shallower.
+fn dissolve(bl: &mut Vec<Block>, i: usize) {
+    let k = bl[i].indent;
+    let end = subtree_end(bl, i);
+    let mut keep: Vec<Block> = vec![];
+    for b in bl[i + 1..end].iter() {
+        if b.indent == k + 1 && b.kind == BlockKind::Column {
+            continue;
+        }
+        let mut b = b.clone();
+        b.indent = b.indent.saturating_sub(2);
+        keep.push(b);
+    }
+    bl.splice(i..end, keep);
 }
 
 fn new_block(next_id: &mut u64, kind: BlockKind, text: String, indent: u8) -> Block {
@@ -1020,6 +1404,11 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
         }
         Act::Merge(i) => {
             if i == 0 {
+                return;
+            }
+            if matches!(bl[i - 1].kind, BlockKind::Column | BlockKind::Columns) || col_depth(bl)[i - 1] != col_depth(bl)[i] {
+                // never merge across a column boundary
+                ed.focus = Some((bl[i].id, 0));
                 return;
             }
             if !bl[i - 1].kind.has_text() {
@@ -1090,6 +1479,55 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
                 bl.insert(to + k, b);
             }
         }
+        Act::MoveAs(from, to, ind) => {
+            let end = subtree_end(bl, from);
+            if to >= from && to <= end {
+                return;
+            }
+            let moved: Vec<Block> = bl.drain(from..end).collect();
+            let len = moved.len();
+            let to = if to > from { to - len } else { to };
+            let to = to.min(bl.len());
+            let delta = ind as i32 - moved[0].indent as i32;
+            for (k, mut b) in moved.into_iter().enumerate() {
+                b.indent = (b.indent as i32 + delta).clamp(0, 6) as u8;
+                bl.insert(to + k, b);
+            }
+        }
+        Act::ColAdd(c) => {
+            let k = bl[c].indent;
+            let end = subtree_end(bl, c);
+            let col = new_block(next_id, BlockKind::Column, String::new(), k);
+            let txt = new_block(next_id, BlockKind::Text, String::new(), k + 1);
+            ed.focus = Some((txt.id, 0));
+            bl.insert(end, txt);
+            bl.insert(end, col);
+            if let Some(p) = (0..c).rev().find(|j| bl[*j].kind == BlockKind::Columns && bl[*j].indent + 1 == k) {
+                let pe = subtree_end(bl, p);
+                for b in bl[p + 1..pe].iter_mut().filter(|b| b.kind == BlockKind::Column && b.indent == k) {
+                    b.start = 0;
+                }
+            }
+        }
+        Act::ColDel(c) => {
+            let end = subtree_end(bl, c);
+            bl.drain(c..end);
+        }
+        Act::ColDelete(i) => {
+            let end = subtree_end(bl, i);
+            bl.drain(i..end);
+            if bl.is_empty() {
+                bl.push(new_block(next_id, BlockKind::Text, String::new(), 0));
+            }
+        }
+        Act::ColEqual(i) => {
+            let end = subtree_end(bl, i);
+            let k = bl[i].indent;
+            for b in bl[i + 1..end].iter_mut().filter(|b| b.kind == BlockKind::Column && b.indent == k + 1) {
+                b.start = 0;
+            }
+        }
+        Act::ColUnwrap(i) => dissolve(bl, i),
         Act::Dup(i) => {
             let end = subtree_end(bl, i);
             let mut copies: Vec<Block> = bl[i..end].to_vec();
@@ -1129,6 +1567,9 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
             }
         }
         Act::Indent(i, d) => {
+            if matches!(bl[i].kind, BlockKind::Column | BlockKind::Columns) {
+                return;
+            }
             let cur = bl[i].indent as i8;
             let max_allowed = if i == 0 { 0 } else { (bl[i - 1].indent as i8 + 1).min(6) };
             let new = if d > 0 { (cur + 1).min(max_allowed) } else { (cur - 1).max(0) };
@@ -1207,6 +1648,34 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
                 });
                 let ind = bl[i].indent;
                 if i + 1 >= bl.len() {
+                    let nb = new_block(next_id, BlockKind::Text, String::new(), ind);
+                    bl.push(nb);
+                }
+            }
+            Slash::Columns(n) => {
+                let ind = bl[i].indent.min(4);
+                bl[i].indent = ind;
+                bl[i].kind = BlockKind::Columns;
+                bl[i].text.clear();
+                let mut first = 0;
+                let mut ins: Vec<Block> = vec![];
+                for q in 0..n.clamp(2, 6) {
+                    ins.push(new_block(next_id, BlockKind::Column, String::new(), ind + 1));
+                    let t = new_block(next_id, BlockKind::Text, String::new(), ind + 2);
+                    if q == 0 {
+                        first = t.id;
+                    }
+                    ins.push(t);
+                }
+                ed.focus = Some((first, 0));
+                bl.splice(i + 1..i + 1, ins);
+            }
+            Slash::DbView => {
+                bl[i].kind = BlockKind::DbView;
+                bl[i].text.clear();
+                bl[i].link = None;
+                if i + 1 >= bl.len() {
+                    let ind = bl[i].indent;
                     let nb = new_block(next_id, BlockKind::Text, String::new(), ind);
                     bl.push(nb);
                 }
@@ -1395,6 +1864,8 @@ fn draw_block(
             }
             ui.add_space(4.0);
         }
+        // laid out by `draw_range` / `draw_columns` / `draw_dbview`, never by this function
+        BlockKind::Columns | BlockKind::Column | BlockKind::DbView => {}
         BlockKind::PageLink => {
             let info = b.link.and_then(|l| links.get(&l));
             let (rect, resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::click());
@@ -2373,6 +2844,102 @@ mod tests {
         assert_eq!(slash_items("todo")[0].label, "To-do list");
         assert!(slash_items("kanban").iter().any(|i| i.label == "Board database"));
         assert!(slash_items("zzzzzz").is_empty());
+    }
+
+    fn kinds(p: &Page) -> Vec<(BlockKind, u8)> {
+        p.blocks.iter().map(|b| (b.kind, b.indent)).collect()
+    }
+
+    #[test]
+    fn slash_columns_builds_a_valid_layout() {
+        let mut p = page(vec![blk(1, BlockKind::Text, "/columns", 0), blk(2, BlockKind::Text, "tail", 0)]);
+        let mut next = 100;
+        let mut ed = EditorState::default();
+        apply(&mut p, Act::Special(0, Slash::Columns(3)), &mut next, &mut ed);
+        normalize_layout(&mut p.blocks, &mut next);
+        let k = kinds(&p);
+        assert_eq!(k[0], (BlockKind::Columns, 0));
+        assert_eq!(k.iter().filter(|x| **x == (BlockKind::Column, 1)).count(), 3);
+        assert_eq!(k.iter().filter(|x| **x == (BlockKind::Text, 2)).count(), 3);
+        assert_eq!(*k.last().unwrap(), (BlockKind::Text, 0));
+        let before = kinds(&p);
+        normalize_layout(&mut p.blocks, &mut next);
+        assert_eq!(before, kinds(&p), "normalising twice changes nothing");
+    }
+
+    #[test]
+    fn normalize_repairs_broken_layouts() {
+        let mut next = 500;
+        // a single column dissolves, its content moves back to the page body
+        let mut p = page(vec![blk(1, BlockKind::Columns, "", 0), blk(2, BlockKind::Column, "", 1), blk(3, BlockKind::Text, "only", 2), blk(4, BlockKind::Text, "after", 0)]);
+        normalize_layout(&mut p.blocks, &mut next);
+        assert_eq!(kinds(&p), vec![(BlockKind::Text, 0), (BlockKind::Text, 0)]);
+        // a stray block directly under Columns is pulled into the previous column
+        let mut p = page(vec![blk(1, BlockKind::Columns, "", 0), blk(2, BlockKind::Column, "", 1), blk(3, BlockKind::Text, "a", 2), blk(4, BlockKind::Column, "", 1), blk(5, BlockKind::Text, "b", 2), blk(6, BlockKind::Text, "stray", 1), blk(7, BlockKind::Text, "end", 0)]);
+        normalize_layout(&mut p.blocks, &mut next);
+        assert_eq!(p.blocks[5].indent, 2);
+        assert_eq!(p.blocks[5].text, "stray");
+        // an empty column gets an empty block; an orphan Column becomes text; a page never ends inside a layout
+        let mut p = page(vec![blk(1, BlockKind::Column, "", 1), blk(2, BlockKind::Columns, "", 0), blk(3, BlockKind::Column, "", 1), blk(4, BlockKind::Column, "", 1), blk(5, BlockKind::Text, "x", 2)]);
+        normalize_layout(&mut p.blocks, &mut next);
+        assert_eq!(p.blocks[0].kind, BlockKind::Text);
+        let cols = p.blocks.iter().filter(|b| b.kind == BlockKind::Column).count();
+        assert_eq!(cols, 2);
+        assert!(p.blocks.iter().all(|b| b.kind != BlockKind::Column || b.indent == 1));
+        assert_eq!(p.blocks.last().unwrap().indent, 0);
+        assert_eq!(p.blocks.last().unwrap().kind, BlockKind::Text);
+    }
+
+    #[test]
+    fn column_actions_add_remove_and_unwrap() {
+        let mut p = page(vec![blk(1, BlockKind::Text, "/c", 0)]);
+        let mut next = 100;
+        let mut ed = EditorState::default();
+        apply(&mut p, Act::Special(0, Slash::Columns(2)), &mut next, &mut ed);
+        normalize_layout(&mut p.blocks, &mut next);
+        let first_col = p.blocks.iter().position(|b| b.kind == BlockKind::Column).unwrap();
+        apply(&mut p, Act::ColAdd(first_col), &mut next, &mut ed);
+        normalize_layout(&mut p.blocks, &mut next);
+        assert_eq!(p.blocks.iter().filter(|b| b.kind == BlockKind::Column).count(), 3);
+        apply(&mut p, Act::ColDel(first_col), &mut next, &mut ed);
+        normalize_layout(&mut p.blocks, &mut next);
+        assert_eq!(p.blocks.iter().filter(|b| b.kind == BlockKind::Column).count(), 2);
+        apply(&mut p, Act::ColUnwrap(0), &mut next, &mut ed);
+        normalize_layout(&mut p.blocks, &mut next);
+        assert!(p.blocks.iter().all(|b| !matches!(b.kind, BlockKind::Column | BlockKind::Columns)));
+        assert!(p.blocks.iter().all(|b| b.indent == 0));
+    }
+
+    #[test]
+    fn dragging_into_a_column_adopts_its_indent() {
+        let mut p = page(vec![
+            blk(1, BlockKind::Text, "move me", 0),
+            blk(2, BlockKind::Columns, "", 0),
+            blk(3, BlockKind::Column, "", 1),
+            blk(4, BlockKind::Text, "a", 2),
+            blk(5, BlockKind::Column, "", 1),
+            blk(6, BlockKind::Text, "b", 2),
+            blk(7, BlockKind::Text, "end", 0),
+        ]);
+        let mut next = 100;
+        let mut ed = EditorState::default();
+        apply(&mut p, Act::MoveAs(0, 5, 2), &mut next, &mut ed); // before "b"
+        normalize_layout(&mut p.blocks, &mut next);
+        let i = p.blocks.iter().position(|b| b.text == "move me").unwrap();
+        assert_eq!(p.blocks[i].indent, 2);
+        assert_eq!(p.blocks[i + 1].text, "b");
+        assert_eq!(p.blocks[i - 1].kind, BlockKind::Column);
+    }
+
+    #[test]
+    fn backspace_never_merges_across_a_column_boundary() {
+        let mut p = page(vec![blk(1, BlockKind::Text, "before", 0), blk(2, BlockKind::Columns, "", 0), blk(3, BlockKind::Column, "", 1), blk(4, BlockKind::Text, "in column", 2), blk(5, BlockKind::Column, "", 1), blk(6, BlockKind::Text, "second", 2), blk(7, BlockKind::Text, "end", 0)]);
+        let mut next = 100;
+        let mut ed = EditorState::default();
+        let n = p.blocks.len();
+        apply(&mut p, Act::Merge(3), &mut next, &mut ed); // first block of column 1 vs. the Column marker
+        apply(&mut p, Act::Merge(5), &mut next, &mut ed); // first block of column 2
+        assert_eq!(p.blocks.len(), n);
     }
 
     #[test]

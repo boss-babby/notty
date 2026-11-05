@@ -401,6 +401,9 @@ pub struct Board {
     /// page can be a dashboard — the page keeps its blocks and gains a grid of widgets.
     #[serde(default)]
     pub page: u64,
+    /// Time window of this board (Today / This week / …) — used by dashboards that live on a page; Home tabs share `Dash::range`.
+    #[serde(default)]
+    pub range: Range,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug, Default)]
@@ -414,6 +417,23 @@ pub struct Dash {
     /// Dashboard-wide time window: overrides the window of every widget that has none of its own.
     #[serde(default)]
     pub range: Range,
+}
+
+impl Dash {
+    /// The time window that applies to the board `board` (page dashboards have their own, Home tabs share one).
+    pub fn scope_range(&self, board: u64) -> Range {
+        match self.boards.iter().find(|b| b.id == board) {
+            Some(b) if b.page != 0 => b.range,
+            _ => self.range,
+        }
+    }
+
+    pub fn set_scope_range(&mut self, board: u64, r: Range) {
+        match self.boards.iter_mut().find(|b| b.id == board) {
+            Some(b) if b.page != 0 => b.range = r,
+            _ => self.range = r,
+        }
+    }
 }
 
 thread_local! {
@@ -510,7 +530,7 @@ impl Dash {
 
     pub fn add_board(&mut self, name: &str, widgets: Vec<Widget>) -> usize {
         let id = self.new_id();
-        self.boards.push(Board { id, name: name.to_owned(), widgets, page: 0 });
+        self.boards.push(Board { id, name: name.to_owned(), widgets, page: 0, range: Range::All });
         self.active = self.boards.len() - 1;
         self.active
     }
@@ -598,7 +618,7 @@ impl Dash {
             return b;
         }
         let id = self.new_id();
-        self.boards.push(Board { id, name: name.to_owned(), widgets: vec![], page });
+        self.boards.push(Board { id, name: name.to_owned(), widgets: vec![], page, range: Range::All });
         id
     }
 

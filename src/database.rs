@@ -45,6 +45,16 @@ pub struct DbState {
 }
 
 thread_local! {
+    /// Namespace of the widget ids while a *linked* database view is drawn (0 otherwise): the same rows can show up in several
+    /// views on one page, and their widgets must not share ids.
+    static SCOPE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn sid(x: impl std::hash::Hash) -> Id {
+    Id::new((SCOPE.with(|s| s.get()), x))
+}
+
+thread_local! {
     /// Titles of all live database rows (for relation chips) — refreshed at the start of every database render.
     static TITLES: std::cell::RefCell<std::collections::HashMap<u64, String>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
@@ -85,6 +95,8 @@ pub(crate) enum A {
     SetGroup(usize, u64),
     SetDateProp(usize, u64),
     AddFilter(usize),
+    /// Adds a ready-made filter (quick date presets).
+    AddFilterWith(usize, Filter),
     SetFilter(usize, usize, Filter),
     DelFilter(usize, usize),
     AddSort(usize),
@@ -226,17 +238,38 @@ pub(crate) fn title_of(r: &Page) -> &str {
 /// Renders the full database (views toolbar + active view). Returns `true` when data changed.
 pub fn show(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState, pal: &Palette, w: f32) -> bool {
     let Some(db) = ws.db(id).cloned() else { return false };
-    if db.views.is_empty() {
+    if db.tabs().is_empty() {
         ws.add_view(id, ViewKind::Table);
         return true;
     }
-    let vi = db.active.min(db.views.len() - 1);
+    let vi = db.active_tab();
+    show_inner(ui, ws, id, db, vi, false, ed, pal, w)
+}
+
+/// A *linked view* of database `id` inside a page: the view `vi` belongs to the block `block` (own layout, filters, sorts).
+pub fn show_linked(ui: &mut Ui, ws: &mut Workspace, id: u64, vi: usize, block: u64, ed: &mut EditorState, pal: &Palette, w: f32) -> bool {
+    let Some(db) = ws.db(id).cloned() else { return false };
+    if vi >= db.views.len() {
+        return false;
+    }
+    SCOPE.with(|s| s.set(block));
+    let r = ui.push_id(("dbview", block), |ui| show_inner(ui, ws, id, db, vi, true, ed, pal, w)).inner;
+    SCOPE.with(|s| s.set(0));
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_inner(ui: &mut Ui, ws: &mut Workspace, id: u64, db: Database, vi: usize, linked: bool, ed: &mut EditorState, pal: &Palette, w: f32) -> bool {
     let mut acts: Vec<A> = vec![];
     load_titles(ws);
     {
         let wsr: &Workspace = ws;
         let st = &mut ed.db;
-        toolbar(ui, &db, vi, st, pal, w, &mut acts);
+        if linked {
+            linked_toolbar(ui, &db, vi, st, pal, w, &mut acts);
+        } else {
+            toolbar(ui, &db, vi, st, pal, w, &mut acts);
+        }
         ui.add_space(2.0);
         let (lr, _) = ui.allocate_exact_size(vec2(w, 1.0), Sense::hover());
         ui.painter().rect_filled(lr, 0.0, pal.border);
@@ -253,6 +286,10 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState, pal:
             }
             ViewKind::Timeline => crate::timeline::timeline(ui, wsr, id, &db, vi, &rows, pal, w, &mut acts),
         }
+        if linked && rows.is_empty() {
+            ui.label(RichText::new(if view.filters.is_empty() { "   No pages yet — use New to add one." } else { "   Nothing matches the filters of this view." }).font(body(13.0)).color(pal.muted));
+            ui.add_space(4.0);
+        }
         popups(ui, wsr, id, &db, vi, st, pal, &mut acts);
         row_menu(ui, wsr, st, pal, &mut acts);
     }
@@ -261,6 +298,25 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState, pal:
         apply(ws, id, a, ed);
     }
     changed
+}
+
+/// Toolbar of a linked view: layout switcher on the left, Filter / Sort / Properties / New on the right.
+fn linked_toolbar(ui: &mut Ui, db: &Database, vi: usize, st: &mut DbState, pal: &Palette, w: f32, acts: &mut Vec<A>) {
+    let view = &db.views[vi];
+    let short = w < 560.0;
+    ui.horizontal_wrapped(|ui| {
+        ui.set_width(w);
+        ui.spacing_mut().item_spacing = vec2(2.0, 4.0);
+        for k in [ViewKind::Table, ViewKind::Board, ViewKind::List, ViewKind::Gallery, ViewKind::Calendar, ViewKind::Timeline] {
+            let label = if short || view.kind != k { k.glyph().to_string() } else { format!("{}  {}", k.glyph(), k.label()) };
+            if pill(ui, pal, &label, view.kind == k, false).on_hover_text(format!("{} layout", k.label())).clicked() && view.kind != k {
+                acts.push(A::SetViewKind(vi, k));
+            }
+        }
+        ui.add_space(8.0);
+        tools_ui(ui, view, st, pal, acts, short);
+    });
+    ui.add_space(4.0);
 }
 
 /// Right-click menu for a database row (works in every view).
@@ -277,7 +333,7 @@ fn row_menu(ui: &mut Ui, ws: &Workspace, st: &mut DbState, pal: &Palette, acts: 
         CtxItem::new(l::COPY, "Copy title").enabled(!title.is_empty()),
         CtxItem::new(l::TRASH_2, "Delete").danger().sep(),
     ];
-    let (open, pick) = context_menu(ui.ctx(), Id::new("db_row_menu"), pos, pal, &mut st.rmenu_fresh, &items);
+    let (open, pick) = context_menu(ui.ctx(), sid("db_row_menu"), pos, pal, &mut st.rmenu_fresh, &items);
     match pick {
         Some(0) => acts.push(A::Open(rid)),
         Some(1) => acts.push(A::DupRow(rid)),
@@ -327,7 +383,7 @@ pub fn row_props(ui: &mut Ui, ws: &mut Workspace, row_id: u64, ed: &mut EditorSt
 
 fn views_ui(ui: &mut Ui, db: &Database, vi: usize, st: &mut DbState, pal: &Palette, acts: &mut Vec<A>) {
     ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
-    for (i, v) in db.views.iter().enumerate() {
+    for (i, v) in db.views.iter().enumerate().filter(|(_, v)| v.linked == 0) {
         let r = pill(ui, pal, &format!("{}  {}", v.kind.glyph(), v.name), i == vi, false);
         if let Some(p) = right_clicked(ui, r.rect) {
             if i != vi {
@@ -417,7 +473,7 @@ fn open_popup_at(st: &mut DbState, p: Popup) {
 #[allow(clippy::too_many_arguments)]
 fn cell(ui: &mut Ui, db: &Database, row: &Page, prop: &Prop, rect: Rect, pal: &Palette, st: &mut DbState, acts: &mut Vec<A>) {
     let ctx = ui.ctx().clone();
-    let id = Id::new(("cell", row.id, prop.id));
+    let id = sid(("cell", row.id, prop.id));
     let val = row.props.get(&prop.id);
     let clip = ui.painter().with_clip_rect(rect);
     let inner = Rect::from_center_size(rect.center(), vec2(rect.width() - 16.0, 24.0));
@@ -580,23 +636,23 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, rows: &[u64], st
         let (hr, _) = ui.allocate_exact_size(vec2(total, 32.0), Sense::hover());
         let mut x = hr.left();
         ui.painter().text(pos2(x + 8.0, hr.center().y), Align2::LEFT_CENTER, "Aa  Name", body(13.0), pal.muted);
-        resize_handle(ui, pal, Rect::from_min_size(pos2(x + title_w - 6.0, hr.top()), vec2(12.0, 32.0)), Id::new(("thr", vi, 0u64)), title_w, vi, 0, acts);
+        resize_handle(ui, pal, Rect::from_min_size(pos2(x + title_w - 6.0, hr.top()), vec2(12.0, 32.0)), sid(("thr", vi, 0u64)), title_w, vi, 0, acts);
         x += title_w;
         for p in &db.props {
             let cw = cw_of(p);
             let r = Rect::from_min_size(pos2(x, hr.top()), vec2(cw, 32.0));
-            let resp = ui.interact(r, Id::new(("th", p.id)), Sense::click());
+            let resp = ui.interact(r, sid(("th", p.id)), Sense::click());
             let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
             ui.painter().rect_filled(r, 0.0, with_alpha(pal.hover, t));
             crate::widgets::text_fit(&ui.painter().with_clip_rect(r), pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, &format!("{}  {}", p.kind.glyph(), p.name), body(13.0), lerp_color(pal.muted, pal.text, t), cw - 16.0);
             if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                 open_popup_at(st, Popup::PropMenu { prop: p.id, pos: r.left_bottom() + vec2(0.0, 4.0) });
             }
-            resize_handle(ui, pal, Rect::from_min_size(pos2(x + cw - 6.0, hr.top()), vec2(12.0, 32.0)), Id::new(("thr", vi, p.id)), cw, vi, p.id, acts);
+            resize_handle(ui, pal, Rect::from_min_size(pos2(x + cw - 6.0, hr.top()), vec2(12.0, 32.0)), sid(("thr", vi, p.id)), cw, vi, p.id, acts);
             x += cw;
         }
         let ar = Rect::from_min_size(pos2(x, hr.top()), vec2(40.0, 32.0));
-        let resp = ui.interact(ar, Id::new("th_add"), Sense::click());
+        let resp = ui.interact(ar, sid("th_add"), Sense::click());
         let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
         icons::paint(ui.painter(), ar.center(), 14.0, Icon::Plus, lerp_color(pal.muted, pal.text, t));
         if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Add a property").clicked() {
@@ -609,13 +665,13 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, rows: &[u64], st
             let Some(row) = ws.page(*rid) else { continue };
             let (rr, _) = ui.allocate_exact_size(vec2(total, ROW_H), Sense::hover());
             let hovered = ui.rect_contains_pointer(rr);
-            let t = ui.ctx().animate_bool_with_time(Id::new(("rowh", row.id)), hovered, 0.1);
+            let t = ui.ctx().animate_bool_with_time(sid(("rowh", row.id)), hovered, 0.1);
             ui.painter().rect_filled(rr, 0.0, with_alpha(pal.hover, t * 0.6));
             ui.painter().hline(rr.x_range(), rr.bottom(), Stroke::new(1.0_f32, pal.border));
             // title
             let t = if compact { 1.0 } else { t }; // touch screens have no hover: keep the OPEN button visible
             let tr = Rect::from_min_size(rr.min, vec2(title_w, ROW_H));
-            let tid = Id::new(("rt", row.id));
+            let tid = sid(("rt", row.id));
             if st.focus_row == Some(row.id) {
                 ui.ctx().memory_mut(|m| m.request_focus(tid));
                 st.focus_row = None;
@@ -643,7 +699,7 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, rows: &[u64], st
             }
             if t > 0.05 {
                 let open = Rect::from_min_size(pos2(tr.right() - if compact { 52.0 } else { 74.0 }, tr.center().y - 11.0), vec2(46.0, 22.0));
-                let resp = ui.interact(open, Id::new(("ro", row.id)), Sense::click());
+                let resp = ui.interact(open, sid(("ro", row.id)), Sense::click());
                 let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
                 ui.painter().rect_filled(open, 5.0, with_alpha(lerp_color(pal.active, pal.border, h), t));
                 ui.painter().text(open.center(), Align2::CENTER_CENTER, "OPEN", bold(10.5), with_alpha(pal.text, t));
@@ -651,7 +707,7 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, rows: &[u64], st
                     acts.push(A::Open(row.id));
                 }
                 let del = Rect::from_min_size(pos2(tr.right() - 26.0, tr.center().y - 11.0), vec2(if compact { 0.0 } else { 22.0 }, 22.0));
-                let resp = ui.interact(del, Id::new(("rd", row.id)), if compact { Sense::hover() } else { Sense::click() });
+                let resp = ui.interact(del, sid(("rd", row.id)), if compact { Sense::hover() } else { Sense::click() });
                 let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
                 if !compact {
                     icons::paint(ui.painter(), del.center(), 13.0, Icon::Trash, with_alpha(lerp_color(pal.muted, pal.danger, h), t));
@@ -799,8 +855,8 @@ fn board(ui: &mut Ui, ws: &Workspace, db: &Database, view: &View, rows: &[u64], 
                     });
                     for row in &members {
                         let dragging_me = st.drag == Some(row.id);
-                        let prev = ui.ctx().data(|d| d.get_temp::<bool>(Id::new(("cardh", row.id)))).unwrap_or(false);
-                        let t = ui.ctx().animate_bool_with_time(Id::new(("cardt", row.id)), prev, 0.12);
+                        let prev = ui.ctx().data(|d| d.get_temp::<bool>(sid(("cardh", row.id)))).unwrap_or(false);
+                        let t = ui.ctx().animate_bool_with_time(sid(("cardt", row.id)), prev, 0.12);
                         let f = Frame::new()
                             .fill(if dragging_me { with_alpha(pal.card, 0.4) } else { pal.card })
                             .stroke(Stroke::new(1.0_f32, lerp_color(pal.border, pal.accent.gamma_multiply(0.7), t * 0.6)))
@@ -815,8 +871,8 @@ fn board(ui: &mut Ui, ws: &Workspace, db: &Database, view: &View, rows: &[u64], 
                         if let Some(p) = right_clicked(ui, f.response.rect) {
                             acts.push(A::RowMenu(row.id, p));
                         }
-                        let resp = ui.interact(f.response.rect, Id::new(("card", row.id)), Sense::click_and_drag());
-                        ui.ctx().data_mut(|d| d.insert_temp(Id::new(("cardh", row.id)), resp.hovered() || resp.dragged()));
+                        let resp = ui.interact(f.response.rect, sid(("card", row.id)), Sense::click_and_drag());
+                        ui.ctx().data_mut(|d| d.insert_temp(sid(("cardh", row.id)), resp.hovered() || resp.dragged()));
                         if resp.drag_started() {
                             st.drag = Some(row.id);
                         }
@@ -849,7 +905,7 @@ fn board(ui: &mut Ui, ws: &Workspace, db: &Database, view: &View, rows: &[u64], 
         let target = pointer.and_then(|p| col_rects.iter().find(|(r, _)| r.x_range().contains(p.x)).map(|(r, o)| (*r, *o)));
         if let Some(p) = pointer {
             if let Some(row) = ws.page(did) {
-                egui::Area::new(Id::new("board_ghost")).order(Order::Tooltip).fixed_pos(p + vec2(10.0, 8.0)).interactable(false).show(ui.ctx(), |ui| {
+                egui::Area::new(sid("board_ghost")).order(Order::Tooltip).fixed_pos(p + vec2(10.0, 8.0)).interactable(false).show(ui.ctx(), |ui| {
                     Frame::new()
                         .fill(pal.card)
                         .stroke(Stroke::new(1.5_f32, pal.accent))
@@ -939,8 +995,8 @@ fn gallery(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], pal: &Palet
         ui.spacing_mut().item_spacing = vec2(14.0, 14.0);
         for rid in rows {
             let Some(row) = ws.page(*rid) else { continue };
-            let prev = ui.ctx().data(|d| d.get_temp::<bool>(Id::new(("galh", row.id)))).unwrap_or(false);
-            let t = ui.ctx().animate_bool_with_time(Id::new(("galt", row.id)), prev, 0.12);
+            let prev = ui.ctx().data(|d| d.get_temp::<bool>(sid(("galh", row.id)))).unwrap_or(false);
+            let t = ui.ctx().animate_bool_with_time(sid(("galt", row.id)), prev, 0.12);
             let f = Frame::new()
                 .fill(pal.card)
                 .stroke(Stroke::new(1.0_f32, lerp_color(pal.border, pal.accent.gamma_multiply(0.7), t * 0.6)))
@@ -979,8 +1035,8 @@ fn gallery(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], pal: &Palet
             if let Some(p) = right_clicked(ui, f.response.rect) {
                 acts.push(A::RowMenu(row.id, p));
             }
-            let resp = ui.interact(f.response.rect, Id::new(("gal", row.id)), Sense::click());
-            ui.ctx().data_mut(|d| d.insert_temp(Id::new(("galh", row.id)), resp.hovered()));
+            let resp = ui.interact(f.response.rect, sid(("gal", row.id)), Sense::click());
+            ui.ctx().data_mut(|d| d.insert_temp(sid(("galh", row.id)), resp.hovered()));
             if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                 acts.push(A::Open(row.id));
             }
@@ -1060,7 +1116,7 @@ fn calendar(ui: &mut Ui, ws: &Workspace, db: &Database, view: &View, rows: &[u64
             ui.painter().text(dc, Align2::CENTER_CENTER, day.to_string(), body(12.5), if is_today { Color32::WHITE } else { pal.text });
             if hovered {
                 let pr = Rect::from_center_size(pos2(cr.right() - 16.0, cr.top() + 14.0), vec2(22.0, 22.0));
-                let resp = ui.interact(pr, Id::new(("cal_add", day)), Sense::click());
+                let resp = ui.interact(pr, sid(("cal_add", day)), Sense::click());
                 let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
                 ui.painter().rect_filled(pr, 5.0, with_alpha(pal.active, h));
                 icons::paint(ui.painter(), pr.center(), 12.0, Icon::Plus, lerp_color(pal.muted, pal.text, h));
@@ -1073,7 +1129,7 @@ fn calendar(ui: &mut Ui, ws: &Workspace, db: &Database, view: &View, rows: &[u64
             let clip = ui.painter().with_clip_rect(cr.shrink(1.0));
             for (k, it) in items.iter().take(3).enumerate() {
                 let ir = Rect::from_min_size(pos2(cr.left() + 4.0, cr.top() + 30.0 + k as f32 * 25.0), vec2(cw - 8.0, 22.0));
-                let resp = ui.interact(ir, Id::new(("cal_item", it.id)), Sense::click());
+                let resp = ui.interact(ir, sid(("cal_item", it.id)), Sense::click());
                 let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
                 let color = db.group_prop(view).and_then(|g| match it.props.get(&g) {
                     Some(Val::Sel(o)) => db.opt(g, *o).map(|o| o.color),
@@ -1137,7 +1193,7 @@ fn filter_value(ui: &mut Ui, db: &Database, pal: &Palette, f: &Filter, kind: Pro
     } else {
         let mut v = f.value.clone();
         let hint = if kind == PropKind::Date { "YYYY-MM-DD" } else { "Value" };
-        let r = field(ui, pal, pal.bg, &mut v, hint, false, w, Id::new(("fv", vi, fi)));
+        let r = field(ui, pal, pal.bg, &mut v, hint, false, w, sid(("fv", vi, fi)));
         if r.changed() {
             acts.push(A::SetFilter(vi, fi, Filter { value: v, ..f.clone() }));
         }
@@ -1147,7 +1203,7 @@ fn filter_value(ui: &mut Ui, db: &Database, pal: &Palette, f: &Filter, kind: Pro
 fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st: &mut DbState, pal: &Palette, acts: &mut Vec<A>) {
     let Some(pop) = st.popup.clone() else { return };
     let ctx = ui.ctx().clone();
-    let pid = Id::new("db_popup");
+    let pid = sid("db_popup");
     let mut next: Option<Option<Popup>> = None;
     let view = &db.views[vi.min(db.views.len() - 1)];
     let vi = vi.min(db.views.len() - 1);
@@ -1197,6 +1253,19 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
             }
             if menu_item(ui, pal, "+", "Add a filter", None, false, false).clicked() {
                 acts.push(A::AddFilter(vi));
+            }
+            if let Some(dp) = db.first_of(PropKind::Date) {
+                ui.add_space(4.0);
+                section_label(ui, pal, "QUICK DATE FILTERS");
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                    for (op, t) in [(FilterOp::Today, "Today"), (FilterOp::ThisWeek, "This week"), (FilterOp::ThisMonth, "This month"), (FilterOp::Next7, "Next 7 days"), (FilterOp::Past7, "Past 7 days"), (FilterOp::Overdue, "Overdue")] {
+                        let on = view.filters.iter().any(|f| f.prop == dp && f.op == op);
+                        if pill(ui, pal, t, on, false).clicked() {
+                            acts.push(A::AddFilterWith(vi, Filter { prop: dp, op, value: String::new() }));
+                        }
+                    }
+                });
             }
         }),
         Popup::Sort(pos) => popup_area(&ctx, pid, pos, pal, &mut st.fresh, 340.0, |ui| {
@@ -1250,7 +1319,7 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
             };
             popup_area(&ctx, pid, pos, pal, &mut st.fresh, 270.0, |ui| {
                 let mut name = p.name.clone();
-                let r = field(ui, pal, pal.bg, &mut name, "Property name", false, 250.0, Id::new(("pn", prop)));
+                let r = field(ui, pal, pal.bg, &mut name, "Property name", false, 250.0, sid(("pn", prop)));
                 if r.changed() {
                     acts.push(A::RenameProp(prop, name));
                 }
@@ -1276,7 +1345,7 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                         let mut f = p.cfg.formula.clone();
                         let r = ui.add(
                             TextEdit::multiline(&mut f)
-                                .id(Id::new(("fx", prop)))
+                                .id(sid(("fx", prop)))
                                 .desired_rows(3)
                                 .desired_width(250.0)
                                 .font(egui::FontId::monospace(13.0))
@@ -1364,7 +1433,7 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                                 acts.push(A::RecolorOpt(prop, o.id));
                             }
                             let mut n = o.name.clone();
-                            let r = ui.add(TextEdit::singleline(&mut n).frame(false).desired_width(170.0).font(body(14.0)).id(Id::new(("on", o.id))));
+                            let r = ui.add(TextEdit::singleline(&mut n).frame(false).desired_width(170.0).font(body(14.0)).id(sid(("on", o.id))));
                             if r.changed() {
                                 acts.push(A::RenameOpt(prop, o.id, n));
                             }
@@ -1375,10 +1444,10 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                             });
                         });
                     }
-                    let r = field(ui, pal, pal.bg, &mut st.new_opt, "Add an option…", false, 250.0, Id::new(("no", prop)));
+                    let r = field(ui, pal, pal.bg, &mut st.new_opt, "Add an option…", false, 250.0, sid(("no", prop)));
                     if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !st.new_opt.trim().is_empty() {
                         acts.push(A::AddOpt(prop, std::mem::take(&mut st.new_opt), None));
-                        ui.ctx().memory_mut(|m| m.request_focus(Id::new(("no", prop))));
+                        ui.ctx().memory_mut(|m| m.request_focus(sid(("no", prop))));
                     }
                 }
                 rule(ui, pal);
@@ -1390,7 +1459,7 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
         }
         Popup::ViewMenu(pos) => popup_area(&ctx, pid, pos, pal, &mut st.fresh, 270.0, |ui| {
             let mut name = view.name.clone();
-            let r = field(ui, pal, pal.bg, &mut name, "View name", false, 250.0, Id::new(("vn", view.id)));
+            let r = field(ui, pal, pal.bg, &mut name, "View name", false, 250.0, sid(("vn", view.id)));
             if r.changed() {
                 acts.push(A::RenameView(vi, name));
             }
@@ -1456,7 +1525,7 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                     }
                 }
             }
-            if db.views.len() > 1 {
+            if db.tabs().len() > 1 || view.linked != 0 {
                 rule(ui, pal);
                 if menu_item(ui, pal, l::TRASH_2, "Delete view", None, false, true).clicked() {
                     acts.push(A::DelView(vi));
@@ -1485,7 +1554,7 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
             };
             let multi = p.kind == PropKind::MultiSelect;
             popup_area(&ctx, pid, pos, pal, &mut st.fresh, 250.0, |ui| {
-                let r = field(ui, pal, pal.bg, &mut st.new_opt, "Search or create…", false, 230.0, Id::new(("sel_q", prop)));
+                let r = field(ui, pal, pal.bg, &mut st.new_opt, "Search or create…", false, 230.0, sid(("sel_q", prop)));
                 if !r.has_focus() && st.new_opt.is_empty() {
                     r.request_focus();
                 }
@@ -1577,7 +1646,7 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                         Some((a, b)) => (dn == a, dn == b, dn > a && dn < b),
                         None => (false, false, false),
                     };
-                    let resp = ui.interact(r, Id::new(("dp", day)), Sense::click());
+                    let resp = ui.interact(r, sid(("dp", day)), Sense::click());
                     let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.08);
                     if inside || ((is_s || is_e) && curv.map_or(false, |(a, b)| a != b)) {
                         let band = Rect::from_min_max(pos2(if is_s { center.x } else { center.x - cw / 2.0 }, r.top()), pos2(if is_e { center.x } else { center.x + cw / 2.0 }, r.bottom()));
@@ -1648,7 +1717,7 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                     }
                     return;
                 }
-                let r = field(ui, pal, pal.bg, &mut st.new_opt, &format!("Link {}…", ws.display_title(target)), false, 260.0, Id::new(("rel_q", prop)));
+                let r = field(ui, pal, pal.bg, &mut st.new_opt, &format!("Link {}…", ws.display_title(target)), false, 260.0, sid(("rel_q", prop)));
                 if !r.has_focus() && st.new_opt.is_empty() {
                     r.request_focus();
                 }
@@ -1757,7 +1826,9 @@ fn apply(ws: &mut Workspace, db_id: u64, a: A, ed: &mut EditorState) {
         }
         A::SetActive(i) => {
             if let Some(d) = ws.db_mut(db_id) {
-                d.active = i.min(d.views.len().saturating_sub(1));
+                if d.views.get(i).map_or(false, |v| v.linked == 0) {
+                    d.active = i;
+                }
             }
         }
         A::AddView(k) => {
@@ -1765,9 +1836,10 @@ fn apply(ws: &mut Workspace, db_id: u64, a: A, ed: &mut EditorState) {
         }
         A::DelView(i) => {
             if let Some(d) = ws.db_mut(db_id) {
-                if d.views.len() > 1 && i < d.views.len() {
+                if i < d.views.len() && (d.views[i].linked != 0 || d.tabs().len() > 1) {
                     d.views.remove(i);
-                    d.active = d.active.min(d.views.len() - 1);
+                    d.active = d.active.min(d.views.len().saturating_sub(1));
+                    d.active = d.active_tab();
                 }
             }
         }
@@ -1794,6 +1866,16 @@ fn apply(ws: &mut Workspace, db_id: u64, a: A, ed: &mut EditorState) {
         A::AddFilter(i) => {
             if let Some(v) = ws.db_mut(db_id).and_then(|d| d.views.get_mut(i)) {
                 v.filters.push(Filter { prop: 0, op: FilterOp::Contains, value: String::new() });
+            }
+        }
+        A::AddFilterWith(i, nf) => {
+            if let Some(v) = ws.db_mut(db_id).and_then(|d| d.views.get_mut(i)) {
+                let same = v.filters.iter().position(|f| f.prop == nf.prop && f.op == nf.op);
+                let rel = |o: FilterOp| matches!(o, FilterOp::Today | FilterOp::ThisWeek | FilterOp::ThisMonth | FilterOp::Next7 | FilterOp::Past7 | FilterOp::Overdue);
+                v.filters.retain(|f| !(f.prop == nf.prop && rel(f.op)));
+                if same.is_none() {
+                    v.filters.push(nf);
+                }
             }
         }
         A::SetFilter(i, f, nf) => {

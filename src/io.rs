@@ -44,8 +44,21 @@ pub fn page_markdown(ws: &Workspace, id: u64) -> String {
         return out;
     }
     let mut counters = [0usize; 8];
+    // blocks inside a column layout are exported as plain sequential content (two levels shallower)
+    let mut cols: Option<u8> = None;
     for b in &p.blocks {
-        let ind = (b.indent as usize).min(7);
+        let mut shift = 0usize;
+        if let Some(k) = cols {
+            if b.indent > k {
+                shift = 2;
+            } else {
+                cols = None;
+            }
+        }
+        if b.kind == BlockKind::Columns {
+            cols = Some(b.indent);
+        }
+        let ind = (b.indent as usize).saturating_sub(shift).min(7);
         for c in counters.iter_mut().skip(ind + 1) {
             *c = 0;
         }
@@ -74,6 +87,8 @@ pub fn page_markdown(ws: &Workspace, id: u64) -> String {
             BlockKind::Embed | BlockKind::Bookmark => format!("{pad}[{}]({})", if b.text.is_empty() { b.url.as_str() } else { b.text.as_str() }, b.url),
             BlockKind::File => format!("{pad}📎 {}", if b.url.is_empty() { b.text.clone() } else { format!("[{}]({})", b.text, b.url) }),
             BlockKind::PageLink => format!("{pad}[{}]", b.link.map(|l| ws.display_title(l)).unwrap_or_else(|| "Missing page".into())),
+            BlockKind::Columns | BlockKind::Column => String::new(),
+            BlockKind::DbView => format!("{pad}[Database view: {}]", b.link.map(|l| ws.display_title(l)).unwrap_or_else(|| "none".into())),
         };
         let tight = matches!(b.kind, BlockKind::Bullet | BlockKind::Numbered | BlockKind::Todo | BlockKind::Toggle);
         if !line.is_empty() {

@@ -37,6 +37,12 @@ pub enum BlockKind {
     Bookmark,
     /// Attached file stored in the workspace.
     File,
+    /// Layout container: its children are `Column` blocks laid out side by side.
+    Columns,
+    /// One column of a `Columns` container (width in `start`, permille of the row; 0 = equal share). Content = its children.
+    Column,
+    /// A linked view of a database: `link` = the source database, its own layout / filters / sorts live in a hidden `View`.
+    DbView,
 }
 
 impl BlockKind {
@@ -56,7 +62,7 @@ impl BlockKind {
     ];
 
     pub fn has_text(self) -> bool {
-        !matches!(self, BlockKind::Divider | BlockKind::Toc | BlockKind::PageLink | BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File)
+        !matches!(self, BlockKind::Divider | BlockKind::Toc | BlockKind::PageLink | BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File | BlockKind::Columns | BlockKind::Column | BlockKind::DbView)
     }
 
     pub fn label(self) -> &'static str {
@@ -79,6 +85,9 @@ impl BlockKind {
             BlockKind::Embed => "Embed",
             BlockKind::Bookmark => "Web bookmark",
             BlockKind::File => "File",
+            BlockKind::Columns => "Columns",
+            BlockKind::Column => "Column",
+            BlockKind::DbView => "Linked database view",
         }
     }
 
@@ -102,6 +111,9 @@ impl BlockKind {
             BlockKind::Embed => "Embed a website, video, map or design.",
             BlockKind::Bookmark => "Save a link as a visual card.",
             BlockKind::File => "Attach a file to this page.",
+            BlockKind::Columns => "Lay content out side by side.",
+            BlockKind::Column => "A column.",
+            BlockKind::DbView => "Show a filtered view of any database right here.",
         }
     }
 
@@ -125,6 +137,8 @@ impl BlockKind {
             BlockKind::Embed => l::GLOBE,
             BlockKind::Bookmark => l::BOOKMARK,
             BlockKind::File => l::PAPERCLIP,
+            BlockKind::Columns | BlockKind::Column => l::COLUMNS_2,
+            BlockKind::DbView => l::TABLE_2,
         }
     }
 
@@ -148,6 +162,8 @@ impl BlockKind {
             BlockKind::Embed => "embed website iframe video youtube vimeo map figma spotify",
             BlockKind::Bookmark => "bookmark link url web card",
             BlockKind::File => "file attachment upload pdf document",
+            BlockKind::Columns | BlockKind::Column => "columns layout side by side split grid",
+            BlockKind::DbView => "linked database view filter embed table inline",
         }
     }
 }
@@ -424,9 +440,30 @@ pub enum FilterOp {
     NotEmpty,
     Checked,
     Unchecked,
+    /// Date filters relative to today (no value needed).
+    Today,
+    ThisWeek,
+    ThisMonth,
+    Next7,
+    Past7,
+    Overdue,
 }
 
 impl FilterOp {
+    /// The window (inclusive day numbers) of a relative date filter.
+    pub fn window(self, today: i64) -> Option<(i64, i64)> {
+        use crate::dashcfg::Range;
+        match self {
+            FilterOp::Today => Range::Today.bounds(today),
+            FilterOp::ThisWeek => Range::ThisWeek.bounds(today),
+            FilterOp::ThisMonth => Range::ThisMonth.bounds(today),
+            FilterOp::Next7 => Range::Next7.bounds(today),
+            FilterOp::Past7 => Range::Last7.bounds(today),
+            FilterOp::Overdue => Some((i64::MIN / 2, today - 1)),
+            _ => None,
+        }
+    }
+
     pub fn label(self, kind: PropKind) -> &'static str {
         match (self, kind) {
             (FilterOp::Contains, _) => "contains",
@@ -441,6 +478,12 @@ impl FilterOp {
             (FilterOp::NotEmpty, _) => "is not empty",
             (FilterOp::Checked, _) => "is checked",
             (FilterOp::Unchecked, _) => "is unchecked",
+            (FilterOp::Today, _) => "is today",
+            (FilterOp::ThisWeek, _) => "is this week",
+            (FilterOp::ThisMonth, _) => "is this month",
+            (FilterOp::Next7, _) => "is in the next 7 days",
+            (FilterOp::Past7, _) => "is in the past 7 days",
+            (FilterOp::Overdue, _) => "is overdue",
         }
     }
 
@@ -456,7 +499,7 @@ impl FilterOp {
             PropKind::Select => &[Is, IsNot, IsEmpty, NotEmpty],
             PropKind::MultiSelect => &[Contains, IsEmpty, NotEmpty],
             PropKind::Checkbox => &[Checked, Unchecked],
-            PropKind::Date => &[Is, Gt, Lt, IsEmpty, NotEmpty],
+            PropKind::Date => &[Today, ThisWeek, ThisMonth, Next7, Past7, Overdue, Is, Gt, Lt, IsEmpty, NotEmpty],
             PropKind::Formula | PropKind::Rollup => &[Contains, Is, Gt, Lt, IsEmpty, NotEmpty],
             PropKind::Relation => &[IsEmpty, NotEmpty],
         }
@@ -501,6 +544,10 @@ pub struct View {
     /// Table: custom column widths (property id → points; 0 = the name column).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub widths: BTreeMap<u64, f32>,
+    /// 0 = a normal view (shown as a tab of the database). Otherwise the id of the page block (`BlockKind::DbView`) that owns
+    /// this view: it only appears inside that block, with its own filters and sorts ("linked database view").
+    #[serde(default)]
+    pub linked: u64,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -512,6 +559,26 @@ pub struct Database {
 }
 
 impl Database {
+    /// Indexes of the views that are tabs of the database page (linked views are hidden).
+    pub fn tabs(&self) -> Vec<usize> {
+        (0..self.views.len()).filter(|i| self.views[*i].linked == 0).collect()
+    }
+
+    /// The active view index, never pointing at a linked (hidden) view.
+    pub fn active_tab(&self) -> usize {
+        let a = self.active.min(self.views.len().saturating_sub(1));
+        if self.views.get(a).map_or(true, |v| v.linked == 0) {
+            a
+        } else {
+            self.tabs().first().copied().unwrap_or(0)
+        }
+    }
+
+    /// Index of the view owned by the linked block `block`.
+    pub fn linked_index(&self, block: u64) -> Option<usize> {
+        self.views.iter().position(|v| v.linked == block)
+    }
+
     pub fn prop(&self, id: u64) -> Option<&Prop> {
         self.props.iter().find(|p| p.id == id)
     }
@@ -646,6 +713,32 @@ fn half() -> f32 {
 }
 
 impl Page {
+    /// A cheap stand-in with the same identity but no blocks / history / database (see `editor::show_page`).
+    pub fn shell(&self) -> Page {
+        Page {
+            id: self.id,
+            parent: self.parent,
+            title: self.title.clone(),
+            icon: self.icon.clone(),
+            cover: self.cover,
+            cover_img: self.cover_img.clone(),
+            cover_pos: self.cover_pos,
+            kind: self.kind,
+            blocks: vec![],
+            columns: vec![],
+            favorite: self.favorite,
+            trashed: self.trashed,
+            expanded: self.expanded,
+            updated: self.updated,
+            row: self.row,
+            props: self.props.clone(),
+            db: None,
+            small_text: self.small_text,
+            full_width: self.full_width,
+            history: vec![],
+        }
+    }
+
     pub fn has_cover(&self) -> bool {
         self.cover.is_some() || !self.cover_img.is_empty()
     }
@@ -863,10 +956,34 @@ impl Workspace {
         if let Some(d) = self.db_mut(db) {
             let same = d.views.iter().filter(|v| v.kind == kind).count();
             let name = if same == 0 { format!("{} view", kind.label()) } else { format!("{} view {}", kind.label(), same + 1) };
-            d.views.push(View { id: vid, name, kind, group: 0, date: 0, dep: 0, zoom: 0, filters: vec![], sorts: vec![], widths: BTreeMap::new() });
+            d.views.push(View { id: vid, name, kind, group: 0, date: 0, dep: 0, zoom: 0, filters: vec![], sorts: vec![], widths: BTreeMap::new(), linked: 0 });
             d.active = d.views.len() - 1;
         }
         vid
+    }
+
+    /// Creates (or returns) the view that belongs to the linked-database block `block`; the database's own tabs are untouched.
+    pub fn ensure_linked_view(&mut self, db: u64, block: u64, kind: ViewKind) -> Option<usize> {
+        if let Some(i) = self.db(db)?.linked_index(block) {
+            return Some(i);
+        }
+        let vid = self.id();
+        let d = self.db_mut(db)?;
+        d.views.push(View { id: vid, name: format!("{} view", kind.label()), kind, group: 0, date: 0, dep: 0, zoom: 0, filters: vec![], sorts: vec![], widths: BTreeMap::new(), linked: block });
+        Some(d.views.len() - 1)
+    }
+
+    /// Drops the hidden views of linked blocks that no longer exist on any page.
+    pub fn prune_linked_views(&mut self) {
+        let live: std::collections::HashSet<u64> = self.pages.iter().filter(|p| !p.trashed).flat_map(|p| p.blocks.iter()).filter(|b| b.kind == BlockKind::DbView).map(|b| b.id).collect();
+        for p in self.pages.iter_mut() {
+            if let Some(d) = p.db.as_mut() {
+                if d.views.iter().any(|v| v.linked != 0 && !live.contains(&v.linked)) {
+                    d.views.retain(|v| v.linked == 0 || live.contains(&v.linked));
+                    d.active = d.active_tab();
+                }
+            }
+        }
     }
 
     pub fn add_row(&mut self, db: u64, preset: Option<(u64, Val)>) -> u64 {
@@ -1687,6 +1804,11 @@ pub fn row_matches(row: &Page, d: &Database, f: &Filter) -> bool {
         FilterOp::NotEmpty => !empty,
         FilterOp::Checked => matches!(val, Some(Val::Check(true))),
         FilterOp::Unchecked => !matches!(val, Some(Val::Check(true))),
+        FilterOp::Today | FilterOp::ThisWeek | FilterOp::ThisMonth | FilterOp::Next7 | FilterOp::Past7 | FilterOp::Overdue => {
+            let (Some(Val::Text(s)), Some((lo, hi))) = (&val, f.op.window(dates::today_day())) else { return false };
+            // a record matches when its date (or date range) touches the window
+            dates::span(s).map_or(false, |(a, b)| a <= hi && b >= lo)
+        }
         op => {
             if needle.is_empty() {
                 return true; // incomplete filter: ignore

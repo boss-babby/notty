@@ -112,8 +112,12 @@ fn val_html(ws: &Workspace, db: &Database, row: &Page, p: &Prop) -> String {
 
 /// Table (and, for timeline views, an SVG Gantt chart) of a database.
 fn database_html(ws: &Workspace, id: u64, out: &mut String) {
+    database_html_at(ws, id, out, None)
+}
+
+fn database_html_at(ws: &Workspace, id: u64, out: &mut String, at: Option<usize>) {
     let Some(db) = ws.db(id) else { return };
-    let vi = db.active.min(db.views.len().saturating_sub(1));
+    let vi = at.filter(|i| *i < db.views.len()).unwrap_or_else(|| db.active_tab());
     let rows = ws.query(id, vi);
     let view = db.views.get(vi);
     if let (Some(v), true) = (view, view.map_or(false, |v| v.kind == ViewKind::Timeline)) {
@@ -300,8 +304,19 @@ pub fn page_html(ws: &Workspace, media: &MediaStore, id: u64, auto_print: bool) 
     }
 
     let mut nums = [0u32; 8];
+    // open <div>s of column layouts: (indent of the block, is a Columns container)
+    let mut open: Vec<(u8, bool)> = vec![];
     for (bi, b) in page.blocks.iter().enumerate() {
-        let ind = (b.indent as usize).min(6);
+        while let Some(&(k, _)) = open.last() {
+            if b.indent <= k {
+                o.push_str("</div>");
+                open.pop();
+            } else {
+                break;
+            }
+        }
+        let depth = open.iter().filter(|x| x.1).count();
+        let ind = (b.indent as usize).saturating_sub(2 * depth).min(6);
         for n in nums.iter_mut().skip(ind + 1) {
             *n = 0;
         }
@@ -361,6 +376,22 @@ pub fn page_html(ws: &Workspace, media: &MediaStore, id: u64, auto_print: bool) 
                 let pdf = crate::pdf::looks_like_pdf(&name, &b.url);
                 o.push_str(&format!("<div class=\"card\" style=\"{pad}\">{} <b>{}</b>{}</div>", if pdf { "📄 PDF" } else { "📎" }, esc(&name), if b.url.is_empty() { String::new() } else { format!("<small><a href=\"{}\">{}</a></small>", if safe_url(&b.url) { esc(&b.url) } else { String::new() }, esc(&b.url)) }));
             }
+            BlockKind::Columns => {
+                o.push_str("<div style=\"display:flex;gap:28px;align-items:flex-start\">");
+                open.push((b.indent, true));
+            }
+            BlockKind::Column => {
+                let w = if b.start == 0 { 1000 } else { b.start };
+                o.push_str(&format!("<div style=\"flex:{w} 1 0;min-width:0\">"));
+                open.push((b.indent, false));
+            }
+            BlockKind::DbView => {
+                if let Some(t) = b.link.and_then(|l| ws.page(l)).filter(|t| !t.trashed && t.db.is_some()) {
+                    let tt = if t.title.is_empty() { "Untitled" } else { &t.title };
+                    o.push_str(&format!("<div class=\"dbtitle\" style=\"{pad}\">{}</div>", esc(tt)));
+                    database_html_at(ws, t.id, &mut o, t.db.as_ref().and_then(|d| d.linked_index(b.id)));
+                }
+            }
             BlockKind::PageLink => {
                 if let Some(t) = b.link.and_then(|l| ws.page(l)).filter(|t| !t.trashed) {
                     let tt = if t.title.is_empty() { "Untitled" } else { &t.title };
@@ -374,6 +405,9 @@ pub fn page_html(ws: &Workspace, media: &MediaStore, id: u64, auto_print: bool) 
             }
         }
         let _ = bi;
+    }
+    for _ in open.drain(..) {
+        o.push_str("</div>");
     }
     o.push_str(&format!("<div class=\"foot\">Exported from Lumen · {}</div></div>", esc(&dates::long_today())));
     if auto_print {
