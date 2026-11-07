@@ -2,6 +2,7 @@
 //! floating toolbar or the keyboard (Delete, Ctrl+C/X/D, Esc, Ctrl+A, Ctrl+Z / Ctrl+Shift+Z).
 //! Also hosts the block-level undo / redo history.
 
+use crate::widgets::LayerRaise;
 use egui::{pos2, vec2, Align2, Context, CursorIcon, Event, Id, Key, Margin, Modifiers, Order, Pos2, Rect, Response, Sense, Stroke, Ui};
 
 use crate::editor::{gutter, swatches, EditorState};
@@ -432,7 +433,7 @@ pub fn bar(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState
             }
         });
     });
-    ctx.move_to_top(area.response.layer_id);
+    ctx.raise_layer(area.response.layer_id);
     ed.sel_menu = menu;
     let mut changed = false;
     if let Some(o) = op {

@@ -1181,7 +1181,7 @@ fn automation_views_buttons_and_popovers_render_on_desktop_and_phone() {
     let date = ws.db(db).unwrap().first_of(PropKind::Date).unwrap();
     ws.page_mut(row).unwrap().props.insert(date, Val::Text(dates::today_iso()));
     let mut b = ws.blk(BlockKind::Button, "Go", 0);
-    b.acts = vec![au::Action::Notify { message: "{title}".into() }, au::Action::Rename { title: "{title} ✓".into() }];
+    b.acts = vec![au::Action::Notify { message: "{title}".into() }, au::Action::Rename { title: "{title} ✓".into() }, au::Action::Script { code: "print(row.title)".into() }];
     let bid = b.id;
     ws.page_mut(row).unwrap().blocks.push(b);
     let rid = ws.id();
@@ -1191,7 +1191,14 @@ fn automation_views_buttons_and_popovers_render_on_desktop_and_phone() {
     let pal = Palette::light();
     let mut ed = EditorState::default();
     let mut t = 0.0;
-    for tab in 0..4u8 {
+    // a saved script (open in the Scripts tab) and a rule whose action is a script (expanded in the Rules tab)
+    let sid = ws.id();
+    ws.auto.scripts.push(au::Script { id: sid, name: "Demo".into(), code: crate::scripthost::EXAMPLES[1].code.to_owned(), runs: 0, last_run: 0.0 });
+    crate::scriptui::open_script(sid);
+    let srid = ws.id();
+    ws.auto.rules.push(au::Rule::new(srid, "Scripted", db, au::Trigger::RowAdded, vec![au::Action::Script { code: crate::scripthost::EXAMPLES[2].code.to_owned() }]));
+    crate::autoui::focus_rule(srid);
+    for tab in 0..6u8 {
         crate::autoui::open_tab(tab);
         for size in [vec2(1280.0, 800.0), vec2(390.0, 780.0), vec2(320.0, 560.0)] {
             for _ in 0..3 {
@@ -1213,6 +1220,15 @@ fn automation_views_buttons_and_popovers_render_on_desktop_and_phone() {
         });
     }
     let _ = first;
+    crate::autoui::focus_rule(srid);
+    for size in [vec2(1280.0, 800.0), vec2(390.0, 780.0)] {
+        for _ in 0..3 {
+            t += 0.05;
+            frame_sized(&ctx, size, t, vec![], |ui| {
+                crate::autoui::show(ui, &mut ws, &mut rt, &pal);
+            });
+        }
+    }
     // row page with the button, the date chips and every popover
     ed.edit_button = Some(bid);
     for _ in 0..4 {
@@ -1237,7 +1253,7 @@ fn automation_views_buttons_and_popovers_render_on_desktop_and_phone() {
     let back: Workspace = serde_json::from_str(&json).unwrap();
     assert_eq!(back.auto.rules.len(), ws.auto.rules.len());
     assert_eq!(back.auto.reminders.len(), 1);
-    assert!(back.page(row).unwrap().blocks.iter().any(|b| b.kind == BlockKind::Button && b.acts.len() == 2));
+    assert!(back.page(row).unwrap().blocks.iter().any(|b| b.kind == BlockKind::Button && b.acts.len() == 3));
     assert!(!back.page(row).unwrap().repeats.is_empty());
     // a workspace saved by an older version (no automation fields at all) still loads
     let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();

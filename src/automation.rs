@@ -287,6 +287,8 @@ pub enum Action {
     Duplicate,
     /// Move the row to the trash.
     Trash,
+    /// Run a LumenScript (see `script.rs`): full programmatic control — loops, conditions, several databases.
+    Script { code: String },
 }
 
 impl Action {
@@ -300,6 +302,7 @@ impl Action {
             Action::Notify { .. } => "Notify",
             Action::Duplicate => "Duplicate",
             Action::Trash => "Move to trash",
+            Action::Script { .. } => "Run script",
         }
     }
 }
@@ -486,6 +489,21 @@ pub struct AutoState {
     pub log: Vec<LogEntry>,
     #[serde(default)]
     pub settings: Settings,
+    /// Saved LumenScripts (the Scripts tab of the Automations page).
+    #[serde(default)]
+    pub scripts: Vec<Script>,
+}
+
+/// A script saved in the library.
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug, Default)]
+pub struct Script {
+    pub id: u64,
+    pub name: String,
+    pub code: String,
+    #[serde(default)]
+    pub runs: u32,
+    #[serde(default)]
+    pub last_run: f64,
 }
 
 const MAX_INBOX: usize = 120;
@@ -747,7 +765,7 @@ struct Ctx {
     kind: NoticeKind,
 }
 
-fn log(ws: &mut Workspace, rule: &str, msg: &str, ok: bool, now: f64) {
+pub(crate) fn log(ws: &mut Workspace, rule: &str, msg: &str, ok: bool, now: f64) {
     ws.auto.log.push(LogEntry { ts: now, rule: rule.into(), msg: msg.into(), ok });
     let n = ws.auto.log.len();
     if n > MAX_LOG {
@@ -755,7 +773,7 @@ fn log(ws: &mut Workspace, rule: &str, msg: &str, ok: bool, now: f64) {
     }
 }
 
-fn push_notice(ws: &mut Workspace, out: &mut Output, title: &str, body: &str, page: Option<u64>, kind: NoticeKind, now: f64) {
+pub(crate) fn push_notice(ws: &mut Workspace, out: &mut Output, title: &str, body: &str, page: Option<u64>, kind: NoticeKind, now: f64) {
     let id = ws.id();
     let n = Notice { id, ts: now, title: title.into(), body: body.into(), page, kind, read: false };
     ws.auto.inbox.push(n.clone());
@@ -1371,6 +1389,17 @@ fn run_actions(ws: &mut Workspace, acts: &[Action], ctx: &Ctx, now: f64, out: &m
                 if let Some(row) = ctx.row {
                     ws.set_trashed(row, true);
                     notes.push("moved to trash".into());
+                }
+            }
+            Action::Script { code } => {
+                let sctx = crate::scripthost::ScriptCtx { row: ctx.row, page: ctx.page, db, source: ctx.source.clone(), kind: ctx.kind, now };
+                let rep = crate::scripthost::run_script(ws, code, &sctx, out, follow);
+                for line in rep.output.iter().take(6) {
+                    notes.push(format!("print: {line}"));
+                }
+                match rep.error {
+                    Some(e) => notes.push(format!("⚠ script error — {e}")),
+                    None => notes.push(format!("script ran ({} change(s), {} steps)", rep.effects.len(), rep.steps)),
                 }
             }
         }

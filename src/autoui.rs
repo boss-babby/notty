@@ -48,6 +48,16 @@ pub const TAB_RULES: u8 = 0;
 pub const TAB_REMINDERS: u8 = 1;
 pub const TAB_INBOX: u8 = 2;
 pub const TAB_ACTIVITY: u8 = 3;
+pub const TAB_SCRIPTS: u8 = 4;
+pub const TAB_ROADMAP: u8 = 5;
+
+/// Jumps to the Rules tab with this rule expanded.
+pub(crate) fn focus_rule(id: u64) {
+    st(|s| {
+        s.tab = TAB_RULES;
+        s.open_rule = Some(id);
+    });
+}
 
 pub fn open_tab(tab: u8) {
     st(|s| s.tab = tab);
@@ -63,11 +73,11 @@ pub struct Out {
 
 // ───────────────────────────── small widgets ─────────────────────────────
 
-fn roomy() -> bool {
+pub(crate) fn roomy() -> bool {
     crate::touch::touchy()
 }
 
-fn card<R>(ui: &mut Ui, pal: &Palette, add: impl FnOnce(&mut Ui) -> R) -> R {
+pub(crate) fn card<R>(ui: &mut Ui, pal: &Palette, add: impl FnOnce(&mut Ui) -> R) -> R {
     Frame::new()
         .fill(pal.bg)
         .stroke(Stroke::new(1.0_f32, pal.border))
@@ -81,18 +91,18 @@ fn card<R>(ui: &mut Ui, pal: &Palette, add: impl FnOnce(&mut Ui) -> R) -> R {
         .inner
 }
 
-fn label(ui: &mut Ui, pal: &Palette, text: &str) {
+pub(crate) fn label(ui: &mut Ui, pal: &Palette, text: &str) {
     ui.label(RichText::new(text).font(body(13.0)).color(pal.muted));
 }
 
-fn caps(ui: &mut Ui, pal: &Palette, text: &str) {
+pub(crate) fn caps(ui: &mut Ui, pal: &Palette, text: &str) {
     ui.add_space(6.0);
     ui.label(RichText::new(text.to_uppercase()).font(bold(11.0)).color(pal.muted));
     ui.add_space(2.0);
 }
 
 /// Square icon button; returns the response.
-fn icon_btn(ui: &mut Ui, pal: &Palette, glyph: &str, tip: &str, danger: bool) -> egui::Response {
+pub(crate) fn icon_btn(ui: &mut Ui, pal: &Palette, glyph: &str, tip: &str, danger: bool) -> egui::Response {
     let s = if roomy() { 38.0 } else { 30.0 };
     let (r, resp) = ui.allocate_exact_size(vec2(s, s), Sense::click());
     let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
@@ -103,7 +113,7 @@ fn icon_btn(ui: &mut Ui, pal: &Palette, glyph: &str, tip: &str, danger: bool) ->
 }
 
 /// iOS-style switch.
-fn switch(ui: &mut Ui, pal: &Palette, on: &mut bool) -> bool {
+pub(crate) fn switch(ui: &mut Ui, pal: &Palette, on: &mut bool) -> bool {
     let (r, resp) = ui.allocate_exact_size(vec2(38.0, 22.0), Sense::click());
     let t = ui.ctx().animate_bool_with_time(resp.id, *on, 0.14);
     ui.painter().rect_filled(r, 11.0, lerp_color(pal.active, pal.accent, t));
@@ -117,7 +127,7 @@ fn switch(ui: &mut Ui, pal: &Palette, on: &mut bool) -> bool {
     false
 }
 
-fn pill(ui: &mut Ui, pal: &Palette, text: &str, fg: Color32, bg: Color32) {
+pub(crate) fn pill(ui: &mut Ui, pal: &Palette, text: &str, fg: Color32, bg: Color32) {
     let g = ui.painter().layout_no_wrap(text.to_owned(), bold(11.5), fg);
     let (r, _) = ui.allocate_exact_size(g.size() + vec2(14.0, 6.0), Sense::hover());
     ui.painter().rect_filled(r, 9.0, bg);
@@ -125,7 +135,7 @@ fn pill(ui: &mut Ui, pal: &Palette, text: &str, fg: Color32, bg: Color32) {
     let _ = pal;
 }
 
-fn combo<T: PartialEq + Clone>(ui: &mut Ui, salt: impl std::hash::Hash, width: f32, items: &[(String, T)], cur: &T) -> Option<T> {
+pub(crate) fn combo<T: PartialEq + Clone>(ui: &mut Ui, salt: impl std::hash::Hash, width: f32, items: &[(String, T)], cur: &T) -> Option<T> {
     let text = items.iter().find(|(_, v)| v == cur).map(|(s, _)| s.clone()).unwrap_or_else(|| "—".into());
     let mut out = None;
     ComboBox::from_id_salt(Id::new(salt)).selected_text(RichText::new(text).font(body(13.5))).width(width).show_ui(ui, |ui| {
@@ -186,7 +196,7 @@ fn date_input(ui: &mut Ui, pal: &Palette, salt: impl std::hash::Hash, day: &mut 
     ch
 }
 
-fn databases(ws: &Workspace) -> Vec<(String, u64)> {
+pub(crate) fn databases(ws: &Workspace) -> Vec<(String, u64)> {
     ws.pages.iter().filter(|p| p.kind == PageKind::Database && !p.trashed && p.db.is_some()).map(|p| (format!("{} {}", icons::icon_text(&p.icon), ws.display_title(p.id)).trim().to_owned(), p.id)).collect()
 }
 
@@ -235,6 +245,7 @@ pub fn describe_action(ws: &Workspace, db: u64, a: &Action) -> String {
         Action::Notify { message } => format!("Notify “{message}”"),
         Action::Duplicate => "Duplicate the row".into(),
         Action::Trash => "Move the row to the trash".into(),
+        Action::Script { code } => format!("Run script ({} lines)", code.lines().count()),
     }
 }
 
@@ -406,7 +417,7 @@ fn default_setter(ws: &Workspace, db: u64, prop: u64) -> Setter {
     }
 }
 
-const KINDS_ROW: [&str; 8] = ["Set property", "Create row", "Move row", "Rename", "Add to page", "Notify", "Duplicate", "Move to trash"];
+const KINDS_ROW: [&str; 9] = ["Set property", "Create row", "Move row", "Rename", "Add to page", "Notify", "Duplicate", "Move to trash", "Run script"];
 
 fn kind_index(a: &Action) -> usize {
     match a {
@@ -418,6 +429,7 @@ fn kind_index(a: &Action) -> usize {
         Action::Notify { .. } => 5,
         Action::Duplicate => 6,
         Action::Trash => 7,
+        Action::Script { .. } => 8,
     }
 }
 
@@ -434,6 +446,7 @@ fn new_action(ws: &Workspace, db: u64, kind: usize) -> Action {
         4 => Action::Append { text: "Done on {today}".into(), todo: false },
         5 => Action::Notify { message: "{title}".into() },
         6 => Action::Duplicate,
+        8 => Action::Script { code: crate::scripthost::EXAMPLES[2].code.to_owned() },
         _ => Action::Trash,
     }
 }
@@ -444,7 +457,7 @@ pub fn actions_editor(ui: &mut Ui, pal: &Palette, ws: &Workspace, db: u64, acts:
     let mut ch = false;
     let mut remove: Option<usize> = None;
     let mut swap: Option<usize> = None;
-    let allowed: Vec<usize> = if row_ctx { (0..8).collect() } else { vec![1, 4, 5] };
+    let allowed: Vec<usize> = if row_ctx { (0..9).collect() } else { vec![1, 4, 5, 8] };
     let dbs = databases(ws);
     for i in 0..acts.len() {
         let idp = (salt, "act", i);
@@ -535,6 +548,9 @@ pub fn actions_editor(ui: &mut Ui, pal: &Palette, ws: &Workspace, db: u64, acts:
                     ui.add(TextEdit::singleline(message).desired_width(f32::INFINITY).hint_text("Message — {title}, {date}, {today}").margin(Margin::symmetric(8, 6)));
                 }
                 Action::Duplicate | Action::Trash => {}
+                Action::Script { code } => {
+                    crate::scriptui::inline_editor(ui, pal, ws, db, code, (idp, "script"));
+                }
             }
             if a != acts[i] {
                 acts[i] = a;
@@ -908,7 +924,7 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette) ->
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         ui.label(RichText::new("Automations").font(bold(if narrow { 22.0 } else { 26.0 })).color(pal.text));
-                        ui.label(RichText::new("Rules, buttons, recurring tasks and reminders").font(body(13.0)).color(pal.muted));
+                        ui.label(RichText::new("Rules, scripts, buttons, recurring tasks and reminders").font(body(13.0)).color(pal.muted));
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon_btn(ui, pal, l::X, "Close", false).clicked() {
@@ -920,7 +936,7 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette) ->
                 let mut tab = st(|s| s.tab) as usize;
                 let unread = ws.auto.unread();
                 let inbox_label = if unread > 0 { format!("Inbox · {unread}") } else { "Inbox".to_owned() };
-                let labels: Vec<&str> = vec!["Rules", "Reminders", &inbox_label, "Activity"];
+                let labels: Vec<&str> = vec!["Rules", "Reminders", &inbox_label, "Activity", "Scripts", "Roadmap"];
                 ScrollArea::horizontal().id_salt("auto_tabs").auto_shrink([false, true]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
                     crate::uploader::segmented(ui, pal, Id::new("auto_seg"), &labels, &mut tab);
                 });
@@ -933,7 +949,9 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette) ->
                     0 => rules_tab(ui, ws, rt, pal, &mut out),
                     1 => reminders_tab(ui, ws, rt, pal, &mut out),
                     2 => inbox_tab(ui, ws, pal, &mut out),
-                    _ => activity_tab(ui, ws, pal),
+                    3 => activity_tab(ui, ws, pal),
+                    4 => crate::scriptui::scripts_tab(ui, ws, rt, pal, &mut out),
+                    _ => crate::scriptui::roadmap_tab(ui, pal),
                 }
                 ui.add_space(60.0);
             });
@@ -1080,46 +1098,55 @@ fn rules_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette, o
     let db = st(|s| s.recipe_db);
     let db = if dbs.iter().any(|d| d.1 == db) { db } else { dbs.first().map(|d| d.1).unwrap_or(0) };
     let avail = ui.available_width();
-    let cols = if avail > 700.0 { 2 } else { 1 };
-    let cw = (avail - 10.0 * (cols as f32 - 1.0)) / cols as f32;
+    let gap = 10.0;
+    let cols = if avail > 640.0 { 2 } else { 1 };
+    let cw = ((avail - gap * (cols as f32 - 1.0)) / cols as f32).floor();
+    let (pad, icon, btn_h) = (14.0_f32, 34.0_f32, if roomy() { 40.0_f32 } else { 32.0_f32 });
+    let tx = pad + icon + 10.0;
+    let tw = (cw - tx - pad).max(80.0);
     let recipes = au::recipes();
     let mut created: Option<String> = None;
     for chunk in recipes.chunks(cols) {
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            for rc in chunk {
-                ui.allocate_ui(vec2(cw, 0.0), |ui| {
-                    let usable = !rc.needs_db || db != 0;
-                    Frame::new().fill(pal.hover).corner_radius(CornerRadius::same(12)).inner_margin(Margin::same(12)).show(ui, |ui| {
-                        ui.set_width(cw - 24.0);
-                        ui.set_min_height(76.0);
-                        ui.horizontal(|ui| {
-                            let (r, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
-                            ui.painter().rect_filled(r, 8.0, with_alpha(pal.accent, 0.13));
-                            icons::glyph(ui.painter(), r.center(), 15.0, rc.icon, pal.accent);
-                            ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 1.0;
-                                ui.add(egui::Label::new(RichText::new(rc.title).font(bold(13.5)).color(pal.text)).wrap());
-                                ui.add(egui::Label::new(RichText::new(rc.desc).font(body(12.0)).color(pal.muted)).wrap());
-                            });
-                        });
-                        ui.add_space(6.0);
-                        ui.add_enabled_ui(usable, |ui| {
-                            if widgets::ghost_button(ui, pal, "+ Add this rule").clicked() {
-                                if let Some(id) = rc.create(ws, if rc.needs_db { db } else { 0 }) {
-                                    st(|s| s.open_rule = Some(id));
-                                    created = Some(format!("Added “{}”", rc.title));
-                                    rt.dirty = true;
-                                } else {
-                                    created = Some("This database lacks the properties this recipe needs (e.g. a Status select or a Date).".into());
-                                }
-                            }
-                        });
-                    });
+        // measure every tile of the row first, so all tiles of a row get the same height and the buttons line up
+        let mut galleys = vec![];
+        let mut h_max = 0.0_f32;
+        for rc in chunk {
+            let gt = ui.painter().layout(rc.title.to_owned(), bold(14.0), pal.text, tw);
+            let gd = ui.painter().layout(rc.desc.to_owned(), body(12.5), pal.muted, tw);
+            h_max = h_max.max(pad + gt.size().y + 3.0 + gd.size().y + 10.0 + btn_h + pad);
+            galleys.push((gt, gd));
+        }
+        let h_max = h_max.max(pad * 2.0 + icon);
+        let (row_rect, _) = ui.allocate_exact_size(vec2(avail, h_max), Sense::hover());
+        for (i, rc) in chunk.iter().enumerate() {
+            let rect = Rect::from_min_size(pos2(row_rect.left() + i as f32 * (cw + gap), row_rect.top()), vec2(cw, h_max));
+            let usable = !rc.needs_db || db != 0;
+            let p = ui.painter();
+            p.rect_filled(rect, 12.0, pal.hover);
+            p.rect_stroke(rect, 12.0, Stroke::new(1.0_f32, with_alpha(pal.border, 0.6)), egui::StrokeKind::Inside);
+            let ir = Rect::from_min_size(rect.min + vec2(pad, pad), vec2(icon, icon));
+            p.rect_filled(ir, 9.0, with_alpha(pal.accent, 0.14));
+            icons::glyph(p, ir.center(), 16.0, rc.icon, pal.accent);
+            let (gt, gd) = &galleys[i];
+            let (tpos, dpos) = (pos2(rect.left() + tx, rect.top() + pad), pos2(rect.left() + tx, rect.top() + pad + gt.size().y + 3.0));
+            p.galley(tpos, gt.clone(), pal.text);
+            p.galley(dpos, gd.clone(), pal.muted);
+            let br = Rect::from_min_size(pos2(rect.left() + tx, rect.bottom() - pad - btn_h), vec2(tw, btn_h));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(br).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                ui.add_enabled_ui(usable, |ui| {
+                    if widgets::ghost_button(ui, pal, "+ Add this rule").clicked() {
+                        if let Some(id) = rc.create(ws, if rc.needs_db { db } else { 0 }) {
+                            st(|s| s.open_rule = Some(id));
+                            created = Some(format!("Added “{}”", rc.title));
+                            rt.dirty = true;
+                        } else {
+                            created = Some("This database lacks the properties this recipe needs (e.g. a Status select or a Date).".into());
+                        }
+                    }
                 });
-            }
-        });
-        ui.add_space(10.0);
+            });
+        }
+        ui.add_space(gap);
     }
     if created.is_some() {
         out.toast = created;

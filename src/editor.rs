@@ -1,5 +1,6 @@
 //! The Notion-style block editor: nesting, toggles, colours, inline formatting, slash menu, drag & drop.
 
+use crate::widgets::LayerRaise;
 use std::collections::HashMap;
 
 use egui::{
@@ -1328,7 +1329,7 @@ fn mobile_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette)
             });
         });
     });
-    ctx.move_to_top(bar.response.layer_id);
+    ctx.raise_layer(bar.response.layer_id);
     let mut covered = bar.response.rect;
 
     if menu != 0 {
@@ -1374,7 +1375,7 @@ fn mobile_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette)
                 });
             });
         });
-        ctx.move_to_top(sheet.response.layer_id);
+        ctx.raise_layer(sheet.response.layer_id);
         covered = covered.union(sheet.response.rect);
         // a tap outside the sheet and the toolbar closes it
         if ctx.input(|i| i.pointer.any_pressed()) {
@@ -2574,7 +2575,7 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
                 });
             });
         });
-        ctx.move_to_top(area.response.layer_id);
+        ctx.raise_layer(area.response.layer_id);
         if let Some(k) = pick {
             *act = Some(slash_act(idx, k));
         }
@@ -2962,7 +2963,7 @@ fn fmt_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) ->
             }
         });
     });
-    ctx.move_to_top(area.response.layer_id);
+    ctx.raise_layer(area.response.layer_id);
     ctx.data_mut(|d| d.insert_temp(rect_id, area.response.rect));
     let mut changed = false;
     if link_clicked && clicked.is_none() {
@@ -3020,7 +3021,7 @@ pub fn link_popup(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Pale
             });
         });
     });
-    ctx.move_to_top(area.response.layer_id);
+    ctx.raise_layer(area.response.layer_id);
     if ctx.input(|i| i.key_pressed(Key::Escape)) {
         close = true;
     }

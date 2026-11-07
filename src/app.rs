@@ -1,5 +1,6 @@
 //! Application shell: sidebar, top bar, command palette, dialogs, toasts and persistence.
 
+use crate::widgets::LayerRaise;
 use crate::lucide as l;
 use std::f32::consts::FRAC_PI_2;
 use std::time::Duration;
@@ -2072,7 +2073,7 @@ impl LumenApp {
                         self.ws.sidebar_open = false;
                     }
                 });
-                ctx.move_to_top(bd.response.layer_id);
+                ctx.raise_layer(bd.response.layer_id);
                 let dr = Area::new(Id::new("drawer")).order(Order::Middle).fixed_pos(pos2(-(1.0 - st) * sw, 0.0)).show(ctx, |ui| {
                     Frame::new().fill(pal.sidebar).inner_margin(Margin::symmetric(8, 0)).shadow(egui::epaint::Shadow { offset: [3, 0], blur: 20, spread: 0, color: Color32::from_black_alpha((70.0 * st) as u8) }).show(ui, |ui| {
                         ui.set_min_size(vec2(sw - 16.0, screen.height()));
@@ -2080,7 +2081,7 @@ impl LumenApp {
                         self.sidebar(ui, &pal);
                     });
                 });
-                ctx.move_to_top(dr.response.layer_id);
+                ctx.raise_layer(dr.response.layer_id);
             }
         } else if st > 0.003 {
             egui::SidePanel::left("sidebar")
@@ -2324,7 +2325,7 @@ pub(crate) fn modal(ctx: &Context, id: Id, pal: &Palette, width: f32, top: f32, 
         }
     });
     // The backdrop must always sit *below* the dialog, otherwise the dialog looks greyed-out/hidden.
-    ctx.move_to_top(bd.response.layer_id);
+    ctx.raise_layer(bd.response.layer_id);
     let md = Area::new(id).order(Order::Foreground).anchor(Align2::CENTER_TOP, vec2(0.0, top + (1.0 - t) * 16.0)).show(ctx, |ui| {
         ui.set_opacity(t);
         crate::widgets::popup_frame(pal).corner_radius(CornerRadius::same(14)).inner_margin(Margin::same(8)).show(ui, |ui| {
@@ -2332,7 +2333,7 @@ pub(crate) fn modal(ctx: &Context, id: Id, pal: &Palette, width: f32, top: f32, 
             add(ui);
         });
     });
-    ctx.move_to_top(md.response.layer_id);
+    ctx.raise_layer(md.response.layer_id);
     if ctx.input(|i| i.key_pressed(Key::Escape)) {
         open = false;
     }

@@ -41,6 +41,24 @@ pub fn popup_frame(pal: &Palette) -> Frame {
         .shadow(Shadow { offset: [0, 10], blur: 30, spread: 0, color: Color32::from_black_alpha(60) })
 }
 
+/// Layer ordering helper shared by every popup, modal, drawer and menu.
+///
+/// egui resolves "want to be on top" requests at the end of each frame while keeping the *previous* relative order, so a popup that asks
+/// to be raised every frame ends up ABOVE a ComboBox / context-menu popup that was opened from inside it (the drop-down only asks once,
+/// when it is created). That was the "dropdowns hide behind pop-ups" bug. Rule implemented here: while any egui popup (combo box,
+/// menu, colour picker …) is open nobody re-raises itself, so the drop-down always stays on top of the window that spawned it.
+pub trait LayerRaise {
+    fn raise_layer(&self, layer: egui::LayerId);
+}
+
+impl LayerRaise for Context {
+    fn raise_layer(&self, layer: egui::LayerId) {
+        if !self.memory(|m| m.any_popup_open()) {
+            self.move_to_top(layer);
+        }
+    }
+}
+
 /// Floating popup anchored at `pos`. Returns `false` when it should close (click outside / Esc).
 pub fn popup_area(
     ctx: &Context,
@@ -74,7 +92,7 @@ pub fn popup_area(
             });
         });
     // Always draw popups above everything else (modal backdrops included).
-    ctx.move_to_top(resp.response.layer_id);
+    ctx.raise_layer(resp.response.layer_id);
     let rect = resp.response.rect;
     ctx.data_mut(|d| d.insert_temp(id.with("h"), rect.height()));
     let mut open = true;
@@ -438,7 +456,7 @@ pub fn context_menu(ctx: &Context, id: Id, pos: Pos2, pal: &Palette, fresh: &mut
             }
         });
     });
-    ctx.move_to_top(resp.response.layer_id);
+    ctx.raise_layer(resp.response.layer_id);
     let rect = resp.response.rect;
     ctx.data_mut(|d| {
         d.insert_temp(id.with("size"), rect.size());
