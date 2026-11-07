@@ -617,11 +617,19 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
     ed.embed_rects.clear();
     ed.cur_page = id;
     let avail = ui.available_width();
-    let (kind, is_row, full, small) = {
+    // two-finger pinch on the page = content size (the same value as the slider in the ⋯ menu)
+    if let Some(d) = ui.input(|i| i.multi_touch().map(|m| m.zoom_delta)) {
+        if d.is_finite() && (d - 1.0).abs() > 1e-4 && ed.pdf_req.is_none() {
+            let p = &mut ws.pages[idx];
+            p.zoom = crate::model::clamp_zoom(p.content_zoom() * d.clamp(0.9, 1.1));
+            ui.ctx().request_repaint();
+        }
+    }
+    let (kind, is_row, full, small, zoom) = {
         let p = &ws.pages[idx];
-        (p.kind, p.row, p.full_width, p.small_text)
+        (p.kind, p.row, p.full_width, p.small_text, p.content_zoom())
     };
-    ed.scale = if small { 0.9 } else { 1.0 };
+    ed.scale = zoom * if small { 0.9 } else { 1.0 };
     // Page-wide drag surface (registered first = lowest): blank space starts the selection rectangle.
     let top = ui.cursor().min;
     let bg_rect = Rect::from_min_max(pos2(ui.max_rect().left(), top.y), pos2(ui.max_rect().right(), top.y + 30000.0));
@@ -767,7 +775,7 @@ fn header(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, con
 
     let row_h = 30.0;
     let (row, _) = ui.allocate_exact_size(vec2(content_w + gutter(), row_h), Sense::hover());
-    let hov = ui.rect_contains_pointer(Rect::from_min_max(pos2(row.left(), hdr_top - 10.0), pos2(row.right(), row.bottom() + 56.0)));
+    let hov = crate::touch::reveal(ui.rect_contains_pointer(Rect::from_min_max(pos2(row.left(), hdr_top - 10.0), pos2(row.right(), row.bottom() + 56.0))));
     let t = ui.ctx().animate_bool_with_time(Id::new(("hdr_h", page.id)), hov, 0.15);
     let mut x = row.left() + gutter();
     let mut buttons: Vec<(String, &str)> = vec![];
@@ -807,8 +815,8 @@ fn header(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, con
             TextEdit::singleline(&mut page.title)
                 .id(tid)
                 .frame(false)
-                .font(bold(40.0))
-                .hint_text(RichText::new("Untitled").font(bold(40.0)).color(with_alpha(pal.muted, 0.55)))
+                .font(bold(40.0 * ed.scale.max(0.5)))
+                .hint_text(RichText::new("Untitled").font(bold(40.0 * ed.scale.max(0.5))).color(with_alpha(pal.muted, 0.55)))
                 .desired_width(content_w)
                 .margin(Margin::symmetric(0, 4)),
         );
@@ -1994,6 +2002,8 @@ fn draw_block(
 ) -> bool {
     let mut changed = false;
     let font = font_for(b.kind, ed.scale);
+    // content size: every fixed dimension of a block (bullets, check boxes, icons) follows the text
+    let s = ed.scale.max(0.5);
     let base = if b.color > 0 { tag_color(b.color as usize - 1) } else { pal.text };
     match b.kind {
         BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File => {
@@ -2012,17 +2022,17 @@ fn draw_block(
         BlockKind::Todo => {
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                let (r, resp) = ui.allocate_exact_size(vec2(28.0, 26.0), Sense::click());
-                let c = pos2(r.left() + 10.0, r.top() + 13.5);
+                let (r, resp) = ui.allocate_exact_size(vec2(28.0 * s, 26.0 * s), Sense::click());
+                let c = pos2(r.left() + 10.0 * s, r.top() + 13.5 * s);
                 let t = ui.ctx().animate_bool_with_time(Id::new(("chk", b.id)), b.checked, 0.18);
-                let box_r = Rect::from_center_size(c, vec2(17.0, 17.0));
-                ui.painter().rect_filled(box_r, 4.0, with_alpha(pal.accent, t));
-                ui.painter().rect_stroke(box_r, 4.0, Stroke::new(1.6_f32, lerp_color(pal.text.gamma_multiply(0.8), pal.accent, t)), egui::StrokeKind::Inside);
+                let box_r = Rect::from_center_size(c, vec2(17.0 * s, 17.0 * s));
+                ui.painter().rect_filled(box_r, 4.0 * s, with_alpha(pal.accent, t));
+                ui.painter().rect_stroke(box_r, 4.0 * s, Stroke::new(1.6_f32, lerp_color(pal.text.gamma_multiply(0.8), pal.accent, t)), egui::StrokeKind::Inside);
                 if t > 0.02 {
                     let s = t.min(1.0);
-                    let p1 = pos2(c.x - 4.2, c.y + 0.2);
-                    let p2 = pos2(c.x - 1.2, c.y + 3.2);
-                    let p3 = pos2(c.x + 4.4, c.y - 3.2);
+                    let p1 = pos2(c.x - 4.2 * s, c.y + 0.2 * s);
+                    let p2 = pos2(c.x - 1.2 * s, c.y + 3.2 * s);
+                    let p3 = pos2(c.x + 4.4 * s, c.y - 3.2 * s);
                     let mid = p1 + (p2 - p1) * (s * 2.0).min(1.0);
                     let mut pts = vec![p1, mid];
                     if s > 0.5 {
@@ -2035,19 +2045,19 @@ fn draw_block(
                     changed = true;
                 }
                 let col = lerp_color(base, pal.muted, t);
-                changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: col, hint: "To-do", width: w - 28.0 }, act);
+                changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: col, hint: "To-do", width: w - 28.0 * s }, act);
             });
         }
         BlockKind::Bullet | BlockKind::Numbered => {
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                let (r, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
+                let (r, _) = ui.allocate_exact_size(vec2(26.0 * s, 26.0 * s), Sense::hover());
                 if b.kind == BlockKind::Bullet {
-                    let c = pos2(r.left() + 10.0, r.top() + 13.5);
+                    let c = pos2(r.left() + 10.0 * s, r.top() + 13.5 * s);
                     match b.indent % 3 {
-                        0 => ui.painter().circle_filled(c, 3.0, base),
-                        1 => ui.painter().circle_stroke(c, 3.0, Stroke::new(1.3_f32, base)),
-                        _ => ui.painter().rect_filled(Rect::from_center_size(c, vec2(5.5, 5.5)), 1.0, base),
+                        0 => ui.painter().circle_filled(c, 3.0 * s, base),
+                        1 => ui.painter().circle_stroke(c, 3.0 * s, Stroke::new(1.3_f32, base)),
+                        _ => ui.painter().rect_filled(Rect::from_center_size(c, vec2(5.5 * s, 5.5 * s)), 1.0, base),
                     };
                 } else {
                     let label = match b.indent % 3 {
@@ -2055,26 +2065,26 @@ fn draw_block(
                         1 => format!("{}.", (b'a' + ((num.max(1) - 1) % 26) as u8) as char),
                         _ => format!("{}.", roman(num)),
                     };
-                    ui.painter().text(pos2(r.left() + 17.0, r.top() + 13.5), Align2::RIGHT_CENTER, label, body(16.0 * ed.scale.max(0.5)), base);
+                    ui.painter().text(pos2(r.left() + 17.0 * s, r.top() + 13.5 * s), Align2::RIGHT_CENTER, label, body(16.0 * ed.scale.max(0.5)), base);
                 }
                 let hint = if b.kind == BlockKind::Bullet { "List" } else { "List item" };
-                changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: base, hint, width: w - 26.0 }, act);
+                changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: base, hint, width: w - 26.0 * s }, act);
             });
         }
         BlockKind::Toggle => {
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+                let (r, resp) = ui.allocate_exact_size(vec2(26.0 * s, 26.0 * s), Sense::click());
                 let t = ui.ctx().animate_bool_with_time(Id::new(("tgl", b.id)), !b.collapsed, 0.14);
                 let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-                let rr = Rect::from_center_size(r.center() + vec2(-2.0, 0.0), vec2(22.0, 22.0));
+                let rr = Rect::from_center_size(r.center() + vec2(-2.0, 0.0), vec2(22.0 * s, 22.0 * s));
                 ui.painter().rect_filled(rr, 5.0, with_alpha(pal.hover, h));
-                icons::chevron(ui.painter(), rr.center(), 13.0, t * std::f32::consts::FRAC_PI_2, lerp_color(pal.muted, pal.text, h));
+                icons::chevron(ui.painter(), rr.center(), 13.0 * s, t * std::f32::consts::FRAC_PI_2, lerp_color(pal.muted, pal.text, h));
                 if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                     b.collapsed = !b.collapsed;
                     changed = true;
                 }
-                changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: base, hint: "Toggle", width: w - 26.0 }, act);
+                changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: base, hint: "Toggle", width: w - 26.0 * s }, act);
             });
         }
         BlockKind::Quote => {
@@ -2091,9 +2101,9 @@ fn draw_block(
                 ui.set_width(w - 28.0);
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    let (r, _) = ui.allocate_exact_size(vec2(34.0, 26.0), Sense::hover());
-                    icons::glyph(ui.painter(), r.left_center() + vec2(12.0, 0.0), 19.0, l::LIGHTBULB, tag_color(3));
-                    changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: base, hint: "Type something…", width: w - 28.0 - 34.0 }, act);
+                    let (r, _) = ui.allocate_exact_size(vec2(34.0 * s, 26.0 * s), Sense::hover());
+                    icons::glyph(ui.painter(), r.left_center() + vec2(12.0 * s, 0.0), 19.0 * s, l::LIGHTBULB, tag_color(3));
+                    changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: base, hint: "Type something…", width: w - 28.0 - 34.0 * s }, act);
                 });
             });
         }
@@ -2108,7 +2118,7 @@ fn draw_block(
                     changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: pal.text, hint: "Write some code…", width: w - 32.0 }, act);
                 });
             let rr = fr.response.rect;
-            if ui.rect_contains_pointer(rr) {
+            if crate::touch::reveal(ui.rect_contains_pointer(rr)) {
                 let br = Rect::from_min_size(pos2(rr.right() - 58.0, rr.top() + 6.0), vec2(50.0, 22.0));
                 let resp = ui.interact(br, Id::new(("copy", b.id)), Sense::click());
                 let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
@@ -2126,15 +2136,15 @@ fn draw_block(
         BlockKind::Toc => {
             ui.add_space(4.0);
             if heads.is_empty() {
-                ui.label(RichText::new("Add headings to your page and they will appear here.").color(pal.muted).font(body(14.0)));
+                ui.label(RichText::new("Add headings to your page and they will appear here.").color(pal.muted).font(body(14.0 * s)));
             }
             for (hid, lvl, text) in heads {
-                let (r, resp) = ui.allocate_exact_size(vec2(w, 24.0), Sense::click());
+                let (r, resp) = ui.allocate_exact_size(vec2(w, 24.0 * s), Sense::click());
                 let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
                 let x = r.left() + (*lvl as f32 - 1.0) * 18.0;
                 let label = if text.trim().is_empty() { "Untitled" } else { text.trim() };
                 let col = lerp_color(pal.muted, pal.text, t);
-                let gal = ui.painter().layout_no_wrap(label.to_owned(), body(14.5), col);
+                let gal = ui.painter().layout_no_wrap(label.to_owned(), body(14.5 * s), col);
                 let wd = gal.size().x;
                 ui.painter().galley(pos2(x, r.center().y - gal.size().y / 2.0), gal, col);
                 if t > 0.01 {

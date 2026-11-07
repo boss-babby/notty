@@ -669,7 +669,7 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, rows: &[u64], st
             ui.painter().rect_filled(rr, 0.0, with_alpha(pal.hover, t * 0.6));
             ui.painter().hline(rr.x_range(), rr.bottom(), Stroke::new(1.0_f32, pal.border));
             // title
-            let t = if compact { 1.0 } else { t }; // touch screens have no hover: keep the OPEN button visible
+            let t = if compact || crate::touch::touchy() { 1.0 } else { t }; // touch screens have no hover: keep the OPEN button visible
             let tr = Rect::from_min_size(rr.min, vec2(title_w, ROW_H));
             let tid = sid(("rt", row.id));
             if st.focus_row == Some(row.id) {
@@ -1147,7 +1147,7 @@ fn calendar(ui: &mut Ui, ws: &Workspace, db: &Database, view: &View, rows: &[u64
                 ui.painter().circle_filled(dc, 11.0, pal.accent);
             }
             ui.painter().text(dc, Align2::CENTER_CENTER, day.to_string(), body(12.5), if is_today { Color32::WHITE } else { pal.text });
-            if hovered {
+            if crate::touch::reveal(hovered) {
                 let pr = Rect::from_center_size(pos2(cr.right() - 16.0, cr.top() + 14.0), vec2(22.0, 22.0));
                 let resp = ui.interact(pr, sid(("cal_add", day)), Sense::click());
                 let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);

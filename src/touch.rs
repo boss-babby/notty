@@ -64,6 +64,11 @@ pub fn claim(r: egui::Rect) {
     CLAIMS_NOW.with(|c| c.borrow_mut().push(r));
 }
 
+/// Hover-only controls (cover buttons, row actions, copy buttons …) are drawn permanently on touch screens: a finger cannot hover.
+pub fn reveal(hovered: bool) -> bool {
+    hovered || touchy()
+}
+
 /// Bigger tap targets / spacing (touch screen in use).
 pub fn touchy() -> bool {
     TOUCHY.with(|t| t.get())
@@ -124,6 +129,8 @@ pub struct Gestures {
     drop_tail: bool,
     /// Distance travelled this frame (accumulated from `Touch::Move`).
     frame_delta: Vec2,
+    /// A finger that was not scrolling / holding lifted during this call of `process` (its pointer-gone must not end the hover).
+    ended_now: bool,
     /// A touch screen has been used at least once.
     pub seen: bool,
     /// Grab zones of the previous frame (see [`claim`]).
@@ -132,7 +139,7 @@ pub struct Gestures {
 
 impl Default for Gestures {
     fn default() -> Self {
-        Gestures { mode: Mode::Idle, lock: Lock::Free, fingers: 0, start: Pos2::ZERO, last: Pos2::ZERO, t0: 0.0, last_t: 0.0, buf: vec![], vel: Vec2::ZERO, drop_tail: false, frame_delta: Vec2::ZERO, seen: false, claims: vec![] }
+        Gestures { mode: Mode::Idle, lock: Lock::Free, fingers: 0, start: Pos2::ZERO, last: Pos2::ZERO, t0: 0.0, last_t: 0.0, buf: vec![], vel: Vec2::ZERO, drop_tail: false, frame_delta: Vec2::ZERO, ended_now: false, seen: false, claims: vec![] }
     }
 }
 
@@ -191,6 +198,7 @@ impl Gestures {
         let mut out: Vec<Event> = Vec::with_capacity(events.len() + 4);
         let mut outcome = Outcome::default();
         self.frame_delta = Vec2::ZERO;
+        self.ended_now = false;
         let events = Self::touch_first(events);
 
         for ev in events {
@@ -253,10 +261,14 @@ impl Gestures {
                         }
                         TouchPhase::End | TouchPhase::Cancel => {
                             self.fingers = self.fingers.saturating_sub(1);
+                            self.ended_now = matches!(self.mode, Mode::Pending | Mode::Pass);
                             match self.mode {
                                 Mode::Pending if self.fingers == 0 => {
                                     if phase == TouchPhase::End {
-                                        out.append(&mut self.buf);
+                                        // a tap: replay press / release, but NOT the pointer-gone that follows — the tapped spot stays
+                                        // "hovered", so the controls that a mouse reveals on hover (cover buttons, row actions, block
+                                        // handles, image toolbars …) stay visible until the next tap somewhere else
+                                        out.extend(self.buf.drain(..).filter(|e| !matches!(e, Event::PointerGone)));
                                     }
                                     self.buf.clear();
                                     self.mode = Mode::Idle;
@@ -290,7 +302,9 @@ impl Gestures {
                     Mode::Scroll => {}
                     _ => {
                         let tail = matches!(ev, Event::PointerGone | Event::PointerButton { pressed: false, .. });
-                        if self.drop_tail && tail {
+                        if matches!(ev, Event::PointerGone) && (self.fingers > 0 || self.ended_now) {
+                            // a finger is lifting (sticky hover, see the tap case above) — a mouse leaving the window passes
+                        } else if self.drop_tail && tail {
                             if matches!(ev, Event::PointerGone) {
                                 self.drop_tail = false;
                             }
@@ -484,6 +498,25 @@ mod tests {
         let (o, _) = g.process(0.1, false, vec![touch(TouchPhase::End, p), press(p, false), Event::PointerGone]);
         let presses = o.iter().filter(|e| matches!(e, Event::PointerButton { .. })).count();
         assert_eq!(presses, 2, "press + release delivered: {o:?}");
+    }
+
+    #[test]
+    fn tap_keeps_the_hover_so_hover_only_controls_stay_visible() {
+        // web order: release, pointer-gone, touch end
+        let mut g = Gestures::default();
+        let p = pos2(50.0, 60.0);
+        g.process(0.0, false, vec![touch(TouchPhase::Start, p), Event::PointerMoved(p), press(p, true)]);
+        let (o, _) = g.process(0.1, false, vec![press(p, false), Event::PointerGone, touch(TouchPhase::End, p)]);
+        assert!(!o.iter().any(|e| matches!(e, Event::PointerGone)), "hover must survive a tap: {o:?}");
+        assert_eq!(o.iter().filter(|e| matches!(e, Event::PointerButton { .. })).count(), 2);
+        // native order: touch end, release, pointer-gone
+        let mut g = Gestures::default();
+        g.process(0.0, false, vec![touch(TouchPhase::Start, p), Event::PointerMoved(p), press(p, true)]);
+        let (o, _) = g.process(0.1, false, vec![touch(TouchPhase::End, p), press(p, false), Event::PointerGone]);
+        assert!(!o.iter().any(|e| matches!(e, Event::PointerGone)), "native order too: {o:?}");
+        // a mouse leaving the window later still ends the hover
+        let (o, _) = g.process(2.0, false, vec![Event::PointerGone]);
+        assert!(o.iter().any(|e| matches!(e, Event::PointerGone)));
     }
 
     #[test]

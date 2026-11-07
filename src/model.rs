@@ -663,6 +663,22 @@ pub struct Column {
     pub cards: Vec<Card>,
 }
 
+pub const ZOOM_MIN: f32 = 0.7;
+pub const ZOOM_MAX: f32 = 1.8;
+
+fn default_zoom() -> f32 {
+    1.0
+}
+
+/// Clamps a content size factor; NaN / 0 / negative values fall back to 100 %.
+pub fn clamp_zoom(z: f32) -> f32 {
+    if z.is_finite() && z > 0.0 {
+        z.clamp(ZOOM_MIN, ZOOM_MAX)
+    } else {
+        1.0
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Page {
     pub id: u64,
@@ -696,6 +712,9 @@ pub struct Page {
     pub small_text: bool,
     #[serde(default)]
     pub full_width: bool,
+    /// Content size of the page body (1.0 = 100 %), set from the ⋯ page menu. Only the page content scales; menus never do.
+    #[serde(default = "default_zoom")]
+    pub zoom: f32,
     /// Versioned snapshots (oldest first), see `history.rs`.
     #[serde(default)]
     pub history: Vec<Version>,
@@ -741,8 +760,14 @@ impl Page {
             db: None,
             small_text: self.small_text,
             full_width: self.full_width,
+            zoom: self.zoom,
             history: vec![],
         }
+    }
+
+    /// Content size factor, always inside [`ZOOM_MIN`, `ZOOM_MAX`] (a damaged / hand-edited backup can never blow the layout up).
+    pub fn content_zoom(&self) -> f32 {
+        clamp_zoom(self.zoom)
     }
 
     pub fn has_cover(&self) -> bool {
@@ -846,6 +871,7 @@ fn blank_page(id: u64, parent: Option<u64>, kind: PageKind) -> Page {
         db: None,
         small_text: false,
         full_width: false,
+        zoom: 1.0,
         history: vec![],
     }
 }

@@ -510,8 +510,8 @@ impl LumenApp {
         );
         let cr = Rect::from_center_size(pos2(hr.right() - 18.0, hr.center().y), vec2(26.0, 26.0));
         let cresp = ui.interact(cr, Id::new("sb_collapse"), Sense::click());
-        if ui.rect_contains_pointer(hr) {
-            let h = ui.ctx().animate_bool_with_time(cresp.id, cresp.hovered(), 0.1);
+        if crate::touch::reveal(ui.rect_contains_pointer(hr)) {
+            let h = ui.ctx().animate_bool_with_time(cresp.id, cresp.hovered() || cresp.is_pointer_button_down_on(), 0.1);
             ui.painter().rect_filled(cr, 6.0, with_alpha(pal.active, h));
             icons::paint(ui.painter(), cr.center(), 15.0, Icon::ChevronLeft, pal.muted);
         }
@@ -1270,6 +1270,8 @@ impl LumenApp {
             return;
         };
         let (small, full, is_db) = (page.small_text, page.full_width, page.db.is_some());
+        let zoom0 = page.content_zoom();
+        let mut zoom = zoom0;
         let has_dash = self.ws.dash.page_board(cur).is_some();
         let (words, chars) = (nio::word_count(page), nio::char_count(page));
         let mut act: Option<u8> = None;
@@ -1295,6 +1297,16 @@ impl LumenApp {
                 ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
                 ui.add_space(4.0);
             }
+            section_label(ui, pal, "CONTENT SIZE");
+            crate::widgets::size_control(ui, pal, &mut zoom);
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                ui.label(RichText::new("Resizes the page content only — menus, the sidebar and pop-ups keep their size.").font(body(11.5)).color(pal.muted));
+            });
+            ui.add_space(3.0);
+            ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
+            ui.add_space(4.0);
             section_label(ui, pal, "PAGE STYLE");
 
             if menu_item(ui, pal, l::TYPE, if small { "Normal text size" } else { "Small text" }, None, false, false).clicked() {
@@ -1344,6 +1356,11 @@ impl LumenApp {
         });
         if !open || act.is_some() {
             self.page_menu = None;
+        }
+        if (zoom - zoom0).abs() > 1e-4 {
+            if let Some(p) = self.ws.page_mut(cur) {
+                p.zoom = zoom;
+            }
         }
         match act {
             Some(0) => {
@@ -1937,11 +1954,22 @@ impl LumenApp {
             Some(crate::touch::Swipe::Left) if narrow && self.ws.sidebar_open => self.ws.sidebar_open = false,
             _ => {}
         }
-        let st = ctx.animate_bool_with_time_and_easing(Id::new("sidebar_t"), self.ws.sidebar_open && !self.focus_mode, 0.28, egui::emath::easing::cubic_out);
+        let st = ctx.animate_bool_with_time_and_easing(Id::new("sidebar_t"), self.ws.sidebar_open && !self.focus_mode, 0.34, egui::emath::easing::cubic_in_out);
+        // The page is laid out ONCE at the width it will have when the sidebar has finished moving and then simply slides along with the
+        // sidebar edge (no text re-wrapping on every frame = no stutter). `None` = not animating: lay out at the real panel width.
+        let frozen_w: Option<f32> = if narrow {
+            (st > 0.003).then_some(screen_w)
+        } else if st > 0.003 && st < 0.997 {
+            Some(if self.ws.sidebar_open && !self.focus_mode { screen_w - SIDEBAR_W } else { screen_w })
+        } else {
+            None
+        };
         if narrow {
             if st > 0.003 {
                 let sw = SIDEBAR_W.min(screen_w * 0.88);
                 let screen = ctx.screen_rect();
+                // the drawer pushes the page (and the top bar) to the right in step with its own edge
+                egui::SidePanel::left("drawer_push").resizable(false).show_separator_line(false).exact_width(sw * st).frame(Frame::NONE).show(ctx, |_| {});
                 let bd = Area::new(Id::new("drawer_backdrop")).order(Order::Middle).fixed_pos(Pos2::ZERO).show(ctx, |ui| {
                     let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
                     ui.painter().rect_filled(r, 0.0, Color32::from_black_alpha((110.0 * st) as u8));
@@ -1951,7 +1979,7 @@ impl LumenApp {
                 });
                 ctx.move_to_top(bd.response.layer_id);
                 let dr = Area::new(Id::new("drawer")).order(Order::Middle).fixed_pos(pos2(-(1.0 - st) * sw, 0.0)).show(ctx, |ui| {
-                    Frame::new().fill(pal.sidebar).inner_margin(Margin::symmetric(8, 0)).show(ui, |ui| {
+                    Frame::new().fill(pal.sidebar).inner_margin(Margin::symmetric(8, 0)).shadow(egui::epaint::Shadow { offset: [3, 0], blur: 20, spread: 0, color: Color32::from_black_alpha((70.0 * st) as u8) }).show(ui, |ui| {
                         ui.set_min_size(vec2(sw - 16.0, screen.height()));
                         ui.set_max_width(sw - 16.0);
                         self.sidebar(ui, &pal);
@@ -1979,7 +2007,9 @@ impl LumenApp {
                 .exact_height(46.0)
                 .frame(Frame::new().fill(pal.bg))
                 .show(ctx, |ui| {
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| self.topbar(ui, &pal));
+                    frozen_layout(ui, frozen_w, |ui| {
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| self.topbar(ui, &pal));
+                    });
                 });
         }
 
@@ -1987,7 +2017,7 @@ impl LumenApp {
         if let Some(t) = crate::dashcfg::take_toast() {
             self.toast(t, None);
         }
-        egui::CentralPanel::default().frame(Frame::new().fill(pal.bg)).show(ctx, |ui| {
+        egui::CentralPanel::default().frame(Frame::new().fill(pal.bg)).show(ctx, |ui| frozen_layout(ui, frozen_w, |ui| {
             match crate::views::mode() {
                 crate::views::Mode::Dashboard => {
                     let nav = crate::dashboard::show(ui, &mut self.ws, &pal);
@@ -2065,7 +2095,7 @@ impl LumenApp {
             if changed {
                 ws.touch(cur);
             }
-        });
+        }));
 
         // computed properties (formulas / rollups), undo stack and page versions
         let tnow = now_ms() / 1000.0;
@@ -2125,6 +2155,22 @@ impl LumenApp {
 }
 
 // ───────────── helpers ─────────────
+
+/// Runs `add` in a child `Ui` that is laid out at `w` (when given) instead of the width of the panel, starting at the panel's left edge, and
+/// clipped to the panel. While the sidebar moves, the page / top bar therefore slide along with it instead of re-wrapping every frame.
+pub(crate) fn frozen_layout<R>(ui: &mut Ui, w: Option<f32>, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let r = ui.max_rect();
+    let lr = match w {
+        Some(w) => Rect::from_min_size(r.min, vec2(w.max(160.0), r.height())),
+        None => r,
+    };
+    let clip = ui.clip_rect().intersect(r);
+    ui.scope_builder(egui::UiBuilder::new().max_rect(lr), |ui| {
+        ui.set_clip_rect(clip);
+        add(ui)
+    })
+    .inner
+}
 
 pub(crate) fn ago(ms: f64) -> String {
     let s = ((now_ms() - ms) / 1000.0).max(0.0) as u64;
@@ -2283,6 +2329,9 @@ fn page_row(ui: &mut Ui, pal: &Palette, key: Id, w: f32, depth: usize, page: &Pa
     } else {
         icons::paint_page_icon(ui, ic, &page.icon, 17.0, pal.text);
     }
+    // a finger cannot hover: the + and ⋯ actions of a row are always there on touch screens
+    let hovered = crate::touch::reveal(hovered);
+    let t = if crate::touch::touchy() { 1.0 } else { t };
     let label_right = rect.right() - 6.0 - 48.0 * t;
     let clip = Rect::from_min_max(pos2(x0 + 46.0, rect.top()), pos2(label_right.max(x0 + 60.0), rect.bottom()));
     let title = if page.title.is_empty() { "Untitled" } else { &page.title };

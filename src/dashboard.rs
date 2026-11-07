@@ -522,11 +522,12 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                         ui.painter().text(chip.center(), Align2::CENTER_CENTER, d.glyph, body(13.0), pal.accent);
                         tx += 30.0;
                     }
-                    let right_w = if st.edit { 62.0 } else if hover_card { 30.0 } else { 0.0 };
+                    let show_ctl = crate::touch::reveal(hover_card); // a finger cannot hover: the ⋯ button is always there on touch screens
+                    let right_w = if st.edit { 62.0 } else if show_ctl { 30.0 } else { 0.0 };
                     text_fit(ui.painter(), pos2(tx, hr.center().y), Align2::LEFT_CENTER, &title, bold(14.0), pal.text, (hr.right() - tx - right_w - 4.0).max(30.0));
                     // header buttons
                     let mut bx = hr.right();
-                    if st.edit || hover_card || st.menu.as_ref().map_or(false, |m| matches!(m.0, Menu::Widget(id) if id == wd.id)) {
+                    if st.edit || show_ctl || st.menu.as_ref().map_or(false, |m| matches!(m.0, Menu::Widget(id) if id == wd.id)) {
                         let br = Rect::from_min_size(pos2(bx - 28.0, hr.top() - 1.0), vec2(28.0, 26.0));
                         bx -= 30.0;
                         let resp = ui.interact(br, Id::new(("dash_more", wd.id)), Sense::click());

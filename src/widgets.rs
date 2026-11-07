@@ -573,3 +573,85 @@ pub fn field_menu(ui: &Ui, pal: &Palette, resp: &Response, text: &mut String) ->
     }
     changed
 }
+
+// ───────────────────────────── content size control ─────────────────────────────
+
+/// Next content size when the user presses − / +  (5 % steps, always inside the allowed range).
+pub fn step_zoom(z: f32, dir: i32) -> f32 {
+    let pct = (crate::model::clamp_zoom(z) * 100.0).round() as i32;
+    let next = (pct / 5) * 5 + if dir > 0 { 5 } else if pct % 5 == 0 { -5 } else { 0 };
+    crate::model::clamp_zoom(next as f32 / 100.0)
+}
+
+/// Slider position (0‥1) → content size, snapped to 5 % and to 100 % when close to it.
+pub fn zoom_from_t(t: f32) -> f32 {
+    let (lo, hi) = (crate::model::ZOOM_MIN, crate::model::ZOOM_MAX);
+    let raw = lo + (hi - lo) * t.clamp(0.0, 1.0);
+    let snapped = (raw * 20.0).round() / 20.0;
+    crate::model::clamp_zoom(if (snapped - 1.0).abs() < 0.04 { 1.0 } else { snapped })
+}
+
+/// `[−] ──●────── [+] [100 %]` — resizes the *content* of the page only (the caller stores the value in the page).
+/// The 100 % chip resets. Works with mouse and finger (the track is claimed so a finger drags the knob instead of scrolling the menu).
+pub fn size_control(ui: &mut Ui, pal: &Palette, zoom: &mut f32) -> bool {
+    let (lo, hi) = (crate::model::ZOOM_MIN, crate::model::ZOOM_MAX);
+    let cur = crate::model::clamp_zoom(*zoom);
+    let mut out = cur;
+    let touchy = crate::touch::touchy();
+    let h = if touchy { 42.0 } else { 34.0 };
+    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+    let bs = h - 6.0;
+    let minus = Rect::from_center_size(pos2(row.left() + 6.0 + bs / 2.0, row.center().y), vec2(bs, bs));
+    let chip = Rect::from_center_size(pos2(row.right() - 4.0 - 24.0, row.center().y), vec2(48.0, bs));
+    let plus = Rect::from_center_size(pos2(chip.left() - 4.0 - bs / 2.0, row.center().y), vec2(bs, bs));
+    let track = Rect::from_min_max(pos2(minus.right() + 12.0, row.top()), pos2(plus.left() - 12.0, row.bottom()));
+
+    let mr = ui.interact(minus, Id::new("zoom_minus"), Sense::click());
+    let pr = ui.interact(plus, Id::new("zoom_plus"), Sense::click());
+    let cr = ui.interact(chip, Id::new("zoom_reset"), Sense::click());
+    let tr = ui.interact(track.expand2(vec2(10.0, 0.0)), Id::new("zoom_track"), Sense::click_and_drag());
+    crate::touch::claim(track.expand2(vec2(12.0, 0.0)));
+
+    paint_icon_button(ui, pal, minus, &mr, Icon::Minus, 16.0);
+    paint_icon_button(ui, pal, plus, &pr, Icon::Plus, 16.0);
+    if mr.on_hover_text("Smaller content").clicked() {
+        out = step_zoom(cur, -1);
+    }
+    if pr.on_hover_text("Larger content").clicked() {
+        out = step_zoom(cur, 1);
+    }
+    if tr.clicked() || tr.dragged() {
+        if let Some(p) = tr.interact_pointer_pos() {
+            out = zoom_from_t((p.x - track.left()) / track.width().max(1.0));
+        }
+    }
+    let (cr_id, cr_hov) = (cr.id, cr.hovered());
+    if cr.on_hover_text("Reset to 100 %").clicked() {
+        out = 1.0;
+    }
+
+    // rail, 100 % tick, filled part and knob
+    let t = ((out - lo) / (hi - lo)).clamp(0.0, 1.0);
+    let y = track.center().y;
+    let rail = Rect::from_min_max(pos2(track.left(), y - 2.0), pos2(track.right(), y + 2.0));
+    ui.painter().rect_filled(rail, 2.0, pal.active);
+    ui.painter().rect_filled(Rect::from_min_max(rail.min, pos2(track.left() + track.width() * t, rail.max.y)), 2.0, pal.accent);
+    let t100 = (1.0 - lo) / (hi - lo);
+    ui.painter().vline(track.left() + track.width() * t100, (y - 6.0)..=(y + 6.0), Stroke::new(1.0_f32, with_alpha(pal.muted, 0.6)));
+    let kn = pos2(track.left() + track.width() * t, y);
+    let active = tr.dragged() || tr.hovered();
+    ui.painter().circle_filled(kn, if active { 10.0 } else { 8.5 }, Color32::WHITE);
+    ui.painter().circle_stroke(kn, if active { 10.0 } else { 8.5 }, Stroke::new(2.0_f32, pal.accent));
+
+    let cth = ui.ctx().animate_bool_with_time(cr_id, cr_hov, 0.1);
+    ui.painter().rect_filled(chip, 6.0, with_alpha(pal.hover, cth));
+    ui.painter().text(chip.center(), Align2::CENTER_CENTER, format!("{}%", (out * 100.0).round() as i32), bold(12.5), if (out - 1.0).abs() < 0.001 { pal.muted } else { pal.text });
+
+    if (out - cur).abs() > 1e-4 {
+        *zoom = out;
+        ui.ctx().request_repaint();
+        true
+    } else {
+        false
+    }
+}

@@ -9,6 +9,7 @@ use crate::lucide as l;
 pub enum Icon {
     Menu,
     Plus,
+    Minus,
     Dots,
     Search,
     Sun,
@@ -90,6 +91,7 @@ impl Icon {
         match self {
             Icon::Menu => l::MENU,
             Icon::Plus => l::PLUS,
+            Icon::Minus => l::MINUS,
             Icon::Dots => l::ELLIPSIS,
             Icon::Search => l::SEARCH,
             Icon::Sun => l::SUN,

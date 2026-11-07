@@ -318,7 +318,8 @@ pub fn cover(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, 
         ui.painter().rect_filled(Rect::from_center_size(pos2(rect.center().x, rect.top() + 24.0), vec2(250.0, 28.0)), 14.0, Color32::from_black_alpha(150));
         ui.painter().text(pos2(rect.center().x, rect.top() + 24.0), Align2::CENTER_CENTER, "Drag the image to reposition", body(13.0), Color32::WHITE);
     }
-    let hovered = ui.rect_contains_pointer(rect) || repos;
+    // phones have no hover: the buttons are always there (and wrap onto a second row when the banner is narrow)
+    let hovered = crate::touch::reveal(ui.rect_contains_pointer(rect)) || repos;
     let t = ui.ctx().animate_bool_with_time(Id::new(("cover_h", page.id)), hovered, 0.15);
     if t > 0.01 {
         let labels: Vec<(&str, &str)> = if repos {
@@ -328,13 +329,22 @@ pub fn cover(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, 
         } else {
             vec![("cc", "Change cover"), ("cr", "Remove")]
         };
-        let mut x = rect.right() - 16.0;
+        let bh = if crate::touch::touchy() { 34.0 } else { 28.0 };
+        let right = rect.right() - 12.0;
+        let mut x = right;
+        let mut y = rect.bottom() - bh - 14.0;
         for (id, label) in labels.iter().rev() {
             let gw = ui.painter().layout_no_wrap((*label).to_owned(), body(12.5), pal.text).size().x;
-            let rr = Rect::from_min_size(pos2(x - gw - 20.0, rect.bottom() - 42.0), vec2(gw + 20.0, 28.0));
+            let bw = gw + 22.0;
+            if x - bw < rect.left() + 12.0 && x < right {
+                // does not fit next to its neighbour: next row up
+                x = right;
+                y -= bh + 8.0;
+            }
+            let rr = Rect::from_min_size(pos2(x - bw, y), vec2(bw, bh));
             x = rr.left() - 8.0;
             let resp = ui.interact(rr, Id::new((*id, page.id)), Sense::click());
-            let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+            let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || resp.is_pointer_button_down_on(), 0.1);
             ui.painter().rect_filled(rr, 6.0, with_alpha(lerp_color(pal.bg, pal.hover, h), t * 0.92));
             ui.painter().text(rr.center(), Align2::CENTER_CENTER, label, body(12.5), with_alpha(pal.text, t));
             if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {

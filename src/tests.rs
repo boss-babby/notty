@@ -923,3 +923,186 @@ fn gallery_wraps_into_rows_instead_of_growing_sideways() {
         assert!(used.2 > 300.0, "{width}px: 40 cards need several rows (height {})", used.2);
     }
 }
+
+// ───────────────────────── mobile update 3 ─────────────────────────
+
+/// Height the page content takes at a given content size (rendered headlessly on a desktop-sized screen).
+fn page_height_at(zoom: f32) -> f32 {
+    let ctx = test_ctx();
+    let mut ws = Workspace::seed();
+    let id = ws.current.unwrap();
+    {
+        let p = ws.page_mut(id).unwrap();
+        p.zoom = zoom;
+        p.blocks.clear();
+    }
+    for (k, txt) in [
+        (BlockKind::H1, "A heading"),
+        (BlockKind::Text, "Some body text that is long enough to wrap onto a second line when the content is made larger, and a third one, and so on and so on."),
+        (BlockKind::Todo, "a to-do"),
+        (BlockKind::Bullet, "a bullet"),
+        (BlockKind::Numbered, "a number"),
+        (BlockKind::Callout, "a callout"),
+        (BlockKind::Quote, "a quote"),
+    ] {
+        let b = ws.blk(k, txt, 0);
+        ws.page_mut(id).unwrap().blocks.push(b);
+    }
+    let mut ed = EditorState::default();
+    let pal = Palette::light();
+    let mut h = 0.0;
+    for i in 0..4 {
+        let mut input = RawInput::default();
+        input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 4000.0)));
+        input.time = Some(i as f64 * 0.1);
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let out = egui::ScrollArea::vertical().drag_to_scroll(false).show(ui, |ui| {
+                    editor::show_page(ui, &mut ws, id, &mut ed, &pal);
+                });
+                h = out.content_size.y;
+            });
+        });
+    }
+    h
+}
+
+#[test]
+fn content_size_scales_the_page_and_is_clamped() {
+    let (small, normal, big) = (page_height_at(0.7), page_height_at(1.0), page_height_at(1.8));
+    assert!(small < normal && normal < big, "page height must follow the content size: {small} < {normal} < {big}");
+    // damaged values never break the layout
+    for bad in [f32::NAN, 0.0, -3.0, 50.0, f32::INFINITY] {
+        let h = page_height_at(bad);
+        assert!(h.is_finite() && h > 100.0 && h < 100_000.0, "zoom {bad} gave height {h}");
+    }
+    assert_eq!(clamp_zoom(f32::NAN), 1.0);
+    assert_eq!(clamp_zoom(9.0), ZOOM_MAX);
+    assert_eq!(clamp_zoom(0.1), ZOOM_MIN);
+    // pages saved before this update have no `zoom`
+    let ws = Workspace::seed();
+    let mut v: serde_json::Value = serde_json::to_value(&ws).unwrap();
+    for p in v["pages"].as_array_mut().unwrap() {
+        p.as_object_mut().unwrap().remove("zoom");
+    }
+    let back: Workspace = serde_json::from_value(v).unwrap();
+    assert!(back.pages.iter().all(|p| (p.zoom - 1.0).abs() < f32::EPSILON));
+}
+
+#[test]
+fn size_control_steps_and_slider_mapping() {
+    use crate::widgets::{step_zoom, zoom_from_t};
+    assert_eq!(step_zoom(1.0, 1), 1.05);
+    assert_eq!(step_zoom(1.0, -1), 0.95);
+    assert_eq!(step_zoom(ZOOM_MAX, 1), ZOOM_MAX);
+    assert_eq!(step_zoom(ZOOM_MIN, -1), ZOOM_MIN);
+    let mut z = 1.0;
+    for _ in 0..40 {
+        z = step_zoom(z, 1);
+    }
+    assert_eq!(z, ZOOM_MAX);
+    for _ in 0..80 {
+        z = step_zoom(z, -1);
+    }
+    assert_eq!(z, ZOOM_MIN);
+    assert_eq!(zoom_from_t(0.0), ZOOM_MIN);
+    assert_eq!(zoom_from_t(1.0), ZOOM_MAX);
+    assert_eq!(zoom_from_t(-5.0), ZOOM_MIN);
+    let t100 = (1.0 - ZOOM_MIN) / (ZOOM_MAX - ZOOM_MIN);
+    assert_eq!(zoom_from_t(t100), 1.0);
+}
+
+/// The widget renders and the +/− buttons change the stored value (clicked with a real pointer press / release).
+#[test]
+fn size_control_buttons_work_with_a_pointer() {
+    let ctx = test_ctx();
+    let pal = Palette::light();
+    let mut zoom = 1.0_f32;
+    let size = vec2(300.0, 100.0);
+    let mut plus_center = None;
+    // layout pass: find the + button (right part of the row)
+    frame_sized(&ctx, size, 0.0, vec![], |ui| {
+        let before = ui.cursor().min;
+        crate::widgets::size_control(ui, &pal, &mut zoom);
+        let w = ui.min_rect().width();
+        plus_center = Some(pos2(before.x + w - 4.0 - 48.0 - 4.0 - 17.0, before.y + 17.0));
+    });
+    let p = plus_center.unwrap();
+    for (i, ev) in [vec![Event::PointerMoved(p)], vec![ptr(p, true)], vec![ptr(p, false)], vec![]].into_iter().enumerate() {
+        frame_sized(&ctx, size, 0.1 * (i + 1) as f64, ev, |ui| {
+            crate::widgets::size_control(ui, &pal, &mut zoom);
+        });
+    }
+    assert!(zoom > 1.0, "the + button must enlarge the content, zoom = {zoom}");
+}
+
+/// All the text the frame painted (to look for controls that must be visible).
+fn painted_text(out: &egui::FullOutput) -> String {
+    fn walk(s: &egui::epaint::Shape, acc: &mut String) {
+        match s {
+            egui::epaint::Shape::Text(t) => {
+                acc.push_str(&t.galley.text());
+                acc.push('\n');
+            }
+            egui::epaint::Shape::Vec(v) => v.iter().for_each(|x| walk(x, acc)),
+            _ => {}
+        }
+    }
+    let mut acc = String::new();
+    for c in &out.shapes {
+        walk(&c.shape, &mut acc);
+    }
+    acc
+}
+
+/// Cover buttons used to need a mouse hover and so never showed on a phone.
+#[test]
+fn cover_buttons_are_visible_on_touch_without_hover() {
+    fn run(touchy: bool, width: f32) -> String {
+        crate::touch::set_touchy(touchy);
+        let ctx = test_ctx();
+        let mut ws = Workspace::seed();
+        let id = ws.current.unwrap();
+        ws.page_mut(id).unwrap().cover = Some(2);
+        let mut ed = EditorState::default();
+        let pal = Palette::light();
+        let mut text = String::new();
+        for i in 0..8 {
+            let mut input = RawInput::default();
+            input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 800.0)));
+            input.time = Some(i as f64 * 0.1);
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    editor::show_page(ui, &mut ws, id, &mut ed, &pal);
+                });
+            });
+            text = painted_text(&out);
+        }
+        crate::touch::set_touchy(false);
+        text
+    }
+    let mouse = run(false, 1000.0);
+    assert!(!mouse.contains("Change cover"), "with a mouse the buttons appear on hover only");
+    for w in [320.0_f32, 360.0, 1000.0] {
+        let t = run(true, w);
+        assert!(t.contains("Change cover") && t.contains("Remove"), "{w}px touch: cover buttons missing in {t:?}");
+    }
+}
+
+/// While the sidebar moves, the page is laid out at one fixed width (no re-wrapping per frame) and is clipped to its panel.
+#[test]
+fn frozen_layout_keeps_the_layout_width_constant() {
+    let ctx = test_ctx();
+    let mut widths = vec![];
+    for (i, panel_w) in [1000.0_f32, 900.0, 800.0, 700.0].into_iter().enumerate() {
+        let mut input = RawInput::default();
+        input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(panel_w, 600.0)));
+        input.time = Some(i as f64 * 0.1);
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                crate::app::frozen_layout(ui, Some(700.0), |ui| widths.push(ui.available_width()));
+            });
+        });
+    }
+    assert!(widths.iter().all(|w| (*w - 700.0).abs() < 1.0), "{widths:?}");
+}

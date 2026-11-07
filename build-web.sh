@@ -10,7 +10,8 @@ WASM="${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/web/lumen.wasm"
 mkdir -p "$OUT"
 wasm-bindgen --target web --no-typescript --out-dir "$OUT" --out-name lumen "$WASM"
 BUILD=$(date -u +%Y%m%d%H%M%S)
-sed "s/__BUILD__/$BUILD/g" web/index.html > "$OUT/index.html"
+# WEB_BASE (optional) = URL prefix the folder is served from, e.g. WEB_BASE=/webapp/ lets the page also be opened at /app
+sed "s/__BUILD__/$BUILD/g; s#<!--BASE-->#${WEB_BASE:+<base href=\"$WEB_BASE\" />}#" web/index.html > "$OUT/index.html"
 VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
 printf '{"version":"%s","built":"%s"}\n' "$VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$OUT/version.json"
 if [ "${WASM_OPT:-0}" = "1" ] && command -v wasm-opt >/dev/null 2>&1; then

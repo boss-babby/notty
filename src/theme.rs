@@ -220,6 +220,8 @@ pub fn apply(ctx: &Context, p: &Palette, dark: bool) {
         s.spacing.button_padding = egui::vec2(10.0, 5.0);
         s.interaction.selectable_labels = true;
         s.animation_time = 0.12;
+        // a tapped control stays "hovered" on touch screens — its tooltip would hang on screen until the next tap
+        s.interaction.tooltip_delay = if crate::touch::touchy() { 1.0e6 } else { 0.5 };
         s.spacing.scroll = egui::style::ScrollStyle::floating();
         if crate::touch::touchy() {
             // finger-sized targets: ≥ 38 pt rows, roomier padding, bigger check boxes / radio buttons
