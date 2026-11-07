@@ -1,0 +1,22 @@
+{
+  "name": "Lumen — workspace",
+  "short_name": "Lumen",
+  "description": "Notes, databases and dashboards — a Notion + Obsidian alternative written entirely in Rust, running as WebAssembly.",
+  "id": "/app",
+  "start_url": "/app",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "categories": ["productivity", "business", "utilities"],
+  "icons": [
+    { "src": "/webapp/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/webapp/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/webapp/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "New page", "short_name": "New", "url": "/app", "icons": [{ "src": "/webapp/icons/icon-192.png", "sizes": "192x192" }] }
+  ]
+}

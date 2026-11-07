@@ -489,6 +489,8 @@ fn install_pointerdown(runner_ref: &WebRunner, target: &EventTarget) -> Result<(
                 event.stop_propagation();
                 return;
             }
+            // a real mouse / pen: desktop keyboard behaviour (the focused text field owns the hidden input)
+            super::kbd::set_touch_mode(false);
             let modifiers = modifiers_from_mouse_event(&event);
             runner.input.raw.modifiers = modifiers;
             let mut should_propagate = false;
@@ -641,6 +643,9 @@ fn install_touchstart(runner_ref: &WebRunner, target: &EventTarget) -> Result<()
             let mut should_propagate = false;
             // The touch event goes first so that the app's gesture layer knows a finger is down before it sees the press.
             let primary = primary_touch_pos(runner, &event);
+            if let Some((pos, _)) = primary {
+                super::kbd::touch_start(pos, event.touches().length(), super::kbd::event_time(event.time_stamp()));
+            }
             push_touches(runner, egui::TouchPhase::Start, &event);
             if let Some((pos, _)) = primary {
                 let egui_event = egui::Event::PointerButton {
@@ -671,6 +676,7 @@ fn install_touchmove(runner_ref: &WebRunner, target: &EventTarget) -> Result<(),
                 runner,
                 egui::pos2(touch.client_x() as f32, touch.client_y() as f32),
             ) {
+                super::kbd::touch_move(pos, super::kbd::event_time(event.time_stamp()));
                 let egui_event = egui::Event::PointerMoved(pos);
                 let should_propagate = (runner.web_options.should_propagate_event)(&egui_event);
                 runner.input.raw.events.push(egui_event);
@@ -695,6 +701,8 @@ fn install_touchend(runner_ref: &WebRunner, target: &EventTarget) -> Result<(), 
                 runner,
                 egui::pos2(touch.client_x() as f32, touch.client_y() as f32),
             ) {
+                // A short, motionless touch is a tap: it may open the soft keyboard (src/web/kbd.rs).
+                super::kbd::touch_end(pos, super::kbd::event_time(event.time_stamp()));
                 // First release mouse to click:
                 let mut should_propagate = false;
                 let egui_event = egui::Event::PointerButton {
@@ -736,6 +744,7 @@ fn install_touchcancel(runner_ref: &WebRunner, target: &EventTarget) -> Result<(
         target,
         "touchcancel",
         |event: web_sys::TouchEvent, runner| {
+            super::kbd::touch_cancel();
             push_touches(runner, egui::TouchPhase::Cancel, &event);
             event.stop_propagation();
             event.prevent_default();
@@ -975,9 +984,18 @@ fn get_display_size(resize_observer_entries: &js_sys::Array) -> Result<(u32, u32
         // Unfortunately this doesn't work perfectly everywhere.
         let size: web_sys::ResizeObserverSize =
             entry.device_pixel_content_box_size().at(0).dyn_into()?;
-        width = size.inline_size();
-        height = size.block_size();
+        let (mut w, mut h) = (size.inline_size(), size.block_size());
         dpr = 1.0; // no need to apply
+        // Sanity check: some browsers / emulators report the *CSS* size here, which leaves the canvas dpr× too small (the whole UI is drawn
+        // dpr× too big and taps land on the wrong widget). The device-pixel size must be ≈ CSS size × devicePixelRatio, otherwise use that.
+        let css = entry.content_rect();
+        let (ew, eh) = (css.width() * web_sys::window().unwrap().device_pixel_ratio(), css.height() * web_sys::window().unwrap().device_pixel_ratio());
+        if (w - ew).abs() > 2.0 + ew * 0.01 || (h - eh).abs() > 2.0 + eh * 0.01 {
+            w = ew;
+            h = eh;
+        }
+        width = w;
+        height = h;
 
         if DEBUG_RESIZE {
             // log::info!("devicePixelContentBoxSize {width}x{height}");

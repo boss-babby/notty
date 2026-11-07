@@ -1106,3 +1106,61 @@ fn frozen_layout_keeps_the_layout_width_constant() {
     }
     assert!(widths.iter().all(|w| (*w - 700.0).abs() < 1.0), "{widths:?}");
 }
+
+/// Phones: the page heading is smaller and WRAPS — a long title is fully visible instead of running off the right edge; desktop keeps one line.
+#[test]
+fn long_page_title_wraps_and_fits_on_a_phone() {
+    fn title_rect(compact: bool, width: f32, title: &str) -> Rect {
+        crate::touch::set_touchy(compact);
+        crate::touch::set_narrow(compact);
+        let ctx = test_ctx();
+        let mut ws = Workspace::seed();
+        let id = ws.current.unwrap();
+        ws.page_mut(id).unwrap().title = title.to_owned();
+        let mut ed = EditorState::default();
+        let pal = Palette::light();
+        for i in 0..6 {
+            let mut input = RawInput::default();
+            input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 800.0)));
+            input.time = Some(i as f64 * 0.1);
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    editor::show_page(ui, &mut ws, id, &mut ed, &pal);
+                });
+            });
+        }
+        let r = ctx.read_response(egui::Id::new(("title", id))).expect("title widget").rect;
+        crate::touch::set_touchy(false);
+        crate::touch::set_narrow(false);
+        r
+    }
+    let long = "A very long page heading that cannot possibly fit on one line of a small phone screen";
+    for w in [320.0_f32, 360.0, 390.0, 430.0] {
+        let r = title_rect(true, w, long);
+        assert!(r.right() <= w + 0.5, "{w}px: the heading runs off the screen (right edge {})", r.right());
+        assert!(r.height() > 60.0, "{w}px: the heading must wrap onto several lines (height {})", r.height());
+    }
+    let short = title_rect(true, 360.0, "Notes");
+    assert!(short.height() < 60.0, "a short heading stays on one line (height {})", short.height());
+}
+
+/// Keyboard policy (pure part): a caret that stays outside the visible area is reported, a visible one never is.
+#[cfg(test)]
+mod kbd_rules {
+    #[test]
+    fn hidden_caret_rules_are_documented_in_the_vendor_patch() {
+        // The policy itself lives in vendor/eframe/src/web/kbd.rs (wasm only: it needs `window`). Guard the contract it relies on:
+        // the hidden input is only focused after a tap, a swipe closes it, a hidden caret closes it.
+        let kbd = include_str!("../vendor/eframe/src/web/kbd.rs");
+        let runner = include_str!("../vendor/eframe/src/web/app_runner.rs");
+        for needle in ["pub fn tap_in", "pub fn take_dismiss", "pub fn caret_hidden_too_long", "pub fn keyboard_visible"] {
+            assert!(kbd.contains(needle), "kbd.rs lost `{needle}`");
+        }
+        for needle in ["kbd::take_dismiss()", "kbd::caret_hidden_too_long(", "kbd::tap_in(ime.rect)"] {
+            assert!(runner.contains(needle), "app_runner.rs no longer applies `{needle}`");
+        }
+        // focus() of the hidden input may only be reached from the tap branch / the Android re-focus branch in touch mode
+        let touch_fn = runner.split("fn touch_keyboard").nth(1).expect("touch_keyboard");
+        assert_eq!(touch_fn.matches("self.text_agent.focus()").count(), 2);
+    }
+}

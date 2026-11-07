@@ -12,3 +12,5 @@
 5. `mod.rs` — `native_pixels_per_point()` is the plain `devicePixelRatio` again (5.5 capped it at 2 on touch devices). The cap made the canvas
    (sized in *device* pixels by the ResizeObserver) and the logical coordinates (CSS pixels from touch events) disagree on 3× phones, so a
    tap landed on a different widget than the one under the finger. Never decouple the pixels-per-point from the device pixel ratio.
+6. `kbd.rs` (new) + `events.rs` + `app_runner.rs` — touch keyboard policy: tap-to-open, swipe-to-close, hidden-caret-closes, Android re-focus (see README "Mobile update 3").
+7. `events.rs` — `get_display_size` cross-checks `devicePixelContentBoxSize` against `contentBoxSize × devicePixelRatio`.

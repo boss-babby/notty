@@ -811,15 +811,30 @@ fn header(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, con
         let tid = Id::new(("title", page.id));
         let title_focused = ui.memory(|m| m.has_focus(tid));
         let enter = title_focused && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+        // Phones: a smaller heading that WRAPS (a single 40 pt line is wider than the screen and could not be scrolled to the end).
+        // The size also steps down for long titles. Desktop keeps the single 40 pt line.
+        let phone = crate::touch::compact();
+        let size = if phone {
+            let n = page.title.chars().count();
+            (if n > 48 { 22.0 } else if n > 26 { 26.0 } else { 30.0 }) * ed.scale.max(0.5)
+        } else {
+            40.0 * ed.scale.max(0.5)
+        };
+        let w = if phone { (content_w - 4.0).max(80.0) } else { content_w };
+        let edit = if phone { TextEdit::multiline(&mut page.title).desired_rows(1) } else { TextEdit::singleline(&mut page.title) };
         let r = ui.add(
-            TextEdit::singleline(&mut page.title)
-                .id(tid)
+            edit.id(tid)
                 .frame(false)
-                .font(bold(40.0 * ed.scale.max(0.5)))
-                .hint_text(RichText::new("Untitled").font(bold(40.0 * ed.scale.max(0.5))).color(with_alpha(pal.muted, 0.55)))
-                .desired_width(content_w)
+                .font(bold(size))
+                .hint_text(RichText::new("Untitled").font(bold(size)).color(with_alpha(pal.muted, 0.55)))
+                .desired_width(w)
                 .margin(Margin::symmetric(0, 4)),
         );
+        if phone && page.title.contains('\n') {
+            // a title is one paragraph: pasted line breaks become spaces
+            page.title = page.title.replace("\r\n", " ").replace('\n', " ");
+            changed = true;
+        }
         changed |= r.changed();
         changed |= widgets::field_menu(ui, pal, &r, &mut page.title);
         if enter && page.kind == PageKind::Doc {
@@ -2452,6 +2467,21 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         if let Some(cr) = out.cursor_range {
             let r = out.galley.pos_from_cursor(&cr.primary).translate(out.galley_pos.to_vec2());
             ui.scroll_to_rect(r.expand2(vec2(0.0, 72.0)), None);
+        }
+    }
+    // Phones: when the visible height changes (the soft keyboard opens / closes, the phone is rotated) bring the caret of the block that is
+    // being edited back into view once — otherwise a block in the lower half of the screen ends up below the keyboard. Only on a size
+    // change, so it never fights a swipe that scrolls the page.
+    if crate::touch::touchy() && focused {
+        let h = ctx.screen_rect().height();
+        let key = id.with("kb_view_h");
+        let prev: Option<f32> = ctx.data(|d| d.get_temp(key));
+        if prev.map_or(true, |p| (p - h).abs() > 1.0) {
+            ctx.data_mut(|d| d.insert_temp(key, h));
+            if let Some(cr) = out.cursor_range {
+                let r = out.galley.pos_from_cursor(&cr.primary).translate(out.galley_pos.to_vec2());
+                ui.scroll_to_rect(r.expand2(vec2(0.0, 72.0)), None);
+            }
         }
     }
 

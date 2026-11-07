@@ -2003,8 +2003,10 @@ impl LumenApp {
         }
 
         if !self.focus_mode {
+            // Short screens (a phone in landscape, or a portrait phone with the keyboard up) get a slimmer bar so the page keeps its room.
+            let bar_h = if crate::touch::touchy() && ctx.screen_rect().height() < 440.0 { 40.0 } else { 46.0 };
             egui::TopBottomPanel::top("topbar")
-                .exact_height(46.0)
+                .exact_height(bar_h)
                 .frame(Frame::new().fill(pal.bg))
                 .show(ctx, |ui| {
                     frozen_layout(ui, frozen_w, |ui| {

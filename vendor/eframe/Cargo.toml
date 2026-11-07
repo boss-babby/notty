@@ -328,6 +328,7 @@ features = [
     "InputEvent",
     "KeyboardEvent",
     "Location",
+    "VisualViewport",
     "MediaQueryList",
     "MediaQueryListEvent",
     "MouseEvent",

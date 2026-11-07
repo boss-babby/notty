@@ -352,7 +352,12 @@ impl AppRunner {
             super::set_clipboard_text(&copied_text);
         }
 
-        if self.has_focus() {
+        if super::kbd::touch_mode() {
+            super::kbd::keyboard_visible(); // keeps the "no keyboard" viewport height fresh
+            if self.has_focus() {
+                self.touch_keyboard(ime);
+            }
+        } else if self.has_focus() {
             // The eframe app has focus.
             if ime.is_some() {
                 // We are editing text: give the focus to the text agent.
@@ -397,6 +402,78 @@ impl AppRunner {
                 "failed to update text agent position: {}",
                 super::string_from_js_value(&err)
             );
+        }
+    }
+
+    /// Soft-keyboard handling while a finger is the input device (see `kbd.rs` for the rules and the reasons).
+    fn touch_keyboard(&self, ime: Option<egui::output::IMEOutput>) {
+        use super::kbd;
+        let agent_focused = self.text_agent.has_focus();
+
+        // 2. a scroll swipe closes the keyboard (and is never followed by a re-open: only a tap opens it)
+        if kbd::take_dismiss() && agent_focused {
+            self.text_agent.blur();
+            self.canvas().focus().ok();
+            kbd::reset_hidden();
+            return;
+        }
+
+        let Some(ime) = ime else {
+            // Not editing text. Text fields lose / regain the caret for a frame or two (a block is rebuilt, the caret moves to the
+            // next block …): blur only after a grace period, never on every such frame.
+            if agent_focused {
+                let now = now_sec();
+                let since = match self.ime_idle_since.get() {
+                    Some(t) => t,
+                    None => {
+                        self.ime_idle_since.set(Some(now));
+                        now
+                    }
+                };
+                if now - since > super::text_agent::KEYBOARD_GRACE_SECS {
+                    self.ime_idle_since.set(None);
+                    self.text_agent.blur();
+                    self.canvas().focus().ok();
+                } else {
+                    self.egui_ctx.request_repaint_after(std::time::Duration::from_millis(
+                        (super::text_agent::KEYBOARD_GRACE_SECS * 1000.0) as u64 + 30,
+                    ));
+                }
+            } else if !super::has_focus(self.canvas()) {
+                self.canvas().focus().ok();
+            }
+            kbd::reset_hidden();
+            return;
+        };
+        self.ime_idle_since.set(None);
+
+        if agent_focused {
+            // 3. the caret is below the keyboard / above the top of the screen and stays there: close the keyboard
+            let visible = self.egui_ctx.screen_rect();
+            if kbd::caret_hidden_too_long(ime.cursor_rect, visible) {
+                self.text_agent.blur();
+                self.canvas().focus().ok();
+                self.egui_ctx.request_repaint();
+                return;
+            }
+            if !visible.contains(ime.cursor_rect.center()) {
+                self.egui_ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
+            // 4. Android's back button hides the keyboard but leaves the input focused: a tap on the field brings it back
+            if kbd::tap_in(ime.rect) {
+                kbd::consume_tap();
+                if !kbd::keyboard_visible() {
+                    self.text_agent.blur();
+                    self.text_agent.focus();
+                }
+            }
+        } else if kbd::tap_in(ime.rect) {
+            // 1. a deliberate tap on the text field that is being edited opens the keyboard — nothing else does
+            kbd::consume_tap();
+            kbd::reset_hidden();
+            self.text_agent.focus();
+        } else if !super::has_focus(self.canvas()) {
+            self.canvas().focus().ok();
         }
     }
 }
