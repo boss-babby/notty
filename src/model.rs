@@ -45,6 +45,8 @@ pub enum BlockKind {
     DbView,
     /// A dashboard widget placed inside the page (`media` = id of the widget on the hidden store board, see `inlinew.rs`).
     Widget,
+    /// One-click automation button: `text` = label, `acts` = what it does (see `automation.rs`).
+    Button,
 }
 
 impl BlockKind {
@@ -64,7 +66,7 @@ impl BlockKind {
     ];
 
     pub fn has_text(self) -> bool {
-        !matches!(self, BlockKind::Divider | BlockKind::Toc | BlockKind::PageLink | BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File | BlockKind::Columns | BlockKind::Column | BlockKind::DbView | BlockKind::Widget)
+        !matches!(self, BlockKind::Divider | BlockKind::Toc | BlockKind::PageLink | BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File | BlockKind::Columns | BlockKind::Column | BlockKind::DbView | BlockKind::Widget | BlockKind::Button)
     }
 
     pub fn label(self) -> &'static str {
@@ -91,6 +93,7 @@ impl BlockKind {
             BlockKind::Column => "Column",
             BlockKind::DbView => "Linked database view",
             BlockKind::Widget => "Dashboard widget",
+            BlockKind::Button => "Button",
         }
     }
 
@@ -118,6 +121,7 @@ impl BlockKind {
             BlockKind::Column => "A column.",
             BlockKind::DbView => "Show a filtered view of any database right here.",
             BlockKind::Widget => "Place a dashboard widget (chart, number, tasks …) in the page.",
+            BlockKind::Button => "One click runs actions: set properties, create tasks, move rows, notify.",
         }
     }
 
@@ -144,6 +148,7 @@ impl BlockKind {
             BlockKind::Columns | BlockKind::Column => l::COLUMNS_2,
             BlockKind::DbView => l::TABLE_2,
             BlockKind::Widget => l::CHART_PIE,
+            BlockKind::Button => l::MOUSE_POINTER_2,
         }
     }
 
@@ -170,6 +175,7 @@ impl BlockKind {
             BlockKind::Columns | BlockKind::Column => "columns layout side by side split grid",
             BlockKind::DbView => "linked database view filter embed table inline",
             BlockKind::Widget => "widget chart kpi number gauge stats dashboard",
+            BlockKind::Button => "button automation action click run rule trigger macro",
         }
     }
 }
@@ -209,11 +215,14 @@ pub struct Block {
     /// Video blocks: 1 = autoplay, 2 = muted, 4 = loop. (`size` holds the aspect ratio: 0 = 16:9, 1 = 4:3, 2 = 21:9, 3 = 1:1, 4 = 9:16.)
     #[serde(default)]
     pub vopts: u8,
+    /// Button blocks: the automation actions one click runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acts: Vec<crate::automation::Action>,
 }
 
 impl Block {
     pub fn new(id: u64, kind: BlockKind, text: &str, indent: u8) -> Block {
-        Block { id, kind, text: text.into(), checked: false, indent, collapsed: false, color: 0, bg: 0, link: None, url: String::new(), media: 0, size: 0, start: 0, vopts: 0 }
+        Block { id, kind, text: text.into(), checked: false, indent, collapsed: false, color: 0, bg: 0, link: None, url: String::new(), media: 0, size: 0, start: 0, vopts: 0, acts: vec![] }
     }
 
     /// Source string of a media block: `media:<id>` for local files, otherwise the URL.
@@ -718,6 +727,9 @@ pub struct Page {
     /// Versioned snapshots (oldest first), see `history.rs`.
     #[serde(default)]
     pub history: Vec<Version>,
+    /// Repeat rules of this row's date properties (date property id → rule), see `automation.rs`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub repeats: BTreeMap<u64, crate::automation::Repeat>,
 }
 
 /// A saved snapshot of a page's content.
@@ -762,6 +774,7 @@ impl Page {
             full_width: self.full_width,
             zoom: self.zoom,
             history: vec![],
+            repeats: self.repeats.clone(),
         }
     }
 
@@ -793,6 +806,9 @@ pub struct Workspace {
     /// Customisable dashboard: boards of widgets (see `dashcfg.rs`).
     #[serde(default)]
     pub dash: crate::dashcfg::Dash,
+    /// Automations: rules, reminders, notification inbox and run log (see `automation.rs`).
+    #[serde(default)]
+    pub auto: crate::automation::AutoState,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
@@ -873,6 +889,7 @@ fn blank_page(id: u64, parent: Option<u64>, kind: PageKind) -> Page {
         full_width: false,
         zoom: 1.0,
         history: vec![],
+        repeats: BTreeMap::new(),
     }
 }
 
@@ -1629,7 +1646,7 @@ impl Workspace {
     // ───────── first-run content ─────────
 
     pub fn seed() -> Self {
-        let mut ws = Workspace { name: "My Workspace".into(), pages: vec![], next_id: 0, current: None, dark: false, sidebar_open: true, accent: 0, icons_v2: false, pdf_annots: BTreeMap::new(), dash: Default::default() };
+        let mut ws = Workspace { name: "My Workspace".into(), pages: vec![], next_id: 0, current: None, dark: false, sidebar_open: true, accent: 0, icons_v2: false, pdf_annots: BTreeMap::new(), dash: Default::default(), auto: Default::default() };
         use BlockKind::*;
 
         let start = ws.add_page(None, PageKind::Doc);

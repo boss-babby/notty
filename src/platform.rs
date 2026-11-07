@@ -431,3 +431,163 @@ pub fn coarse_pointer() -> bool {
 pub fn coarse_pointer() -> bool {
     false
 }
+
+// ───────────────────────────── time zone ─────────────────────────────
+
+/// Minutes to add to UTC to get local time (native builds). Windows asks the OS; elsewhere `LUMEN_TZ_MIN` or UTC.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn tz_offset_minutes() -> i64 {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct SystemTime([u16; 8]);
+        #[repr(C)]
+        struct Tzi {
+            bias: i32,
+            std_name: [u16; 32],
+            std_date: SystemTime,
+            std_bias: i32,
+            dst_name: [u16; 32],
+            dst_date: SystemTime,
+            dst_bias: i32,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetTimeZoneInformation(info: *mut Tzi) -> u32;
+        }
+        // SAFETY: plain C struct filled by the OS; zeroed is a valid initial value.
+        unsafe {
+            let mut t: Tzi = std::mem::zeroed();
+            let r = GetTimeZoneInformation(&mut t);
+            let bias = t.bias + match r {
+                1 => t.std_bias,
+                2 => t.dst_bias,
+                _ => 0,
+            };
+            -(bias as i64)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("LUMEN_TZ_MIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    }
+}
+
+// ───────────────────────────── notifications ─────────────────────────────
+//
+// Windows: a native toast (PowerShell → Windows.UI.Notifications, no console window, no extra dependency).
+// Web: the page's `lumenNotify` bridge (web/index.html) → service-worker `showNotification` (works for installed PWAs and on phones).
+// Other desktops: `notify-send` / `osascript` when present.
+
+/// Permission state of web notifications: "granted", "denied", "default" or "unsupported". Desktop builds are always "granted".
+pub fn notify_permission() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+        if let Some(w) = web_sys::window() {
+            if let Ok(f) = js_sys::Reflect::get(&w, &"lumenNotifyState".into()) {
+                if let Some(f) = f.dyn_ref::<js_sys::Function>() {
+                    if let Ok(v) = f.call0(&w) {
+                        return v.as_string().unwrap_or_else(|| "unsupported".into());
+                    }
+                }
+            }
+        }
+        "unsupported".into()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    "granted".into()
+}
+
+/// Asks the browser for notification permission (must run inside a click handler). No-op on desktop.
+pub fn notify_request() {
+    #[cfg(target_arch = "wasm32")]
+    call_bridge("lumenNotifyRequest", &[]);
+}
+
+/// Shows a system notification right now.
+pub fn notify_os(title: &str, body: &str, tag: &str) {
+    #[cfg(target_arch = "wasm32")]
+    call_bridge("lumenNotify", &[title.into(), body.into(), tag.into()]);
+    #[cfg(windows)]
+    windows_toast(title, body);
+    #[cfg(all(not(windows), not(target_arch = "wasm32")))]
+    {
+        let _ = tag;
+        #[cfg(target_os = "macos")]
+        {
+            let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+            let _ = std::process::Command::new("osascript").arg("-e").arg(format!("display notification \"{}\" with title \"{}\"", esc(body), esc(title))).spawn();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = std::process::Command::new("notify-send").arg("--app-name=Lumen").arg(title).arg(body).spawn();
+        }
+    }
+}
+
+/// Hands the upcoming reminders (JSON: `[{"at": epoch_ms, "title", "body", "tag"}]`) to the page so the browser can fire them
+/// with its own timers even while the tab is in the background and the canvas is not repainting. No-op on desktop.
+pub fn schedule_push(json: &str) {
+    #[cfg(target_arch = "wasm32")]
+    call_bridge("lumenSchedule", &[json.into()]);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = json;
+}
+
+#[cfg(target_arch = "wasm32")]
+fn call_bridge(name: &str, args: &[wasm_bindgen::JsValue]) {
+    use wasm_bindgen::JsCast;
+    let Some(w) = web_sys::window() else { return };
+    let Ok(f) = js_sys::Reflect::get(&w, &name.into()) else { return };
+    let Some(f) = f.dyn_ref::<js_sys::Function>() else { return };
+    let arr = js_sys::Array::new();
+    for a in args {
+        arr.push(a);
+    }
+    let _ = f.apply(&w, &arr);
+}
+
+#[cfg(windows)]
+fn windows_toast(title: &str, body: &str) {
+    use std::os::windows::process::CommandExt;
+    fn xml(s: &str) -> String {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
+    }
+    let script = format!(
+        "$ErrorActionPreference='Stop';\
+         [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;\
+         [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null;\
+         $x = New-Object Windows.Data.Xml.Dom.XmlDocument;\
+         $x.LoadXml('<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual></toast>');\
+         $t = [Windows.UI.Notifications.ToastNotification]::new($x);\
+         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe').Show($t)",
+        xml(title),
+        xml(body)
+    );
+    // -EncodedCommand = base64 of the UTF-16LE script: no quoting problems whatever the text contains.
+    let mut bytes = Vec::with_capacity(script.len() * 2);
+    for u in script.encode_utf16() {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    let enc = base64(&bytes);
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &enc])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+}
+
+#[cfg(windows)]
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len() * 4 / 3 + 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}

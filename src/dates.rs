@@ -31,13 +31,39 @@ pub fn civil_from_days(z: i64) -> (i32, u32, u32) {
 
 /// Today's local date (browser local time on the web, UTC on native).
 pub fn today() -> (i32, u32, u32) {
-    #[allow(unused_mut)]
-    let mut ms = now_ms();
+    civil_from_days(now_local_min().div_euclid(1440))
+}
+
+/// Minutes to add to UTC to get local wall-clock time (browser time zone on the web, the Windows time zone natively).
+pub fn tz_offset_min() -> i64 {
     #[cfg(target_arch = "wasm32")]
     {
-        ms -= js_sys::Date::new_0().get_timezone_offset() * 60_000.0;
+        -(js_sys::Date::new_0().get_timezone_offset() as i64)
     }
-    civil_from_days((ms / 86_400_000.0).floor() as i64)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        crate::platform::tz_offset_minutes()
+    }
+}
+
+/// Local wall-clock time as whole minutes since 1970-01-01 00:00 (local). `div_euclid(1440)` = local day number.
+pub fn now_local_min() -> i64 {
+    (now_ms() / 60_000.0).floor() as i64 + tz_offset_min()
+}
+
+/// "09:30" for minutes after midnight.
+pub fn hhmm(min: u16) -> String {
+    format!("{:02}:{:02}", min / 60, min % 60)
+}
+
+/// Parses "9:30", "09:30", "930" or "9" (hours) into minutes after midnight.
+pub fn parse_hhmm(s: &str) -> Option<u16> {
+    let s = s.trim();
+    let (h, m) = match s.split_once(':') {
+        Some((h, m)) => (h.trim().parse::<u16>().ok()?, m.trim().parse::<u16>().ok()?),
+        None => (s.parse::<u16>().ok()?, 0),
+    };
+    (h < 24 && m < 60).then_some(h * 60 + m)
 }
 
 /// 0 = Monday … 6 = Sunday.
@@ -137,4 +163,9 @@ pub fn today_day() -> i64 {
 pub fn long_today() -> String {
     let (y, m, d) = today();
     format!("{} {d}, {y}", MONTHS[m as usize - 1])
+}
+
+/// 0 = Monday … 6 = Sunday for a day number.
+pub fn weekday_of_day(day: i64) -> u32 {
+    (day + 3).rem_euclid(7) as u32
 }

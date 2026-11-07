@@ -47,6 +47,48 @@
     <div id="bar" class="indeterminate"><div id="fill"></div></div>
     <div id="err"></div>
   </div>
+  <script>
+    // ── notifications bridge (called from Rust, see src/platform.rs) ─────────────────────────────────────────────────────
+    // lumenNotifyState()          → "granted" | "denied" | "default" | "unsupported"
+    // lumenNotifyRequest()        → asks for permission (needs a user gesture: the app calls it from a click)
+    // lumenNotify(title, body, tag) → shows a system notification through the service worker (works for installed PWAs / phones)
+    // lumenSchedule(json)         → [{at, title, body, tag}] reminders of the next hours; fired by setTimeout so they work in a
+    //                               background tab where the canvas is not repainting. Persisted so a reload re-arms them.
+    (function () {
+      const shown = new Map();           // tag → time, de-duplicates the Rust-side and the timer-side notification
+      let timers = [];
+      const supported = () => "Notification" in window;
+      window.lumenNotifyState = () => (supported() ? Notification.permission : "unsupported");
+      window.lumenNotifyRequest = () => { if (supported() && Notification.permission === "default") Notification.requestPermission().catch(() => {}); };
+      async function show(title, body, tag) {
+        if (!supported() || Notification.permission !== "granted") return;
+        const now = Date.now();
+        if (tag && shown.has(tag) && now - shown.get(tag) < 10 * 60 * 1000) return;
+        if (tag) shown.set(tag, now);
+        const opts = { body: body || "", tag: tag || undefined, icon: "icons/icon-192.png", badge: "icons/icon-192.png", data: { url: "/app" }, renotify: false };
+        try {
+          const reg = "serviceWorker" in navigator ? await navigator.serviceWorker.getRegistration("/") : null;
+          if (reg && reg.showNotification) { await reg.showNotification(title, opts); return; }
+        } catch (_) {}
+        try { new Notification(title, opts); } catch (_) {}
+      }
+      window.lumenNotify = (title, body, tag) => { show(String(title), String(body), String(tag || "")); };
+      function arm(items) {
+        timers.forEach(clearTimeout); timers = [];
+        const now = Date.now();
+        for (const it of items) {
+          const wait = it.at - now;
+          if (wait < -60000 || wait > 48 * 3600 * 1000) continue;
+          timers.push(setTimeout(() => show(it.title, it.body, it.tag), Math.max(0, wait)));
+        }
+      }
+      window.lumenSchedule = (json) => {
+        try { const items = JSON.parse(json); localStorage.setItem("lumen_push_schedule", json); arm(items); } catch (_) {}
+      };
+      // re-arm after a reload (the app pushes a fresh list as soon as it is running)
+      try { const j = localStorage.getItem("lumen_push_schedule"); if (j) arm(JSON.parse(j)); } catch (_) {}
+    })();
+  </script>
   <script type="module">
     import init, { LumenWeb } from "./lumen.js?v=__BUILD__";
 

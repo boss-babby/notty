@@ -48,54 +48,24 @@ fn chips(ui: &mut Ui, pal: &Palette, area: Rect, key: Id, items: &[(&str, bool)]
     hit
 }
 
-struct Ph<'a> {
-    icon: &'a str,
-    title: &'a str,
-    hint: &'a str,
-    upload: Option<(bool, &'a str)>,
-    button: &'a str,
-}
+use crate::uploader::{self, Spec};
 
-/// "Add a …" card with a link field and (where supported) an upload button.
-fn placeholder(ui: &mut Ui, b: &mut Block, ph: Ph, target: Option<PickTarget>, pal: &Palette, w: f32) -> bool {
-    let ctx = ui.ctx().clone();
-    let mut changed = false;
-    let id = Id::new(("media_in", b.id));
-    let mut buf: String = ctx.data(|d| d.get_temp(id)).unwrap_or_default();
-    Frame::new()
-        .fill(pal.hover)
-        .stroke(Stroke::new(1.0_f32, pal.border))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(16, 14))
-        .show(ui, |ui| {
-            ui.set_width(w - 34.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(ph.icon).font(icons::font(20.0)).color(pal.muted));
-                ui.label(RichText::new(ph.title).font(bold(15.0)).color(pal.text));
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                let r = ui.add(TextEdit::singleline(&mut buf).id(id.with("te")).hint_text(ph.hint).desired_width((w - 34.0 - 250.0).max(120.0)).margin(Margin::symmetric(8, 8)));
-                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                if (widgets::primary_button(ui, pal, ph.button, 112.0).clicked() || enter) && !buf.trim().is_empty() {
-                    b.url = media::normalize_url(&buf);
-                    b.media = 0;
-                    buf.clear();
-                    changed = true;
-                }
-                if let (Some((images_only, label)), Some(t)) = (ph.upload, target) {
-                    if platform::can_pick_files() && widgets::ghost_button(ui, pal, label).clicked() {
-                        platform::pick_file(ui.ctx(), t, images_only);
-                    }
-                }
-            });
-            if ph.upload.is_some() && !platform::can_pick_files() {
-                ui.add_space(4.0);
-                ui.label(RichText::new("Tip: drop a file onto the window to add it to this page.").font(body(12.5)).color(pal.muted));
-            }
-        });
-    ctx.data_mut(|d| d.insert_temp(id, buf));
-    changed
+const IMG_CHIPS: &[&str] = &["PNG", "JPG", "GIF", "WebP"];
+const FILE_CHIPS: &[&str] = &["PDF", "DOCX", "XLSX", "ZIP", "MP3", "any file"];
+const PROVIDERS: &[(&str, &str)] = &[
+    (l::YOUTUBE, "YouTube"),
+    (l::VIDEO, "Vimeo"),
+    (l::MONITOR_PLAY, "Loom"),
+    (l::MUSIC, "Spotify"),
+    (l::FIGMA, "Figma"),
+    (l::MAP, "Google Maps"),
+    (l::CODE_XML, "CodePen"),
+    (l::FILE_TEXT, "Google Docs"),
+];
+
+/// "Add a …" card: segmented Upload | Link switch, dashed drop zone, rounded link field (see `uploader.rs`).
+fn placeholder(ui: &mut Ui, b: &mut Block, spec: &Spec, target: Option<PickTarget>, pal: &Palette, w: f32) -> bool {
+    uploader::block_card(ui, b, spec, target, pal, w)
 }
 
 fn caption(ui: &mut Ui, b: &mut Block, pal: &Palette, width: f32, open_req: bool) -> bool {
@@ -125,8 +95,8 @@ fn caption(ui: &mut Ui, b: &mut Block, pal: &Palette, width: f32, open_req: bool
 fn image(ui: &mut Ui, b: &mut Block, page_id: u64, pal: &Palette, w: f32) -> bool {
     let src = b.src();
     if src.is_empty() {
-        let ph = Ph { icon: l::IMAGE, title: "Add an image", hint: "Paste an image link…", upload: Some((true, "Upload image")), button: "Embed link" };
-        return placeholder(ui, b, ph, Some(PickTarget::BlockImage { page: page_id, block: b.id }), pal, w);
+        let ph = Spec { icon: l::IMAGE, title: "Add an image", subtitle: "Upload a photo from your device or paste an image address.", upload: Some((true, IMG_CHIPS)), link_hint: "Paste an image link…", link_button: "Add image", providers: &[] };
+        return placeholder(ui, b, &ph, Some(PickTarget::BlockImage { page: page_id, block: b.id }), pal, w);
     }
     let ctx = ui.ctx().clone();
     let mut changed = false;
@@ -222,8 +192,8 @@ fn play_button(ui: &Ui, c: egui::Pos2, r: f32) {
 
 fn embed(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: f32) -> bool {
     if b.url.is_empty() {
-        let ph = Ph { icon: l::GLOBE, title: "Embed a website, video, map or design", hint: "Paste a link — YouTube, Vimeo, Loom, Maps, Figma, Spotify, any site…", upload: None, button: "Embed" };
-        return placeholder(ui, b, ph, None, pal, w);
+        let ph = Spec { icon: l::GLOBE, title: "Embed anything", subtitle: "Videos, maps, designs, documents or any website — live inside your page.", upload: None, link_hint: "Paste a link to embed…", link_button: "Embed", providers: PROVIDERS };
+        return placeholder(ui, b, &ph, None, pal, w);
     }
     let ctx = ui.ctx().clone();
     let mut changed = false;
@@ -374,8 +344,8 @@ fn elide(ui: &Ui, text: &str, font: egui::FontId, color: Color32, width: f32) ->
 
 fn bookmark(ui: &mut Ui, b: &mut Block, pal: &Palette, w: f32) -> bool {
     if b.url.is_empty() {
-        let ph = Ph { icon: l::BOOKMARK, title: "Create a web bookmark", hint: "Paste a link…", upload: None, button: "Create" };
-        return placeholder(ui, b, ph, None, pal, w);
+        let ph = Spec { icon: l::BOOKMARK, title: "Create a web bookmark", subtitle: "Save a link as a clean card with its site name and address.", upload: None, link_hint: "Paste a link…", link_button: "Create", providers: &[] };
+        return placeholder(ui, b, &ph, None, pal, w);
     }
     let ctx = ui.ctx().clone();
     let mut changed = false;
@@ -414,8 +384,8 @@ fn bookmark(ui: &mut Ui, b: &mut Block, pal: &Palette, w: f32) -> bool {
 
 fn file(ui: &mut Ui, b: &mut Block, page_id: u64, ed: &mut EditorState, pal: &Palette, w: f32) -> bool {
     if b.media == 0 && b.url.is_empty() {
-        let ph = Ph { icon: l::PAPERCLIP, title: "Attach a file", hint: "Paste a link to a file…", upload: Some((false, "Upload file")), button: "Add link" };
-        return placeholder(ui, b, ph, Some(PickTarget::BlockFile { page: page_id, block: b.id }), pal, w);
+        let ph = Spec { icon: l::PAPERCLIP, title: "Attach a file or PDF", subtitle: "PDFs open in the built-in reader with highlights and notes.", upload: Some((false, FILE_CHIPS)), link_hint: "Paste a link to a file…", link_button: "Add link", providers: &[] };
+        return placeholder(ui, b, &ph, Some(PickTarget::BlockFile { page: page_id, block: b.id }), pal, w);
     }
     let ctx = ui.ctx().clone();
     let mut changed = false;

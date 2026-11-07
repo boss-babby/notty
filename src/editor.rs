@@ -49,6 +49,9 @@ pub enum Req {
 pub struct EditorState {
     /// Set by the `/dashboard` command: the page gets a widget grid.
     pub want_dash: bool,
+    /// Button blocks: the block whose actions should run (set by a click, consumed by the app) / whose editor should open.
+    pub press_button: Option<u64>,
+    pub edit_button: Option<u64>,
     /// Set by the `/widget` command: open the widget gallery for this (new) widget block.
     pub want_widget: Option<u64>,
     pub focus: Option<(u64, usize)>,
@@ -195,6 +198,7 @@ fn slash_all() -> Vec<SlashItem> {
     for (n, label, glyph) in [(2u8, "2 columns", l::COLUMNS_2), (3, "3 columns", l::COLUMNS_3), (4, "4 columns", l::LAYOUT_GRID), (5, "5 columns", l::LAYOUT_GRID)] {
         v.push(SlashItem { act: Slash::Columns(n), label, hint: "Lay content out side by side.", glyph, kw: "column columns layout side by side split grid", sec: "LAYOUT" });
     }
+    v.push(SlashItem { act: Slash::Block(BlockKind::Button), label: "Button", hint: "One click runs actions: set properties, create tasks, move rows, notify.", glyph: l::MOUSE_POINTER_2, kw: "button automation action click run rule trigger macro one-click", sec: "AUTOMATION" });
     let adv = "ADVANCED";
     v.push(SlashItem { act: Slash::Block(BlockKind::Toc), label: "Table of contents", hint: "Jump links to every heading.", glyph: l::TABLE_OF_CONTENTS, kw: "table of contents toc outline", sec: adv });
     v.push(SlashItem { act: Slash::NewPage, label: "Page", hint: "Embed a new sub-page inside this page.", glyph: l::FILE_PLUS, kw: "page subpage new child", sec: adv });
@@ -1727,6 +1731,10 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
             bl[i].kind = kind;
             if !kind.has_text() {
                 bl[i].text.clear();
+                if kind == BlockKind::Button {
+                    bl[i].text = "New button".into();
+                    ed.edit_button = Some(bl[i].id);
+                }
                 let media_kind = matches!(kind, BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File);
                 if kind != BlockKind::PageLink && (!media_kind || i + 1 >= bl.len()) {
                     let ind = bl[i].indent;
@@ -2021,6 +2029,9 @@ fn draw_block(
     let s = ed.scale.max(0.5);
     let base = if b.color > 0 { tag_color(b.color as usize - 1) } else { pal.text };
     match b.kind {
+        BlockKind::Button => {
+            changed |= crate::autoui::button_block(ui, b, ed, pal, w);
+        }
         BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File => {
             let pid = ed.cur_page;
             changed |= mediablocks::draw(ui, b, pid, ed, pal, w);

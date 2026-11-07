@@ -1,8 +1,8 @@
 [package]
 name = "lumen"
-version = "5.6.0"
+version = "6.0.0"
 edition = "2021"
-description = "Lumen — a free Notion + Obsidian alternative written entirely in Rust with egui (Windows + WebAssembly)"
+description = "Lumen — a free Notion + Obsidian alternative written entirely in Rust with egui (Windows + WebAssembly), now with automations, recurring tasks and reminders"
 license = "MIT"
 
 [lib]

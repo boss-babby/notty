@@ -6,6 +6,7 @@ pub enum Mode {
     Page,
     Dashboard,
     Graph,
+    Automations,
 }
 
 thread_local! {

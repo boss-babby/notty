@@ -1164,3 +1164,87 @@ mod kbd_rules {
         assert_eq!(touch_fn.matches("self.text_agent.focus()").count(), 2);
     }
 }
+
+#[test]
+fn automation_views_buttons_and_popovers_render_on_desktop_and_phone() {
+    use crate::automation as au;
+    let ctx = test_ctx();
+    let mut ws = Workspace::seed();
+    for i in 0..TEMPLATES.len() {
+        ws.add_template(i, None);
+    }
+    let db = ws.pages.iter().find(|p| p.kind == PageKind::Database && p.db.as_ref().map_or(false, |d| d.first_of(PropKind::Select).is_some() && d.first_of(PropKind::Date).is_some())).map(|p| p.id).unwrap();
+    for r in au::recipes() {
+        r.create(&mut ws, if r.needs_db { db } else { 0 });
+    }
+    let row = ws.rows(db)[0];
+    let date = ws.db(db).unwrap().first_of(PropKind::Date).unwrap();
+    ws.page_mut(row).unwrap().props.insert(date, Val::Text(dates::today_iso()));
+    let mut b = ws.blk(BlockKind::Button, "Go", 0);
+    b.acts = vec![au::Action::Notify { message: "{title}".into() }, au::Action::Rename { title: "{title} ✓".into() }];
+    let bid = b.id;
+    ws.page_mut(row).unwrap().blocks.push(b);
+    let rid = ws.id();
+    ws.auto.reminders.push(au::Reminder { id: rid, page: row, prop: date, day: 0, minute: 540, lead_min: 15, message: String::new(), repeat: None, fired_for: 0, done: false });
+    ws.page_mut(row).unwrap().repeats.insert(date, au::Repeat::default());
+    let mut rt = au::Runtime::new();
+    let pal = Palette::light();
+    let mut ed = EditorState::default();
+    let mut t = 0.0;
+    for tab in 0..4u8 {
+        crate::autoui::open_tab(tab);
+        for size in [vec2(1280.0, 800.0), vec2(390.0, 780.0), vec2(320.0, 560.0)] {
+            for _ in 0..3 {
+                t += 0.05;
+                frame_sized(&ctx, size, t, vec![], |ui| {
+                    crate::autoui::show(ui, &mut ws, &mut rt, &pal);
+                });
+            }
+        }
+    }
+    // expand the first rule's editor
+    let first = ws.auto.rules[0].id;
+    ws.auto.rules.iter_mut().for_each(|r| r.on = true);
+    crate::autoui::open_tab(0);
+    for _ in 0..3 {
+        t += 0.05;
+        frame_sized(&ctx, vec2(390.0, 780.0), t, vec![], |ui| {
+            crate::autoui::show(ui, &mut ws, &mut rt, &pal);
+        });
+    }
+    let _ = first;
+    // row page with the button, the date chips and every popover
+    ed.edit_button = Some(bid);
+    for _ in 0..4 {
+        frame_with(&ctx, &mut ws, row, &mut ed, &mut t, vec![]);
+        let _ = ctx.run(
+            {
+                let mut i = RawInput::default();
+                i.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(390.0, 780.0)));
+                i.time = Some(t);
+                i
+            },
+            |c| {
+                crate::autoui::button_editor(c, &mut ws, &mut rt, row, bid, &pal);
+            },
+        );
+    }
+    let o = au::press_button(&mut ws, &mut rt, row, bid, 1000.0);
+    assert_eq!(o.notices.len(), 1);
+    assert!(ws.page(row).unwrap().title.ends_with('✓'));
+    // the whole workspace (rules, reminders, inbox, repeats, buttons) survives a save / load
+    let json = serde_json::to_string(&ws).unwrap();
+    let back: Workspace = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.auto.rules.len(), ws.auto.rules.len());
+    assert_eq!(back.auto.reminders.len(), 1);
+    assert!(back.page(row).unwrap().blocks.iter().any(|b| b.kind == BlockKind::Button && b.acts.len() == 2));
+    assert!(!back.page(row).unwrap().repeats.is_empty());
+    // a workspace saved by an older version (no automation fields at all) still loads
+    let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    v.as_object_mut().unwrap().remove("auto");
+    for p in v["pages"].as_array_mut().unwrap() {
+        p.as_object_mut().unwrap().remove("repeats");
+    }
+    let old: Workspace = serde_json::from_value(v).unwrap();
+    assert!(old.auto.rules.is_empty());
+}

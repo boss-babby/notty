@@ -51,3 +51,33 @@ self.addEventListener("fetch", (e) => {
     e.respondWith(networkFirst(req, req));
   }
 });
+
+// ── notifications ────────────────────────────────────────────────────────────────────────────────────────────────────
+// Clicking a reminder opens (or focuses) the app. A server-sent Web Push payload ({title, body, tag, url}) is displayed too, so the
+// future cloud backend can wake the app up for reminders while it is closed — no client change needed.
+self.addEventListener("notificationclick", (e) => {
+  e.notification.close();
+  const target = (e.notification.data && e.notification.data.url) || "/app";
+  e.waitUntil(
+    self.clients.matchAll({ type: "window", includeUncontrolled: true }).then((list) => {
+      for (const c of list) {
+        if ("focus" in c) return c.focus();
+      }
+      return self.clients.openWindow ? self.clients.openWindow(target) : undefined;
+    })
+  );
+});
+
+self.addEventListener("push", (e) => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch (_) { d = { body: e.data ? e.data.text() : "" }; }
+  e.waitUntil(
+    self.registration.showNotification(d.title || "Lumen", {
+      body: d.body || "",
+      tag: d.tag,
+      icon: "/webapp/icons/icon-192.png",
+      badge: "/webapp/icons/icon-192.png",
+      data: { url: d.url || "/app" },
+    })
+  );
+});

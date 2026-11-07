@@ -388,6 +388,9 @@ pub fn page_html(ws: &Workspace, media: &MediaStore, id: u64, auto_print: bool) 
             BlockKind::Widget => {
                 o.push_str(&format!("<p style=\"{pad};color:#888\"><em>[Dashboard widget]</em></p>"));
             }
+            BlockKind::Button => {
+                o.push_str(&format!("<p style=\"{pad}\"><span style=\"display:inline-block;padding:6px 14px;border-radius:8px;background:#2383e2;color:#fff;font-weight:600\">{}</span></p>", esc(if b.text.is_empty() { "Button" } else { &b.text })));
+            }
             BlockKind::DbView => {
                 if let Some(t) = b.link.and_then(|l| ws.page(l)).filter(|t| !t.trashed && t.db.is_some()) {
                     let tt = if t.title.is_empty() { "Untitled" } else { &t.title };

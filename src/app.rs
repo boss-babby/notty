@@ -73,6 +73,8 @@ enum PalAct {
     Redo,
     Dashboard,
     Graph,
+    Automations,
+    NewReminder,
 }
 
 struct PaletteState {
@@ -139,6 +141,10 @@ pub struct LumenApp {
     last_calc: f64,
     calc_dirty: bool,
     prev_sidebar_page: Option<u64>,
+    /// Automation engine state (change snapshot, rate limits) — never saved.
+    auto_rt: crate::automation::Runtime,
+    last_auto: f64,
+    last_push: f64,
 }
 
 impl LumenApp {
@@ -207,6 +213,9 @@ impl LumenApp {
             last_calc: 0.0,
             calc_dirty: true,
             prev_sidebar_page: None,
+            auto_rt: crate::automation::Runtime::new(),
+            last_auto: 0.0,
+            last_push: 0.0,
         }
     }
 
@@ -450,6 +459,14 @@ impl LumenApp {
             PalAct::Journal => self.ws.open_today(),
             PalAct::Dashboard => crate::views::toggle(crate::views::Mode::Dashboard, self.ws.current),
             PalAct::Graph => crate::views::toggle(crate::views::Mode::Graph, self.ws.current),
+            PalAct::Automations => {
+                crate::autoui::open_tab(crate::autoui::TAB_RULES);
+                crate::views::toggle(crate::views::Mode::Automations, self.ws.current);
+            }
+            PalAct::NewReminder => {
+                crate::autoui::open_tab(crate::autoui::TAB_REMINDERS);
+                crate::views::set(crate::views::Mode::Automations, self.ws.current);
+            }
             PalAct::Templates => self.templates_open = true,
             PalAct::Import => self.import = Some(ImportDialog::default()),
             PalAct::ExportMd => self.export_md(),
@@ -544,6 +561,11 @@ impl LumenApp {
         }
         if simple_row(ui, pal, "sr_graph", w, Icon::Link, "Graph view", Some("Ctrl G")) {
             self.run(PalAct::Graph);
+        }
+        let unread = self.ws.auto.unread();
+        let badge = if unread > 0 { format!("{unread} new") } else { String::new() };
+        if simple_row(ui, pal, "sr_auto", w, Icon::Zap, "Automations", if unread > 0 { Some(badge.as_str()) } else { Some("Ctrl ⇧ A") }) {
+            self.run(PalAct::Automations);
         }
         ui.add_space(8.0);
 
@@ -697,6 +719,17 @@ impl LumenApp {
                 self.fresh = true;
             }
             let (can_u, can_r) = (crate::history::can_undo(&self.ed, cur), crate::history::can_redo(&self.ed, cur));
+            let unread = self.ws.auto.unread();
+            let br = icon_button(ui, pal, Icon::Bell, 16.0, "Notifications & automations");
+            if unread > 0 {
+                let c = br.rect.right_top() + vec2(-6.0, 7.0);
+                ui.painter().circle_filled(c, 7.5, pal.danger);
+                ui.painter().text(c, Align2::CENTER_CENTER, if unread > 9 { "9+".to_owned() } else { unread.to_string() }, bold(9.5), Color32::WHITE);
+            }
+            if br.clicked() {
+                crate::autoui::open_tab(if unread > 0 { crate::autoui::TAB_INBOX } else { crate::autoui::TAB_RULES });
+                crate::views::toggle(crate::views::Mode::Automations, self.ws.current);
+            }
             let (lock_icon, tip) = if self.cred.is_some() { (Icon::Lock, "Lock workspace  (Ctrl+L)") } else { (Icon::Shield, "Set a password") };
             if !narrow {
                 if icon_button(ui, pal, lock_icon, 16.0, tip).clicked() {
@@ -784,7 +817,9 @@ impl LumenApp {
             scored.sort_by_key(|s| s.0);
             out.extend(scored.into_iter().take(8).map(|(_, a, i, t, s)| (a, i, t, s)));
         }
-        let actions: [(PalAct, &str, &str, &str); 20] = [
+        let actions: [(PalAct, &str, &str, &str); 22] = [
+            (PalAct::Automations, l::ZAP, "Automations", "Rules, buttons, recurring tasks, reminders  (Ctrl+Shift+A)"),
+            (PalAct::NewReminder, l::BELL, "New reminder", "Get a desktop / push notification at a set time"),
             (PalAct::Dashboard, l::LAYOUT_DASHBOARD, "Dashboard", "KPIs, pipeline charts, tasks and deadlines  (Ctrl+D)"),
             (PalAct::Graph, l::NETWORK, "Graph view", "Map of how your notes connect  (Ctrl+G)"),
             (PalAct::Undo, l::UNDO_2, "Undo", "Undo the last block change  (Ctrl+Z)"),
@@ -1145,7 +1180,7 @@ impl LumenApp {
         let sw = ui.ctx().screen_rect().width();
         let sp = ui.spacing().item_spacing.x;
         let btn = 38.0;
-        let title_w = (sw - 8.0 - btn * 4.0 - sp * 6.0 - 28.0).clamp(60.0, 520.0);
+        let title_w = (sw - 8.0 - btn * 5.0 - sp * 7.0 - 28.0).clamp(60.0, 520.0);
         if let Some(p) = self.ws.page(cur) {
             let title = if p.title.is_empty() { "Untitled".to_owned() } else { p.title.clone() };
             let icon = p.icon.clone();
@@ -1169,6 +1204,17 @@ impl LumenApp {
             if r.clicked() {
                 self.page_menu = Some(r.rect.left_bottom() + vec2(-230.0, 6.0));
                 self.fresh = true;
+            }
+            let unread = self.ws.auto.unread();
+            let br = icon_button(ui, pal, Icon::Bell, 18.0, "Notifications & automations");
+            if unread > 0 {
+                let c = br.rect.right_top() + vec2(-7.0, 8.0);
+                ui.painter().circle_filled(c, 7.5, pal.danger);
+                ui.painter().text(c, Align2::CENTER_CENTER, if unread > 9 { "9+".to_owned() } else { unread.to_string() }, bold(9.5), Color32::WHITE);
+            }
+            if br.clicked() {
+                crate::autoui::open_tab(if unread > 0 { crate::autoui::TAB_INBOX } else { crate::autoui::TAB_RULES });
+                crate::views::toggle(crate::views::Mode::Automations, self.ws.current);
             }
             if ui.add_enabled_ui(can_r, |ui| icon_button(ui, pal, Icon::Redo, 18.0, "Redo")).inner.clicked() {
                 self.run(PalAct::Redo);
@@ -1532,6 +1578,7 @@ impl LumenApp {
                 Ok(mut w) => {
                     w.migrate();
                     self.ws = w;
+                    self.auto_rt.resync(&self.ws);
                     self.toast("Workspace restored from backup", None);
                     keep = false;
                 }
@@ -1809,7 +1856,50 @@ impl eframe::App for LumenApp {
 }
 
 impl LumenApp {
+    /// Runs the automation engine (rules, recurring tasks, reminders) a few times per second — also while the workspace is locked.
+    fn run_automation(&mut self, ctx: &Context) {
+        let t = now_ms();
+        if t - self.last_auto < 250.0 {
+            return;
+        }
+        self.last_auto = t;
+        let o = crate::automation::tick(&mut self.ws, &mut self.auto_rt, t, crate::dates::now_local_min());
+        self.after_auto(ctx, o);
+        // web: hand the next 48 h of reminders to the page, which fires them with its own timers (even in a background tab)
+        if t - self.last_push > 5000.0 {
+            self.last_push = t;
+            if self.ws.auto.settings.os_notify {
+                if let Some(json) = crate::automation::push_schedule(&self.ws, &mut self.auto_rt, crate::dates::now_local_min(), 48) {
+                    platform::schedule_push(&json);
+                }
+            }
+        }
+    }
+
+    /// Toasts + system notifications for what the engine produced.
+    fn after_auto(&mut self, ctx: &Context, o: crate::automation::Output) {
+        if o.changed {
+            self.calc_dirty = true;
+            ctx.request_repaint();
+        }
+        let minute = crate::dates::now_local_min().rem_euclid(1440) as u16;
+        let quiet = self.ws.auto.settings.is_quiet(minute);
+        for n in o.notices {
+            if !self.locked {
+                self.toast(if n.body.is_empty() { n.title.clone() } else { format!("{} — {}", n.title, n.body) }, None);
+            }
+            if self.ws.auto.settings.os_notify && !quiet {
+                if self.locked {
+                    platform::notify_os("Lumen", "You have a new notification", &format!("lumen-n-{}", n.id));
+                } else {
+                    platform::notify_os(&n.title, &n.body, &format!("lumen-n-{}", n.id));
+                }
+            }
+        }
+    }
+
     fn frame(&mut self, ctx: &Context) {
+        self.run_automation(ctx);
         // theme (animated)
         let target = if self.locked || self.ws.dark { 1.0 } else { 0.0 };
         let t = ctx.animate_value_with_time(Id::new("theme_t"), target, 0.35);
@@ -1833,7 +1923,8 @@ impl LumenApp {
             self.lock_now();
         }
         // Idle wake-ups: only the auto-lock timer needs one, and only when a password is set.
-        ctx.request_repaint_after(Duration::from_secs(if self.cred.is_some() { 10 } else { 30 }));
+        let busy = !self.ws.auto.rules.is_empty() || self.ws.auto.reminders.iter().any(|r| !r.done);
+        ctx.request_repaint_after(Duration::from_secs(if busy { 4 } else if self.cred.is_some() { 10 } else { 30 }));
 
         if self.locked {
             match self.lock.show(ctx, self.cred.as_ref()) {
@@ -1855,6 +1946,7 @@ impl LumenApp {
                 }
                 LockEvent::Reset => {
                     self.ws = Workspace::seed();
+                    self.auto_rt.resync(&self.ws);
                     self.cred = None;
                     self.skipped_setup = false;
                     self.lock = LockScreen::new();
@@ -1897,6 +1989,9 @@ impl LumenApp {
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::D)) && self.ed.sel.is_empty() {
             self.run(PalAct::Dashboard);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::A)) {
+            self.run(PalAct::Automations);
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::E)) {
             self.export_md();
@@ -2055,6 +2150,20 @@ impl LumenApp {
                     }
                     return;
                 }
+                crate::views::Mode::Automations => {
+                    let out = crate::autoui::show(ui, &mut self.ws, &mut self.auto_rt, &pal);
+                    if out.close {
+                        crate::views::set(crate::views::Mode::Page, None);
+                    }
+                    if let Some(id) = out.open {
+                        crate::views::set(crate::views::Mode::Page, None);
+                        self.ws.current = Some(id);
+                    }
+                    if let Some(t) = out.toast {
+                        self.toast(t, None);
+                    }
+                    return;
+                }
                 crate::views::Mode::Page => {}
             }
             let Some(cur) = self.ws.current.filter(|id| self.ws.page(*id).map_or(false, |p| !p.trashed)) else {
@@ -2121,6 +2230,24 @@ impl LumenApp {
         }
         if let (Some(req), Some(cur)) = (self.ed.req.take(), self.ws.current) {
             self.handle_req(req, cur);
+        }
+
+        // one-click buttons, the button editor and the repeat / remind popover of date properties
+        if let (Some(bid), Some(cur)) = (self.ed.press_button.take(), self.ws.current) {
+            let o = crate::automation::press_button(&mut self.ws, &mut self.auto_rt, cur, bid, now_ms());
+            self.after_auto(ctx, o);
+        }
+        if let Some(bid) = self.ed.edit_button {
+            let keep = match self.ws.current {
+                Some(cur) => crate::autoui::button_editor(ctx, &mut self.ws, &mut self.auto_rt, cur, bid, &pal),
+                None => false,
+            };
+            if !keep {
+                self.ed.edit_button = None;
+            }
+        }
+        if crate::autoui::row_popover(ctx, &mut self.ws, &mut self.auto_rt, &pal) {
+            self.calc_dirty = true;
         }
 
         self.row_menu_ui(ctx, &pal);

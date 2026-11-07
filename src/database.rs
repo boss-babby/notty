@@ -365,6 +365,9 @@ pub fn row_props(ui: &mut Ui, ws: &mut Workspace, row_id: u64, ed: &mut EditorSt
                 let (cr, _) = ui.allocate_exact_size(vec2((w - 150.0).max(120.0), 32.0), Sense::hover());
                 cell(ui, &db, row, prop, cr, pal, st, &mut acts);
             });
+            if prop.kind == PropKind::Date {
+                crate::autoui::row_date_chips(ui, pal, wsr, row_id, prop.id, gutter());
+            }
         }
         ui.add_space(6.0);
         let (lr, _) = ui.allocate_exact_size(vec2(w + gutter(), 1.0), Sense::hover());

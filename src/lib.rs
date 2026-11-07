@@ -2,6 +2,9 @@
 //! The same code runs as a native desktop app and as WebAssembly in the browser.
 
 mod app;
+mod automation;
+mod autoui;
+mod uploader;
 mod auth;
 mod database;
 mod dates;

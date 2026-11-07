@@ -14,24 +14,9 @@ use crate::theme::{bold, body, lerp_color, Palette, COVERS};
 use crate::widgets::{self, gradient_rect, menu_item, popup_area, section_label, with_alpha};
 
 fn tabs(ui: &mut Ui, pal: &Palette, labels: &[&str], tab: &mut u8) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        for (i, label) in labels.iter().enumerate() {
-            let g = ui.painter().layout_no_wrap((*label).to_owned(), bold(13.0), pal.text);
-            let (r, resp) = ui.allocate_exact_size(vec2(g.size().x + 20.0, 28.0), Sense::click());
-            let on = *tab as usize == i;
-            let t = ui.ctx().animate_bool_with_time(resp.id, on, 0.15);
-            let h = ui.ctx().animate_bool_with_time(resp.id.with("h"), resp.hovered(), 0.1);
-            ui.painter().rect_filled(r, 6.0, with_alpha(pal.hover, h.max(t)));
-            ui.painter().text(r.center(), Align2::CENTER_CENTER, label, bold(13.0), lerp_color(pal.muted, pal.text, t.max(h)));
-            if on {
-                ui.painter().hline(r.x_range().shrink(8.0), r.bottom() - 1.0, Stroke::new(2.0_f32, pal.accent));
-            }
-            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                *tab = i as u8;
-            }
-        }
-    });
+    let mut sel = *tab as usize;
+    crate::uploader::segmented(ui, pal, Id::new(("pick_tabs", labels.len(), labels[0])), labels, &mut sel);
+    *tab = sel as u8;
 }
 
 fn cell(ui: &mut Ui, pal: &Palette, icon: &str, lucide: bool) -> bool {
@@ -143,21 +128,12 @@ pub fn icon_picker(ctx: &Context, page: &mut Page, ed: &mut EditorState, pal: &P
                 });
             }
             _ => {
-                section_label(ui, pal, "UPLOAD YOUR OWN ICON");
-                if platform::can_pick_files() {
-                    if widgets::primary_button(ui, pal, "Choose an image…", 200.0).clicked() {
-                        platform::pick_file(ui.ctx(), PickTarget::Icon { page: page_id }, true);
-                    }
-                } else {
-                    ui.label(RichText::new("Drop an image file onto the window, then choose “Use as icon”.").font(body(12.5)).color(pal.muted));
-                }
-                ui.add_space(8.0);
-                section_label(ui, pal, "OR PASTE AN IMAGE LINK");
-                if let Some(u) = link_field(ui, pal, Id::new("icon_link"), "https://…/logo.png", "Use link") {
+                let spec = crate::uploader::Spec { icon: l::IMAGE_PLUS, title: "Custom icon", subtitle: "", upload: Some((true, &["PNG", "JPG", "GIF", "WebP"])), link_hint: "https://…/logo.png", link_button: "Use link", providers: &[] };
+                if let Some(u) = crate::uploader::popover_body(ui, pal, Id::new("icon_up"), &spec, Some(PickTarget::Icon { page: page_id }), (ui.available_width() - 4.0).max(200.0)) {
                     chosen = Some(format!("img:{u}"));
                 }
-                ui.add_space(8.0);
-                ui.label(RichText::new("Square PNG, JPG, GIF or WebP pictures work best. Custom icons appear everywhere a page icon does.").font(body(12.0)).color(pal.muted));
+                ui.add_space(6.0);
+                ui.label(RichText::new("Square pictures work best. Custom icons appear everywhere a page icon does.").font(body(12.0)).color(pal.muted));
                 if cur_custom {
                     ui.add_space(4.0);
                     ui.label(RichText::new("This page currently uses a custom icon.").font(body(12.0)).color(pal.accent));
@@ -199,7 +175,7 @@ pub fn cover_picker(ctx: &Context, page: &mut Page, ed: &mut EditorState, pal: &
     let has_img = !page.cover_img.is_empty();
     let open = popup_area(ctx, Id::new("cover_picker"), pos, pal, &mut ed.fresh, 330.0, |ui| {
         let mut tab: u8 = ui.ctx().data(|d| d.get_temp(tab_id)).unwrap_or(0);
-        tabs(ui, pal, &["Gallery", "Upload", "Link"], &mut tab);
+        tabs(ui, pal, &["Gallery", "Upload / link"], &mut tab);
         ui.ctx().data_mut(|d| d.insert_temp(tab_id, tab));
         ui.add_space(6.0);
         match tab {
@@ -220,23 +196,11 @@ pub fn cover_picker(ctx: &Context, page: &mut Page, ed: &mut EditorState, pal: &
                     }
                 });
             }
-            1 => {
-                section_label(ui, pal, "UPLOAD FROM THIS DEVICE");
-                if platform::can_pick_files() {
-                    if widgets::primary_button(ui, pal, "Choose an image…", 220.0).clicked() {
-                        platform::pick_file(ui.ctx(), PickTarget::Cover { page: page_id }, true);
-                    }
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("PNG, JPG, GIF or WebP. Wide images (1500 × 600 or larger) look best.").font(body(12.0)).color(pal.muted));
-                } else {
-                    ui.label(RichText::new("Drag an image file onto the window, then choose “Set as cover”.").font(body(12.5)).color(pal.muted));
-                }
-            }
             _ => {
-                section_label(ui, pal, "IMAGE LINK");
-                link = link_field(ui, pal, Id::new("cover_link"), "https://…/photo.jpg", "Set cover");
-                ui.add_space(4.0);
-                ui.label(RichText::new("Works with any direct link to an image (right-click an image on the web → Copy image address).").font(body(12.0)).color(pal.muted));
+                let spec = crate::uploader::Spec { icon: l::IMAGE_PLUS, title: "Cover", subtitle: "", upload: Some((true, &["PNG", "JPG", "GIF", "WebP"])), link_hint: "https://…/photo.jpg", link_button: "Set cover", providers: &[] };
+                link = crate::uploader::popover_body(ui, pal, Id::new("cover_up"), &spec, Some(PickTarget::Cover { page: page_id }), (ui.available_width() - 4.0).max(200.0));
+                ui.add_space(6.0);
+                ui.label(RichText::new("Wide pictures (1500 × 600 or larger) look best. You can reposition the cover afterwards.").font(body(12.0)).color(pal.muted));
             }
         }
         if has_cover {

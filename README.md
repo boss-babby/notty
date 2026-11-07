@@ -1,3 +1,25 @@
+# Lumen 6.0 — Automations, recurring tasks, reminders
+
+New in this release (details and the cloud roadmap in [AUTOMATION.md](AUTOMATION.md)):
+
+* **Rules** — *when* (row added · property changes / becomes X · a date arrives ± N days at HH:MM · on a schedule · manual) *if* (the same filters
+  database views use) *then* (set property / date, create row, move row to another database, rename, add to page, notify, duplicate, trash).
+  11 one-click **recipes**, **Run now** for bulk application, an **activity log**, a master switch.
+* **Buttons** — `/button` puts a one-click button anywhere; it acts on the database row it sits on. ⚙ / right-click / long-press edits it.
+* **Recurring tasks** — repeat rules on any date property (daily, weekly on chosen weekdays, monthly, yearly; ends never / on a date / after N);
+  completing a task rolls the date and resets the status, or keeps the record and spawns the next copy; "count from completion"; habits that roll by themselves.
+* **Reminders** — on a row's date (moves with it) or standalone; time, lead time, repeat. **Windows toast notifications** on the desktop,
+  **push notifications** in the browser (service worker, works in a background tab / installed PWA), quiet hours, inbox with unread badge.
+* **Redesigned upload / embed card** — one design for photos, PDFs, files, embeds, bookmarks, page icons and covers: segmented *Upload | Link*,
+  animated dashed drop zone that reacts to dragging, accepted-format chips, recognised-service chips, stacked layout on phones.
+* Mobile: every new screen is touch-sized and works down to 320 px wide.
+* Local time zone support (`GetTimeZoneInformation` on Windows, the browser's zone on the web) — "today" is now your today.
+
+Build: `bash build-web.sh` → `../public/webapp` (served at `/app`), `bash build-windows.sh` → `../public/downloads`.
+Tests: `cargo test --lib` (127 tests, 14 for the automation engine).
+
+---
+
 # Lumen
 
 A free, offline-first **Notion alternative written entirely in Rust** with [egui](https://github.com/emilk/egui) — no web engine, no JavaScript UI.

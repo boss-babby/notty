@@ -84,6 +84,8 @@ pub enum Icon {
     Video,
     MoveUp,
     MoveDown,
+    Zap,
+    Bell,
 }
 
 impl Icon {
@@ -165,6 +167,8 @@ impl Icon {
             Icon::Video => l::VIDEO,
             Icon::MoveUp => l::ARROW_UP_FROM_LINE,
             Icon::MoveDown => l::ARROW_DOWN_FROM_LINE,
+            Icon::Zap => l::ZAP,
+            Icon::Bell => l::BELL,
         }
     }
 }
