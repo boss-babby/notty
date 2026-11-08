@@ -47,6 +47,15 @@ pub fn popup_frame(pal: &Palette) -> Frame {
 /// to be raised every frame ends up ABOVE a ComboBox / context-menu popup that was opened from inside it (the drop-down only asks once,
 /// when it is created). That was the "dropdowns hide behind pop-ups" bug. Rule implemented here: while any egui popup (combo box,
 /// menu, colour picker …) is open nobody re-raises itself, so the drop-down always stays on top of the window that spawned it.
+///
+/// ROOT CAUSE of "the drop-down works once, then the dialog greys out and nothing responds":
+/// egui draws a `ComboBox` list as an `Order::Foreground` area. egui keeps the *previous* relative order of every layer that "wants to be
+/// on top" in the same frame, so a drop-down opened for the 2nd time (its layer already exists, low in the list) ended up BELOW the
+/// dialog and BELOW the dimming backdrop that were also Foreground: the list was dimmed, unreachable, and any click hit the backdrop.
+/// Only the very first opening worked, because a brand-new layer is pushed on top. Fix: dialogs, menus and inspectors that can host
+/// drop-downs live on [`HOST_ORDER`] (`Middle`), egui's own popups stay on `Foreground`, so they are above their host by construction.
+pub const HOST_ORDER: Order = Order::Middle;
+
 pub trait LayerRaise {
     fn raise_layer(&self, layer: egui::LayerId);
 }
@@ -78,7 +87,7 @@ pub fn popup_area(
     let h = ctx.data(|d| d.get_temp::<f32>(id.with("h"))).unwrap_or(0.0);
     let y = if h > 0.0 { pos.y.min(screen.bottom() - h - 10.0).max(8.0) } else { pos.y };
     let resp = Area::new(id)
-        .order(Order::Foreground)
+        .order(HOST_ORDER)
         .fixed_pos(pos2(x, y + (1.0 - t) * -6.0))
         .show(ctx, |ui| {
             ui.set_opacity(t);
@@ -418,7 +427,7 @@ pub fn context_menu(ctx: &Context, id: Id, pos: Pos2, pal: &Palette, fresh: &mut
         }
     }
 
-    let resp = Area::new(id).order(Order::Foreground).fixed_pos(pos2(x, y + slide)).show(ctx, |ui| {
+    let resp = Area::new(id).order(HOST_ORDER).fixed_pos(pos2(x, y + slide)).show(ctx, |ui| {
         ui.set_opacity(t);
         popup_frame(pal).inner_margin(Margin::same(6)).show(ui, |ui| {
             ui.set_width(W);

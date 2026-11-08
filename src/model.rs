@@ -656,6 +656,8 @@ pub enum PageKind {
     /// Legacy kanban page — migrated to a database on load.
     Board,
     Database,
+    /// Infinite whiteboard of cards, pages, images and connectors (see `canvas.rs`).
+    Canvas,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -730,6 +732,9 @@ pub struct Page {
     /// Repeat rules of this row's date properties (date property id → rule), see `automation.rs`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub repeats: BTreeMap<u64, crate::automation::Repeat>,
+    /// The whiteboard of a [`PageKind::Canvas`] page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas: Option<crate::canvas::Canvas>,
 }
 
 /// A saved snapshot of a page's content.
@@ -775,6 +780,7 @@ impl Page {
             zoom: self.zoom,
             history: vec![],
             repeats: self.repeats.clone(),
+            canvas: None,
         }
     }
 
@@ -890,6 +896,7 @@ fn blank_page(id: u64, parent: Option<u64>, kind: PageKind) -> Page {
         zoom: 1.0,
         history: vec![],
         repeats: BTreeMap::new(),
+        canvas: None,
     }
 }
 
@@ -946,6 +953,9 @@ impl Workspace {
     }
 
     pub fn add_page(&mut self, parent: Option<u64>, kind: PageKind) -> u64 {
+        if kind == PageKind::Canvas {
+            return self.add_canvas(parent);
+        }
         if kind != PageKind::Doc {
             return self.add_database(parent, ViewKind::Table);
         }
@@ -956,6 +966,30 @@ impl Workspace {
         page.blocks = vec![b];
         self.push_page(page, parent);
         id
+    }
+
+    /// New empty canvas page.
+    pub fn add_canvas(&mut self, parent: Option<u64>) -> u64 {
+        let id = self.id();
+        let mut page = blank_page(id, parent, PageKind::Canvas);
+        page.icon = crate::lucide::NETWORK.into();
+        page.canvas = Some(crate::canvas::Canvas::new());
+        self.push_page(page, parent);
+        id
+    }
+
+    /// Repairs canvases loaded from disk (damaged geometry, dangling connectors, canvas pages without a board).
+    pub fn fix_canvases(&mut self) {
+        for p in self.pages.iter_mut().filter(|p| p.kind == PageKind::Canvas) {
+            match p.canvas.as_mut() {
+                Some(c) => {
+                    if c.nodes.iter().any(|n| !n.x.is_finite() || !n.y.is_finite() || !n.w.is_finite() || n.w < 1.0 || n.color >= crate::canvas::COLOR_COUNT) || c.edges.iter().any(|e| e.from == e.to) {
+                        c.repair();
+                    }
+                }
+                None => p.canvas = Some(crate::canvas::Canvas::new()),
+            }
+        }
     }
 
     fn push_page(&mut self, page: Page, parent: Option<u64>) {
@@ -1733,6 +1767,13 @@ impl Workspace {
         }
 
         ws.seed_projects();
+        // a ready-made canvas that links to two of the pages above
+        let cid = ws.add_canvas(None);
+        let link_a = ws.pages.iter().find(|p| p.title == "Roadmap").map(|p| p.id);
+        if let Some(p) = ws.page_mut(cid) {
+            p.title = "Launch board".into();
+            p.canvas = Some(crate::canvas::Canvas::sample(link_a, Some(start)));
+        }
         ws.current = Some(start);
         ws
     }

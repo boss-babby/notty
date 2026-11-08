@@ -1264,3 +1264,243 @@ fn automation_views_buttons_and_popovers_render_on_desktop_and_phone() {
     let old: Workspace = serde_json::from_value(v).unwrap();
     assert!(old.auto.rules.is_empty());
 }
+
+// ───────────────────────────── drop-down inside a dialog (the "greyed out after the first use" bug) ─────────────────────────────
+
+struct Dlg {
+    t: f64,
+    sel: usize,
+    btn: Rect,
+    rows: Vec<Rect>,
+}
+
+fn dlg_frame(ctx: &egui::Context, pal: &Palette, d: &mut Dlg, evs: Vec<Event>) {
+    d.t += 0.05;
+    let mut input = RawInput::default();
+    input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 700.0)));
+    input.time = Some(d.t);
+    input.events = evs;
+    d.rows.clear();
+    let (mut sel, mut btn, mut rows) = (d.sel, d.btn, vec![]);
+    let _ = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |_| {});
+        crate::app::modal(ctx, Id::new("dlg"), pal, 420.0, 80.0, |ui| {
+            ui.label("Dialog");
+            let r = egui::ComboBox::from_id_salt("cb").selected_text(format!("option {sel}")).width(200.0).show_ui(ui, |ui| {
+                for i in 0..4 {
+                    let r = ui.selectable_label(sel == i, format!("option {i}"));
+                    rows.push(r.rect);
+                    if r.clicked() {
+                        sel = i;
+                    }
+                }
+            });
+            btn = r.response.rect;
+        });
+    });
+    d.sel = sel;
+    d.btn = btn;
+    d.rows = rows;
+}
+
+fn dlg_click(ctx: &egui::Context, pal: &Palette, d: &mut Dlg, p: egui::Pos2) {
+    dlg_frame(ctx, pal, d, vec![Event::PointerMoved(p)]);
+    dlg_frame(ctx, pal, d, vec![Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }]);
+    dlg_frame(ctx, pal, d, vec![Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }]);
+    dlg_frame(ctx, pal, d, vec![]);
+}
+
+/// Regression: a ComboBox inside `app::modal` worked once and then stayed dimmed / unresponsive for the rest of the session,
+/// because its list ended up *below* the dialog and the dimming backdrop on every later opening.
+#[test]
+fn dropdown_inside_a_dialog_works_every_time() {
+    let ctx = test_ctx();
+    let pal = Palette::light();
+    let mut d = Dlg { t: 0.0, sel: 0, btn: Rect::NOTHING, rows: vec![] };
+    for _ in 0..8 {
+        dlg_frame(&ctx, &pal, &mut d, vec![]);
+    }
+    for round in 0..6 {
+        let want = (round + 1) % 4;
+        let b = d.btn.center();
+        dlg_click(&ctx, &pal, &mut d, b);
+        assert_eq!(d.rows.len(), 4, "round {round}: the list must be open after clicking the drop-down");
+        let target = d.rows[want].center();
+        let layer = ctx.layer_id_at(target).expect("something is under the pointer");
+        assert_eq!(layer.order, egui::Order::Foreground, "round {round}: the list must be the top-most layer, not hidden under the dialog / backdrop");
+        dlg_click(&ctx, &pal, &mut d, target);
+        assert_eq!(d.sel, want, "round {round}: clicking an entry must select it");
+        assert!(d.rows.is_empty(), "round {round}: the list closes after a pick");
+    }
+}
+
+// ───────────────────────────── canvas ─────────────────────────────
+
+fn canvas_frame(ctx: &egui::Context, ws: &mut Workspace, page: u64, pal: &Palette, size: egui::Vec2, t: &mut f64, evs: Vec<Event>) {
+    *t += 0.05;
+    let mut input = RawInput::default();
+    input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), size));
+    input.time = Some(*t);
+    input.events = evs;
+    let _ = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+            crate::canvasui::show(ui, ws, page, pal);
+        });
+    });
+}
+
+fn cv_of(ws: &Workspace, page: u64) -> &crate::canvas::Canvas {
+    ws.page(page).unwrap().canvas.as_ref().unwrap()
+}
+
+fn pointer(p: egui::Pos2, down: Option<bool>) -> Vec<Event> {
+    match down {
+        None => vec![Event::PointerMoved(p)],
+        Some(d) => vec![Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: d, modifiers: Modifiers::NONE }],
+    }
+}
+
+#[test]
+fn canvas_page_basics() {
+    let mut ws = Workspace::seed();
+    let id = ws.add_page(None, PageKind::Canvas);
+    assert_eq!(ws.page(id).unwrap().kind, PageKind::Canvas);
+    assert!(ws.page(id).unwrap().canvas.is_some());
+    assert!(ws.pages.iter().any(|p| p.kind == PageKind::Canvas && p.title == "Launch board"), "the seed ships a sample canvas");
+    // whole workspace survives a save / load, canvases included
+    let json = serde_json::to_string(&ws).unwrap();
+    let back: Workspace = serde_json::from_str(&json).unwrap();
+    let n = |w: &Workspace| w.pages.iter().filter(|p| p.kind == PageKind::Canvas).map(|p| p.canvas.as_ref().map_or(0, |c| c.nodes.len())).sum::<usize>();
+    assert_eq!(n(&ws), n(&back));
+    // a workspace saved before canvases existed still loads
+    let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    for p in v["pages"].as_array_mut().unwrap() {
+        p.as_object_mut().unwrap().remove("canvas");
+    }
+    let mut old: Workspace = serde_json::from_value(v).unwrap();
+    old.fix_canvases();
+    assert!(old.pages.iter().filter(|p| p.kind == PageKind::Canvas).all(|p| p.canvas.is_some()));
+}
+
+#[test]
+fn canvas_gestures_work_on_desktop_and_phone() {
+    for size in [vec2(1280.0, 820.0), vec2(390.0, 760.0)] {
+        let ctx = test_ctx();
+        let pal = Palette::light();
+        let mut ws = Workspace::seed();
+        let page = ws.add_canvas(None);
+        let mut t = 0.0;
+        for _ in 0..4 {
+            canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![]);
+        }
+        // double click on the empty board adds a card and starts editing it
+        let p = pos2(size.x * 0.5, size.y * 0.4);
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, pointer(p, None));
+        for d in [true, false, true, false] {
+            canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, pointer(p, Some(d)));
+        }
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![]);
+        assert_eq!(cv_of(&ws, page).nodes.len(), 1, "{size:?}: double click adds a card");
+        // type into it, Esc finishes
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![]);
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![Event::Text("Hello canvas".into())]);
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![]);
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![key(egui::Key::Escape, Modifiers::NONE)]);
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![]);
+        assert_eq!(cv_of(&ws, page).nodes[0].text, "Hello canvas", "{size:?}");
+        // drag the card
+        let c = cv_of(&ws, page);
+        let n = c.nodes[0].clone();
+        let sc = c.view.rect_to_screen(pos2(0.0, 0.0), n.rect()).center();
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, pointer(sc, None));
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, pointer(sc, Some(true)));
+        for k in 1..=8 {
+            canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, pointer(sc + vec2(12.0 * k as f32, 5.0 * k as f32), None));
+        }
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, pointer(sc + vec2(96.0, 40.0), Some(false)));
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![]);
+        let moved = cv_of(&ws, page).nodes[0].clone();
+        assert!(moved.x > n.x + 40.0 && moved.y > n.y + 15.0, "{size:?}: card follows the finger / mouse ({} → {})", n.x, moved.x);
+        // undo puts it back, redo moves it again
+        assert!(crate::canvasui::undo_redo(&mut ws, page, false));
+        assert_eq!(cv_of(&ws, page).nodes[0].x, n.x);
+        assert!(crate::canvasui::undo_redo(&mut ws, page, true));
+        // ctrl + wheel zooms, plain wheel pans
+        let z0 = cv_of(&ws, page).view.zoom;
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![Event::PointerMoved(p), Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, 120.0), modifiers: Modifiers::COMMAND }]);
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![]);
+        assert!(cv_of(&ws, page).view.zoom > z0 * 1.05, "{size:?}: ctrl+wheel zooms in");
+        let x0 = cv_of(&ws, page).view.y;
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -80.0), modifiers: Modifiers::NONE }]);
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![]);
+        assert!(cv_of(&ws, page).view.y > x0, "{size:?}: wheel pans the board");
+        // select all + delete + undo
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![key(egui::Key::A, Modifiers::COMMAND)]);
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![key(egui::Key::Delete, Modifiers::NONE)]);
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![]);
+        assert!(cv_of(&ws, page).nodes.is_empty(), "{size:?}: delete removes the selection");
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![key(egui::Key::Z, Modifiers::COMMAND)]);
+        canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![]);
+        assert_eq!(cv_of(&ws, page).nodes.len(), 1, "{size:?}: ctrl+Z brings it back");
+        // clipboard: pasted text becomes a card, a pasted address a link card, an image address a picture card
+        for txt in ["A pasted thought", "https://example.com/page", "https://example.com/pic.png"] {
+            canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![Event::Paste(txt.into())]);
+            canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![]);
+        }
+        let kinds: Vec<_> = cv_of(&ws, page).nodes.iter().map(|n| n.kind).collect();
+        assert!(kinds.contains(&crate::canvas::Kind::Link) && kinds.contains(&crate::canvas::Kind::Image), "{kinds:?}");
+    }
+}
+
+#[test]
+fn canvas_renders_every_kind_template_and_zoom_without_panicking() {
+    use crate::canvas::{Canvas, Kind, Tpl};
+    for dark in [false, true] {
+        for size in [vec2(1280.0, 820.0), vec2(360.0, 700.0), vec2(320.0, 480.0)] {
+            let ctx = test_ctx();
+            let pal = if dark { Palette::dark() } else { Palette::light() };
+            let mut ws = Workspace::seed();
+            let page = ws.add_canvas(None);
+            let road = ws.pages.iter().find(|p| p.title == "Roadmap").map(|p| p.id);
+            let mut c = Canvas::sample(road, Some(page + 1000)); // second link points at a page that does not exist
+            for (i, t) in Tpl::ALL.iter().enumerate() {
+                c.insert_template(*t, pos2(2000.0 + i as f32 * 1500.0, 0.0));
+            }
+            for (i, k) in [Kind::Note, Kind::Text, Kind::Todo, Kind::Page, Kind::Image, Kind::Link, Kind::Group].iter().enumerate() {
+                c.add_node(*k, pos2(i as f32 * 300.0, 900.0));
+            }
+            c.add_ink(&(0..30).map(|i| pos2(i as f32 * 5.0, (i as f32 * 0.4).sin() * 30.0 + 1200.0)).collect::<Vec<_>>(), 2, 1);
+            let ids: std::collections::BTreeSet<u64> = c.nodes.iter().map(|n| n.id).collect();
+            c.align(&ids, crate::canvas::Align::Top);
+            c.tidy(&ids);
+            ws.page_mut(page).unwrap().canvas = Some(c);
+            let mut t = 0.0;
+            for zoom in [0.05f32, 0.12, 0.3, 0.8, 1.0, 2.5, 4.0] {
+                ws.page_mut(page).unwrap().canvas.as_mut().unwrap().view.zoom = zoom;
+                for _ in 0..3 {
+                    canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![]);
+                }
+            }
+            // sweep clicks / right-clicks over the board to open menus, popovers and toolbars
+            let mut n = 0;
+            for y in (40..size.y as i32).step_by(97) {
+                for x in (30..size.x as i32).step_by(131) {
+                    let p = pos2(x as f32, y as f32);
+                    let secondary = n % 5 == 4;
+                    n += 1;
+                    canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, pointer(p, None));
+                    let b = if secondary { PointerButton::Secondary } else { PointerButton::Primary };
+                    canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![Event::PointerButton { pos: p, button: b, pressed: true, modifiers: Modifiers::NONE }]);
+                    canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![Event::PointerButton { pos: p, button: b, pressed: false, modifiers: Modifiers::NONE }]);
+                }
+            }
+            canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![key(egui::Key::Num1, Modifiers::SHIFT)]);
+            for _ in 0..40 {
+                canvas_frame(&ctx, &mut ws, page, &pal, size, &mut t, vec![]);
+            }
+            let c = cv_of(&ws, page);
+            assert!(c.nodes.iter().all(|n| n.x.is_finite() && n.y.is_finite() && n.w > 0.0 && n.h >= 0.0));
+            assert!(c.view.zoom.is_finite() && c.view.zoom >= crate::canvas::MIN_ZOOM && c.view.zoom <= crate::canvas::MAX_ZOOM);
+        }
+    }
+}

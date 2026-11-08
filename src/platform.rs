@@ -134,6 +134,8 @@ pub enum PickTarget {
     BlockFile { page: u64, block: u64 },
     Cover { page: u64 },
     Icon { page: u64 },
+    /// An image card of a canvas.
+    CanvasImage { page: u64, node: u64 },
 }
 
 pub struct Picked {

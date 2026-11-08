@@ -122,7 +122,7 @@ pub fn gallery(ctx: &egui::Context, ws: &mut Workspace, pal: &Palette, g: &mut G
     g.opened = true;
     // the individual plot types live inside the unified Chart widget
     let defs: Vec<Def> = dw::all().into_iter().filter(|d| !cfg::PLOT_KINDS.contains(&d.kind)).collect();
-    Area::new(Id::new("dash_gallery")).order(Order::Foreground).fixed_pos(screen.min).constrain(false).show(ctx, |ui| {
+    Area::new(Id::new("dash_gallery")).order(crate::widgets::HOST_ORDER).fixed_pos(screen.min).constrain(false).show(ctx, |ui| {
         ui.set_clip_rect(screen);
         let (full, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
         ui.painter().rect_filled(full, 0.0, Color32::from_black_alpha((110.0 * t) as u8));
@@ -287,7 +287,7 @@ pub fn inspector(ctx: &egui::Context, ws: &mut Workspace, pal: &Palette, id: u64
     let pos = pos2(area.right() - width - 4.0, area.top() + 4.0);
     let t = crate::widgets::appear(ctx, Id::new(("dash_insp_in", id)), 0.16);
     let db = ws.db(w.cfg.db).cloned();
-    Area::new(Id::new("dash_inspector")).order(Order::Foreground).fixed_pos(pos + vec2((1.0 - t) * 24.0, 0.0)).constrain(false).show(ctx, |ui| {
+    Area::new(Id::new("dash_inspector")).order(crate::widgets::HOST_ORDER).fixed_pos(pos + vec2((1.0 - t) * 24.0, 0.0)).constrain(false).show(ctx, |ui| {
         popup_frame(pal).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
             ui.set_width(width - 28.0);
             ui.set_height(h - 28.0);

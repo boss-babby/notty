@@ -3,7 +3,7 @@
 # On a Windows machine simply run:  cargo build --release   ->  target\release\lumen.exe
 set -euo pipefail
 cd "$(dirname "$0")"
-cargo build --release --bin lumen --target x86_64-pc-windows-gnu
+cargo build -j2 --release --bin lumen --target x86_64-pc-windows-gnu
 EXE="${CARGO_TARGET_DIR:-target}/x86_64-pc-windows-gnu/release/lumen.exe"
 mkdir -p ../public/downloads
 cp "$EXE" ../public/downloads/Lumen-windows-x64.exe

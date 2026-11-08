@@ -56,6 +56,7 @@ enum PalAct {
     Open(u64),
     NewPage,
     NewDb,
+    NewCanvas,
     Journal,
     Templates,
     Import,
@@ -230,7 +231,7 @@ impl LumenApp {
                 let size = self.media.get(id).map(|i| i.size).unwrap_or(size_hint);
                 self.ed.media_sizes.insert(id, size);
                 let page = match target {
-                    PickTarget::BlockImage { page, .. } | PickTarget::BlockFile { page, .. } | PickTarget::Cover { page } | PickTarget::Icon { page } => page,
+                    PickTarget::BlockImage { page, .. } | PickTarget::BlockFile { page, .. } | PickTarget::Cover { page } | PickTarget::Icon { page } | PickTarget::CanvasImage { page, .. } => page,
                 };
                 if let Some(p) = self.ws.page_mut(page) {
                     match target {
@@ -259,6 +260,17 @@ impl LumenApp {
                             p.icon = format!("img:media:{id}");
                             self.ed.icon_picker = None;
                         }
+                        PickTarget::CanvasImage { node, .. } => {
+                            if let Some(c) = p.canvas.as_mut() {
+                                if let Some(n) = c.node_mut(node) {
+                                    n.kind = crate::canvas::Kind::Image;
+                                    n.url = format!("media:{id}");
+                                    n.h = 0.0;
+                                }
+                                c.rev += 1;
+                            }
+                            crate::canvasui::close_popup();
+                        }
                     }
                 }
                 self.ws.touch(page);
@@ -269,6 +281,16 @@ impl LumenApp {
     /// Appends an image / file block to the current page (used by drag & drop).
     fn add_media_block(&mut self, ctx: &Context, kind: BlockKind, name: &str, bytes: Vec<u8>) {
         let Some(cur) = self.ws.current else { return };
+        if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Canvas) {
+            if kind == BlockKind::Image {
+                if let Some(node) = crate::canvasui::new_image_node(&mut self.ws, cur) {
+                    self.set_media(ctx, PickTarget::CanvasImage { page: cur, node }, name, bytes);
+                }
+            } else {
+                self.toast("Drop images onto a canvas to add them", None);
+            }
+            return;
+        }
         let bid = self.ws.id();
         let tail_id = self.ws.id();
         let target = if kind == BlockKind::Image { PickTarget::BlockImage { page: cur, block: bid } } else { PickTarget::BlockFile { page: cur, block: bid } };
@@ -429,8 +451,22 @@ impl LumenApp {
         self.toast(msg, None);
     }
 
+    fn can_undo_redo(&self, cur: u64) -> (bool, bool) {
+        if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Canvas) {
+            crate::canvasui::can_undo_redo(&self.ws, cur)
+        } else {
+            (crate::history::can_undo(&self.ed, cur), crate::history::can_redo(&self.ed, cur))
+        }
+    }
+
     fn undo_redo(&mut self, redo: bool) {
         let Some(cur) = self.ws.current else { return };
+        if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Canvas) {
+            if !crate::canvasui::undo_redo(&mut self.ws, cur, redo) {
+                self.toast(if redo { "Nothing to redo" } else { "Nothing to undo" }, None);
+            }
+            return;
+        }
         let Some(p) = self.ws.page_mut(cur) else { return };
         let ok = if redo { crate::history::redo(&mut self.ed, p) } else { crate::history::undo(&mut self.ed, p) };
         if ok {
@@ -457,6 +493,7 @@ impl LumenApp {
             PalAct::Open(id) => self.ws.current = Some(id),
             PalAct::NewPage => self.new_page(None, PageKind::Doc),
             PalAct::NewDb => self.new_page(None, PageKind::Database),
+            PalAct::NewCanvas => self.new_page(None, PageKind::Canvas),
             PalAct::Journal => self.ws.open_today(),
             PalAct::Dashboard => crate::views::toggle(crate::views::Mode::Dashboard, self.ws.current),
             PalAct::Graph => crate::views::toggle(crate::views::Mode::Graph, self.ws.current),
@@ -550,6 +587,9 @@ impl LumenApp {
         }
         if simple_row(ui, pal, "sr_board", w, Icon::Board, "New database", None) {
             self.new_page(None, PageKind::Database);
+        }
+        if simple_row(ui, pal, "sr_canvas", w, Icon::Canvas, "New canvas", None) {
+            self.new_page(None, PageKind::Canvas);
         }
         if simple_row(ui, pal, "sr_journal", w, Icon::Page, "Today's journal", Some("Ctrl J")) {
             self.run(PalAct::Journal);
@@ -719,7 +759,7 @@ impl LumenApp {
                 self.page_menu = Some(r.rect.left_bottom() + vec2(-220.0, 6.0));
                 self.fresh = true;
             }
-            let (can_u, can_r) = (crate::history::can_undo(&self.ed, cur), crate::history::can_redo(&self.ed, cur));
+            let (can_u, can_r) = self.can_undo_redo(cur);
             let unread = self.ws.auto.unread();
             let br = icon_button(ui, pal, Icon::Bell, 16.0, "Notifications & automations");
             if unread > 0 {
@@ -818,7 +858,7 @@ impl LumenApp {
             scored.sort_by_key(|s| s.0);
             out.extend(scored.into_iter().take(8).map(|(_, a, i, t, s)| (a, i, t, s)));
         }
-        let actions: [(PalAct, &str, &str, &str); 22] = [
+        let actions: [(PalAct, &str, &str, &str); 23] = [
             (PalAct::Automations, l::ZAP, "Automations", "Rules, buttons, recurring tasks, reminders  (Ctrl+Shift+A)"),
             (PalAct::NewReminder, l::BELL, "New reminder", "Get a desktop / push notification at a set time"),
             (PalAct::Dashboard, l::LAYOUT_DASHBOARD, "Dashboard", "KPIs, pipeline charts, tasks and deadlines  (Ctrl+D)"),
@@ -829,6 +869,7 @@ impl LumenApp {
             (PalAct::Print, l::PRINTER, "Print / Save as PDF", "Print-ready version with images and databases"),
             (PalAct::NewPage, l::PLUS, "New page", "Create a blank page"),
             (PalAct::NewDb, l::KANBAN, "New database", "Table, board, list, gallery or calendar"),
+            (PalAct::NewCanvas, l::NETWORK, "New canvas", "Infinite whiteboard of cards, pages, images and connectors"),
             (PalAct::Journal, l::BOOK_OPEN, "Today's journal", "Open or create today's entry  (Ctrl+J)"),
             (PalAct::Templates, l::LAYOUT_TEMPLATE, "Browse templates", "Meeting notes, trackers, wiki…"),
             (PalAct::Import, l::FILE_DOWN, "Import…", "Markdown, CSV or a workspace backup"),
@@ -992,6 +1033,7 @@ impl LumenApp {
         let items = [
             CtxItem::new(l::FILE_PLUS, "New page").hint("Ctrl+N"),
             CtxItem::new(l::KANBAN, "New database"),
+            CtxItem::new(l::NETWORK, "New canvas"),
             CtxItem::new(l::BOOK_OPEN, "Today's journal").hint("Ctrl+J"),
             CtxItem::new(l::LAYOUT_TEMPLATE, "Templates…").sep(),
             CtxItem::new(l::FILE_DOWN, "Import…"),
@@ -1004,10 +1046,11 @@ impl LumenApp {
         match pick {
             Some(0) => self.new_page(None, PageKind::Doc),
             Some(1) => self.new_page(None, PageKind::Database),
-            Some(2) => self.run(PalAct::Journal),
-            Some(3) => self.templates_open = true,
-            Some(4) => self.run(PalAct::Import),
-            Some(5) => self.trash_open = true,
+            Some(2) => self.new_page(None, PageKind::Canvas),
+            Some(3) => self.run(PalAct::Journal),
+            Some(4) => self.templates_open = true,
+            Some(5) => self.run(PalAct::Import),
+            Some(6) => self.trash_open = true,
             _ => {}
         }
     }
@@ -1198,7 +1241,7 @@ impl LumenApp {
                 self.fresh = true;
             }
         }
-        let (can_u, can_r) = (crate::history::can_undo(&self.ed, cur), crate::history::can_redo(&self.ed, cur));
+        let (can_u, can_r) = self.can_undo_redo(cur);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(4.0);
             let r = icon_button(ui, pal, Icon::Dots, 18.0, "Page options");
@@ -2192,6 +2235,20 @@ impl LumenApp {
                 ctx.memory_mut(|m| m.request_focus(Id::new(("title", cur))));
                 self.focus_title = None;
             }
+            // canvas pages are a full-bleed whiteboard, not a scrolling document
+            if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Canvas) {
+                crate::canvasui::fix_once(&mut self.ws);
+                let out = crate::canvasui::show(ui, &mut self.ws, cur, &pal);
+                if let Some(id) = out.open {
+                    if self.ws.page(id).map_or(false, |p| !p.trashed) {
+                        self.ws.current = Some(id);
+                    }
+                }
+                if let Some(t) = out.toast {
+                    self.toast(t, None);
+                }
+                return;
+            }
             ui.add_space((1.0 - a) * 14.0);
             ui.set_opacity(a);
 
@@ -2317,7 +2374,7 @@ pub(crate) fn modal(ctx: &Context, id: Id, pal: &Palette, width: f32, top: f32, 
     let t = appear(ctx, id.with("a"), 0.2);
     let mut open = true;
     let screen = ctx.screen_rect();
-    let bd = Area::new(id.with("backdrop")).order(Order::Foreground).fixed_pos(Pos2::ZERO).show(ctx, |ui| {
+    let bd = Area::new(id.with("backdrop")).order(crate::widgets::HOST_ORDER).fixed_pos(Pos2::ZERO).show(ctx, |ui| {
         let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
         ui.painter().rect_filled(r, 0.0, Color32::from_black_alpha((120.0 * t) as u8));
         if resp.clicked() {
@@ -2325,20 +2382,22 @@ pub(crate) fn modal(ctx: &Context, id: Id, pal: &Palette, width: f32, top: f32, 
         }
     });
     // The backdrop must always sit *below* the dialog, otherwise the dialog looks greyed-out/hidden.
-    ctx.raise_layer(bd.response.layer_id);
-    let md = Area::new(id).order(Order::Foreground).anchor(Align2::CENTER_TOP, vec2(0.0, top + (1.0 - t) * 16.0)).show(ctx, |ui| {
+    ctx.move_to_top(bd.response.layer_id);
+    let md = Area::new(id).order(crate::widgets::HOST_ORDER).anchor(Align2::CENTER_TOP, vec2(0.0, top + (1.0 - t) * 16.0)).show(ctx, |ui| {
         ui.set_opacity(t);
         crate::widgets::popup_frame(pal).corner_radius(CornerRadius::same(14)).inner_margin(Margin::same(8)).show(ui, |ui| {
             ui.set_width(width.min((screen.width() - 32.0).max(280.0)));
             add(ui);
         });
     });
-    ctx.raise_layer(md.response.layer_id);
+    ctx.move_to_top(md.response.layer_id);
     if ctx.input(|i| i.key_pressed(Key::Escape)) {
         open = false;
     }
     if !open {
         reset_appear(ctx, id.with("a"));
+        // a drop-down that was open when the dialog closed must not stay "open" in egui's memory (it would block re-raising later)
+        ctx.memory_mut(|m| m.close_popup());
     }
     open
 }
@@ -2365,7 +2424,7 @@ fn hier_rows(ui: &mut Ui, pal: &Palette, ws: &Workspace, exp: &std::collections:
         }
         let ic = pos2(x0 + 44.0, rect.center().y);
         if p.icon.is_empty() {
-            icons::paint(ui.painter(), ic, 16.0, if p.kind == PageKind::Database { Icon::Board } else { Icon::Page }, pal.muted);
+            icons::paint(ui.painter(), ic, 16.0, match p.kind { PageKind::Database => Icon::Board, PageKind::Canvas => Icon::Canvas, _ => Icon::Page }, pal.muted);
         } else {
             icons::paint_page_icon(ui, ic, &p.icon, 18.0, pal.text);
         }
@@ -2455,7 +2514,7 @@ fn page_row(ui: &mut Ui, pal: &Palette, key: Id, w: f32, depth: usize, page: &Pa
     // icon & title
     let ic = pos2(x0 + 32.0, rect.center().y);
     if page.icon.is_empty() {
-        icons::paint(p, ic, 15.0, if page.kind == PageKind::Database { Icon::Board } else { Icon::Page }, pal.muted);
+        icons::paint(p, ic, 15.0, match page.kind { PageKind::Database => Icon::Board, PageKind::Canvas => Icon::Canvas, _ => Icon::Page }, pal.muted);
     } else {
         icons::paint_page_icon(ui, ic, &page.icon, 17.0, pal.text);
     }
