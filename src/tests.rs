@@ -1504,3 +1504,38 @@ fn canvas_renders_every_kind_template_and_zoom_without_panicking() {
         }
     }
 }
+
+// ───────────── complex-script shaping (vendor/epaint, HarfBuzz) ─────────────
+
+#[test]
+fn shaping_bengali_hindi_arabic_thai() {
+    let ctx = test_ctx();
+    let font = egui::FontId::proportional(20.0);
+    let mut report = String::new();
+    let _ = ctx.run(RawInput::default(), |ctx| {
+        for text in ["বাংলা ভাষা কি", "ক্ষত্রিয় র্ক্ষ", "हिन्दी क्षत्रिय", "العربية 123", "สวัสดี", "தமிழ்", "שלום"] {
+            let g = ctx.fonts(|f| f.layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::BLACK));
+            let n_chars = text.chars().count();
+            let row = &g.rows[0];
+            assert_eq!(row.glyphs.len(), n_chars, "one entry per character: {text}");
+            let quads: usize = row.glyphs.iter().map(|gl| (0..4).filter(|i| !gl.quad(*i).0.is_nothing()).count()).sum();
+            assert!(quads > 0 && g.size().x > 10.0, "{text}: drew nothing ({quads} quads, w {})", g.size().x);
+            report += &format!("{text}: chars {n_chars}, quads {quads}, width {:.1}\n", g.size().x);
+        }
+        // Bengali: the vowel sign I (ি, U+09BF) is drawn LEFT of its consonant — a quad of the cluster starts left of the cluster origin or the
+        // cluster is narrower than its two plain letters would be.
+        let ki = ctx.fonts(|f| f.layout_no_wrap("কি".to_owned(), font.clone(), egui::Color32::BLACK));
+        let plain = ctx.fonts(|f| f.layout_no_wrap("ক".to_owned(), font.clone(), egui::Color32::BLACK));
+        assert!(ki.size().x > plain.size().x * 0.9, "cluster must have a width");
+        // Arabic joins: a shaped word is narrower than the same letters set in isolated forms
+        let joined = ctx.fonts(|f| f.layout_no_wrap("سلام".to_owned(), font.clone(), egui::Color32::BLACK));
+        let isolated = ctx.fonts(|f| f.layout_no_wrap("س ل ا م".replace(' ', "\u{200B}"), font.clone(), egui::Color32::BLACK));
+        report += &format!("arabic joined {:.1} / zwsp-split {:.1}\n", joined.size().x, isolated.size().x);
+        // mixed-direction row: the Arabic letters sit to the right of the Latin word in an LTR paragraph only when the Latin comes first
+        let mixed = ctx.fonts(|f| f.layout_no_wrap("abc سلام".to_owned(), font.clone(), egui::Color32::BLACK));
+        let gl = &mixed.rows[0].glyphs;
+        assert!(gl[0].pos.x < gl[4].pos.x, "Latin first stays on the left");
+        assert!(gl[4].pos.x > gl[7].pos.x, "Arabic reads right to left: first letter is rightmost");
+    });
+    println!("{report}");
+}

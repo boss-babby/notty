@@ -5,7 +5,7 @@
 # Optional: WASM_OPT=1 runs binaryen wasm-opt — NOT the default: with this toolchain it breaks the externref table and the app fails to start in Chrome.
 set -euo pipefail
 cd "$(dirname "$0")"
-OUT=../public/webapp
+OUT="${OUT:-../public/webapp}"
 # URL prefix the folder is served from. The page is reachable at /webapp and (rewrite in next.config.ts) at /app, so <base href> is mandatory.
 WEB_BASE="${WEB_BASE:-/webapp/}"
 cargo build --lib --profile web --target wasm32-unknown-unknown
@@ -17,6 +17,7 @@ sed "s/__BUILD__/$BUILD/g; s#<!--BASE-->#<base href=\"$WEB_BASE\" />#" web/index
 sed "s/__BUILD__/$BUILD/g" web/sw.js > "$OUT/sw.js"
 cp web/manifest.webmanifest "$OUT/manifest.webmanifest"
 cp web/icons/*.png "$OUT/icons/"
+mkdir -p "$OUT/fonts" && cp web/fonts/* "$OUT/fonts/"
 VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
 printf '{"version":"%s","built":"%s","build":"%s"}\n' "$VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BUILD" > "$OUT/version.json"
 if [ "${WASM_OPT:-0}" = "1" ] && command -v wasm-opt >/dev/null 2>&1; then

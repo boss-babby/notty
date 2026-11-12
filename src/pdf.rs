@@ -278,6 +278,10 @@ struct Reader {
     /// Pinch: where the centre of the two fingers is (screen), and how far it travelled since the last zoom was applied.
     pinch_c: Option<Pos2>,
     pinch_pan: Vec2,
+    /// Raw fingers on the screen (touch id -> position) and the centre / spread of the previous frame's pinch. The zoom anchor is the
+    /// *measured* centre of the fingers, so the page point between the fingers stays exactly there.
+    fingers: Vec<(u64, Pos2)>,
+    pinch_prev: Option<(Pos2, f32)>,
     /// Pages on screen in the last frame (for the selection handles).
     shown_last: Vec<(usize, Rect)>,
     /// Screen positions of the start / end of the selection (bottom of the first / last selected line) and the handle being dragged.
@@ -355,6 +359,8 @@ impl Reader {
             menu: false,
             pinch_c: None,
             pinch_pan: Vec2::ZERO,
+            fingers: vec![],
+            pinch_prev: None,
             shown_last: vec![],
             hstart: None,
             hend: None,
@@ -1423,23 +1429,47 @@ fn reading_view(
     // input: pinch / Ctrl+wheel zoom, keys
     // Two fingers: the page point between the fingers stays between the fingers (zoom *and* pan), one step per frame, and nothing
     // else (text drag, page pan, selection) may react to the same fingers — that is what made the pages jump while pinching.
-    let multi = ctx.input(|i| i.multi_touch());
-    if let Some(m) = multi {
-        rd.touch = true;
-        let prev = *rd.pinch_c.get_or_insert(m.start_pos);
-        let zd = if m.zoom_delta.is_finite() { m.zoom_delta.clamp(0.5, 2.0) } else { 1.0 };
-        let tr = if m.translation_delta.is_finite() { m.translation_delta } else { Vec2::ZERO };
-        rd.pinch_c = Some(prev + tr);
-        rd.pinch_pan += tr;
-        if (zd - 1.0).abs() > 1e-4 {
-            *zoom_req = Some((zoom_req.map_or(rd.zoom, |z| z.0) * zd, prev));
+    ctx.input(|i| {
+        if !i.any_touches() {
+            rd.fingers.clear();
         }
+        for ev in &i.events {
+            if let egui::Event::Touch { id, phase, pos, .. } = ev {
+                match phase {
+                    egui::TouchPhase::Start | egui::TouchPhase::Move => {
+                        if let Some(f) = rd.fingers.iter_mut().find(|f| f.0 == id.0) {
+                            f.1 = *pos;
+                        } else {
+                            rd.fingers.push((id.0, *pos));
+                        }
+                    }
+                    egui::TouchPhase::End | egui::TouchPhase::Cancel => rd.fingers.retain(|f| f.0 != id.0),
+                }
+            }
+        }
+    });
+    if rd.fingers.len() >= 2 && ctx.input(|i| i.any_touches()) {
+        rd.touch = true;
+        let n = rd.fingers.len() as f32;
+        let c = rd.fingers.iter().fold(Vec2::ZERO, |a, f| a + f.1.to_vec2()) / n;
+        let c = c.to_pos2();
+        let d = rd.fingers.iter().map(|f| (f.1 - c).length()).sum::<f32>() / n;
+        if let Some((c0, d0)) = rd.pinch_prev.filter(|p| p.1 > 6.0 && c.x.is_finite() && c.y.is_finite()) {
+            let k = if d.is_finite() { (d / d0).clamp(0.5, 2.0) } else { 1.0 };
+            rd.pinch_pan += c - c0;
+            if (k - 1.0).abs() > 1e-4 {
+                *zoom_req = Some((zoom_req.map_or(rd.zoom, |z| z.0) * k, c0));
+            }
+        }
+        rd.pinch_c = Some(c);
+        rd.pinch_prev = Some((c, d));
         rd.text_drag = false;
         rd.pan = false;
         rd.hdrag = 0;
         ctx.request_repaint();
     } else {
         rd.pinch_c = None;
+        rd.pinch_prev = None;
         if hovered {
             let zd = ctx.input(|i| i.zoom_delta());
             if (zd - 1.0).abs() > 1e-4 {

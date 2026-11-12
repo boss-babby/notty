@@ -916,54 +916,68 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette) ->
     let avail = ui.available_width();
     let side = if avail > 900.0 { (avail - 820.0) / 2.0 } else { 14.0_f32.min(avail * 0.04) };
     let narrow = avail < 560.0;
-    ScrollArea::vertical().id_salt("auto_scroll").auto_shrink([false, false]).show(ui, |ui| {
-        ui.horizontal_top(|ui| {
-            ui.add_space(side);
-            ui.vertical(|ui| {
-                let page_w = (avail - 2.0 * side - 8.0).clamp(240.0, 820.0);
-                ui.set_width(page_w);
-                // long labels wrap inside their column instead of running over the next widget (phones)
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                ui.add_space(18.0);
-                // header
-                ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
-                    ui.painter().rect_filled(r, 12.0, with_alpha(pal.accent, 0.14));
-                    icons::glyph(ui.painter(), r.center(), 22.0, l::ZAP, pal.accent);
-                    ui.vertical(|ui| {
-                        ui.set_max_width((page_w - 44.0 - roomy_w() - 3.0 * ui.spacing().item_spacing.x).max(120.0));
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(RichText::new("Automations").font(bold(if narrow { 22.0 } else { 26.0 })).color(pal.text));
-                        ui.label(RichText::new("Rules, scripts, buttons, recurring tasks and reminders").font(body(13.0)).color(pal.muted));
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if icon_btn(ui, pal, l::X, "Close", false).clicked() {
-                            out.close = true;
-                        }
-                    });
-                });
-                ui.add_space(14.0);
-                let mut tab = st(|s| s.tab) as usize;
-                let unread = ws.auto.unread();
-                let inbox_label = if unread > 0 { format!("Inbox · {unread}") } else { "Inbox".to_owned() };
-                let labels: Vec<&str> = vec!["Rules", "Reminders", &inbox_label, "Activity", "Scripts", "Roadmap"];
-                ScrollArea::horizontal().id_salt("auto_tabs").auto_shrink([false, true]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
-                    crate::uploader::segmented(ui, pal, Id::new("auto_seg"), &labels, &mut tab);
-                });
-                st(|s| s.tab = tab as u8);
-                ui.add_space(14.0);
-                if let Some(m) = st(|s| s.msg.take()) {
-                    out.toast = Some(m);
+    let page_w = (avail - 2.0 * side - 8.0).clamp(240.0, 820.0);
+    // The header and the tab strip are a fixed block *above* the scroll area (they never scroll under / over the page content, and the
+    // content can never be painted on top of them). Everything is clipped to its own rectangle.
+    let head_top = ui.cursor().min.y;
+    let full = ui.max_rect();
+    let mut tab = st(|s| s.tab) as usize;
+    let unread = ws.auto.unread();
+    let inbox_label = if unread > 0 { format!("Inbox · {unread}") } else { "Inbox".to_owned() };
+    let labels: Vec<&str> = vec!["Rules", "Reminders", &inbox_label, "Activity", "Scripts", "Roadmap"];
+    ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_max(pos2(full.left() + side, head_top), pos2(full.left() + side + page_w, full.bottom()))), |ui| {
+        ui.set_width(page_w);
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
+            ui.painter().rect_filled(r, 12.0, with_alpha(pal.accent, 0.14));
+            icons::glyph(ui.painter(), r.center(), 22.0, l::ZAP, pal.accent);
+            let close_w = 44.0;
+            let text_w = (page_w - 44.0 - close_w - 2.0 * ui.spacing().item_spacing.x).max(100.0);
+            ui.allocate_ui_with_layout(vec2(text_w, 44.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_max_width(text_w);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.add(egui::Label::new(RichText::new("Automations").font(bold(if narrow { 22.0 } else { 26.0 })).color(pal.text)).truncate());
+                if !narrow {
+                    ui.add(egui::Label::new(RichText::new("Rules, scripts, buttons, recurring tasks and reminders").font(body(13.0)).color(pal.muted)).truncate());
                 }
-                match tab {
-                    0 => rules_tab(ui, ws, rt, pal, &mut out),
-                    1 => reminders_tab(ui, ws, rt, pal, &mut out),
-                    2 => inbox_tab(ui, ws, pal, &mut out),
-                    3 => activity_tab(ui, ws, pal),
-                    4 => crate::scriptui::scripts_tab(ui, ws, rt, pal, &mut out),
-                    _ => crate::scriptui::roadmap_tab(ui, pal),
-                }
-                ui.add_space(60.0);
+            });
+            if icon_btn(ui, pal, l::X, "Close", false).clicked() {
+                out.close = true;
+            }
+        });
+        ui.add_space(10.0);
+        ScrollArea::horizontal().id_salt("auto_tabs").auto_shrink([false, true]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
+            crate::uploader::segmented(ui, pal, Id::new("auto_seg"), &labels, &mut tab);
+        });
+        ui.add_space(10.0);
+    });
+    st(|s| s.tab = tab as u8);
+    let body_top = ui.cursor().min.y.max(head_top + 14.0 + 44.0 + 10.0 + 36.0 + 10.0);
+    let body_rect = Rect::from_min_max(pos2(full.left(), body_top), full.right_bottom());
+    ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
+        ui.set_clip_rect(body_rect.intersect(ui.clip_rect()));
+        ScrollArea::vertical().id_salt("auto_scroll").auto_shrink([false, false]).show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.add_space(side);
+                ui.vertical(|ui| {
+                    ui.set_width(page_w);
+                    // long labels wrap inside their column instead of running over the next widget (phones)
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                    if let Some(m) = st(|s| s.msg.take()) {
+                        out.toast = Some(m);
+                    }
+                    match tab {
+                        0 => rules_tab(ui, ws, rt, pal, &mut out),
+                        1 => reminders_tab(ui, ws, rt, pal, &mut out),
+                        2 => inbox_tab(ui, ws, pal, &mut out),
+                        3 => activity_tab(ui, ws, pal),
+                        4 => crate::scriptui::scripts_tab(ui, ws, rt, pal, &mut out),
+                        _ => crate::scriptui::roadmap_tab(ui, pal),
+                    }
+                    ui.add_space(60.0);
+                });
             });
         });
     });

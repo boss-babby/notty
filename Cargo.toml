@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "9.0.0"
+version = "9.1.0"
 edition = "2021"
 description = "Lumen — a free Notion + Obsidian + Miro-lite alternative (infinite canvas) written entirely in Rust with egui (Windows + WebAssembly), with automations, reminders and the LumenScript scripting language"
 license = "MIT"
@@ -50,6 +50,7 @@ wry = { version = "0.53", default-features = false, features = ["os-webview"] }
 rfd = { version = "0.15", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+ehttp = "0.5"
 # rfd's build script insists on a Linux backend feature even for wasm32; the feature pulls in nothing there.
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 wasm-bindgen = "0.2"
@@ -84,6 +85,8 @@ eframe = { path = "vendor/eframe" }
 egui-winit = { path = "vendor/egui-winit" }
 # egui_glow 0.31.1 with highp shaders: the stock mediump precision is 16-bit on Android GPUs and sliced / blurred the glyph atlas lookups
 egui_glow = { path = "vendor/egui_glow" }
+# epaint 0.31.1 with HarfBuzz shaping (rustybuzz) + bidi reordering for complex scripts (vendor/epaint/src/text/text_layout.rs, "Lumen")
+epaint = { path = "vendor/epaint" }
 
 # Read by `cargo apk` (plain NativeActivity package). The production APK is assembled by ./build-android.sh instead, because Lumen
 # ships its own Java activity (window insets, soft keyboard, Storage-Access-Framework file dialogs, clipboard, print) that cargo-apk

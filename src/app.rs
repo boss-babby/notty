@@ -155,6 +155,8 @@ impl LumenApp {
             crate::touch::set_touchy(true);
         }
         theme::setup_fonts(&cc.egui_ctx);
+        #[cfg(target_arch = "wasm32")]
+        theme::load_web_fonts(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let saved: Option<Saved> = cc.storage.and_then(|s| eframe::get_value(s, STORAGE_KEY));
         let (ws, cred, skipped) = match saved {
@@ -712,6 +714,13 @@ impl LumenApp {
         ui.add_space(8.0);
         if icon_button(ui, pal, Icon::Menu, 16.0, "Toggle sidebar  (Ctrl+\\)").clicked() {
             self.ws.sidebar_open = !self.ws.sidebar_open;
+        }
+        // Automations is its own workspace: the bar must not show (or act on) the page that is hidden behind it.
+        if crate::views::mode() == crate::views::Mode::Automations {
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(RichText::new(l::ZAP).font(body(15.0)).color(pal.accent)));
+            ui.add(egui::Label::new(RichText::new("Automations").font(bold(15.0)).color(pal.text)).truncate());
+            return;
         }
         let Some(cur) = self.ws.current else { return };
         let narrow = ui.ctx().screen_rect().width() < 720.0;

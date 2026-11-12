@@ -181,6 +181,29 @@ pub fn body(size: f32) -> FontId {
     FontId::new(size * content_z(), FontFamily::Proportional)
 }
 
+/// Fonts downloaded at run time (web), see [`load_web_fonts`].
+static EXTRA_FONTS: std::sync::Mutex<Vec<(String, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Web: the Chinese / Japanese / Korean subsets (≈ 2.8 MB, cached by the service worker) are fetched in the background and registered
+/// as soon as they arrive. Native builds use the operating system's fonts instead.
+#[cfg(target_arch = "wasm32")]
+pub fn load_web_fonts(ctx: &Context) {
+    for (name, url) in [("cjk-sc", "fonts/NotoSansSC-subset.otf"), ("cjk-jp", "fonts/NotoSansJP-subset.otf"), ("cjk-kr", "fonts/NotoSansKR-subset.otf")] {
+        let ctx = ctx.clone();
+        ehttp::fetch(ehttp::Request::get(url), move |res| {
+            if let Ok(r) = res {
+                if r.ok && r.bytes.len() > 1000 {
+                    if let Ok(mut g) = EXTRA_FONTS.lock() {
+                        g.push((name.to_owned(), r.bytes));
+                    }
+                    setup_fonts(&ctx);
+                    ctx.request_repaint();
+                }
+            }
+        });
+    }
+}
+
 pub fn setup_fonts(ctx: &Context) {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert(
@@ -200,14 +223,38 @@ pub fn setup_fonts(ctx: &Context) {
     // Scripts Inter does not cover: Bengali, Devanagari (Hindi, Marathi, Nepali), Arabic (also Persian, Urdu) and Hebrew are embedded, every
     // other script (CJK, Thai, Tamil, Telugu, Gujarati, Khmer, …) comes from the fonts of the operating system (Android / Windows).
     let mut scripts: Vec<String> = vec![];
+    // Every script with complex shaping (Indic, Arabic, Hebrew, Thai, Khmer, Myanmar …) is shaped by HarfBuzz (vendor/epaint), so each of
+    // them needs its own font. Order matters only for shared code points (the danda).
     for (name, bytes) in [
         ("noto-bengali", &include_bytes!("../assets/NotoSansBengali-Regular.ttf")[..]),
         ("noto-devanagari", &include_bytes!("../assets/NotoSansDevanagari-Regular.ttf")[..]),
         ("noto-arabic", &include_bytes!("../assets/NotoSansArabic-Regular.ttf")[..]),
         ("noto-hebrew", &include_bytes!("../assets/NotoSansHebrew-Regular.ttf")[..]),
+        ("noto-thai", &include_bytes!("../assets/NotoSansThai-Regular.ttf")[..]),
+        ("noto-tamil", &include_bytes!("../assets/NotoSansTamil-Regular.ttf")[..]),
+        ("noto-telugu", &include_bytes!("../assets/NotoSansTelugu-Regular.ttf")[..]),
+        ("noto-kannada", &include_bytes!("../assets/NotoSansKannada-Regular.ttf")[..]),
+        ("noto-malayalam", &include_bytes!("../assets/NotoSansMalayalam-Regular.ttf")[..]),
+        ("noto-gujarati", &include_bytes!("../assets/NotoSansGujarati-Regular.ttf")[..]),
+        ("noto-gurmukhi", &include_bytes!("../assets/NotoSansGurmukhi-Regular.ttf")[..]),
+        ("noto-oriya", &include_bytes!("../assets/NotoSansOriya-Regular.ttf")[..]),
+        ("noto-sinhala", &include_bytes!("../assets/NotoSansSinhala-Regular.ttf")[..]),
+        ("noto-khmer", &include_bytes!("../assets/NotoSansKhmer-Regular.ttf")[..]),
+        ("noto-lao", &include_bytes!("../assets/NotoSansLao-Regular.ttf")[..]),
+        ("noto-myanmar", &include_bytes!("../assets/NotoSansMyanmar-Regular.ttf")[..]),
+        ("noto-armenian", &include_bytes!("../assets/NotoSansArmenian-Regular.ttf")[..]),
+        ("noto-georgian", &include_bytes!("../assets/NotoSansGeorgian-Regular.ttf")[..]),
+        ("noto-ethiopic", &include_bytes!("../assets/NotoSansEthiopic-Regular.ttf")[..]),
     ] {
         fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
         scripts.push(name.to_owned());
+    }
+    // fonts that arrived over the network (web: CJK subsets)
+    if let Ok(extra) = EXTRA_FONTS.lock() {
+        for (name, bytes) in extra.iter() {
+            fonts.font_data.insert(name.clone(), Arc::new(FontData::from_owned(bytes.clone())));
+            scripts.push(name.clone());
+        }
     }
     scripts.extend(system_fonts(&mut fonts));
     let rest: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();

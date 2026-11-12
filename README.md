@@ -1,3 +1,21 @@
+# Lumen 9.1 — every script, exact pinch-zoom, Android-first build
+
+* **Complex-script text shaping** (`vendor/epaint`, a patched epaint 0.31.1 + [rustybuzz](https://crates.io/crates/rustybuzz) = HarfBuzz in Rust).
+  egui draws one glyph per character, which is why Bangla / Hindi / Tamil … looked "broken" (no conjuncts, vowel signs on the wrong side,
+  unjoined Arabic). Now every run of a complex script is shaped per word with the font that supplies it; a shaped cluster keeps one layout
+  entry per character (cursor, selection, editing and wrapping are unchanged) and is drawn from up to four glyph quads per entry.
+  Covered: Bengali, Devanagari, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam, Sinhala, Thai, Lao, Khmer, Myanmar, Tibetan (system font),
+  Arabic (also Persian, Urdu, Pashto …), Hebrew, Armenian, Georgian, Ethiopic, Cyrillic / Greek / Vietnamese (Inter) and CJK
+  (web: lazily fetched Simplified-Chinese / Japanese / Korean subsets from `web/fonts`; Android and Windows: the system fonts).
+* **Right-to-left**: rows are reordered visually (Unicode bidi in its simplest useful form): RTL runs are mirrored as a whole, numbers and Latin
+  words inside them stay left-to-right, brackets are mirrored, and a paragraph that starts with a right-to-left letter is right-aligned.
+  Test: `cargo test --lib shaping_`.
+* **Automations screen**: the header and the tab strip are a fixed block above the scroll area (content can no longer be drawn over them), and the top bar
+  no longer shows — or acts on — the page that is hidden behind the workspace.
+* **PDF pinch zoom** is driven by the *measured* centre and spread of the raw fingers (`Event::Touch`) instead of egui's derived gesture: the page point
+  between the fingers stays between the fingers while the fingers move, in both axes, at every zoom level.
+* Build: `./build-web.sh` (copies the CJK subsets too), `./build-android.sh` (signed arm64 APK), `./build-windows.sh`. Outputs land in `../public`.
+
 # Lumen 6.0 — Automations, recurring tasks, reminders
 
 New in this release (details and the cloud roadmap in [AUTOMATION.md](AUTOMATION.md)):
