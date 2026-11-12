@@ -1,6 +1,8 @@
 //! Lumen — a Notion-style workspace written entirely in Rust with egui.
 //! The same code runs as a native desktop app and as WebAssembly in the browser.
 
+#[cfg(target_os = "android")]
+mod android;
 mod app;
 mod canvas;
 mod canvasdraw;
@@ -91,5 +93,25 @@ mod web {
         fn default() -> Self {
             Self::new()
         }
+    }
+}
+
+/// Android entry point (NativeActivity → android-activity → here). The Java half is `android/java/com/lumen/app/LumenActivity.java`.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub fn android_main(app: android_activity::AndroidApp) {
+    android::init(&app);
+    let options = eframe::NativeOptions {
+        android_app: Some(app),
+        renderer: eframe::Renderer::Glow,
+        vsync: true,
+        // Plain 2D UI: no depth / stencil / MSAA buffers (saves GPU memory and battery).
+        multisampling: 0,
+        depth_buffer: 0,
+        stencil_buffer: 0,
+        ..Default::default()
+    };
+    if let Err(e) = eframe::run_native("Lumen", options, Box::new(|cc| Ok(Box::new(LumenApp::new(cc))))) {
+        log::error!("Lumen stopped: {e}");
     }
 }

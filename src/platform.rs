@@ -3,7 +3,11 @@
 /// Saves `data` as a file the user can reach. Desktop: writes to the Downloads folder.
 /// Web: triggers a browser download. Returns a human readable status message.
 pub fn save_download(name: &str, data: &[u8], mime: &str) -> String {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(target_os = "android")]
+    {
+        crate::android::save_file(name, data, mime)
+    }
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     {
         let _ = mime;
         let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_else(|_| ".".into());
@@ -75,7 +79,13 @@ thread_local! {
 /// Starts reading the system clipboard. The text arrives via [`take_paste`] (immediately on desktop, a moment later
 /// in the browser because the Clipboard API is asynchronous).
 pub fn request_paste(ctx: &egui::Context) {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(target_os = "android")]
+    {
+        let text = crate::android::clipboard_get();
+        PASTE.with(|p| *p.borrow_mut() = Some(text));
+        ctx.request_repaint();
+    }
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     {
         let text = arboard::Clipboard::new().and_then(|mut c| c.get_text()).unwrap_or_default();
         PASTE.with(|p| *p.borrow_mut() = Some(text));
@@ -105,7 +115,12 @@ pub fn take_paste() -> Option<String> {
 
 /// Opens a URL in the system browser (desktop) or a new tab (web).
 pub fn open_url(ctx: &egui::Context, url: &str) {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(target_os = "android")]
+    {
+        let _ = ctx;
+        crate::android::open_url(url);
+    }
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     {
         let _ = ctx;
         let _ = webbrowser::open(url);
@@ -121,7 +136,9 @@ pub fn haptic(ctx: &egui::Context, ms: u32) {
     if let Some(w) = web_sys::window() {
         let _ = w.navigator().vibrate_with_duration(ms);
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(target_os = "android")]
+    crate::android::haptic(ms);
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     let _ = ms;
 }
 
@@ -158,7 +175,7 @@ pub fn push_picked(p: Picked) {
 
 /// True when a native "open file" dialog exists on this platform (Windows, macOS, web).
 pub fn can_pick_files() -> bool {
-    cfg!(any(windows, target_os = "macos", target_arch = "wasm32"))
+    cfg!(any(windows, target_os = "macos", target_os = "android", target_arch = "wasm32"))
 }
 
 /// Opens the system file dialog; the result shows up in [`take_picked`].
@@ -195,7 +212,9 @@ pub fn pick_file(ctx: &egui::Context, target: PickTarget, images_only: bool) {
             ctx.request_repaint();
         });
     }
-    #[cfg(not(any(windows, target_os = "macos", target_arch = "wasm32")))]
+    #[cfg(target_os = "android")]
+    crate::android::pick_file(ctx, target, images_only);
+    #[cfg(not(any(windows, target_os = "macos", target_os = "android", target_arch = "wasm32")))]
     {
         let _ = (ctx, target, images_only);
     }
@@ -382,7 +401,11 @@ mod native {
 /// Shows a self-contained HTML document in the browser (new tab on the web, system browser on desktop) so the user can print
 /// it or save it as PDF. Returns a status message.
 pub fn open_html(name: &str, html: &str) -> String {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(target_os = "android")]
+    {
+        crate::android::print_html(name, html)
+    }
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     {
         let mut path = std::env::temp_dir();
         path.push(name);
@@ -431,7 +454,7 @@ pub fn coarse_pointer() -> bool {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn coarse_pointer() -> bool {
-    false
+    cfg!(target_os = "android")
 }
 
 // ───────────────────────────── time zone ─────────────────────────────
@@ -469,7 +492,11 @@ pub fn tz_offset_minutes() -> i64 {
             -(bias as i64)
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "android")]
+    {
+        crate::android::tz_minutes()
+    }
+    #[cfg(not(any(windows, target_os = "android")))]
     {
         std::env::var("LUMEN_TZ_MIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
     }
@@ -505,6 +532,8 @@ pub fn notify_permission() -> String {
 pub fn notify_request() {
     #[cfg(target_arch = "wasm32")]
     call_bridge("lumenNotifyRequest", &[]);
+    #[cfg(target_os = "android")]
+    crate::android::notify_request();
 }
 
 /// Shows a system notification right now.
@@ -513,7 +542,9 @@ pub fn notify_os(title: &str, body: &str, tag: &str) {
     call_bridge("lumenNotify", &[title.into(), body.into(), tag.into()]);
     #[cfg(windows)]
     windows_toast(title, body);
-    #[cfg(all(not(windows), not(target_arch = "wasm32")))]
+    #[cfg(target_os = "android")]
+    crate::android::notify(title, body, tag);
+    #[cfg(all(not(windows), not(target_arch = "wasm32"), not(target_os = "android")))]
     {
         let _ = tag;
         #[cfg(target_os = "macos")]

@@ -7,5 +7,6 @@ cargo build -j2 --release --bin lumen --target x86_64-pc-windows-gnu
 EXE="${CARGO_TARGET_DIR:-target}/x86_64-pc-windows-gnu/release/lumen.exe"
 mkdir -p ../public/downloads
 cp "$EXE" ../public/downloads/Lumen-windows-x64.exe
-(cd ../public/downloads && rm -f Lumen-windows-x64.zip && zip -q Lumen-windows-x64.zip Lumen-windows-x64.exe && sha256sum Lumen-windows-x64.exe Lumen-windows-x64.zip > SHA256SUMS.txt)
+(cd ../public/downloads && rm -f Lumen-windows-x64.zip && zip -q Lumen-windows-x64.zip Lumen-windows-x64.exe)
+./make-sums.sh >/dev/null
 ls -la ../public/downloads

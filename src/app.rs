@@ -1888,14 +1888,70 @@ impl eframe::App for LumenApp {
         crate::widgets::filter_raw_input(ctx, raw_input);
         // Finger gestures: tap / swipe-to-scroll with fling / long-press to drag (touch.rs).
         crate::touch::on_raw_input(ctx, raw_input);
+        // Android: exact pixel density, safe area (status bar / navigation bar / keyboard), soft-keyboard text and keys.
+        #[cfg(target_os = "android")]
+        crate::android::on_raw_input(ctx, raw_input);
     }
 
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
         self.ed.embed_rects.clear();
+        #[cfg(target_os = "android")]
+        self.android_back(ctx);
         self.frame(ctx);
         self.sync_embeds(frame);
         crate::touch::paint_hold(ctx);
         crate::widgets::end_frame(ctx);
+        #[cfg(target_os = "android")]
+        crate::android::after_frame(ctx, self.ws.dark || self.locked);
+    }
+}
+
+#[cfg(target_os = "android")]
+impl LumenApp {
+    /// The Android Back button / gesture, handled like a native app: close the drawer, close the top-most dialog or menu, leave the text
+    /// field, go up one level in the page tree — and only then send the app to the background (never destroy it).
+    fn android_back(&mut self, ctx: &Context) {
+        if !crate::android::take_back() {
+            return;
+        }
+        let narrow = ctx.screen_rect().width() < 720.0;
+        if self.locked {
+            crate::android::go_home();
+            return;
+        }
+        if narrow && self.ws.sidebar_open {
+            self.ws.sidebar_open = false;
+            return;
+        }
+        let overlay = self.history.is_some()
+            || self.palette.is_some()
+            || self.help_open
+            || self.import.is_some()
+            || self.templates_open
+            || self.trash_open
+            || self.security.is_some()
+            || self.ed.pdf_req.is_some()
+            || self.ed.menu.is_some()
+            || self.ed.block_menu.is_some()
+            || self.ed.icon_picker.is_some()
+            || self.ed.cover_picker.is_some();
+        if overlay || ctx.memory(|m| m.any_popup_open()) {
+            crate::android::push_key(egui::Key::Escape);
+            return;
+        }
+        if let Some(id) = ctx.memory(|m| m.focused()) {
+            ctx.memory_mut(|m| m.surrender_focus(id));
+            ctx.request_repaint();
+            return;
+        }
+        if let Some(parent) = self.ws.current.and_then(|c| self.ws.page(c)).and_then(|p| p.parent) {
+            if self.ws.page(parent).is_some_and(|p| !p.trashed) {
+                self.ws.current = Some(parent);
+                ctx.request_repaint();
+                return;
+            }
+        }
+        crate::android::go_home();
     }
 }
 
@@ -2109,7 +2165,7 @@ impl LumenApp {
                 let screen = ctx.screen_rect();
                 // the drawer pushes the page (and the top bar) to the right in step with its own edge
                 egui::SidePanel::left("drawer_push").resizable(false).show_separator_line(false).exact_width(sw * st).frame(Frame::NONE).show(ctx, |_| {});
-                let bd = Area::new(Id::new("drawer_backdrop")).order(Order::Middle).fixed_pos(Pos2::ZERO).show(ctx, |ui| {
+                let bd = Area::new(Id::new("drawer_backdrop")).order(Order::Middle).fixed_pos(screen.min).show(ctx, |ui| {
                     let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
                     ui.painter().rect_filled(r, 0.0, Color32::from_black_alpha((110.0 * st) as u8));
                     if resp.clicked() {
@@ -2117,7 +2173,7 @@ impl LumenApp {
                     }
                 });
                 ctx.raise_layer(bd.response.layer_id);
-                let dr = Area::new(Id::new("drawer")).order(Order::Middle).fixed_pos(pos2(-(1.0 - st) * sw, 0.0)).show(ctx, |ui| {
+                let dr = Area::new(Id::new("drawer")).order(Order::Middle).fixed_pos(pos2(screen.min.x - (1.0 - st) * sw, screen.min.y)).show(ctx, |ui| {
                     Frame::new().fill(pal.sidebar).inner_margin(Margin::symmetric(8, 0)).shadow(egui::epaint::Shadow { offset: [3, 0], blur: 20, spread: 0, color: Color32::from_black_alpha((70.0 * st) as u8) }).show(ui, |ui| {
                         ui.set_min_size(vec2(sw - 16.0, screen.height()));
                         ui.set_max_width(sw - 16.0);

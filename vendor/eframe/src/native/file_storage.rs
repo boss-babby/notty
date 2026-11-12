@@ -17,6 +17,10 @@ use std::{
 pub fn storage_dir(app_id: &str) -> Option<PathBuf> {
     use egui::os::OperatingSystem as OS;
     use std::env::var_os;
+    // Android (and sandboxed launchers) hand the app its private data directory through this variable.
+    if let Some(dir) = var_os("LUMEN_DATA_DIR").map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return Some(dir.join("storage"));
+    }
     match OS::from_target_os() {
         OS::Nix => var_os("XDG_DATA_HOME")
             .map(PathBuf::from)

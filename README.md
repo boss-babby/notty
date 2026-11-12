@@ -25,6 +25,12 @@ Tests: `cargo test --lib` (127 tests, 14 for the automation engine).
 A free, offline-first **Notion alternative written entirely in Rust** with [egui](https://github.com/emilk/egui) — no web engine, no JavaScript UI.
 One codebase builds a native **Windows** app and a **WebAssembly** app for the browser.
 
+
+## Android app (new) — see [ANDROID.md](ANDROID.md)
+Signed arm64 APK built by `./build-android.sh` (served at `/downloads`): exact-density text rendering (as crisp as WebAssembly), edge-to-edge window with
+exact system-bar / cutout insets, content that stops on top of the keyboard, a real soft-keyboard `InputConnection`, native Storage-Access-Framework file
+dialogs, system Back handling, clipboard, haptics, notifications and Android print / Save-as-PDF. `./setup-android-env.sh` installs the headless toolchain.
+
 ## Mobile update 3 — keyboard, headings, PWA (increment on 5.6)
 * **Keyboard policy** (`vendor/eframe/src/web/kbd.rs`, wired in `app_runner.rs::touch_keyboard`). On touch devices the hidden `<input>` is focused **only by a deliberate tap inside the text field being edited** (short, motionless touch). Carets that appear by themselves — a new block, a widget added with `/widget`, a new page, Enter — never open the keyboard, so you can keep scrolling. A **swipe closes the keyboard** and is never followed by a re-open. A caret that stays **outside the visible area for > 1.1 s** (below the keyboard) closes it, which removes the open → scroll → close → open loop. After Android's *Back* hid the keyboard, tapping the field brings it back. Timing uses the browser's event timestamps, so a busy main thread cannot turn a swipe into a "hold". Mouse / desktop browsers keep the old behaviour.
 * **Caret stays visible**: when the visible height changes (keyboard opens/closes, rotation) the block being edited scrolls its caret into view once (`editor.rs`).
