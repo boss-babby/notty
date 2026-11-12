@@ -43,7 +43,20 @@ pub struct Report {
 
 /// Runs `code` on the live workspace. Row changes are reported to the automation engine through `follow`.
 pub fn run_script(ws: &mut Workspace, code: &str, ctx: &ScriptCtx, out: &mut Output, follow: &mut Vec<Ev>) -> Report {
-    let mut h = SH { ws, ctx, out, follow, effects: vec![], writes: 0, created: 0, notified: 0 };
+    run_script_with(ws, code, ctx, out, follow, None)
+}
+
+/// Extra globals and `emit()` / `emit_to()` for scripts that run as a node of a Flow (see `flow.rs`).
+#[derive(Default)]
+pub struct Extra {
+    pub globals: BTreeMap<String, Value>,
+    /// (output port name, value) in call order; `emit(v)` uses the port name `""` (the first output).
+    pub emitted: Vec<(String, Value)>,
+}
+
+/// Same as [`run_script`] with optional flow globals.
+pub fn run_script_with(ws: &mut Workspace, code: &str, ctx: &ScriptCtx, out: &mut Output, follow: &mut Vec<Ev>, extra: Option<&mut Extra>) -> Report {
+    let mut h = SH { ws, ctx, out, follow, effects: vec![], writes: 0, created: 0, notified: 0, extra };
     let o = script::run(code, &mut h);
     let effects = std::mem::take(&mut h.effects);
     if !effects.is_empty() {
@@ -69,6 +82,7 @@ struct SH<'a> {
     writes: u32,
     created: u32,
     notified: u32,
+    extra: Option<&'a mut Extra>,
 }
 
 fn row_ref(id: u64) -> Value {
@@ -394,10 +408,13 @@ const FUNCS: [&str; 13] = ["notify", "db", "dbs", "today", "now", "date_add", "d
 
 impl<'a> Host for SH<'a> {
     fn has_fn(&self, name: &str) -> bool {
-        FUNCS.contains(&name)
+        FUNCS.contains(&name) || (self.extra.is_some() && (name == "emit" || name == "emit_to"))
     }
 
     fn global(&mut self, name: &str) -> Option<Value> {
+        if let Some(v) = self.extra.as_ref().and_then(|e| e.globals.get(name)) {
+            return Some(v.clone());
+        }
         match name {
             "row" => Some(self.ctx.row.map(row_ref).unwrap_or(Value::Null)),
             "page" => Some(self.ctx.page.or(self.ctx.row).map(row_ref).unwrap_or(Value::Null)),
@@ -423,6 +440,20 @@ impl<'a> Host for SH<'a> {
 
     fn call(&mut self, name: &str, args: &[Value]) -> Result<Value, String> {
         match name {
+            "emit" | "emit_to" if self.extra.is_some() => {
+                let (port, v) = if name == "emit" {
+                    (String::new(), args.first().cloned().unwrap_or(Value::Null))
+                } else {
+                    (Self::arg_str(args, 0, "emit_to(port, value) needs a port name")?, args.get(1).cloned().unwrap_or(Value::Null))
+                };
+                if let Some(e) = self.extra.as_mut() {
+                    if e.emitted.len() >= 200 {
+                        return Err("a node can emit at most 200 values".into());
+                    }
+                    e.emitted.push((port, v));
+                }
+                Ok(Value::Null)
+            }
             "notify" => {
                 self.notified += 1;
                 if self.notified > MAX_NOTIFY {

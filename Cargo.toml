@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "9.1.0"
+version = "10.0.0"
 edition = "2021"
 description = "Lumen — a free Notion + Obsidian + Miro-lite alternative (infinite canvas) written entirely in Rust with egui (Windows + WebAssembly), with automations, reminders and the LumenScript scripting language"
 license = "MIT"
@@ -22,6 +22,7 @@ serde_json = "1"
 sha2 = "0.10"
 log = "0.4"
 hayro = "0.9"
+ehttp = "0.5"
 
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "persistence", "x11", "wayland"] }

@@ -658,6 +658,8 @@ pub enum PageKind {
     Database,
     /// Infinite whiteboard of cards, pages, images and connectors (see `canvas.rs`).
     Canvas,
+    /// Node-based data-flow / automation graph (see `flow.rs`).
+    Flow,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -735,6 +737,9 @@ pub struct Page {
     /// The whiteboard of a [`PageKind::Canvas`] page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canvas: Option<crate::canvas::Canvas>,
+    /// The node graph of a [`PageKind::Flow`] page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<crate::flow::Flow>,
 }
 
 /// A saved snapshot of a page's content.
@@ -781,6 +786,7 @@ impl Page {
             history: vec![],
             repeats: self.repeats.clone(),
             canvas: None,
+            flow: None,
         }
     }
 
@@ -897,6 +903,7 @@ fn blank_page(id: u64, parent: Option<u64>, kind: PageKind) -> Page {
         history: vec![],
         repeats: BTreeMap::new(),
         canvas: None,
+        flow: None,
     }
 }
 
@@ -956,6 +963,9 @@ impl Workspace {
         if kind == PageKind::Canvas {
             return self.add_canvas(parent);
         }
+        if kind == PageKind::Flow {
+            return self.add_flow(parent);
+        }
         if kind != PageKind::Doc {
             return self.add_database(parent, ViewKind::Table);
         }
@@ -976,6 +986,26 @@ impl Workspace {
         page.canvas = Some(crate::canvas::Canvas::new());
         self.push_page(page, parent);
         id
+    }
+
+    /// New empty flow (node graph) page.
+    pub fn add_flow(&mut self, parent: Option<u64>) -> u64 {
+        let id = self.id();
+        let mut page = blank_page(id, parent, PageKind::Flow);
+        page.icon = crate::lucide::ZAP.into();
+        page.flow = Some(crate::flow::Flow::default());
+        self.push_page(page, parent);
+        id
+    }
+
+    /// Repairs flows loaded from disk (dangling wires, loops, flow pages without a graph).
+    pub fn fix_flows(&mut self) {
+        for p in self.pages.iter_mut().filter(|p| p.kind == PageKind::Flow) {
+            match p.flow.as_mut() {
+                Some(f) => f.repair(),
+                None => p.flow = Some(crate::flow::Flow::default()),
+            }
+        }
     }
 
     /// Repairs canvases loaded from disk (damaged geometry, dangling connectors, canvas pages without a board).

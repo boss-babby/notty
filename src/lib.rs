@@ -7,6 +7,8 @@ mod app;
 mod canvas;
 mod canvasdraw;
 mod canvasui;
+mod flow;
+mod flowui;
 mod automation;
 mod autoui;
 mod uploader;

@@ -2665,7 +2665,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "lumen"
-version = "9.1.0"
+version = "10.0.0"
 dependencies = [
  "android-activity",
  "android_logger",

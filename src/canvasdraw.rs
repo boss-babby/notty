@@ -321,6 +321,7 @@ fn page_excerpt(ws: &Workspace, id: u64) -> (String, String, String, bool) {
     let sub = match p.kind {
         PageKind::Database => format!("Database · {} rows", ws.rows(id).len()),
         PageKind::Canvas => format!("Canvas · {} items", p.canvas.as_ref().map_or(0, |c| c.nodes.len())),
+        PageKind::Flow => format!("Flow · {} nodes", p.flow.as_ref().map_or(0, |c| c.nodes.len())),
         _ => {
             let mut s = String::new();
             for b in p.blocks.iter().filter(|b| !b.text.trim().is_empty()) {

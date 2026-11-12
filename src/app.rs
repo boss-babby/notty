@@ -57,6 +57,7 @@ enum PalAct {
     NewPage,
     NewDb,
     NewCanvas,
+    NewFlow,
     Journal,
     Templates,
     Import,
@@ -456,6 +457,8 @@ impl LumenApp {
     fn can_undo_redo(&self, cur: u64) -> (bool, bool) {
         if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Canvas) {
             crate::canvasui::can_undo_redo(&self.ws, cur)
+        } else if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Flow) {
+            crate::flowui::can_undo_redo(&self.ws, cur)
         } else {
             (crate::history::can_undo(&self.ed, cur), crate::history::can_redo(&self.ed, cur))
         }
@@ -465,6 +468,12 @@ impl LumenApp {
         let Some(cur) = self.ws.current else { return };
         if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Canvas) {
             if !crate::canvasui::undo_redo(&mut self.ws, cur, redo) {
+                self.toast(if redo { "Nothing to redo" } else { "Nothing to undo" }, None);
+            }
+            return;
+        }
+        if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Flow) {
+            if !crate::flowui::undo_redo(&mut self.ws, cur, redo) {
                 self.toast(if redo { "Nothing to redo" } else { "Nothing to undo" }, None);
             }
             return;
@@ -496,6 +505,7 @@ impl LumenApp {
             PalAct::NewPage => self.new_page(None, PageKind::Doc),
             PalAct::NewDb => self.new_page(None, PageKind::Database),
             PalAct::NewCanvas => self.new_page(None, PageKind::Canvas),
+            PalAct::NewFlow => self.new_page(None, PageKind::Flow),
             PalAct::Journal => self.ws.open_today(),
             PalAct::Dashboard => crate::views::toggle(crate::views::Mode::Dashboard, self.ws.current),
             PalAct::Graph => crate::views::toggle(crate::views::Mode::Graph, self.ws.current),
@@ -592,6 +602,9 @@ impl LumenApp {
         }
         if simple_row(ui, pal, "sr_canvas", w, Icon::Canvas, "New canvas", None) {
             self.new_page(None, PageKind::Canvas);
+        }
+        if simple_row(ui, pal, "sr_flow", w, Icon::Flow, "New flow", None) {
+            self.new_page(None, PageKind::Flow);
         }
         if simple_row(ui, pal, "sr_journal", w, Icon::Page, "Today's journal", Some("Ctrl J")) {
             self.run(PalAct::Journal);
@@ -867,7 +880,7 @@ impl LumenApp {
             scored.sort_by_key(|s| s.0);
             out.extend(scored.into_iter().take(8).map(|(_, a, i, t, s)| (a, i, t, s)));
         }
-        let actions: [(PalAct, &str, &str, &str); 23] = [
+        let actions: [(PalAct, &str, &str, &str); 24] = [
             (PalAct::Automations, l::ZAP, "Automations", "Rules, buttons, recurring tasks, reminders  (Ctrl+Shift+A)"),
             (PalAct::NewReminder, l::BELL, "New reminder", "Get a desktop / push notification at a set time"),
             (PalAct::Dashboard, l::LAYOUT_DASHBOARD, "Dashboard", "KPIs, pipeline charts, tasks and deadlines  (Ctrl+D)"),
@@ -879,6 +892,7 @@ impl LumenApp {
             (PalAct::NewPage, l::PLUS, "New page", "Create a blank page"),
             (PalAct::NewDb, l::KANBAN, "New database", "Table, board, list, gallery or calendar"),
             (PalAct::NewCanvas, l::NETWORK, "New canvas", "Infinite whiteboard of cards, pages, images and connectors"),
+            (PalAct::NewFlow, l::ZAP, "New flow", "Node-based automation: APIs, data, logic and your workspace, wired together"),
             (PalAct::Journal, l::BOOK_OPEN, "Today's journal", "Open or create today's entry  (Ctrl+J)"),
             (PalAct::Templates, l::LAYOUT_TEMPLATE, "Browse templates", "Meeting notes, trackers, wiki…"),
             (PalAct::Import, l::FILE_DOWN, "Import…", "Markdown, CSV or a workspace backup"),
@@ -1043,6 +1057,7 @@ impl LumenApp {
             CtxItem::new(l::FILE_PLUS, "New page").hint("Ctrl+N"),
             CtxItem::new(l::KANBAN, "New database"),
             CtxItem::new(l::NETWORK, "New canvas"),
+            CtxItem::new(l::ZAP, "New flow"),
             CtxItem::new(l::BOOK_OPEN, "Today's journal").hint("Ctrl+J"),
             CtxItem::new(l::LAYOUT_TEMPLATE, "Templates…").sep(),
             CtxItem::new(l::FILE_DOWN, "Import…"),
@@ -1056,10 +1071,11 @@ impl LumenApp {
             Some(0) => self.new_page(None, PageKind::Doc),
             Some(1) => self.new_page(None, PageKind::Database),
             Some(2) => self.new_page(None, PageKind::Canvas),
-            Some(3) => self.run(PalAct::Journal),
-            Some(4) => self.templates_open = true,
-            Some(5) => self.run(PalAct::Import),
-            Some(6) => self.trash_open = true,
+            Some(3) => self.new_page(None, PageKind::Flow),
+            Some(4) => self.run(PalAct::Journal),
+            Some(5) => self.templates_open = true,
+            Some(6) => self.run(PalAct::Import),
+            Some(7) => self.trash_open = true,
             _ => {}
         }
     }
@@ -2314,6 +2330,17 @@ impl LumenApp {
                 }
                 return;
             }
+            if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Flow) {
+                crate::flowui::fix_once(&mut self.ws);
+                let out = crate::flowui::show(ui, &mut self.ws, cur, &pal);
+                if let Some(o) = out.output {
+                    self.after_auto(ctx, o);
+                }
+                if let Some(t) = out.toast {
+                    self.toast(t, None);
+                }
+                return;
+            }
             ui.add_space((1.0 - a) * 14.0);
             ui.set_opacity(a);
 
@@ -2489,7 +2516,7 @@ fn hier_rows(ui: &mut Ui, pal: &Palette, ws: &Workspace, exp: &std::collections:
         }
         let ic = pos2(x0 + 44.0, rect.center().y);
         if p.icon.is_empty() {
-            icons::paint(ui.painter(), ic, 16.0, match p.kind { PageKind::Database => Icon::Board, PageKind::Canvas => Icon::Canvas, _ => Icon::Page }, pal.muted);
+            icons::paint(ui.painter(), ic, 16.0, match p.kind { PageKind::Database => Icon::Board, PageKind::Canvas => Icon::Canvas, PageKind::Flow => Icon::Flow, _ => Icon::Page }, pal.muted);
         } else {
             icons::paint_page_icon(ui, ic, &p.icon, 18.0, pal.text);
         }
@@ -2579,7 +2606,7 @@ fn page_row(ui: &mut Ui, pal: &Palette, key: Id, w: f32, depth: usize, page: &Pa
     // icon & title
     let ic = pos2(x0 + 32.0, rect.center().y);
     if page.icon.is_empty() {
-        icons::paint(p, ic, 15.0, match page.kind { PageKind::Database => Icon::Board, PageKind::Canvas => Icon::Canvas, _ => Icon::Page }, pal.muted);
+        icons::paint(p, ic, 15.0, match page.kind { PageKind::Database => Icon::Board, PageKind::Canvas => Icon::Canvas, PageKind::Flow => Icon::Flow, _ => Icon::Page }, pal.muted);
     } else {
         icons::paint_page_icon(ui, ic, &page.icon, 17.0, pal.text);
     }
