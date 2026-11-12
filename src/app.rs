@@ -78,6 +78,8 @@ enum PalAct {
     Graph,
     Automations,
     NewReminder,
+    Ai,
+    AiSettings,
 }
 
 struct PaletteState {
@@ -148,6 +150,8 @@ pub struct LumenApp {
     auto_rt: crate::automation::Runtime,
     last_auto: f64,
     last_push: f64,
+    /// Lumen AI: provider settings, chats, the agent loop and the MCP transports (see `ai.rs`, `aiui.rs`, `mcp.rs`).
+    ai: crate::ai::AiHost,
 }
 
 impl LumenApp {
@@ -181,6 +185,7 @@ impl LumenApp {
             media.gc(&used);
             media.register(&cc.egui_ctx);
         }
+        let ai = crate::ai::AiHost { st: cc.storage.and_then(|s| eframe::get_value::<crate::ai::AiState>(s, crate::ai::STORAGE_KEY)).unwrap_or_default(), rt: Default::default() };
         let mut ed = EditorState::default();
         ed.media_sizes = media.items.iter().map(|(k, v)| (*k, v.size)).collect();
         Self {
@@ -221,6 +226,7 @@ impl LumenApp {
             auto_rt: crate::automation::Runtime::new(),
             last_auto: 0.0,
             last_push: 0.0,
+            ai,
         }
     }
 
@@ -509,6 +515,14 @@ impl LumenApp {
             PalAct::Journal => self.ws.open_today(),
             PalAct::Dashboard => crate::views::toggle(crate::views::Mode::Dashboard, self.ws.current),
             PalAct::Graph => crate::views::toggle(crate::views::Mode::Graph, self.ws.current),
+            PalAct::Ai => {
+                self.ai.rt.open = !self.ai.rt.open;
+                self.ai.rt.focus_input = self.ai.rt.open;
+            }
+            PalAct::AiSettings => {
+                self.ai.rt.open = true;
+                self.ai.rt.settings = Some(crate::ai::SettingsTab::Providers);
+            }
             PalAct::Automations => {
                 crate::autoui::open_tab(crate::autoui::TAB_RULES);
                 crate::views::toggle(crate::views::Mode::Automations, self.ws.current);
@@ -622,6 +636,12 @@ impl LumenApp {
         let badge = if unread > 0 { format!("{unread} new") } else { String::new() };
         if simple_row(ui, pal, "sr_auto", w, Icon::Zap, "Automations", if unread > 0 { Some(badge.as_str()) } else { Some("Ctrl ⇧ A") }) {
             self.run(PalAct::Automations);
+        }
+        if simple_row(ui, pal, "sr_ai", w, Icon::Sparkles, "Ask Lumen AI", Some("Ctrl ⇧ J")) {
+            self.run(PalAct::Ai);
+            if ui.ctx().screen_rect().width() < 720.0 {
+                self.ws.sidebar_open = false;
+            }
         }
         ui.add_space(8.0);
 
@@ -782,6 +802,9 @@ impl LumenApp {
                 self.fresh = true;
             }
             let (can_u, can_r) = self.can_undo_redo(cur);
+            if icon_button(ui, pal, Icon::Sparkles, 16.0, "Ask Lumen AI  (Ctrl+Shift+J)").clicked() {
+                self.run(PalAct::Ai);
+            }
             let unread = self.ws.auto.unread();
             let br = icon_button(ui, pal, Icon::Bell, 16.0, "Notifications & automations");
             if unread > 0 {
@@ -880,7 +903,9 @@ impl LumenApp {
             scored.sort_by_key(|s| s.0);
             out.extend(scored.into_iter().take(8).map(|(_, a, i, t, s)| (a, i, t, s)));
         }
-        let actions: [(PalAct, &str, &str, &str); 24] = [
+        let actions: [(PalAct, &str, &str, &str); 26] = [
+            (PalAct::Ai, l::SPARKLES, "Ask Lumen AI", "Chat with the agent that can build pages, databases, dashboards and automations  (Ctrl+Shift+J)"),
+            (PalAct::AiSettings, l::KEY_ROUND, "AI settings & agent connections", "API keys (Gemini, OpenAI, Claude, OpenRouter …), access level, MCP server"),
             (PalAct::Automations, l::ZAP, "Automations", "Rules, buttons, recurring tasks, reminders  (Ctrl+Shift+A)"),
             (PalAct::NewReminder, l::BELL, "New reminder", "Get a desktop / push notification at a set time"),
             (PalAct::Dashboard, l::LAYOUT_DASHBOARD, "Dashboard", "KPIs, pipeline charts, tasks and deadlines  (Ctrl+D)"),
@@ -1249,7 +1274,7 @@ impl LumenApp {
         let sw = ui.ctx().screen_rect().width();
         let sp = ui.spacing().item_spacing.x;
         let btn = 38.0;
-        let title_w = (sw - 8.0 - btn * 5.0 - sp * 7.0 - 28.0).clamp(60.0, 520.0);
+        let title_w = (sw - 8.0 - btn * 6.0 - sp * 8.0 - 28.0).clamp(60.0, 520.0);
         if let Some(p) = self.ws.page(cur) {
             let title = if p.title.is_empty() { "Untitled".to_owned() } else { p.title.clone() };
             let icon = p.icon.clone();
@@ -1273,6 +1298,9 @@ impl LumenApp {
             if r.clicked() {
                 self.page_menu = Some(r.rect.left_bottom() + vec2(-230.0, 6.0));
                 self.fresh = true;
+            }
+            if icon_button(ui, pal, Icon::Sparkles, 18.0, "Ask Lumen AI").clicked() {
+                self.run(PalAct::Ai);
             }
             let unread = self.ws.auto.unread();
             let br = icon_button(ui, pal, Icon::Bell, 18.0, "Notifications & automations");
@@ -1896,6 +1924,7 @@ impl eframe::App for LumenApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, STORAGE_KEY, &SavedRef { ws: &self.ws, cred: &self.cred, skipped: self.skipped_setup });
         self.media.save(storage);
+        eframe::set_value(storage, crate::ai::STORAGE_KEY, &self.ai.st.for_save());
     }
 
     fn auto_save_interval(&self) -> Duration {
@@ -1946,6 +1975,14 @@ impl LumenApp {
         }
         if narrow && self.ws.sidebar_open {
             self.ws.sidebar_open = false;
+            return;
+        }
+        if self.ai.rt.settings.is_some() {
+            self.ai.rt.settings = None;
+            return;
+        }
+        if self.ai.rt.open && narrow {
+            self.ai.rt.open = false;
             return;
         }
         let overlay = self.history.is_some()
@@ -2023,8 +2060,36 @@ impl LumenApp {
         }
     }
 
+    /// Lumen AI: network answers, the agent loop, MCP requests — and what they ask of the app (open a page, toasts, formula refresh).
+    fn run_ai(&mut self, ctx: &Context) {
+        let changed = self.ai.tick(&mut self.ws, ctx, self.locked);
+        if changed {
+            self.calc_dirty = true;
+            ctx.request_repaint();
+        }
+        if self.ai.rt.undone {
+            self.ai.rt.undone = false;
+            self.auto_rt.resync(&self.ws);
+            self.calc_dirty = true;
+        }
+        if let Some(t) = self.ai.rt.toast.take() {
+            self.toast(t, None);
+        }
+        if let Some(id) = self.ai.rt.open_req.take() {
+            // wide screens follow the agent live; on phones the chat covers the page, so the card's Open button does it
+            if ctx.screen_rect().width() >= 720.0 && !self.locked {
+                crate::views::set(crate::views::Mode::Page, None);
+                self.ws.current = Some(id);
+            }
+        }
+        if self.ai.rt.mcp.wants_fast_repaint(&self.ai.st.mcp) {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
     fn frame(&mut self, ctx: &Context) {
         self.run_automation(ctx);
+        self.run_ai(ctx);
         // theme (animated)
         let target = if self.locked || self.ws.dark { 1.0 } else { 0.0 };
         let t = ctx.animate_value_with_time(Id::new("theme_t"), target, 0.35);
@@ -2087,6 +2152,9 @@ impl LumenApp {
         if self.ed.pdf_req.is_none() {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::L)) {
             self.ws.dark = !self.ws.dark;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::J)) {
+            self.run(PalAct::Ai);
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
             self.palette = if self.palette.is_some() { None } else { Some(PaletteState { query: String::new(), sel: 0, focused: false, pick: None }) };
@@ -2235,6 +2303,23 @@ impl LumenApp {
                 });
         }
 
+        let ai_wide = self.ai.rt.open && !self.locked && ctx.screen_rect().width() >= 720.0;
+        if ai_wide {
+            let mut out = crate::aiui::PanelOut::default();
+            egui::SidePanel::right("ai_panel")
+                .resizable(true)
+                .default_width(400.0)
+                .width_range(320.0..=680.0)
+                .frame(Frame::new().fill(pal.bg).stroke(Stroke::new(1.0_f32, pal.border)))
+                .show(ctx, |ui| out = crate::aiui::panel(ui, ctx, &mut self.ai, &mut self.ws, &pal));
+            if out.close {
+                self.ai.rt.open = false;
+            }
+            if let Some(id) = out.open_page {
+                crate::views::set(crate::views::Mode::Page, None);
+                self.ws.current = Some(id);
+            }
+        }
         crate::views::sync(self.ws.current);
         if let Some(t) = crate::dashcfg::take_toast() {
             self.toast(t, None);
@@ -2408,6 +2493,22 @@ impl LumenApp {
         self.import_ui(ctx, &pal);
         self.help_ui(ctx, &pal);
         self.ws_menu_ui(ctx, &pal);
+        if self.ai.rt.open && !self.locked && ctx.screen_rect().width() < 720.0 {
+            let out = crate::aiui::fullscreen(ctx, &mut self.ai, &mut self.ws, &pal);
+            if out.close {
+                self.ai.rt.open = false;
+                crate::widgets::reset_appear(ctx, Id::new("ai_sheet_a"));
+            }
+            if let Some(id) = out.open_page {
+                crate::views::set(crate::views::Mode::Page, None);
+                self.ws.current = Some(id);
+                self.ai.rt.open = false;
+                crate::widgets::reset_appear(ctx, Id::new("ai_sheet_a"));
+            }
+        }
+        if !self.locked {
+            crate::aiui::settings(ctx, &mut self.ai, &self.ws, &pal);
+        }
         self.palette_ui(ctx, &pal);
         self.trash_ui(ctx, &pal);
         self.security_ui(ctx, &pal);

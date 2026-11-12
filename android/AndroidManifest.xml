@@ -28,7 +28,8 @@
         android:extractNativeLibs="true"
         android:hardwareAccelerated="true"
         android:enableOnBackInvokedCallback="true"
-        android:supportsRtl="true">
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="true">
 
         <activity
             android:name="com.lumen.app.LumenActivity"

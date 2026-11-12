@@ -3,6 +3,11 @@
 
 #[cfg(target_os = "android")]
 mod android;
+mod agent_build;
+mod agent_tools;
+mod ai;
+mod aiui;
+mod mcp;
 mod app;
 mod canvas;
 mod canvasdraw;
@@ -56,9 +61,17 @@ mod widgets;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod agent_tests;
+#[cfg(test)]
 mod dashtests;
 
 pub use app::LumenApp;
+
+/// Entry point of the headless `lumen-mcp` binary (stdio MCP server over a workspace backup file).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn mcp_cli(args: Vec<String>) -> i32 {
+    mcp::run_cli(args)
+}
 
 #[cfg(target_arch = "wasm32")]
 mod web {

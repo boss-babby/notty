@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "10.0.0"
+version = "11.0.0"
 edition = "2021"
 description = "Lumen — a free Notion + Obsidian + Miro-lite alternative (infinite canvas) written entirely in Rust with egui (Windows + WebAssembly), with automations, reminders and the LumenScript scripting language"
 license = "MIT"
@@ -12,6 +12,11 @@ name = "lumen"
 [[bin]]
 name = "lumen"
 path = "src/main.rs"
+
+# Headless Model Context Protocol server over stdio (Claude Desktop, Cursor, scripts): lumen-mcp --workspace backup.json
+[[bin]]
+name = "lumen-mcp"
+path = "src/bin/lumen_mcp.rs"
 
 [dependencies]
 egui = "0.31"
@@ -57,7 +62,7 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "a
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "Element", "HtmlElement", "HtmlAnchorElement", "Node", "Blob", "BlobPropertyBag", "Url", "Navigator", "Clipboard", "HtmlIFrameElement", "CssStyleDeclaration", "DomRect", "HtmlCollection", "Storage"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "Element", "HtmlElement", "HtmlAnchorElement", "Node", "Blob", "BlobPropertyBag", "Url", "Navigator", "Clipboard", "HtmlIFrameElement", "CssStyleDeclaration", "DomRect", "HtmlCollection", "Storage", "Location"] }
 
 [profile.release]
 opt-level = 3
@@ -66,6 +71,16 @@ codegen-units = 8
 strip = true
 # unwind on native so a damaged PDF can never take the app down (the PDF engine catches panics); wasm always aborts
 panic = "unwind"
+
+# Android: release speed + a smaller, faster-starting .so (used by build-android.sh). Unwinding stays on (the PDF engine catches panics).
+[profile.android]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+debug = false
+incremental = false
 
 # Smaller, slower-to-build profile used by build-web.sh (download size matters in the browser).
 [profile.web]

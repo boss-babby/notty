@@ -49,6 +49,22 @@ fn entropy() -> Vec<u8> {
     out
 }
 
+/// `n_bytes` of unpredictable hex (hash of time, address-space and (web) `Math.random`) — API / bridge tokens.
+pub fn random_hex(n_bytes: usize) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let mut out = String::new();
+    while out.len() < n_bytes * 2 {
+        let mut h = Sha256::new();
+        h.update(entropy());
+        h.update(COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+        h.update(out.as_bytes());
+        out.push_str(&hex(&h.finalize()));
+    }
+    out.truncate(n_bytes * 2);
+    out
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

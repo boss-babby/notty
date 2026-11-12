@@ -42,8 +42,9 @@ export CXX_aarch64_linux_android="$TC/bin/${TRIPLE}${API}-clang++"
 export AR_aarch64_linux_android="$TC/bin/llvm-ar"
 # 16 KB ELF segment alignment (required by Android 15+ devices with 16 KB pages; harmless elsewhere)
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
-cargo build ${CARGO_JOBS:+-j$CARGO_JOBS} --release --lib --target "$TRIPLE"
-SO="$TARGET_DIR/$TRIPLE/release/liblumen.so"
+PROFILE="${PROFILE:-android}"
+cargo build ${CARGO_JOBS:+-j$CARGO_JOBS} --profile "$PROFILE" --lib --target "$TRIPLE"
+SO="$TARGET_DIR/$TRIPLE/$PROFILE/liblumen.so"
 [ -f "$SO" ] || { echo "liblumen.so was not produced" >&2; exit 1; }
 
 # 2. Java -> classes.dex ---------------------------------------------------------------------------------------------------------

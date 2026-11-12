@@ -1,3 +1,12 @@
+# Lumen 11.0 — Agents: built-in AI, MCP server, Android-optimised build
+
+* **Lumen AI** (`src/ai.rs`, `src/aiui.rs`) — an agent panel that builds pages, databases, dashboards, canvases, flows, automations and scripts through one tool registry (`src/agent_tools.rs`, `src/agent_build.rs`). Providers: Gemini, OpenAI, Claude, OpenRouter, Groq, Mistral, DeepSeek, xAI, Together, Fireworks, Cerebras, Ollama, LM Studio, custom OpenAI-compatible. Access levels, approvals, undo.
+* **MCP server** (`src/mcp.rs`) — cloud bridge (`/api/mcp` on the site), local HTTP, and the headless `lumen-mcp` binary. See [MCP.md](MCP.md).
+* **Knowledge base** (`ai-knowledge/*.md`) — read by the agent on demand; extend it with [AI.md](AI.md). Roadmap: [ROADMAP.md](ROADMAP.md).
+* **Android** — `[profile.android]` (thin LTO, stripped), `./build-android.sh`; `./build-all.sh` builds web + APK + Windows into `../public`.
+
+---
+
 # Lumen 9.1 — every script, exact pinch-zoom, Android-first build
 
 * **Complex-script text shaping** (`vendor/epaint`, a patched epaint 0.31.1 + [rustybuzz](https://crates.io/crates/rustybuzz) = HarfBuzz in Rust).

@@ -626,3 +626,14 @@ fn base64(data: &[u8]) -> String {
     }
     out
 }
+
+
+/// The address of the website the app runs on (web build) — used in the MCP connection snippets.
+pub fn site_origin() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        return web_sys::window().and_then(|w| w.location().origin().ok()).unwrap_or_default();
+    }
+    #[allow(unreachable_code)]
+    String::new()
+}
