@@ -30,3 +30,25 @@ Vendored patches: `vendor/eframe` (storage dir), `vendor/egui-winit` (no winit s
 ## Signing
 `android/lumen-release.jks` (password `lumen-release`, override with `LUMEN_KEYSTORE` / `LUMEN_KEYSTORE_PASS`) is generated on first build.
 Keep it: an update must be signed with the same key. For Play Store publishing create your own upload key.
+
+## Text rendering fix (v8.0.1) — sliced / blurry glyphs
+
+Symptom: letters with missing vertical slices, uneven spacing, soft edges (worst on Adreno / Mali phones).
+
+Cause: `egui_glow`'s stock shaders declare `precision mediump float;`. On mobile GPUs `mediump` is a **16-bit float**. Vertex
+positions above 1024 px and — worse — the glyph-atlas texture coordinates (`a_tc` / `v_tc`, an atlas up to 8192 texels wide) cannot be
+represented exactly, so whole texel columns are skipped or duplicated while a glyph is sampled.
+
+Fix:
+* `vendor/egui_glow` (patched copy of 0.31.1, wired through `[patch.crates-io]`): vertex shader `precision highp float`, fragment shader
+  `highp` whenever `GL_FRAGMENT_PRECISION_HIGH` is defined (always on GLES 3.0).
+* `src/android.rs`: the texture side is capped to 4096 px (smaller atlas, less GPU memory) and the pixel density stays pinned to
+  `DisplayMetrics.density`.
+
+## Power / redraw behaviour
+
+egui is immediate-mode, but eframe only runs a frame when something asks for one: an input event, `request_repaint*()` from an
+animation / timer, or a Java callback. Nothing in Lumen repaints continuously while idle (caret blink 650 ms, reminder poll 10–30 s,
+toast animation only while visible). `adb logcat -s Lumen` prints `frames drawn in the last 10s` so the behaviour can be checked on a
+device: idle ≈ 0–2 frames per window, scrolling = one frame per display refresh, then it falls back to 0 again.
+Build profile: `opt-level 3`, thin LTO, stripped, no MSAA / depth / stencil buffers, vsync on.

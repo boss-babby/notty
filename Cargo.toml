@@ -82,6 +82,8 @@ opt-level = 1
 eframe = { path = "vendor/eframe" }
 # egui-winit 0.31.1 without winit's own soft-keyboard handling on Android (vendor/egui-winit/src/lib.rs, "Lumen patch")
 egui-winit = { path = "vendor/egui-winit" }
+# egui_glow 0.31.1 with highp shaders: the stock mediump precision is 16-bit on Android GPUs and sliced / blurred the glyph atlas lookups
+egui_glow = { path = "vendor/egui_glow" }
 
 # Read by `cargo apk` (plain NativeActivity package). The production APK is assembled by ./build-android.sh instead, because Lumen
 # ships its own Java activity (window insets, soft keyboard, Storage-Access-Framework file dialogs, clipboard, print) that cargo-apk

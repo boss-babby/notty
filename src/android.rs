@@ -335,6 +335,9 @@ thread_local! {
 pub fn on_raw_input(ctx: &Context, raw: &mut RawInput) {
     let _ = CTX.get_or_init(|| ctx.clone());
 
+    // 0. glyph atlas / texture size: 4096 px is plenty for a phone UI and halves the worst-case GPU memory of the 8192 px default.
+    raw.max_texture_side = Some(raw.max_texture_side.unwrap_or(4096).min(4096));
+
     // 1. density — the logical size must equal the device's real dp size
     let d = density();
     if d > 0.5 {
@@ -401,6 +404,7 @@ pub fn on_raw_input(ctx: &Context, raw: &mut RawInput) {
 /// its current state. It closes once no text field has had focus for half a second.
 pub fn after_frame(ctx: &Context, dark: bool) {
     let now = ctx.input(|i| i.time);
+    frame_stats(now);
 
     if DARK.with(|d| d.get()) != Some(dark) {
         DARK.with(|d| d.set(Some(dark)));
@@ -447,4 +451,23 @@ pub fn after_frame(ctx: &Context, dark: bool) {
             }
         }
     }
+}
+
+/// Power diagnostics: `adb logcat -s Lumen` prints how many frames were drawn per 10 s window. egui is reactive — an idle
+/// workspace draws 0–2 frames per window (caret blink / reminder poll), a scroll or drag draws one per display refresh.
+fn frame_stats(now: f64) {
+    thread_local! {
+        static WINDOW: std::cell::Cell<(f64, u32)> = const { std::cell::Cell::new((0.0, 0)) };
+    }
+    WINDOW.with(|w| {
+        let (t0, n) = w.get();
+        if t0 == 0.0 {
+            w.set((now, 1));
+        } else if now - t0 >= 10.0 {
+            log::info!("frames drawn in the last {:.0}s: {} ({:.1} fps average)", now - t0, n, n as f64 / (now - t0));
+            w.set((now, 1));
+        } else {
+            w.set((t0, n + 1));
+        }
+    });
 }
