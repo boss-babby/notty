@@ -564,7 +564,9 @@ pub fn notify_os(title: &str, body: &str, tag: &str) {
 pub fn schedule_push(json: &str) {
     #[cfg(target_arch = "wasm32")]
     call_bridge("lumenSchedule", &[json.into()]);
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(target_os = "android")]
+    crate::android::schedule(json);
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     let _ = json;
 }
 

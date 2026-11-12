@@ -1965,11 +1965,11 @@ impl LumenApp {
         self.last_auto = t;
         let o = crate::automation::tick(&mut self.ws, &mut self.auto_rt, t, crate::dates::now_local_min());
         self.after_auto(ctx, o);
-        // web: hand the next 48 h of reminders to the page, which fires them with its own timers (even in a background tab)
+        // web: hand the reminders of the next 14 days to the page (own timers, even in a background tab); Android: to AlarmManager (fires while the app is closed)
         if t - self.last_push > 5000.0 {
             self.last_push = t;
             if self.ws.auto.settings.os_notify {
-                if let Some(json) = crate::automation::push_schedule(&self.ws, &mut self.auto_rt, crate::dates::now_local_min(), 48) {
+                if let Some(json) = crate::automation::push_schedule(&self.ws, &mut self.auto_rt, crate::dates::now_local_min(), 24 * 14) {
                     platform::schedule_push(&json);
                 }
             }

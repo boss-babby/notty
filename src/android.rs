@@ -231,6 +231,15 @@ pub fn clipboard_set(text: &str) {
 
 pub fn notify_request() {
     call_void("requestNotificationPermission", "()V", &[]);
+    call_void("requestExactAlarms", "()V", &[]);
+}
+
+/// Hands the upcoming reminders (JSON) to the Java side, which arms system alarms: they fire while the app is closed.
+pub fn schedule(json: &str) {
+    with_activity(|env, act| {
+        let j = env.new_string(json)?;
+        env.call_method(act, "scheduleReminders", "(Ljava/lang/String;)V", &[JValue::Object(&j)]).map(|_| ())
+    });
 }
 
 pub fn notify(title: &str, body: &str, tag: &str) {

@@ -141,12 +141,44 @@ pub const COVERS: [((u8, u8, u8), (u8, u8, u8)); 8] = [
     ((253, 160, 133), (246, 211, 101)),
 ];
 
+thread_local! {
+    static CONTENT_Z: std::cell::Cell<f32> = const { std::cell::Cell::new(1.0) };
+}
+
+/// Page "content size" while a database view (table / board / list / gallery / calendar) is drawn; 1.0 everywhere else.
+/// `body()`, `bold()` and the icon painter multiply by it, so the text of a scaled view follows the page zoom automatically.
+pub fn content_z() -> f32 {
+    CONTENT_Z.with(|z| z.get())
+}
+
+/// Scales a layout dimension (row height, column width, card size …) by the current content size.
+pub fn zs(v: f32) -> f32 {
+    v * content_z()
+}
+
+/// RAII guard: the content size is `z` until it is dropped.
+pub struct ContentScale(f32);
+
+impl ContentScale {
+    pub fn new(z: f32) -> Self {
+        let z = if z.is_finite() && z > 0.0 { z.clamp(0.5, 2.5) } else { 1.0 };
+        let old = CONTENT_Z.with(|c| c.replace(z));
+        ContentScale(old)
+    }
+}
+
+impl Drop for ContentScale {
+    fn drop(&mut self) {
+        CONTENT_Z.with(|c| c.set(self.0));
+    }
+}
+
 pub fn bold(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name("bold".into()))
+    FontId::new(size * content_z(), FontFamily::Name("bold".into()))
 }
 
 pub fn body(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Proportional)
+    FontId::new(size * content_z(), FontFamily::Proportional)
 }
 
 pub fn setup_fonts(ctx: &Context) {
@@ -165,17 +197,88 @@ pub fn setup_fonts(ctx: &Context) {
     // Inter v4 ships 700+ private-use stylistic alternates (e.g. U+E286 = an accented 'u'); they were stripped from the bundled
     // Inter files (assets/) so that they can no longer shadow Lucide. Lucide is also subset to the private-use range only. Otherwise some
     // icons render as other symbols, dots or empty boxes.
+    // Scripts Inter does not cover: Bengali, Devanagari (Hindi, Marathi, Nepali), Arabic (also Persian, Urdu) and Hebrew are embedded, every
+    // other script (CJK, Thai, Tamil, Telugu, Gujarati, Khmer, …) comes from the fonts of the operating system (Android / Windows).
+    let mut scripts: Vec<String> = vec![];
+    for (name, bytes) in [
+        ("noto-bengali", &include_bytes!("../assets/NotoSansBengali-Regular.ttf")[..]),
+        ("noto-devanagari", &include_bytes!("../assets/NotoSansDevanagari-Regular.ttf")[..]),
+        ("noto-arabic", &include_bytes!("../assets/NotoSansArabic-Regular.ttf")[..]),
+        ("noto-hebrew", &include_bytes!("../assets/NotoSansHebrew-Regular.ttf")[..]),
+    ] {
+        fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
+        scripts.push(name.to_owned());
+    }
+    scripts.extend(system_fonts(&mut fonts));
     let rest: Vec<String> = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     let prop = fonts.families.entry(FontFamily::Proportional).or_default();
     prop.insert(0, "inter".to_owned());
     prop.insert(1, "lucide".to_owned());
+    prop.extend(scripts.iter().cloned());
     let mono = fonts.families.entry(FontFamily::Monospace).or_default();
     mono.insert(1.min(mono.len()), "lucide".to_owned());
+    mono.extend(scripts.iter().cloned());
     let mut b = vec!["inter-bold".to_owned(), "lucide".to_owned()];
     b.extend(rest);
+    b.extend(scripts.iter().cloned());
     fonts.families.insert(FontFamily::Name("bold".into()), b);
     fonts.families.insert(FontFamily::Name("lucide".into()), vec!["lucide".to_owned()]);
     ctx.set_fonts(fonts);
+}
+
+/// Fonts of the operating system for the scripts that are not embedded. Registers the files it finds and returns their names
+/// (in fallback order). Web has no access to system fonts; the embedded Noto fonts cover the most used scripts there.
+#[allow(unused_variables)]
+fn system_fonts(fonts: &mut FontDefinitions) -> Vec<String> {
+    let mut names = vec![];
+    #[cfg(any(target_os = "android", windows))]
+    {
+        #[cfg(target_os = "android")]
+        let candidates: &[&str] = &[
+            "/system/fonts/NotoSansCJK-Regular.ttc",
+            "/system/fonts/NotoSansCJKjp-Regular.otf",
+            "/system/fonts/NotoSansCJKsc-Regular.otf",
+            "/system/fonts/NotoSansThai-Regular.ttf",
+            "/system/fonts/NotoSansTamil-Regular.ttf",
+            "/system/fonts/NotoSansTelugu-Regular.ttf",
+            "/system/fonts/NotoSansKannada-Regular.ttf",
+            "/system/fonts/NotoSansMalayalam-Regular.ttf",
+            "/system/fonts/NotoSansGujarati-Regular.ttf",
+            "/system/fonts/NotoSansGurmukhi-Regular.ttf",
+            "/system/fonts/NotoSansSinhala-Regular.ttf",
+            "/system/fonts/NotoSansKhmer-Regular.ttf",
+            "/system/fonts/NotoSansLao-Regular.ttf",
+            "/system/fonts/NotoSansMyanmar-Regular.ttf",
+            "/system/fonts/NotoSansArmenian-Regular.ttf",
+            "/system/fonts/NotoSansGeorgian-Regular.ttf",
+            "/system/fonts/NotoSansEthiopic-Regular.ttf",
+            "/system/fonts/NotoSansSymbols-Regular-Subsetted.ttf",
+            "/system/fonts/DroidSansFallback.ttf",
+            "/system/fonts/DroidSansFallbackFull.ttf",
+        ];
+        #[cfg(windows)]
+        let candidates: &[&str] = &[
+            "C:\\Windows\\Fonts\\Nirmala.ttc",
+            "C:\\Windows\\Fonts\\msyh.ttc",
+            "C:\\Windows\\Fonts\\YuGothR.ttc",
+            "C:\\Windows\\Fonts\\meiryo.ttc",
+            "C:\\Windows\\Fonts\\malgun.ttf",
+            "C:\\Windows\\Fonts\\leelawui.ttf",
+            "C:\\Windows\\Fonts\\segoeui.ttf",
+            "C:\\Windows\\Fonts\\seguisym.ttf",
+        ];
+        for (i, path) in candidates.iter().enumerate() {
+            let Ok(meta) = std::fs::metadata(path) else { continue };
+            if meta.len() > 40 * 1024 * 1024 {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(path) else { continue };
+            let name = format!("system-{i}");
+            fonts.font_data.insert(name.clone(), Arc::new(FontData::from_owned(bytes)));
+            names.push(name);
+        }
+    }
+    names
 }
 
 pub fn apply(ctx: &Context, p: &Palette, dark: bool) {

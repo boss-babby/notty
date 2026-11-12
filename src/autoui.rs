@@ -77,6 +77,11 @@ pub(crate) fn roomy() -> bool {
     crate::touch::touchy()
 }
 
+/// Width of the close button of the page header.
+fn roomy_w() -> f32 {
+    if roomy() { 38.0 } else { 30.0 }
+}
+
 pub(crate) fn card<R>(ui: &mut Ui, pal: &Palette, add: impl FnOnce(&mut Ui) -> R) -> R {
     Frame::new()
         .fill(pal.bg)
@@ -138,6 +143,7 @@ pub(crate) fn pill(ui: &mut Ui, pal: &Palette, text: &str, fg: Color32, bg: Colo
 pub(crate) fn combo<T: PartialEq + Clone>(ui: &mut Ui, salt: impl std::hash::Hash, width: f32, items: &[(String, T)], cur: &T) -> Option<T> {
     let text = items.iter().find(|(_, v)| v == cur).map(|(s, _)| s.clone()).unwrap_or_else(|| "—".into());
     let mut out = None;
+    let width = width.min((ui.available_width() - 12.0).max(96.0));
     ComboBox::from_id_salt(Id::new(salt)).selected_text(RichText::new(text).font(body(13.5))).width(width).show_ui(ui, |ui| {
         for (name, v) in items {
             if ui.selectable_label(v == cur, RichText::new(name).font(body(13.5))).clicked() {
@@ -152,7 +158,7 @@ fn hm_picker(ui: &mut Ui, salt: impl std::hash::Hash, minute: &mut u16) -> bool 
     let (mut h, mut m) = (*minute / 60, *minute % 60);
     let id = Id::new(salt);
     let mut ch = false;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
         ch |= ui.add(egui::DragValue::new(&mut h).range(0..=23).custom_formatter(|v, _| format!("{:02}", v as u32))).on_hover_text("Hour").changed();
         ui.label(":");
@@ -177,7 +183,7 @@ fn date_input(ui: &mut Ui, pal: &Palette, salt: impl std::hash::Hash, day: &mut 
     }
     ui.horizontal_wrapped(|ui| {
         let ok = dates::parse(&buf).is_some();
-        let r = ui.add(TextEdit::singleline(&mut buf).id(id.with("te")).desired_width(104.0).hint_text("YYYY-MM-DD").text_color(if ok { pal.text } else { pal.danger }).margin(Margin::symmetric(8, 6)));
+        let r = ui.add(TextEdit::singleline(&mut buf).id(id.with("te")).desired_width((104.0_f32).min((ui.available_width() - 12.0).max(90.0))).hint_text("YYYY-MM-DD").text_color(if ok { pal.text } else { pal.danger }).margin(Margin::symmetric(8, 6)));
         if r.changed() {
             if let Some(d) = dates::parse(&buf) {
                 *day = dates::day_of(d);
@@ -396,7 +402,7 @@ fn setter_ui(ui: &mut Ui, pal: &Palette, ws: &Workspace, db: u64, prop: u64, s: 
                 Setter::Text(t) => t.clone(),
                 _ => String::new(),
             };
-            if ui.add(TextEdit::singleline(&mut t).desired_width(190.0).hint_text("text, {title}, {today}…").margin(Margin::symmetric(8, 6))).changed() || !matches!(s, Setter::Text(_)) {
+            if ui.add(TextEdit::singleline(&mut t).desired_width((190.0_f32).min((ui.available_width() - 12.0).max(90.0))).hint_text("text, {title}, {today}…").margin(Margin::symmetric(8, 6))).changed() || !matches!(s, Setter::Text(_)) {
                 *s = Setter::Text(t);
                 ch = true;
             }
@@ -567,9 +573,9 @@ pub fn actions_editor(ui: &mut Ui, pal: &Palette, ws: &Workspace, db: u64, acts:
         acts.swap(i, i - 1);
         ch = true;
     }
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let items: Vec<(String, usize)> = allowed.iter().map(|k| (format!("+ {}", KINDS_ROW[*k]), *k)).collect();
-        ComboBox::from_id_salt(Id::new((salt, "add"))).selected_text(RichText::new("+ Add an action").font(bold(13.0))).width(150.0).show_ui(ui, |ui| {
+        ComboBox::from_id_salt(Id::new((salt, "add"))).selected_text(RichText::new("+ Add an action").font(bold(13.0))).width((150.0_f32).min((ui.available_width() - 12.0).max(90.0))).show_ui(ui, |ui| {
             for (n, k) in &items {
                 if ui.selectable_label(false, RichText::new(n).font(body(13.5))).clicked() {
                     acts.push(new_action(ws, db, *k));
@@ -594,7 +600,7 @@ pub fn button_block(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Pale
     let now = ctx.input(|i| i.time);
     let flash: f64 = ctx.data(|d| d.get_temp(flash_id)).unwrap_or(-10.0);
     let ran = now - flash < 1.3;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
         let (rect, resp) = ui.allocate_exact_size(vec2(bw, h), Sense::click());
         let t = ctx.animate_bool_with_time(resp.id, resp.hovered(), 0.12);
@@ -645,7 +651,7 @@ pub fn button_editor(ctx: &egui::Context, ws: &mut Workspace, rt: &mut Runtime, 
     let open = crate::app::modal(ctx, Id::new("btn_editor"), pal, 520.0, 56.0, |ui| {
         ScrollArea::vertical().max_height((ctx.screen_rect().height() - 120.0).max(240.0)).auto_shrink([false, true]).show(ui, |ui| {
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.add_space(8.0);
                 let (r, _) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::hover());
                 ui.painter().rect_filled(r, 10.0, with_alpha(pal.accent, 0.14));
@@ -656,7 +662,7 @@ pub fn button_editor(ctx: &egui::Context, ws: &mut Workspace, rt: &mut Runtime, 
                 });
             });
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
                     ui.set_width(ui.available_width() - 8.0);
@@ -670,7 +676,7 @@ pub fn button_editor(ctx: &egui::Context, ws: &mut Workspace, rt: &mut Runtime, 
                     actions_editor(ui, pal, wsr, db, &mut b.acts, row_ctx, ("btn", block));
                     label(ui, pal, "Placeholders: {title}  {date}  {today}  {now}  {prop:Name}");
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if widgets::primary_button(ui, pal, "Done", 110.0).clicked() {
                             run = false;
                             ui.ctx().data_mut(|d| d.insert_temp(Id::new("btn_editor_done"), true));
@@ -709,7 +715,7 @@ pub fn row_date_chips(ui: &mut Ui, pal: &Palette, ws: &Workspace, row: u64, prop
     }
     let rep = p.repeats.get(&prop);
     let rem = ws.auto.reminders.iter().find(|r| r.page == row && r.prop == prop && !r.done);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         ui.add_space(indent + 150.0);
         let items = [
@@ -778,7 +784,7 @@ pub fn row_popover(ctx: &egui::Context, ws: &mut Workspace, rt: &mut Runtime, pa
     let open = widgets::popup_area(ctx, Id::new("row_date_pop"), pos, pal, &mut fresh, 340.0, |ui| {
         ui.add_space(4.0);
         // ── repeat
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.add_space(6.0);
             icons::glyph(ui.painter(), ui.cursor().min + vec2(8.0, 10.0), 14.0, l::ROTATE_CW, pal.accent);
             ui.add_space(22.0);
@@ -793,7 +799,7 @@ pub fn row_popover(ctx: &egui::Context, ws: &mut Workspace, rt: &mut Runtime, pa
         });
         if let Some(r) = rep.as_mut() {
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.add_space(6.0);
                 ui.vertical(|ui| {
                     repeat_editor(ui, pal, r, ("rowrep", row, prop));
@@ -829,7 +835,7 @@ pub fn row_popover(ctx: &egui::Context, ws: &mut Workspace, rt: &mut Runtime, pa
         ui.separator();
         ui.add_space(6.0);
         // ── reminder
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.add_space(6.0);
             icons::glyph(ui.painter(), ui.cursor().min + vec2(8.0, 10.0), 14.0, l::BELL, pal.accent);
             ui.add_space(22.0);
@@ -844,7 +850,7 @@ pub fn row_popover(ctx: &egui::Context, ws: &mut Workspace, rt: &mut Runtime, pa
         });
         if let Some(r) = rem.as_mut() {
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.add_space(6.0);
                 ui.vertical(|ui| {
                     ui.horizontal_wrapped(|ui| {
@@ -855,7 +861,7 @@ pub fn row_popover(ctx: &egui::Context, ws: &mut Workspace, rt: &mut Runtime, pa
                         }
                     });
                     ui.add_space(4.0);
-                    ui.add(TextEdit::singleline(&mut r.message).desired_width(280.0).hint_text("Custom message (optional)").margin(Margin::symmetric(8, 6)));
+                    ui.add(TextEdit::singleline(&mut r.message).desired_width((280.0_f32).min((ui.available_width() - 12.0).max(90.0))).hint_text("Custom message (optional)").margin(Margin::symmetric(8, 6)));
                     label(ui, pal, "You get a desktop notification on Windows and a push notification in the browser.");
                 });
             });
@@ -914,7 +920,10 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette) ->
         ui.horizontal_top(|ui| {
             ui.add_space(side);
             ui.vertical(|ui| {
-                ui.set_width((avail - 2.0 * side - 8.0).clamp(240.0, 820.0));
+                let page_w = (avail - 2.0 * side - 8.0).clamp(240.0, 820.0);
+                ui.set_width(page_w);
+                // long labels wrap inside their column instead of running over the next widget (phones)
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                 ui.add_space(18.0);
                 // header
                 ui.horizontal(|ui| {
@@ -922,6 +931,7 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette) ->
                     ui.painter().rect_filled(r, 12.0, with_alpha(pal.accent, 0.14));
                     icons::glyph(ui.painter(), r.center(), 22.0, l::ZAP, pal.accent);
                     ui.vertical(|ui| {
+                        ui.set_max_width((page_w - 44.0 - roomy_w() - 3.0 * ui.spacing().item_spacing.x).max(120.0));
                         ui.spacing_mut().item_spacing.y = 0.0;
                         ui.label(RichText::new("Automations").font(bold(if narrow { 22.0 } else { 26.0 })).color(pal.text));
                         ui.label(RichText::new("Rules, scripts, buttons, recurring tasks and reminders").font(body(13.0)).color(pal.muted));
@@ -1015,31 +1025,52 @@ fn rules_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette, o
         let summary_a: Vec<String> = rule.actions.iter().map(|a| describe_action(ws, rule.db, a)).collect();
         let mut toggle_open = false;
         card(ui, pal, |ui| {
+            // phones: the title gets the whole row, the three buttons move to their own row (nothing overlaps)
+            let stacked = ui.available_width() < 460.0;
+            let btn_w = roomy_w() * 3.0 + ui.spacing().item_spacing.x * 3.0;
             ui.horizontal(|ui| {
                 let mut on = rule.on;
                 if switch(ui, pal, &mut on) {
                     rule.on = on;
                 }
                 ui.vertical(|ui| {
+                    let room = ui.available_width() - if stacked { 0.0 } else { btn_w };
+                    ui.set_max_width(room.max(110.0));
                     ui.spacing_mut().item_spacing.y = 1.0;
-                    let r = ui.add(egui::Label::new(RichText::new(&rule.name).font(bold(15.0)).color(if rule.on { pal.text } else { pal.muted })).sense(Sense::click()));
+                    let r = ui.add(egui::Label::new(RichText::new(&rule.name).font(bold(15.0)).color(if rule.on { pal.text } else { pal.muted })).sense(Sense::click()).wrap());
                     if r.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                         toggle_open = true;
                     }
                     ui.add(egui::Label::new(RichText::new(format!("When {}", lc_first(&summary_t))).font(body(12.5)).color(pal.muted)).wrap());
                 });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if icon_btn(ui, pal, l::TRASH_2, "Delete rule", true).clicked() {
-                        delete = Some(id);
+                if !stacked {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icon_btn(ui, pal, l::TRASH_2, "Delete rule", true).clicked() {
+                            delete = Some(id);
+                        }
+                        if icon_btn(ui, pal, if open { l::CHEVRONS_UP_DOWN } else { l::SETTINGS_2 }, if open { "Collapse" } else { "Edit rule" }, false).clicked() {
+                            toggle_open = true;
+                        }
+                        if icon_btn(ui, pal, l::PLAY, "Run now (all matching rows)", false).clicked() {
+                            run_now = Some(id);
+                        }
+                    });
+                }
+            });
+            if stacked {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if icon_btn(ui, pal, l::PLAY, "Run now (all matching rows)", false).clicked() {
+                        run_now = Some(id);
                     }
                     if icon_btn(ui, pal, if open { l::CHEVRONS_UP_DOWN } else { l::SETTINGS_2 }, if open { "Collapse" } else { "Edit rule" }, false).clicked() {
                         toggle_open = true;
                     }
-                    if icon_btn(ui, pal, l::PLAY, "Run now (all matching rows)", false).clicked() {
-                        run_now = Some(id);
+                    if icon_btn(ui, pal, l::TRASH_2, "Delete rule", true).clicked() {
+                        delete = Some(id);
                     }
                 });
-            });
+            }
             if !open {
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
@@ -1318,7 +1349,7 @@ fn rule_editor(ui: &mut Ui, pal: &Palette, ws: &Workspace, rule: &mut Rule, id: 
                             }
                         }
                     } else {
-                        ui.add(TextEdit::singleline(&mut f.value).desired_width(120.0).margin(Margin::symmetric(8, 6)));
+                        ui.add(TextEdit::singleline(&mut f.value).desired_width((120.0_f32).min((ui.available_width() - 12.0).max(90.0))).margin(Margin::symmetric(8, 6)));
                     }
                 }
                 if icon_btn(ui, pal, l::X, "Remove condition", true).clicked() {
@@ -1464,7 +1495,7 @@ fn reminders_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palett
     let mut toggle_done: Option<u64> = None;
     for (due, r) in list {
         card(ui, pal, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 icons::glyph(ui.painter(), ui.cursor().min + vec2(10.0, 12.0), 16.0, if r.done { l::CIRCLE_CHECK } else { l::BELL }, if r.done { pal.muted } else { pal.accent });
                 ui.add_space(26.0);
                 ui.vertical(|ui| {
@@ -1517,7 +1548,7 @@ fn kind_color(k: NoticeKind, pal: &Palette) -> Color32 {
 }
 
 fn inbox_tab(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, out: &mut Out) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Inbox").font(bold(15.0)));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if widgets::ghost_button(ui, pal, "Clear all").clicked() {
@@ -1546,7 +1577,7 @@ fn inbox_tab(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, out: &mut Out) {
         let (rect, resp) = {
             let r = Frame::new().fill(if n.read { pal.bg } else { with_alpha(pal.accent, 0.06) }).stroke(Stroke::new(1.0_f32, pal.border)).corner_radius(CornerRadius::same(12)).inner_margin(Margin::same(12)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let c = kind_color(n.kind, pal);
                     ui.vertical(|ui| {
                         ui.add_space(4.0);
@@ -1557,7 +1588,7 @@ fn inbox_tab(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, out: &mut Out) {
                     });
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             pill(ui, pal, n.kind.label(), c, with_alpha(c, 0.14));
                             label(ui, pal, &format!("{} ago", crate::app::ago(n.ts)));
                         });
@@ -1585,7 +1616,7 @@ fn inbox_tab(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, out: &mut Out) {
 }
 
 fn activity_tab(ui: &mut Ui, ws: &mut Workspace, pal: &Palette) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Activity").font(bold(15.0)));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if widgets::ghost_button(ui, pal, "Clear").clicked() {
@@ -1600,12 +1631,12 @@ fn activity_tab(ui: &mut Ui, ws: &mut Workspace, pal: &Palette) {
     }
     for e in ws.auto.log.iter().rev().take(80) {
         card(ui, pal, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 icons::glyph(ui.painter(), ui.cursor().min + vec2(9.0, 11.0), 14.0, if e.ok { l::ZAP } else { l::TRIANGLE_ALERT }, if e.ok { pal.accent } else { pal.danger });
                 ui.add_space(24.0);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new(&e.rule).font(bold(13.5)));
                         label(ui, pal, &format!("{} ago", crate::app::ago(e.ts)));
                     });

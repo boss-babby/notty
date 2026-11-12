@@ -12,7 +12,7 @@ use crate::editor::{gutter, EditorState};
 use crate::icons::{self, Icon};
 use crate::model::*;
 use crate::platform;
-use crate::theme::{bold, body, lerp_color, tag_color, Palette, COVERS, TAG_NAMES};
+use crate::theme::{bold, body, lerp_color, tag_color, zs, Palette, COVERS, TAG_NAMES};
 use crate::widgets::{field, gradient_rect, icon_button, menu_item, popup_area, section_label, with_alpha};
 
 const ROW_H: f32 = 34.0;
@@ -262,6 +262,7 @@ pub fn show_linked(ui: &mut Ui, ws: &mut Workspace, id: u64, vi: usize, block: u
 fn show_inner(ui: &mut Ui, ws: &mut Workspace, id: u64, db: Database, vi: usize, linked: bool, ed: &mut EditorState, pal: &Palette, w: f32) -> bool {
     let mut acts: Vec<A> = vec![];
     load_titles(ws);
+    let content_scale = ed.scale;
     {
         let wsr: &Workspace = ws;
         let st = &mut ed.db;
@@ -276,6 +277,8 @@ fn show_inner(ui: &mut Ui, ws: &mut Workspace, id: u64, db: Database, vi: usize,
         ui.add_space(8.0);
         let rows = wsr.query(id, vi);
         let view = &db.views[vi];
+        // the page's content size (⋯ menu / pinch) scales the rows, columns, cards and text of the view, not only the page text
+        let _zoom = crate::theme::ContentScale::new(content_scale);
         match view.kind {
             ViewKind::Table => table(ui, wsr, &db, vi, &rows, st, pal, w, &mut acts),
             ViewKind::Board => board(ui, wsr, &db, view, &rows, st, pal, &mut acts),
@@ -628,18 +631,18 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, rows: &[u64], st
     // Phones: a narrower name column, the hover buttons shrink to "OPEN" only — nothing overlaps the title text.
     let compact = w < 560.0;
     let view = &db.views[vi];
-    let title_w: f32 = view.widths.get(&0).copied().unwrap_or(if compact { (w * 0.5).clamp(150.0, 230.0) } else { TITLE_W }).clamp(130.0, 640.0);
-    let btn_w: f32 = if compact { 62.0 } else { 92.0 };
-    let cw_of = |p: &Prop| view.widths.get(&p.id).copied().unwrap_or_else(|| col_w(p.kind)).clamp(70.0, 700.0);
-    let total: f32 = title_w + db.props.iter().map(|p| cw_of(p)).sum::<f32>() + 44.0;
+    let title_w: f32 = view.widths.get(&0).copied().unwrap_or(if compact { (w * 0.5).clamp(150.0, 230.0) } else { TITLE_W }).clamp(130.0, 640.0) * zs(1.0);
+    let btn_w: f32 = zs(if compact { 62.0 } else { 92.0 });
+    let cw_of = |p: &Prop| view.widths.get(&p.id).copied().unwrap_or_else(|| col_w(p.kind)).clamp(70.0, 700.0) * zs(1.0);
+    let total: f32 = title_w + db.props.iter().map(|p| cw_of(p)).sum::<f32>() + zs(44.0);
     ScrollArea::horizontal().id_salt("table_scroll").auto_shrink([false, true]).show(ui, |ui| {
         ui.set_min_width(w.max(total.min(w)));
         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
         // header
-        let (hr, _) = ui.allocate_exact_size(vec2(total, 32.0), Sense::hover());
+        let (hr, _) = ui.allocate_exact_size(vec2(total, zs(32.0)), Sense::hover());
         let mut x = hr.left();
         ui.painter().text(pos2(x + 8.0, hr.center().y), Align2::LEFT_CENTER, "Aa  Name", body(13.0), pal.muted);
-        resize_handle(ui, pal, Rect::from_min_size(pos2(x + title_w - 6.0, hr.top()), vec2(12.0, 32.0)), sid(("thr", vi, 0u64)), title_w, vi, 0, acts);
+        resize_handle(ui, pal, Rect::from_min_size(pos2(x + title_w - 6.0, hr.top()), vec2(12.0, zs(32.0))), sid(("thr", vi, 0u64)), title_w, vi, 0, acts);
         x += title_w;
         for p in &db.props {
             let cw = cw_of(p);
@@ -651,10 +654,10 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, rows: &[u64], st
             if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                 open_popup_at(st, Popup::PropMenu { prop: p.id, pos: r.left_bottom() + vec2(0.0, 4.0) });
             }
-            resize_handle(ui, pal, Rect::from_min_size(pos2(x + cw - 6.0, hr.top()), vec2(12.0, 32.0)), sid(("thr", vi, p.id)), cw, vi, p.id, acts);
+            resize_handle(ui, pal, Rect::from_min_size(pos2(x + cw - 6.0, hr.top()), vec2(12.0, zs(32.0))), sid(("thr", vi, p.id)), cw, vi, p.id, acts);
             x += cw;
         }
-        let ar = Rect::from_min_size(pos2(x, hr.top()), vec2(40.0, 32.0));
+        let ar = Rect::from_min_size(pos2(x, hr.top()), vec2(zs(40.0), zs(32.0)));
         let resp = ui.interact(ar, sid("th_add"), Sense::click());
         let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
         icons::paint(ui.painter(), ar.center(), 14.0, Icon::Plus, lerp_color(pal.muted, pal.text, t));
@@ -666,21 +669,21 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, rows: &[u64], st
         // rows
         for rid in rows {
             let Some(row) = ws.page(*rid) else { continue };
-            let (rr, _) = ui.allocate_exact_size(vec2(total, ROW_H), Sense::hover());
+            let (rr, _) = ui.allocate_exact_size(vec2(total, zs(ROW_H)), Sense::hover());
             let hovered = ui.rect_contains_pointer(rr);
             let t = ui.ctx().animate_bool_with_time(sid(("rowh", row.id)), hovered, 0.1);
             ui.painter().rect_filled(rr, 0.0, with_alpha(pal.hover, t * 0.6));
             ui.painter().hline(rr.x_range(), rr.bottom(), Stroke::new(1.0_f32, pal.border));
             // title
             let t = if compact || crate::touch::touchy() { 1.0 } else { t }; // touch screens have no hover: keep the OPEN button visible
-            let tr = Rect::from_min_size(rr.min, vec2(title_w, ROW_H));
+            let tr = Rect::from_min_size(rr.min, vec2(title_w, zs(ROW_H)));
             let tid = sid(("rt", row.id));
             if st.focus_row == Some(row.id) {
                 ui.ctx().memory_mut(|m| m.request_focus(tid));
                 st.focus_row = None;
             }
             let mut title = row.title.clone();
-            let ir = Rect::from_center_size(pos2(tr.left() + 8.0 + (title_w - btn_w - 8.0) / 2.0, tr.center().y), vec2(title_w - btn_w - 8.0, 24.0));
+            let ir = Rect::from_center_size(pos2(tr.left() + 8.0 + (title_w - btn_w - 8.0) / 2.0, tr.center().y), vec2(title_w - btn_w - 8.0, zs(24.0)));
             let r = ui.put(
                 ir,
                 TextEdit::singleline(&mut title)
@@ -701,7 +704,7 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, rows: &[u64], st
                 acts.push(A::SetTitle(row.id, title));
             }
             if t > 0.05 {
-                let open = Rect::from_min_size(pos2(tr.right() - if compact { 52.0 } else { 74.0 }, tr.center().y - 11.0), vec2(46.0, 22.0));
+                let open = Rect::from_min_size(pos2(tr.right() - zs(if compact { 52.0 } else { 74.0 }), tr.center().y - zs(11.0)), vec2(zs(46.0), zs(22.0)));
                 let resp = ui.interact(open, sid(("ro", row.id)), Sense::click());
                 let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
                 ui.painter().rect_filled(open, 5.0, with_alpha(lerp_color(pal.active, pal.border, h), t));
@@ -709,7 +712,7 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, rows: &[u64], st
                 if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                     acts.push(A::Open(row.id));
                 }
-                let del = Rect::from_min_size(pos2(tr.right() - 26.0, tr.center().y - 11.0), vec2(if compact { 0.0 } else { 22.0 }, 22.0));
+                let del = Rect::from_min_size(pos2(tr.right() - zs(26.0), tr.center().y - zs(11.0)), vec2(if compact { 0.0 } else { zs(22.0) }, zs(22.0)));
                 let resp = ui.interact(del, sid(("rd", row.id)), if compact { Sense::hover() } else { Sense::click() });
                 let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
                 if !compact {
@@ -723,14 +726,14 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, rows: &[u64], st
             let mut x = rr.left() + title_w;
             for p in &db.props {
                 let cw = cw_of(p);
-                let cr = Rect::from_min_size(pos2(x, rr.top()), vec2(cw, ROW_H));
+                let cr = Rect::from_min_size(pos2(x, rr.top()), vec2(cw, zs(ROW_H)));
                 ui.painter().vline(cr.left(), cr.y_range(), Stroke::new(1.0_f32, with_alpha(pal.border, 0.7)));
                 cell(ui, db, row, p, cr, pal, st, acts);
                 x += cw;
             }
         }
         // new row
-        let (nr, resp) = ui.allocate_exact_size(vec2(total.min(w), 32.0), Sense::click());
+        let (nr, resp) = ui.allocate_exact_size(vec2(total.min(w), zs(32.0)), Sense::click());
         let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
         ui.painter().rect_filled(nr, 0.0, with_alpha(pal.hover, t));
         icons::paint(ui.painter(), pos2(nr.left() + 16.0, nr.center().y), 13.0, Icon::Plus, lerp_color(pal.muted, pal.text, t));
@@ -797,7 +800,7 @@ fn resize_handle(ui: &mut Ui, pal: &Palette, r: Rect, id: Id, cur: f32, vi: usiz
     if resp.dragged() {
         let dx = resp.drag_delta().x;
         if dx != 0.0 {
-            acts.push(A::SetColW(vi, key, (cur + dx).clamp(70.0, 700.0)));
+            acts.push(A::SetColW(vi, key, ((cur + dx) / zs(1.0).max(0.1)).clamp(70.0, 700.0)));
         }
     }
     if resp.double_clicked() {
@@ -840,7 +843,7 @@ fn board(ui: &mut Ui, ws: &Workspace, db: &Database, view: &View, rows: &[u64], 
                     })
                     .collect();
                 let fr = Frame::new().fill(pal.sidebar).corner_radius(CornerRadius::same(10)).inner_margin(Margin::same(8)).show(ui, |ui| {
-                    ui.set_width(264.0);
+                    ui.set_width(zs(264.0));
                     ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing = vec2(6.0, 8.0);
                     ui.horizontal(|ui| {
@@ -867,7 +870,7 @@ fn board(ui: &mut Ui, ws: &Workspace, db: &Database, view: &View, rows: &[u64], 
                             .inner_margin(Margin::symmetric(10, 8))
                             .shadow(egui::Shadow { offset: [0, 2], blur: (2.0 + 8.0 * t) as u8, spread: 0, color: Color32::from_black_alpha((12.0 + 20.0 * t) as u8) })
                             .show(ui, |ui| {
-                                ui.set_width(246.0);
+                                ui.set_width(zs(246.0));
                                 ui.label(RichText::new(title_of(row)).font(bold(14.5)).color(if row.title.is_empty() { pal.muted } else { pal.text }));
                                 card_chips(ui, db, row, gp, pal);
                             });
@@ -886,7 +889,7 @@ fn board(ui: &mut Ui, ws: &Workspace, db: &Database, view: &View, rows: &[u64], 
                             acts.push(A::Open(row.id));
                         }
                     }
-                    let (r, resp) = ui.allocate_exact_size(vec2(246.0, 28.0), Sense::click());
+                    let (r, resp) = ui.allocate_exact_size(vec2(zs(246.0), zs(28.0)), Sense::click());
                     let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
                     ui.painter().rect_filled(r, 6.0, with_alpha(pal.active, h * 0.8));
                     icons::paint(ui.painter(), pos2(r.left() + 14.0, r.center().y), 12.0, Icon::Plus, lerp_color(pal.muted, pal.text, h));
@@ -946,15 +949,15 @@ fn list(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], pal: &Palette,
     ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
     for rid in rows {
         let Some(row) = ws.page(*rid) else { continue };
-        let (rect, resp) = ui.allocate_exact_size(vec2(w, 36.0), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(vec2(w, zs(36.0)), Sense::click());
         let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
         ui.painter().rect_filled(rect, 6.0, with_alpha(pal.hover, t));
         let icon = if row.icon.is_empty() { l::FILE_TEXT } else { icons::icon_text(&row.icon) };
-        ui.painter().text(pos2(rect.left() + 18.0, rect.center().y), Align2::CENTER_CENTER, icon, body(16.0), pal.muted);
+        ui.painter().text(pos2(rect.left() + zs(18.0), rect.center().y), Align2::CENTER_CENTER, icon, body(16.0), pal.muted);
         let g = ui.painter().layout_no_wrap(title_of(row).to_owned(), bold(14.5), if row.title.is_empty() { pal.muted } else { pal.text });
         let tw = g.size().x;
-        ui.painter().galley(pos2(rect.left() + 38.0, rect.center().y - g.size().y / 2.0), g, pal.text);
-        let mut x = rect.left() + 38.0 + tw + 14.0;
+        ui.painter().galley(pos2(rect.left() + zs(38.0), rect.center().y - g.size().y / 2.0), g, pal.text);
+        let mut x = rect.left() + zs(38.0) + tw + 14.0;
         let clip = ui.painter().with_clip_rect(rect);
         for p in &db.props {
             let ids: Vec<u64> = match row.props.get(&p.id) {
@@ -995,7 +998,7 @@ fn new_row_button(ui: &mut Ui, pal: &Palette, acts: &mut Vec<A>) {
 /// width exactly, so the gallery never grows sideways.
 fn gallery_grid(w: f32, gap: f32) -> (usize, f32) {
     let w = w.max(120.0);
-    let cols = (((w + gap) / (236.0 + gap)).floor() as usize).max(1);
+    let cols = (((w + gap) / (zs(236.0) + gap)).floor() as usize).max(1);
     let cw = ((w - gap * (cols as f32 - 1.0)) / cols as f32).max(120.0);
     (cols, cw)
 }
@@ -1027,7 +1030,7 @@ fn gallery(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], pal: &Palet
 }
 
 fn new_tile(ui: &mut Ui, pal: &Palette, cw: f32, acts: &mut Vec<A>) {
-    let (r, resp) = ui.allocate_exact_size(vec2(cw, 90.0), Sense::click());
+    let (r, resp) = ui.allocate_exact_size(vec2(cw, zs(90.0)), Sense::click());
     let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
     ui.painter().rect_stroke(r, 10.0, Stroke::new(1.2_f32, lerp_color(pal.border, pal.accent, t)), egui::StrokeKind::Inside);
     ui.painter().text(r.center(), Align2::CENTER_CENTER, "+  New", body(14.0), lerp_color(pal.muted, pal.accent, t));
@@ -1051,7 +1054,7 @@ fn gallery_card(ui: &mut Ui, ws: &Workspace, db: &Database, row: &Page, pal: &Pa
             ui.set_width(inner_w);
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-                let (cr, _) = ui.allocate_exact_size(vec2(inner_w, 110.0), Sense::hover());
+                let (cr, _) = ui.allocate_exact_size(vec2(inner_w, zs(110.0)), Sense::hover());
                 let (a, b) = COVERS[(row.cover.unwrap_or(row.id as usize)) % COVERS.len()];
                 let top_r = CornerRadius { nw: 10, ne: 10, sw: 0, se: 0 };
                 ui.painter().rect_filled(cr, top_r, Color32::from_rgb(a.0, a.1, a.2));

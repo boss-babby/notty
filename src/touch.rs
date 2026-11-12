@@ -375,6 +375,15 @@ pub fn on_raw_input(ctx: &Context, raw: &mut RawInput) {
     G.with(|g| hook(&mut g.borrow_mut(), ctx, raw));
 }
 
+thread_local! {
+    static LP_T: Cell<f64> = const { Cell::new(-100.0) };
+}
+
+/// A hold-and-drag started within the last 0.7 s (readable by several consumers, unlike [`take_long_press`] which only one can get).
+pub fn long_press_recent(now: f64) -> bool {
+    now - LP_T.with(|t| t.get()) < 0.7
+}
+
 const LP_ID: &str = "touch_long_press";
 const DIRECT_ID: &str = "touch_direct";
 const RING_ID: &str = "touch_hold_ring";
@@ -418,6 +427,7 @@ pub fn hook(g: &mut Gestures, ctx: &Context, raw: &mut RawInput) {
     let (events, outcome) = g.process(now, pass, events);
     raw.events = events;
     if let Some(p) = outcome.long_press {
+        LP_T.with(|t| t.set(now));
         ctx.data_mut(|d| d.insert_temp(Id::new(LP_ID), p));
         ctx.request_repaint();
     }

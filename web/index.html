@@ -78,7 +78,7 @@
         const now = Date.now();
         for (const it of items) {
           const wait = it.at - now;
-          if (wait < -60000 || wait > 48 * 3600 * 1000) continue;
+          if (wait < -60000 || wait > 14 * 24 * 3600 * 1000) continue;
           timers.push(setTimeout(() => show(it.title, it.body, it.tag), Math.max(0, wait)));
         }
       }

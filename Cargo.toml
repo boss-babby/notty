@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "8.0.0"
+version = "9.0.0"
 edition = "2021"
 description = "Lumen — a free Notion + Obsidian + Miro-lite alternative (infinite canvas) written entirely in Rust with egui (Windows + WebAssembly), with automations, reminders and the LumenScript scripting language"
 license = "MIT"

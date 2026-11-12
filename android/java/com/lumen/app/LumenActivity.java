@@ -132,6 +132,8 @@ public class LumenActivity extends NativeActivity {
                     });
         }
         reportMetrics();
+        requestNotificationPermission();
+        Reminders.arm(getApplicationContext());
     }
 
     /** Edge-to-edge: the surface covers the whole screen, Rust keeps its content inside the insets we report. */
@@ -513,38 +515,45 @@ public class LumenActivity extends NativeActivity {
         });
     }
 
-    public void notifyUser(final String title, final String body, final String tag) {
+    /** Android 12 / 12L: exact alarms need a user-granted special permission (13+ gets USE_EXACT_ALARM automatically). */
+    public void requestExactAlarms() {
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
                 try {
-                    if (Build.VERSION.SDK_INT >= 33
-                            && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                        requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 7003);
-                        return;
+                    if (Build.VERSION.SDK_INT >= 31 && Build.VERSION.SDK_INT < 33) {
+                        android.app.AlarmManager am = (android.app.AlarmManager) getSystemService(Context.ALARM_SERVICE);
+                        if (am != null && !am.canScheduleExactAlarms()) {
+                            startActivity(new Intent(android.provider.Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, Uri.parse("package:" + getPackageName())));
+                        }
                     }
-                    NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-                    if (nm == null) return;
-                    nm.createNotificationChannel(new NotificationChannel(CHANNEL, "Reminders", NotificationManager.IMPORTANCE_DEFAULT));
-                    Intent open = new Intent(LumenActivity.this, LumenActivity.class);
-                    open.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
-                    PendingIntent pi = PendingIntent.getActivity(LumenActivity.this, 0, open,
-                            PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-                    int icon = getResources().getIdentifier("ic_stat_lumen", "drawable", getPackageName());
-                    if (icon == 0) icon = getApplicationInfo().icon;
-                    android.app.Notification n = new android.app.Notification.Builder(LumenActivity.this, CHANNEL)
-                            .setSmallIcon(icon)
-                            .setContentTitle(title)
-                            .setContentText(body)
-                            .setStyle(new android.app.Notification.BigTextStyle().bigText(body))
-                            .setContentIntent(pi)
-                            .setAutoCancel(true)
-                            .build();
-                    nm.notify(tag == null ? "lumen" : tag, 1, n);
-                } catch (Exception ignored) {
+                } catch (Throwable ignored) {
                 }
             }
         });
+    }
+
+    public void notifyUser(final String title, final String body, final String tag) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (!Reminders.canPost(LumenActivity.this)) {
+                    requestNotificationPermission();
+                    return;
+                }
+                Reminders.show(LumenActivity.this, title, body, tag);
+            }
+        });
+    }
+
+    /** Called from Rust: the reminders of the next days; they are armed as system alarms so they fire while the app is closed. */
+    public void scheduleReminders(final String json) {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                Reminders.store(getApplicationContext(), json);
+            }
+        }, "lumen-alarms").start();
     }
 
     // ───────────────────────────── printing ─────────────────────────────
@@ -590,11 +599,15 @@ public class LumenActivity extends NativeActivity {
 
         @Override
         public InputConnection onCreateInputConnection(EditorInfo ei) {
-            // VISIBLE_PASSWORD + NO_SUGGESTIONS: the keyboard commits every character immediately (no composing region we cannot show)
+            // A normal multi-line text field: every installed keyboard language (Bangla, Hindi, Arabic, CJK …) stays available. The old
+            // VISIBLE_PASSWORD variation made Gboard & co. fall back to their Latin-only layout. Suggestions stay off (no autocorrect
+            // popups for text we draw ourselves), composing text is handled by Conn (phonetic / transliteration keyboards).
             ei.inputType = android.text.InputType.TYPE_CLASS_TEXT
                     | android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
-                    | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-                    | android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD;
+                    | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+            if (Build.VERSION.SDK_INT >= 24) {
+                ei.hintLocales = android.os.LocaleList.getAdjustedDefault();
+            }
             ei.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN
                     | EditorInfo.IME_FLAG_NO_EXTRACT_UI
                     | EditorInfo.IME_FLAG_NO_ENTER_ACTION

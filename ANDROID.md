@@ -52,3 +52,16 @@ animation / timer, or a Java callback. Nothing in Lumen repaints continuously wh
 toast animation only while visible). `adb logcat -s Lumen` prints `frames drawn in the last 10s` so the behaviour can be checked on a
 device: idle ≈ 0–2 frames per window, scrolling = one frame per display refresh, then it falls back to 0 again.
 Build profile: `opt-level 3`, thin LTO, stripped, no MSAA / depth / stencil buffers, vsync on.
+
+## 9.0 — what changed on Android
+
+* **Keyboard languages**: the invisible IME view is a normal multi-line text field now (no `VISIBLE_PASSWORD` variation, which made Gboard and
+  other keyboards fall back to a Latin-only layout). Composing text from phonetic / transliteration keyboards (Bangla, Hindi, Arabic …) is
+  replaced in place; `ZWJ` / `ZWNJ` survive.
+* **Fonts**: Noto Sans Bengali, Devanagari, Arabic and Hebrew are embedded (`assets/`), CJK / Thai / Tamil / Telugu … are read from `/system/fonts`.
+* **Reminders while the app is closed**: `Reminders.java` arms exact `AlarmManager` alarms (`setExactAndAllowWhileIdle`) for the next 14 days of reminders
+  that the Rust side pushes (`platform::schedule_push` → `LumenActivity.scheduleReminders`). `ReminderReceiver` posts the heads-up notification,
+  `BootReceiver` re-arms after reboot / app update / clock or time-zone change. Permissions: `POST_NOTIFICATIONS`, `USE_EXACT_ALARM`
+  (`SCHEDULE_EXACT_ALARM` on Android 12), `RECEIVE_BOOT_COMPLETED`.
+* **PDF reader on touch screens**: pinch zoom follows the finger centre (zoom + pan), Select-text mode, hold-and-drag / hold-on-word selection with drag
+  handles, thumbnails drawer and an overflow menu on phones.

@@ -249,7 +249,7 @@ pub fn inline_editor(ui: &mut Ui, pal: &Palette, ws: &Workspace, db: u64, code: 
             ctx.data_mut(|d| d.insert_temp(con_id, lines));
         }
         let items: Vec<(String, usize)> = scripthost::EXAMPLES.iter().enumerate().map(|(i, e)| (e.name.to_owned(), i)).collect();
-        egui::ComboBox::from_id_salt(Id::new((salt, "ex"))).selected_text(RichText::new("Insert example").font(body(13.0))).width(150.0).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt(Id::new((salt, "ex"))).selected_text(RichText::new("Insert example").font(body(13.0))).width((150.0_f32).min((ui.available_width() - 12.0).max(90.0))).show_ui(ui, |ui| {
             for (n, i) in &items {
                 if ui.selectable_label(false, RichText::new(n).font(body(13.5))).on_hover_text(scripthost::EXAMPLES[*i].desc).clicked() {
                     *code = scripthost::EXAMPLES[*i].code.to_owned();
@@ -326,11 +326,11 @@ pub fn scripts_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Pale
         let mut toggle = false;
         let mut run_kind = 0u8; // 1 = test, 2 = run
         card(ui, pal, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
                     if open {
-                        ui.add(TextEdit::singleline(&mut sc.name).desired_width(220.0).font(bold(15.0)).margin(Margin::symmetric(6, 4)));
+                        ui.add(TextEdit::singleline(&mut sc.name).desired_width((220.0_f32).min((ui.available_width() - 12.0).max(90.0))).font(bold(15.0)).margin(Margin::symmetric(6, 4)));
                     } else if ui.add(egui::Label::new(RichText::new(&sc.name).font(bold(15.0))).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         toggle = true;
                     }

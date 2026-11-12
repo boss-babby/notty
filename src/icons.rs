@@ -195,6 +195,7 @@ pub fn chevron(p: &Painter, c: Pos2, size: f32, angle: f32, color: Color32) {
 }
 
 pub fn paint(p: &Painter, c: Pos2, size: f32, icon: Icon, color: Color32) {
+    let size = size * crate::theme::content_z();
     if icon == Icon::StarFilled {
         let k = size / 16.0;
         let mut v = Vec::new();

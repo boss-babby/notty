@@ -1,0 +1,7 @@
+Noto Sans Bengali / Devanagari / Arabic / Hebrew
+Copyright 2022 The Noto Project Authors (https://github.com/notofonts/notofonts.github.io)
+
+These Font Software are licensed under the SIL Open Font License, Version 1.1.
+This license is available with a FAQ at: https://openfontlicense.org
+
+Inter (rsms.me/inter) is licensed under the same SIL Open Font License 1.1.

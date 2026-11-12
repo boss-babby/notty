@@ -271,6 +271,19 @@ struct Reader {
     find_text: String,
     /// Screen rectangle of the last selected line (anchor for the floating toolbar).
     sel_anchor: Option<Rect>,
+    /// Touch: "Select text" mode — a finger drag selects text instead of scrolling the page.
+    select_mode: bool,
+    /// Phones: the overflow menu of the toolbar is open.
+    menu: bool,
+    /// Pinch: where the centre of the two fingers is (screen), and how far it travelled since the last zoom was applied.
+    pinch_c: Option<Pos2>,
+    pinch_pan: Vec2,
+    /// Pages on screen in the last frame (for the selection handles).
+    shown_last: Vec<(usize, Rect)>,
+    /// Screen positions of the start / end of the selection (bottom of the first / last selected line) and the handle being dragged.
+    hstart: Option<Pos2>,
+    hend: Option<Pos2>,
+    hdrag: u8,
     #[cfg(test)]
     dbg_shown: Vec<(usize, Rect)>,
 }
@@ -338,6 +351,14 @@ impl Reader {
             find_open: false,
             find_text: String::new(),
             sel_anchor: None,
+            select_mode: false,
+            menu: false,
+            pinch_c: None,
+            pinch_pan: Vec2::ZERO,
+            shown_last: vec![],
+            hstart: None,
+            hend: None,
+            hdrag: 0,
             #[cfg(test)]
             dbg_shown: vec![],
         };
@@ -478,11 +499,18 @@ impl Reader {
             Tool::Strike => Some(AnnotKind::Strike),
             _ => None,
         };
-        let mut handled = self.text_drag;
+        if ctx.input(|i| i.multi_touch().is_some()) {
+            self.text_drag = false;
+            self.pan = false;
+            return false;
+        }
+        let mut handled = self.text_drag || self.hdrag != 0;
         if resp.drag_started() {
             let origin = ctx.input(|i| i.pointer.press_origin());
             let on_text = origin.map_or(false, |o| self.over_text_at(o, shown));
-            if on_text && !(self.touch && tool == Tool::Hand) {
+            // touch: a plain swipe scrolls (touch.rs); text is selected in "Select text" mode or with hold-and-drag
+            let hold = crate::touch::long_press_recent(ctx.input(|i| i.time));
+            if on_text && !(self.touch && tool == Tool::Hand && !self.select_mode && !hold) {
                 if let Some(c) = origin.and_then(|o| self.caret_from(o, shown)) {
                     self.sel = Some(Sel { a: c, b: c });
                     self.text_drag = true;
@@ -529,6 +557,20 @@ impl Reader {
         }
         if resp.clicked() {
             self.sel = None;
+        }
+        // touch: hold without moving (touch.rs turns it into a right-click) selects the word under the finger and shows the handles
+        if self.touch && resp.secondary_clicked() {
+            if let Some(pos) = resp.interact_pointer_pos().or(ctx.pointer_latest_pos()) {
+                if let Some((pg, r)) = self.page_hit(pos, shown) {
+                    if let Some((t, x, y)) = self.to_pt(pg, r, pos) {
+                        if let Some(s) = t.word_at(pg, x, y).filter(|s| !s.is_empty()) {
+                            self.sel = Some(s);
+                            handled = true;
+                            crate::platform::haptic(ctx, 12);
+                        }
+                    }
+                }
+            }
         }
         if resp.double_clicked() || resp.triple_clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
@@ -605,11 +647,81 @@ impl Reader {
                 for q in &pc.quads {
                     p.rect_filled(to_screen(q), 1.0, with_alpha(accent, 0.38));
                 }
+                if i == s.page {
+                    if let Some(q) = pc.quads.first() {
+                        let r = to_screen(q);
+                        self.hstart = Some(r.left_bottom());
+                    }
+                }
+                if i == e.page {
+                    if let Some(q) = pc.quads.last() {
+                        let r = to_screen(q);
+                        self.hend = Some(r.right_bottom());
+                    }
+                }
                 if i == e.page {
                     if let Some(q) = pc.quads.last() {
                         self.sel_anchor = Some(to_screen(q));
                     }
                 }
+            }
+        }
+    }
+
+    /// Touch: two drag handles at the ends of the selection (like every mobile text selection) — drag one to extend / shrink it.
+    fn sel_handles(&mut self, ui: &mut Ui, pal: &Palette, view: Rect, scroll_by: &mut Option<f32>) {
+        let (Some(a), Some(b)) = (self.hstart, self.hend) else {
+            self.hdrag = 0;
+            return;
+        };
+        let Some(sel) = self.sel.filter(|s| !s.is_empty()) else {
+            self.hdrag = 0;
+            return;
+        };
+        if !self.touch || self.text_drag {
+            return;
+        }
+        let ctx = ui.ctx().clone();
+        for (n, p) in [(1u8, a), (2u8, b)] {
+            if !view.expand(8.0).contains(p) && self.hdrag != n {
+                continue;
+            }
+            let dx = if n == 1 { -7.0 } else { 7.0 };
+            let target = Rect::from_center_size(pos2(p.x + dx, p.y + 18.0), vec2(48.0, 48.0));
+            crate::touch::claim(target);
+            let resp = ui.interact(target, Id::new(("pdf_hdl", n)), Sense::drag());
+            let col = pal.accent;
+            let c = pos2(p.x + dx * 0.6, p.y + 12.0);
+            let hot = resp.dragged();
+            ui.painter().line_segment([p, pos2(c.x, c.y - 4.0)], egui::Stroke::new(2.0_f32, col));
+            ui.painter().circle_filled(c, if hot { 9.5 } else { 8.0 }, col);
+            ui.painter().circle_stroke(c, if hot { 9.5 } else { 8.0 }, egui::Stroke::new(1.5_f32, Color32::WHITE));
+            if resp.drag_started() {
+                let (s0, e0) = sel.ordered();
+                // the other end stays where it is; the dragged end follows the finger
+                self.sel = Some(Sel { a: if n == 1 { e0 } else { s0 }, b: if n == 1 { s0 } else { e0 } });
+                self.hdrag = n;
+            }
+            if resp.dragged() {
+                if let Some(pos) = ctx.pointer_latest_pos() {
+                    // the caret sits above the finger so that the finger does not hide it
+                    let at = pos - vec2(0.0, 26.0);
+                    let shown = self.shown_last.clone();
+                    if let Some(cr) = self.caret_from(at, &shown) {
+                        if let Some(s) = self.sel.as_mut() {
+                            s.b = cr;
+                        }
+                    }
+                    if pos.y < view.top() + 56.0 {
+                        *scroll_by = Some(-14.0);
+                    } else if pos.y > view.bottom() - 56.0 {
+                        *scroll_by = Some(14.0);
+                    }
+                }
+                ctx.request_repaint();
+            }
+            if resp.drag_stopped() {
+                self.hdrag = 0;
             }
         }
     }
@@ -925,7 +1037,7 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
         if tb_button(ui, pal, put(&mut x, bsz.x), "close", l::X, "Close  (Esc)", true, false) {
             keep = false;
         }
-        if !narrow && ready && tb_button(ui, pal, put(&mut x, bsz.x), "thumbs", l::PANEL_LEFT, "Page thumbnails", true, rd.thumbs) {
+        if ready && tb_button(ui, pal, put(&mut x, bsz.x), "thumbs", if narrow { l::IMAGES } else { l::PANEL_LEFT }, "Page thumbnails", true, rd.thumbs) {
             rd.thumbs = !rd.thumbs;
         }
         if ready && tb_button(ui, pal, put(&mut x, bsz.x), "annot", l::HIGHLIGHTER, "Annotate: highlight, underline, notes, pen", true, rd.notes.bar) {
@@ -937,6 +1049,11 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
                 rd.notes.panel = false;
             }
         }
+        if ready && !tiny && (rd.touch || crate::touch::touchy()) && tb_button(ui, pal, put(&mut x, bsz.x), "selmode", l::TEXT_SELECT, "Select text: drag over the text to select it", true, rd.select_mode) {
+            rd.select_mode = !rd.select_mode;
+            rd.sel = None;
+        }
+        let mut menu_toggle = false;
         // right-hand side first (so the title can use the remaining space)
         let mut rx = bar.right() - 8.0;
         let mut put_r = |rx: &mut f32, w: f32| -> Rect {
@@ -946,34 +1063,46 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
             r
         };
         if ready {
-            if !tiny && tb_button(ui, pal, put_r(&mut rx, bsz.x), "night", if rd.night { l::SUN } else { l::MOON }, "Night mode", true, rd.night) {
-                rd.night = !rd.night;
-                rd.tiles.clear();
-                rd.thumb_tex.clear();
-                rd.best.clear();
-            }
-            if !narrow {
+            let anchor = pos2(body_rect.center().x, body_rect.top() + body_rect.height() * 0.4);
+            if narrow {
+                // phones: one "more" button holds thumbnails, select text, night mode, find, fit and zoom (see `mobile_menu`)
+                if tb_button(ui, pal, put_r(&mut rx, bsz.x), "more", l::ELLIPSIS, "More", true, rd.menu) {
+                    menu_toggle = true;
+                }
+                if !tiny {
+                    let lr = put_r(&mut rx, 50.0);
+                    ui.painter().text(lr.center(), Align2::CENTER_CENTER, format!("{:.0}%", rd.zoom * 100.0), body(13.0), pal.text);
+                    if ui.interact(lr, Id::new("pdf_zoom_lbl"), Sense::click()).clicked() {
+                        fit = Some(true);
+                    }
+                }
+            } else {
+                if tb_button(ui, pal, put_r(&mut rx, bsz.x), "night", if rd.night { l::SUN } else { l::MOON }, "Night mode", true, rd.night) {
+                    rd.night = !rd.night;
+                    rd.tiles.clear();
+                    rd.thumb_tex.clear();
+                    rd.best.clear();
+                }
                 if tb_button(ui, pal, put_r(&mut rx, bsz.x), "fitp", l::MAXIMIZE, "Fit page", true, false) {
                     fit = Some(false);
                 }
                 if tb_button(ui, pal, put_r(&mut rx, bsz.x), "fitw", l::MOVE_HORIZONTAL, "Fit width", true, false) {
                     fit = Some(true);
                 }
+                if tb_button(ui, pal, put_r(&mut rx, bsz.x), "zin", l::ZOOM_IN, "Zoom in  (Ctrl +)", rd.zoom < MAX_ZOOM - 0.01, false) {
+                    zoom_req = Some((rd.zoom * 1.25, anchor));
+                }
+                let lr = put_r(&mut rx, 54.0);
+                ui.painter().text(lr.center(), Align2::CENTER_CENTER, format!("{:.0}%", rd.zoom * 100.0), body(13.5), pal.text);
+                if ui.interact(lr, Id::new("pdf_zoom_lbl"), Sense::click()).on_hover_text("Click to reset to 100 %").clicked() {
+                    fit = Some(true);
+                }
+                if tb_button(ui, pal, put_r(&mut rx, bsz.x), "zout", l::ZOOM_OUT, "Zoom out  (Ctrl −)", rd.zoom > MIN_ZOOM + 0.01, false) {
+                    zoom_req = Some((rd.zoom / 1.25, anchor));
+                }
             }
-            let anchor = pos2(body_rect.center().x, body_rect.top() + body_rect.height() * 0.4);
-            if !tiny && tb_button(ui, pal, put_r(&mut rx, bsz.x), "zin", l::ZOOM_IN, "Zoom in  (Ctrl +)", rd.zoom < MAX_ZOOM - 0.01, false) {
-                zoom_req = Some((rd.zoom * 1.25, anchor));
-            }
-            let lr = put_r(&mut rx, 54.0);
-            ui.painter().text(lr.center(), Align2::CENTER_CENTER, format!("{:.0}%", rd.zoom * 100.0), body(13.5), pal.text);
-            if ui.interact(lr, Id::new("pdf_zoom_lbl"), Sense::click()).on_hover_text("Click to reset to 100 %").clicked() {
-                fit = Some(true);
-            }
-            if !tiny && tb_button(ui, pal, put_r(&mut rx, bsz.x), "zout", l::ZOOM_OUT, "Zoom out  (Ctrl −)", rd.zoom > MIN_ZOOM + 0.01, false) {
-                zoom_req = Some((rd.zoom / 1.25, anchor));
-            }
-            // page controls
-            if tb_button(ui, pal, put_r(&mut rx, bsz.x), "next", l::CHEVRON_DOWN, "Next page", rd.page + 1 < n_pages, false) {
+            // page controls (very narrow screens: just the page box — swiping scrolls)
+            if !tiny && tb_button(ui, pal, put_r(&mut rx, bsz.x), "next", l::CHEVRON_DOWN, "Next page", rd.page + 1 < n_pages, false) {
                 goto_req = Some(rd.page + 1);
             }
             let tot = put_r(&mut rx, if narrow { 34.0 } else { 44.0 });
@@ -990,7 +1119,7 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
                     goto_req = Some(n.clamp(1, n_pages.max(1)) - 1);
                 }
             }
-            if tb_button(ui, pal, put_r(&mut rx, bsz.x), "prev", l::CHEVRON_UP, "Previous page", rd.page > 0, false) {
+            if !tiny && tb_button(ui, pal, put_r(&mut rx, bsz.x), "prev", l::CHEVRON_UP, "Previous page", rd.page > 0, false) {
                 goto_req = Some(rd.page.saturating_sub(1));
             }
         }
@@ -1007,6 +1136,9 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
             crate::widgets::text_fit(ui.painter(), pos2(x + 8.0, bar.center().y), Align2::LEFT_CENTER, &title, bold(14.0), pal.text, avail);
         }
 
+        if menu_toggle {
+            rd.menu = !rd.menu;
+        }
         // ── body ──
         match &mut rd.load {
             Load::Fetch(_) => {
@@ -1057,6 +1189,46 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
                 let list_only = narrow && panel_w > 0.0;
                 if !list_only {
                     reading_view(ui, rd, ctx, view, editing, pal, &mut zoom_req, &mut goto_req, &mut fit, &mut scroll_by, &mut keep);
+                    if rd.thumbs && narrow {
+                        // phones: the thumbnails slide over the page (own layer, so scrolling them never scrolls the page below)
+                        let w = 128.0f32.min(area.width() * 0.4);
+                        let pr = Rect::from_min_max(area.min, pos2(area.left() + w, area.bottom()));
+                        let mut picked: Option<usize> = None;
+                        Area::new(Id::new("pdf_thumbs_sheet")).order(Order::Foreground).fixed_pos(pr.min).constrain(false).show(ctx, |ui| {
+                            ui.set_clip_rect(pr);
+                            ui.allocate_exact_size(pr.size(), Sense::hover());
+                            thumbs_panel(ui, rd, ctx, pal, pr, &mut picked);
+                        });
+                        if let Some(p) = picked {
+                            goto_req = Some(p);
+                            rd.thumbs = false;
+                        }
+                    }
+                    if rd.menu && narrow {
+                        let anchor = pos2(body_rect.center().x, body_rect.top() + body_rect.height() * 0.4);
+                        match mobile_menu(ui, rd, pal, bar.bottom(), full) {
+                            Some("thumbs") => rd.thumbs = !rd.thumbs,
+                            Some("select") => {
+                                rd.select_mode = !rd.select_mode;
+                                rd.sel = None;
+                            }
+                            Some("night") => {
+                                rd.night = !rd.night;
+                                rd.tiles.clear();
+                                rd.thumb_tex.clear();
+                                rd.best.clear();
+                            }
+                            Some("find") => {
+                                rd.find_open = true;
+                                ctx.memory_mut(|m| m.request_focus(Id::new("pdf_find_input")));
+                            }
+                            Some("fitw") => fit = Some(true),
+                            Some("fitp") => fit = Some(false),
+                            Some("zin") => zoom_req = Some((rd.zoom * 1.25, anchor)),
+                            Some("zout") => zoom_req = Some((rd.zoom / 1.25, anchor)),
+                            _ => {}
+                        }
+                    }
                 }
                 if panel_w > 0.0 {
                     let pr = Rect::from_min_max(pos2(area.right() - panel_w, area.top()), area.max);
@@ -1097,10 +1269,16 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
                 let ny = new.ys[i] + local * new.s - rel.y;
                 let dx = rd.off.x + rel.x - old.content_w / 2.0;
                 let nx = new.content_w / 2.0 + dx / old.s * new.s - rel.x;
+                let pan = std::mem::take(&mut rd.pinch_pan);
                 rd.zoom = nz;
-                rd.pending_off = Some(vec2(nx.max(0.0), ny.max(0.0)));
+                rd.pending_off = Some(vec2((nx - pan.x).max(0.0), (ny - pan.y).max(0.0)));
                 rd.zoom_changed = now_ms();
             }
+        }
+        let pan = std::mem::take(&mut rd.pinch_pan);
+        if pan != Vec2::ZERO && rd.pinch_c.is_some() && rd.pending_off.is_none() {
+            // the fingers only moved (or the zoom limit was reached): the page follows them
+            rd.pending_off = Some(vec2((rd.off.x - pan.x).max(0.0), (rd.off.y - pan.y).max(0.0)));
         }
         if let Some(p) = goto_req {
             let lay = layout(&e.dims, rd.zoom, vw);
@@ -1113,6 +1291,48 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
         }
     }
     keep
+}
+
+/// Overflow menu of the phone toolbar. Returns the id of the tapped entry (the menu closes after a tap or a tap outside).
+fn mobile_menu(ui: &mut Ui, rd: &mut Reader, pal: &Palette, top: f32, full: Rect) -> Option<&'static str> {
+    let items: [(&'static str, &str, &str, bool); 8] = [
+        ("thumbs", l::IMAGES, "Page thumbnails", rd.thumbs),
+        ("select", l::TEXT_SELECT, "Select text", rd.select_mode),
+        ("find", l::SEARCH, "Find in document", rd.find_open),
+        ("night", if rd.night { l::SUN } else { l::MOON }, if rd.night { "Day mode" } else { "Night mode" }, rd.night),
+        ("fitw", l::MOVE_HORIZONTAL, "Fit width", false),
+        ("fitp", l::MAXIMIZE, "Fit page", false),
+        ("zin", l::ZOOM_IN, "Zoom in", false),
+        ("zout", l::ZOOM_OUT, "Zoom out", false),
+    ];
+    let row_h = 46.0;
+    let w = 248.0f32.min(full.width() - 16.0);
+    let h = row_h * items.len() as f32 + 12.0;
+    let card = Rect::from_min_size(pos2(full.right() - w - 8.0, top + 6.0), vec2(w, h.min(full.bottom() - top - 12.0)));
+    let scrim = ui.interact(Rect::from_min_max(pos2(full.left(), top), full.max), Id::new("pdf_menu_scrim"), Sense::click());
+    ui.painter().rect_filled(card.translate(vec2(0.0, 3.0)).expand(1.0), 14.0, Color32::from_black_alpha(70));
+    ui.painter().rect_filled(card, 14.0, pal.popup);
+    ui.painter().rect_stroke(card, 14.0, egui::Stroke::new(1.0_f32, pal.border), egui::StrokeKind::Inside);
+    let mut hit: Option<&'static str> = None;
+    for (n, (id, glyph, label, on)) in items.iter().enumerate() {
+        let r = Rect::from_min_size(pos2(card.left() + 6.0, card.top() + 6.0 + n as f32 * row_h), vec2(w - 12.0, row_h));
+        let resp = ui.interact(r, Id::new(("pdf_menu_row", *id)), Sense::click());
+        if resp.is_pointer_button_down_on() {
+            ui.painter().rect_filled(r, 8.0, pal.hover);
+        }
+        if *on {
+            ui.painter().rect_filled(r, 8.0, with_alpha(pal.accent, 0.14));
+        }
+        ui.painter().text(pos2(r.left() + 22.0, r.center().y), Align2::CENTER_CENTER, glyph, icons::font(17.0), if *on { pal.accent } else { pal.text });
+        ui.painter().text(pos2(r.left() + 46.0, r.center().y), Align2::LEFT_CENTER, label, body(15.0), pal.text);
+        if resp.clicked() {
+            hit = Some(*id);
+        }
+    }
+    if hit.is_some() || scrim.clicked() {
+        rd.menu = false;
+    }
+    hit
 }
 
 fn thumbs_panel(ui: &mut Ui, rd: &mut Reader, ctx: &Context, pal: &Palette, rect: Rect, goto_req: &mut Option<usize>) {
@@ -1201,11 +1421,31 @@ fn reading_view(
     let hovered = ctx.pointer_hover_pos().map_or(false, |p| view.contains(p));
 
     // input: pinch / Ctrl+wheel zoom, keys
-    if hovered {
-        let zd = ctx.input(|i| i.zoom_delta());
+    // Two fingers: the page point between the fingers stays between the fingers (zoom *and* pan), one step per frame, and nothing
+    // else (text drag, page pan, selection) may react to the same fingers — that is what made the pages jump while pinching.
+    let multi = ctx.input(|i| i.multi_touch());
+    if let Some(m) = multi {
+        rd.touch = true;
+        let prev = *rd.pinch_c.get_or_insert(m.start_pos);
+        let zd = if m.zoom_delta.is_finite() { m.zoom_delta.clamp(0.5, 2.0) } else { 1.0 };
+        let tr = if m.translation_delta.is_finite() { m.translation_delta } else { Vec2::ZERO };
+        rd.pinch_c = Some(prev + tr);
+        rd.pinch_pan += tr;
         if (zd - 1.0).abs() > 1e-4 {
-            let anchor = ctx.input(|i| i.multi_touch().map(|t| t.start_pos)).or_else(|| ctx.pointer_hover_pos()).unwrap_or(view.center());
-            *zoom_req = Some((zoom_req.map_or(rd.zoom, |z| z.0) * zd, anchor));
+            *zoom_req = Some((zoom_req.map_or(rd.zoom, |z| z.0) * zd, prev));
+        }
+        rd.text_drag = false;
+        rd.pan = false;
+        rd.hdrag = 0;
+        ctx.request_repaint();
+    } else {
+        rd.pinch_c = None;
+        if hovered {
+            let zd = ctx.input(|i| i.zoom_delta());
+            if (zd - 1.0).abs() > 1e-4 {
+                let anchor = ctx.pointer_hover_pos().unwrap_or(view.center());
+                *zoom_req = Some((zoom_req.map_or(rd.zoom, |z| z.0) * zd, anchor));
+            }
         }
     }
     if !editing {
@@ -1289,6 +1529,8 @@ fn reading_view(
     let debounce = now - rd.zoom_changed < 160.0;
 
     rd.sel_anchor = None;
+    rd.hstart = None;
+    rd.hend = None;
     if rd.step_find() {
         ctx.request_repaint();
     }
@@ -1429,7 +1671,8 @@ fn reading_view(
             rd.dbg_shown = shown.clone();
         }
         // drawing tools get the raw finger (otherwise a swipe scrolls the page, see touch.rs)
-        crate::touch::set_passthrough(capturing);
+        crate::touch::set_passthrough(capturing || (rd.select_mode && rd.touch && rd.notes.tool == Tool::Hand));
+        rd.shown_last = shown.clone();
         let editing_mark = rd.notes.drag_edit(ctx, &resp, &shown);
         let handled = editing_mark || rd.text_input(ctx, ui, &resp, &shown, view);
         if !handled && (capturing || rd.notes.bar || !rd.notes.list.is_empty()) {
@@ -1444,6 +1687,7 @@ fn reading_view(
         }
     });
     rd.sel_toolbar(ui, pal, view);
+    rd.sel_handles(ui, pal, view, scroll_by);
     rd.find_bar(ui, ctx, pal, view);
     rd.off = out.state.offset;
     rd.vp = out.inner_rect;
