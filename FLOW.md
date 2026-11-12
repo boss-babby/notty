@@ -99,3 +99,52 @@ Android and Windows builds call APIs directly (the Android manifest already decl
 
 Tests: `cargo test --lib flow` — paths & templates, map/filter/aggregate, branch skipping + merge, fan-in + cycle refusal, error blocking, script multi-output + workspace access,
 database round trip, dry-run isolation, timers, template validity + JSON round trip, repair of damaged flows.
+
+---
+
+## 10.1 — Flow grows up: connectors, pickers, examples, and the "dialog stays small" fix
+
+### The dialog-size bug (all pop-ups, whole app)
+**Symptom:** type in a search box (Flow node palette, command palette, menus …), the dialog shrinks to the few results — and then it *stays* that small
+(or the inspector card opens clipped, "Method" cut in half) even after the search is cleared.
+
+**Root cause:** egui lays the content of an `Area` out inside **the rectangle the area had on the previous frame**
+(`vendor/egui/src/containers/area.rs`, `Prepared::content_ui`: `max_rect = state.rect()`). Every Lumen pop-up is an `Area` with a `ScrollArea { max_height }` inside.
+When the previous frame was small, the `ScrollArea` only saw that small height as "available", clipped its content to it, and reported the small size again —
+a fixed point it could never leave.
+
+**Fix (global, one place):** egui 0.31.1 is vendored (`[patch.crates-io] egui = { path = "vendor/egui" }`). The width is still tied to the last frame (menus set their own),
+but the height may grow up to the screen on every frame, and a change of the measured size requests one more frame so anchored sheets settle immediately.
+Regression test: `tests::area_grows_back_after_it_was_small`.
+Additionally the Flow palette now has a **fixed-height list** (the dialog keeps its shape while you type), resets the scroll position when the query changes,
+shows a "no match" hint, supports category chips, Enter = first match, Esc = close.
+
+### Dropdowns instead of typing
+| Parameter kind | Used by | What you get |
+|---|---|---|
+| `PK::Db` | Query database, Add row / task, Update row / task | Dropdown of the databases of your workspace; a warning if the stored name no longer exists. New nodes and templates are pre-filled with a real database (prefers one called *Tasks*). |
+| `PK::Prop` | Where property, Find by property | Dropdown of that database's properties with their type. |
+| `PK::Fields` | Add row / task, Update row / task | `Property = value` rows: property dropdown, value editor that follows the type — select options as dropdown, checkbox true/false, date with a *Today* button, number, text; `＋ Add field`, `✕` remove. |
+| `PK::Secret` | HTTP token, message target, inbox key | Masked text with Show / Hide. |
+
+### New nodes
+| Node | Category | Purpose |
+|---|---|---|
+| **Ready-made API** (`api`) | Network | GitHub repo / issues / releases, weather (Open-Meteo), Hacker News, Wikipedia, exchange rates, CoinGecko, jokes, JSONPlaceholder todos — pick from a list. |
+| **HTTP request** (extended) | Network | + query builder (auto-encoded), authentication (bearer, basic, x-api-key, `api_key` query), retries (network errors, 5xx, 429), proxy on by default on the web. |
+| **RSS / Atom feed** (`rss`) | Network | Feed → `[{title, link, date, summary}]`. |
+| **Send message** (`message`) | Network | ntfy.sh, Slack, Discord, Teams, Telegram, generic JSON webhook. |
+| **Cloud inbox (webhook in)** (`cloud_in`) | Inputs | Reads events that anything POSTed to `/api/hooks/<channel>` on the server. `events` is inactive when empty, so scheduled flows simply stop. |
+| **Cloud inbox (send)** (`cloud_out`) | Network | Writes an event into a channel (flow → flow, device → device). |
+| **CSV → rows** (`csv`) | Data | Quoted fields, `,` `;` tab, header row, numbers detected. |
+
+### Templates (Flow ⋯ menu → Templates)
+Open tasks digest · Public API → tasks · GitHub issues → tasks · Webhook inbox → tasks · News digest → phone push · Weather → push message · Price alert (If / Merge) ·
+CSV → database — plus the four from 10.0.
+
+### Server side (Next.js, `src/app/api`)
+* `POST /api/flow-proxy` — CORS relay for the web build. Public hosts only (DNS resolved and checked, redirects re-checked), 4 MB / 20 s limits, per-IP rate limit.
+* `POST|GET|DELETE /api/hooks/<channel>` — PostgreSQL-backed inbox (500 events per channel, 256 KB per event, optional channel key via `x-hook-key` / `?key=`).
+* `GET /api/downloads` — the published APK / Windows files with sizes and SHA-256.
+
+On Android and Windows the nodes call the server directly: fill in **Server** (e.g. `https://your-site.example`) in the Cloud inbox nodes; HTTP / API nodes need no proxy there.

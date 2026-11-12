@@ -13,7 +13,7 @@ use crate::automation::Output;
 use crate::flow::{self, Cat, FNode, Flow, Json, Run, St as RunSt, Wire, DEFS, HEAD_H, PK, ROW_H};
 use crate::icons;
 use crate::lucide as l;
-use crate::model::Workspace;
+use crate::model::{PageKind, PropKind, Workspace};
 use crate::theme::{body, bold, Palette};
 use crate::touch;
 use crate::widgets::{text_fit, with_alpha, HOST_ORDER};
@@ -37,7 +37,48 @@ enum Pend {
     To(u32, usize),
 }
 
+#[derive(Clone)]
+struct PropInfo {
+    name: String,
+    kind: PropKind,
+    opts: Vec<String>,
+}
+
+/// A database of the workspace as the inspector's dropdowns see it.
+#[derive(Clone)]
+struct DbInfo {
+    name: String,
+    props: Vec<PropInfo>,
+}
+
+fn db_infos(ws: &Workspace) -> Vec<DbInfo> {
+    ws.pages
+        .iter()
+        .filter(|p| p.kind == PageKind::Database && !p.trashed && p.db.is_some())
+        .filter_map(|p| {
+            let d = p.db.as_ref()?;
+            Some(DbInfo { name: ws.display_title(p.id), props: d.props.iter().map(|x| PropInfo { name: x.name.clone(), kind: x.kind, opts: x.opts.iter().map(|o| o.name.clone()).collect() }).collect() })
+        })
+        .collect()
+}
+
+/// Gives every database parameter that points nowhere (fresh node, template, pasted flow) a real database of this workspace.
+fn fix_dbs(f: &mut Flow, ids: &[u32], dbs: &[DbInfo]) {
+    let Some(first) = dbs.iter().find(|d| d.name.to_lowercase().contains("task")).or_else(|| dbs.first()) else { return };
+    for n in f.nodes.iter_mut().filter(|n| ids.contains(&n.id)) {
+        let Some(d) = n.def() else { continue };
+        for pp in d.params.iter().filter(|pp| pp.kind == PK::Db) {
+            let cur = n.param(pp.key);
+            if !dbs.iter().any(|x| x.name.trim().eq_ignore_ascii_case(cur.trim())) {
+                n.params.insert(pp.key.to_owned(), first.name.clone());
+            }
+        }
+    }
+}
+
 struct Picker {
+    cat: Option<Cat>,
+    last_q: String,
     pos: Pos2,
     pend: Option<Pend>,
     query: String,
@@ -75,6 +116,7 @@ struct St {
     last_auto: f64,
     inited: bool,
     toast: Option<String>,
+    dbs: Vec<DbInfo>,
 }
 
 thread_local! {
@@ -105,6 +147,7 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, page: u64, pal: &Palette) -> Out {
             f.zoom = 0.85;
         }
     }
+    st.dbs = db_infos(ws);
     let before = (f.nodes.len(), f.wires.len(), f.every, f.vars.len());
     let dirty = run_ui(ui, ws, page, pal, &mut f, &mut st, &mut out);
     if dirty || before != (f.nodes.len(), f.wires.len(), f.every, f.vars.len()) {
@@ -580,7 +623,7 @@ fn run_ui(ui: &mut Ui, ws: &mut Workspace, page: u64, pal: &Palette, f: &mut Flo
                     let over_node = f.nodes.iter().any(|n| Rect::from_min_size(v.to_screen(n.x, n.y), vec2(n.width(), n.height()) * v.z).contains(pt));
                     if !over_node && rect.contains(pt) && !ctx.is_pointer_over_area() {
                         let w = v.to_world(pt);
-                        st.picker = Some(Picker { pos: w, pend: Some(from), query: String::new(), focus: true });
+                        st.picker = Some(Picker { pos: w, pend: Some(from), query: String::new(), focus: true, cat: None, last_q: String::new() });
                     }
                 }
             }
@@ -661,7 +704,7 @@ fn run_ui(ui: &mut Ui, ws: &mut Workspace, page: u64, pal: &Palette, f: &mut Flo
     }
     if bg.double_clicked() || bg.secondary_clicked() {
         if let Some(pt) = bg.interact_pointer_pos() {
-            st.picker = Some(Picker { pos: v.to_world(pt), pend: None, query: String::new(), focus: true });
+            st.picker = Some(Picker { pos: v.to_world(pt), pend: None, query: String::new(), focus: true, cat: None, last_q: String::new() });
         }
     }
     if f.nodes.is_empty() && st.picker.is_none() {
@@ -814,7 +857,7 @@ fn summary(n: &FNode) -> String {
     let Some(d) = n.def() else { return String::new() };
     for pp in d.params {
         let v = n.param(pp.key);
-        if !v.trim().is_empty() && !matches!(pp.kind, PK::Bool) {
+        if !v.trim().is_empty() && !matches!(pp.kind, PK::Bool | PK::Secret) {
             let one = v.lines().next().unwrap_or("").to_owned();
             return match pp.kind {
                 PK::Choice(_) => one,
@@ -907,7 +950,7 @@ fn top_bar(ctx: &Context, ws: &mut Workspace, page: u64, pal: &Palette, f: &mut 
                 if btn(ui, pal, l::PLUS, if compact { "" } else { "Add node" }, false, true, "Add a node").clicked() {
                     let c = View { origin: rect.min, pan: vec2(f.pan[0], f.pan[1]), z: f.zoom }.to_world(rect.center() - vec2(0.0, 40.0));
                     let jitter = (f.nodes.len() % 5) as f32 * 18.0;
-                    st.picker = Some(Picker { pos: pos2(c.x - 100.0 + jitter, c.y - 40.0 + jitter), pend: None, query: String::new(), focus: true });
+                    st.picker = Some(Picker { pos: pos2(c.x - 100.0 + jitter, c.y - 40.0 + jitter), pend: None, query: String::new(), focus: true, cat: None, last_q: String::new() });
                 }
                 if btn(ui, pal, l::MAXIMIZE, "", false, !f.nodes.is_empty(), "Fit all nodes").clicked() {
                     fit(f, rect);
@@ -1011,7 +1054,8 @@ fn inspector(ctx: &Context, pal: &Palette, f: &mut Flow, st: &mut St, rect: Rect
         _ => None,
     };
     let def = f.nodes[idx].def();
-    let w = if compact { ctx.screen_rect().width() - 16.0 } else { 310.0 };
+    let dbs = st.dbs.clone();
+    let w = if compact { ctx.screen_rect().width() - 16.0 } else { 320.0 };
     let max_h = if compact { ctx.screen_rect().height() * 0.46 } else { (rect.height() - 150.0).max(240.0) };
     let area = egui::Area::new(Id::new("flow_inspector")).order(HOST_ORDER);
     let area = if compact { area.anchor(Align2::CENTER_BOTTOM, vec2(0.0, -62.0)) } else { area.anchor(Align2::RIGHT_TOP, vec2(-12.0, rect.top() + 66.0)) };
@@ -1074,6 +1118,50 @@ fn inspector(ctx: &Context, pal: &Palette, f: &mut Flow, st: &mut St, rect: Rect
                                     val = if b { "true".into() } else { "false".into() };
                                 }
                             }
+                            PK::Db => {
+                                let found = dbs.iter().any(|x| x.name == val);
+                                if dbs.is_empty() {
+                                    ui.label(egui::RichText::new("You have no database yet. Create one from the sidebar (＋ → Database), then pick it here.").small().color(pal.danger));
+                                    ui.add(TextEdit::singleline(&mut val).desired_width(f32::INFINITY).hint_text("Database name"));
+                                } else {
+                                    egui::ComboBox::from_id_salt(("flow_db", id, pp.key)).selected_text(if val.trim().is_empty() { "Choose a database…".to_owned() } else { val.clone() }).width(ui.available_width() - 8.0).show_ui(ui, |ui| {
+                                        for x in &dbs {
+                                            ui.selectable_value(&mut val, x.name.clone(), &x.name);
+                                        }
+                                    });
+                                    if !found && !val.trim().is_empty() {
+                                        ui.label(egui::RichText::new(format!("“{val}” is not a database of this workspace – pick one above.")).small().color(pal.danger));
+                                    }
+                                }
+                            }
+                            PK::Prop => {
+                                let dbname = n.param("db");
+                                if let Some(dbi) = dbs.iter().find(|x| x.name == dbname) {
+                                    egui::ComboBox::from_id_salt(("flow_prop", id, pp.key)).selected_text(if val.is_empty() { "(none)".to_owned() } else { val.clone() }).width(ui.available_width() - 8.0).show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut val, String::new(), "(none)");
+                                        ui.selectable_value(&mut val, "title".to_owned(), "title");
+                                        for x in &dbi.props {
+                                            ui.selectable_value(&mut val, x.name.clone(), format!("{}  ·  {}", x.name, x.kind.label()));
+                                        }
+                                    });
+                                } else {
+                                    ui.add(TextEdit::singleline(&mut val).desired_width(f32::INFINITY).hint_text("Property name (choose the database first)"));
+                                }
+                            }
+                            PK::Secret => {
+                                let sid = Id::new(("flow_secret_show", id, pp.key));
+                                let mut show = ctx.data(|dd| dd.get_temp::<bool>(sid)).unwrap_or(false);
+                                ui.horizontal(|ui| {
+                                    ui.add(TextEdit::singleline(&mut val).password(!show).desired_width(ui.available_width() - 56.0).hint_text(pp.hint.split(['·', '.']).next().unwrap_or("")));
+                                    if ui.small_button(if show { "Hide" } else { "Show" }).clicked() {
+                                        show = !show;
+                                    }
+                                });
+                                ctx.data_mut(|dd| dd.insert_temp(sid, show));
+                            }
+                            PK::Fields => {
+                                fields_editor(ui, pal, id, &mut val, dbs.iter().find(|x| x.name == n.param("db")));
+                            }
                             PK::Choice(opts) => {
                                 egui::ComboBox::from_id_salt(("flow_choice", id, pp.key)).selected_text(val.clone()).width(ui.available_width() - 8.0).show_ui(ui, |ui| {
                                     for o in opts {
@@ -1082,7 +1170,7 @@ fn inspector(ctx: &Context, pal: &Palette, f: &mut Flow, st: &mut St, rect: Rect
                                 });
                             }
                         }
-                        if !pp.hint.is_empty() && !matches!(pp.kind, PK::Text | PK::Num | PK::Long | PK::Code) {
+                        if !pp.hint.is_empty() && !matches!(pp.kind, PK::Text | PK::Num | PK::Long | PK::Code | PK::Secret | PK::Db | PK::Prop) {
                             ui.label(egui::RichText::new(pp.hint).small().color(pal.muted));
                         }
                         if val != old {
@@ -1160,23 +1248,44 @@ fn inspector(ctx: &Context, pal: &Palette, f: &mut Flow, st: &mut St, rect: Rect
 
 fn picker(ctx: &Context, pal: &Palette, f: &mut Flow, st: &mut St, rect: Rect, compact: bool, dirty: &mut bool) {
     let Some(pk) = st.picker.as_mut() else { return };
-    let w = if compact { ctx.screen_rect().width() - 16.0 } else { 340.0 };
+    let screen = ctx.screen_rect();
+    let w = if compact { screen.width() - 16.0 } else { 380.0 };
     let area = egui::Area::new(Id::new("flow_picker")).order(HOST_ORDER);
     let area = if compact { area.anchor(Align2::CENTER_BOTTOM, vec2(0.0, -8.0)) } else { area.anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)) };
     let mut chosen: Option<&'static str> = None;
     let mut close = false;
-    let max_h = if compact { ctx.screen_rect().height() * 0.7 } else { (rect.height() - 120.0).clamp(240.0, 520.0) };
+    // The list always keeps the SAME height – typing in the search box only changes what is inside, never the shape of the dialog.
+    let list_h = if compact { (screen.height() * 0.42).max(160.0) } else { (rect.height() - 190.0).clamp(240.0, 440.0) };
+    let q = pk.query.trim().to_lowercase();
+    let query_changed = pk.last_q != pk.query;
+    pk.last_q = pk.query.clone();
     area.show(ctx, |ui| {
+        ui.set_max_height(screen.height() - 16.0);
         frame(pal).show(ui, |ui| {
             ui.set_width(w - 16.0);
             ui.horizontal(|ui| {
-                let r = ui.add(TextEdit::singleline(&mut pk.query).hint_text("Search nodes…").desired_width(w - 80.0).id(Id::new("flow_pick_q")));
+                let r = ui.add(TextEdit::singleline(&mut pk.query).hint_text("Search nodes, APIs, connectors…").desired_width(w - 90.0).id(Id::new("flow_pick_q")));
                 if pk.focus {
                     r.request_focus();
                     pk.focus = false;
                 }
+                if r.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter)) {
+                    // Enter takes the first match
+                    chosen = DEFS.iter().find(|d| node_matches(d, &q, pk.cat)).map(|d| d.key);
+                }
                 if ui.button("Close").clicked() {
                     close = true;
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+                if ui.selectable_label(pk.cat.is_none(), "All").clicked() {
+                    pk.cat = None;
+                }
+                for c in Cat::ALL {
+                    if ui.selectable_label(pk.cat == Some(c), egui::RichText::new(c.label()).color(if pk.cat == Some(c) { pal.text } else { cat_color(c) })).clicked() {
+                        pk.cat = if pk.cat == Some(c) { None } else { Some(c) };
+                    }
                 }
             });
             if let Some(pend) = pk.pend {
@@ -1185,31 +1294,48 @@ fn picker(ctx: &Context, pal: &Palette, f: &mut Flow, st: &mut St, rect: Rect, c
                     Pend::To(..) => "The new node will feed this input.",
                 }).small().color(pal.muted));
             }
-            let q = pk.query.to_lowercase();
-            egui::ScrollArea::vertical().max_height(max_h).id_salt("flow_pick_scroll").show(ui, |ui| {
+            let mut sa = egui::ScrollArea::vertical().id_salt("flow_pick_scroll").max_height(list_h).min_scrolled_height(list_h).auto_shrink([false, false]);
+            if query_changed {
+                sa = sa.vertical_scroll_offset(0.0);
+            }
+            sa.show(ui, |ui| {
+                let mut any = false;
                 for cat in Cat::ALL {
-                    let items: Vec<&'static flow::Def> = DEFS.iter().filter(|d| d.cat == cat && (q.is_empty() || d.label.to_lowercase().contains(&q) || d.doc.to_lowercase().contains(&q) || d.key.contains(&q))).collect();
+                    let items: Vec<&'static flow::Def> = DEFS.iter().filter(|d| d.cat == cat && node_matches(d, &q, pk.cat)).collect();
                     if items.is_empty() {
                         continue;
                     }
+                    any = true;
+                    ui.add_space(2.0);
                     ui.label(egui::RichText::new(cat.label()).small().strong().color(cat_color(cat)));
                     for d in items {
-                        let h = if touch::touchy() { 46.0 } else { 38.0 };
+                        let h = if touch::touchy() { 50.0 } else { 40.0 };
                         let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
                         if resp.hovered() || resp.is_pointer_button_down_on() {
                             ui.painter().rect_filled(r, 8.0, pal.hover);
                         }
                         ui.painter().circle_filled(pos2(r.left() + 12.0, r.center().y), 5.0, cat_color(cat));
-                        ui.painter().text(pos2(r.left() + 26.0, r.top() + 11.0), Align2::LEFT_CENTER, d.label, bold(13.5), pal.text);
-                        text_fit(ui.painter(), pos2(r.left() + 26.0, r.bottom() - 11.0), Align2::LEFT_CENTER, d.doc.split(['.', '\n']).next().unwrap_or(""), body(11.0), pal.muted, r.width() - 34.0);
+                        ui.painter().text(pos2(r.left() + 26.0, r.top() + 12.0), Align2::LEFT_CENTER, d.label, bold(13.5), pal.text);
+                        text_fit(ui.painter(), pos2(r.left() + 26.0, r.bottom() - 12.0), Align2::LEFT_CENTER, d.doc.split(['.', '\n']).next().unwrap_or("").replace("**", "").replace('`', "").as_str(), body(11.0), pal.muted, r.width() - 34.0);
                         if resp.clicked() {
                             chosen = Some(d.key);
                         }
                     }
                 }
+                if !any {
+                    ui.add_space(16.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("No node matches “").color(pal.muted).small());
+                        ui.label(egui::RichText::new(q.as_str()).strong());
+                        ui.label(egui::RichText::new("Try “http”, “slack”, “database”, “rss” or “csv”.").color(pal.muted).small());
+                    });
+                }
             });
         });
     });
+    if ctx.input(|i| i.key_pressed(Key::Escape)) {
+        close = true;
+    }
     if close {
         st.picker = None;
         return;
@@ -1217,7 +1343,9 @@ fn picker(ctx: &Context, pal: &Palette, f: &mut Flow, st: &mut St, rect: Rect, c
     if let Some(kind) = chosen {
         let Some(pk) = st.picker.take() else { return };
         push_undo(st, f);
+        let dbs = st.dbs.clone();
         if let Some(id) = f.add_node(kind, pk.pos.x, pk.pos.y) {
+            fix_dbs(f, &[id], &dbs);
             match pk.pend {
                 Some(Pend::From(a, i)) => {
                     // first free input, else the first one
@@ -1249,6 +1377,86 @@ fn picker(ctx: &Context, pal: &Palette, f: &mut Flow, st: &mut St, rect: Rect, c
             *dirty = true;
         }
     }
+}
+
+/// `Property = value` rows. The property is a dropdown of the chosen database; the value editor follows the property type.
+fn fields_editor(ui: &mut Ui, pal: &Palette, node: u32, val: &mut String, db: Option<&DbInfo>) {
+    let mut rows: Vec<(String, String)> = val.lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned())).collect();
+    let settable: Vec<&PropInfo> = db.map(|d| d.props.iter().filter(|p| !p.kind.computed() && p.kind != PropKind::Relation).collect()).unwrap_or_default();
+    let mut remove: Option<usize> = None;
+    let mut changed = false;
+    for (i, (k, v)) in rows.iter_mut().enumerate() {
+        let info = settable.iter().find(|p| p.name == *k).copied();
+        let old = (k.clone(), v.clone());
+        ui.horizontal(|ui| {
+            if db.is_some() {
+                egui::ComboBox::from_id_salt(("flow_fk", node, i)).selected_text(if k.is_empty() { "Property".to_owned() } else { k.clone() }).width(104.0).show_ui(ui, |ui| {
+                    ui.selectable_value(k, "title".to_owned(), "title");
+                    for pi in &settable {
+                        ui.selectable_value(k, pi.name.clone(), &pi.name);
+                    }
+                });
+            } else {
+                ui.add(TextEdit::singleline(k).desired_width(96.0).hint_text("Property"));
+            }
+            ui.label("=");
+            let w = (ui.available_width() - 34.0).max(60.0);
+            match info.map(|p| (p.kind, &p.opts)) {
+                Some((PropKind::Select | PropKind::MultiSelect, opts)) if !opts.is_empty() => {
+                    egui::ComboBox::from_id_salt(("flow_fv", node, i)).selected_text(if v.is_empty() { "Choose…".to_owned() } else { v.clone() }).width(w - 8.0).show_ui(ui, |ui| {
+                        for o in opts {
+                            ui.selectable_value(v, o.clone(), o);
+                        }
+                    });
+                }
+                Some((PropKind::Checkbox, _)) => {
+                    egui::ComboBox::from_id_salt(("flow_fv", node, i)).selected_text(if v.is_empty() { "Choose…".to_owned() } else { v.clone() }).width(w - 8.0).show_ui(ui, |ui| {
+                        ui.selectable_value(v, "true".to_owned(), "true (checked)");
+                        ui.selectable_value(v, "false".to_owned(), "false");
+                    });
+                }
+                Some((PropKind::Date, _)) => {
+                    ui.add(TextEdit::singleline(v).desired_width(w - 44.0).hint_text("YYYY-MM-DD"));
+                    if ui.small_button("Today").clicked() {
+                        *v = "{{today}}".into();
+                    }
+                }
+                Some((PropKind::Number, _)) => {
+                    ui.add(TextEdit::singleline(v).desired_width(w).hint_text("number or {{input.n}}"));
+                }
+                _ => {
+                    ui.add(TextEdit::singleline(v).desired_width(w).hint_text("text or {{input.field}}"));
+                }
+            }
+            if ui.small_button("✕").on_hover_text("Remove this field").clicked() {
+                remove = Some(i);
+            }
+        });
+        if (k.clone(), v.clone()) != old {
+            changed = true;
+        }
+    }
+    if let Some(i) = remove {
+        rows.remove(i);
+        changed = true;
+    }
+    ui.horizontal(|ui| {
+        if ui.button("＋ Add field").clicked() {
+            let next = settable.iter().map(|p| p.name.as_str()).chain(std::iter::once("title")).find(|n| !rows.iter().any(|(k, _)| k == n)).unwrap_or("title").to_owned();
+            rows.push((next, String::new()));
+            changed = true;
+        }
+        if db.is_some() {
+            ui.label(egui::RichText::new("pick from the database's properties").small().color(pal.muted));
+        }
+    });
+    if changed {
+        *val = rows.iter().filter(|(k, _)| !k.is_empty()).map(|(k, v)| format!("{k} = {v}")).collect::<Vec<_>>().join("\n");
+    }
+}
+
+fn node_matches(d: &flow::Def, q: &str, cat: Option<Cat>) -> bool {
+    cat.map_or(true, |c| c == d.cat) && (q.is_empty() || q.split_whitespace().all(|w| d.label.to_lowercase().contains(w) || d.doc.to_lowercase().contains(w) || d.key.contains(w)))
 }
 
 fn def_ins(f: &Flow, id: u32) -> usize {
@@ -1354,6 +1562,8 @@ fn menu(ctx: &Context, ws: &mut Workspace, page: u64, pal: &Palette, f: &mut Flo
         snapshot = Some(snap(f));
         let t = (flow::TEMPLATES[i].build)();
         let ids = f.merge_in(&t, 0.0, origin_y);
+        let dbs = st.dbs.clone();
+        fix_dbs(f, &ids, &dbs);
         st.sel = ids.into_iter().collect();
         fit(f, rect);
         *dirty = true;

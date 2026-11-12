@@ -88,6 +88,8 @@ egui-winit = { path = "vendor/egui-winit" }
 egui_glow = { path = "vendor/egui_glow" }
 # epaint 0.31.1 with HarfBuzz shaping (rustybuzz) + bidi reordering for complex scripts (vendor/epaint/src/text/text_layout.rs, "Lumen")
 epaint = { path = "vendor/epaint" }
+# egui 0.31.1 with a fix for the "dialogs stay as small as they were once" bug (vendor/egui/src/containers/area.rs, "Lumen patch")
+egui = { path = "vendor/egui" }
 
 # Read by `cargo apk` (plain NativeActivity package). The production APK is assembled by ./build-android.sh instead, because Lumen
 # ships its own Java activity (window insets, soft keyboard, Storage-Access-Framework file dialogs, clipboard, print) that cargo-apk

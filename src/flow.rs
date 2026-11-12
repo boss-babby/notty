@@ -79,6 +79,14 @@ pub enum PK {
     Bool,
     Code,
     Choice(&'static [&'static str]),
+    /// Dropdown of the databases in this workspace (stores the database's name).
+    Db,
+    /// Dropdown of the properties of the database chosen in the `db` parameter (plus `title`).
+    Prop,
+    /// Masked text (tokens, passwords, webhook URLs). Still stored in the flow, so use `{{vars.x}}` when you share flows.
+    Secret,
+    /// `Property = value` rows: property dropdown + a value editor that fits the property (select options, checkbox, date …).
+    Fields,
 }
 
 pub struct P {
@@ -107,6 +115,9 @@ const TESTS: &[&str] = &["truthy", "falsy", "equals", "not equals", "greater tha
 const AGG: &[&str] = &["count", "sum", "avg", "min", "max", "join", "unique", "first", "last", "flatten"];
 const METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
 const MATH: &[&str] = &["add", "subtract", "multiply", "divide", "modulo", "power", "min", "max", "round"];
+const AUTH: &[&str] = &["none", "bearer token", "basic (user:password)", "x-api-key header", "api_key query"];
+const SERVICES: &[&str] = &["JSONPlaceholder todos", "GitHub repository", "GitHub open issues", "GitHub releases", "Weather (Open-Meteo)", "Hacker News front page", "Wikipedia summary", "Exchange rates", "Crypto price (CoinGecko)", "Random joke"];
+const MSG_SERVICES: &[&str] = &["ntfy.sh push", "Slack webhook", "Discord webhook", "Microsoft Teams webhook", "Telegram bot", "Generic JSON webhook"];
 const LOGIC: &[&str] = &["and", "or", "xor", "not"];
 
 pub static DEFS: &[Def] = &[
@@ -135,7 +146,17 @@ pub static DEFS: &[Def] = &[
     Def { key: "json_text", label: "To JSON text", cat: Cat::Data, ins: &["value"], outs: &["text"], params: &[p("pretty", "Pretty print", PK::Bool, "true", "")], doc: "Turns data into JSON text." },
     Def { key: "hash", label: "SHA-256", cat: Cat::Data, ins: &["text"], outs: &["hex"], params: &[], doc: "SHA-256 of a text, as hexadecimal." },
     Def { key: "code", label: "Code (LumenScript)", cat: Cat::Data, ins: &["a", "b", "c"], outs: &["out", "out2", "out3"], params: &[p("code", "Script", PK::Code, "// a, b, c are the inputs; vars is a map\nemit(a)\n// emit_to(\"out2\", 42)", "Full workspace API: db(\"Tasks\").rows() …")], doc: "Runs a LumenScript with the inputs as variables. `emit(x)` writes to the first output, `emit_to(\"out2\", x)` to another one. Has access to the workspace API (db, notify …) — use Dry run to try it safely." },
-    Def { key: "http", label: "HTTP request", cat: Cat::Network, ins: &["url", "body"], outs: &["body", "status", "error"], params: &[p("method", "Method", PK::Choice(METHODS), "GET", ""), p("url", "URL", PK::Text, "https://api.github.com/repos/rust-lang/rust", "{{vars.base}}/users — used when 'url' is not connected"), p("headers", "Headers (Name: value per line)", PK::Long, "Accept: application/json", ""), p("body", "Body", PK::Long, "", "Used when 'body' is not connected. Objects are sent as JSON."), p("proxy", "Via server proxy (web, avoids CORS)", PK::Bool, "false", "Browsers block most cross-site requests. The proxy is the website's /api/flow-proxy.")], doc: "Calls any HTTP API. JSON answers are parsed into data. Success leaves through **body** and **status**, failures (network error or status ≥ 400) through **error**. Independent requests run in parallel." },
+    Def { key: "http", label: "HTTP request", cat: Cat::Network, ins: &["url", "body"], outs: &["body", "status", "error"], params: &[p("method", "Method", PK::Choice(METHODS), "GET", ""), p("url", "URL", PK::Text, "https://api.github.com/repos/rust-lang/rust", "{{vars.base}}/users — used when 'url' is not connected"), p("query", "Query (name = value per line)", PK::Long, "", "Added to the URL and encoded for you. {{templates}} allowed."), p("auth", "Authentication", PK::Choice(AUTH), "none", "Where the secret below goes."), p("token", "Token / key / user:password", PK::Secret, "", "Tip: store it as a flow variable and write {{vars.token}} here."), p("headers", "Headers (Name: value per line)", PK::Long, "Accept: application/json", ""), p("body", "Body", PK::Long, "", "Used when 'body' is not connected. Objects are sent as JSON."), p("retries", "Retries on failure", PK::Choice(&["0", "1", "2", "3"]), "0", "Network errors and HTTP 5xx / 429 are retried."), p("proxy", "Via server proxy (web, avoids CORS)", PK::Bool, "true", "Browsers block most cross-site requests. The proxy is the website's /api/flow-proxy. Ignored in the Android and Windows apps (they call the API directly).")], doc: "Calls any HTTP API. JSON answers are parsed into data. Success leaves through **body** and **status**, failures (network error or status ≥ 400) through **error**. Independent requests run in parallel." },
+    Def { key: "api", label: "Ready-made API", cat: Cat::Network, ins: &["arg"], outs: &["body", "status", "error"], params: &[p("service", "Service", PK::Choice(SERVICES), "JSONPlaceholder todos", "Pick an API – no keys, no URLs to remember."), p("arg", "Argument", PK::Text, "5", "GitHub: owner/repo · Weather: lat,lon · Wikipedia: page title · Exchange rates: USD · Crypto: bitcoin · Todos: how many")], doc: "A catalogue of free public APIs (GitHub, weather, Hacker News, Wikipedia, exchange rates, crypto prices, demo todos …). Choose one, give it an argument, and the answer flows on as data." },
+    Def { key: "rss", label: "RSS / Atom feed", cat: Cat::Network, ins: &["url"], outs: &["items", "title", "error"], params: &[p("url", "Feed URL", PK::Text, "https://hnrss.org/frontpage", "Used when 'url' is not connected"), p("limit", "Max items", PK::Num, "20", "")], doc: "Reads a news / blog feed into a list of `{title, link, date, summary}`. Combine with Filter, Map and Add row to build a reading list." },
+    Def { key: "message", label: "Send message", cat: Cat::Network, ins: &["message"], outs: &["sent", "error"], params: &[p("service", "Service", PK::Choice(MSG_SERVICES), "ntfy.sh push", ""), p("target", "Webhook URL / topic / bot token", PK::Secret, "", "ntfy: a topic name · Slack, Discord, Teams, generic: the webhook URL · Telegram: the bot token"), p("chat", "Chat id / title", PK::Text, "", "Telegram: chat id · ntfy and generic: optional title"), p("text", "Message (if not connected)", PK::Long, "{{input}}", "{{templates}} allowed")], doc: "Pushes a message to your phone or team chat: ntfy.sh, Slack, Discord, Microsoft Teams, Telegram or any JSON webhook. Calls go through the server proxy on the web." },
+    Def { key: "cloud_in", label: "Cloud inbox (webhook in)", cat: Cat::Input, ins: &[], outs: &["events", "first", "count", "error"], params: &[p("server", "Server", PK::Text, "", "Empty = the website you are on (web). Android / Windows: https://your-site.example"), p("channel", "Channel", PK::Text, "inbox", "Anything can POST to /api/hooks/<channel> – GitHub, Stripe, Zapier, curl, a shortcut on your phone …"), p("key", "Channel key (optional)", PK::Secret, "", "If set, senders must send the same key in the x-hook-key header"), p("consume", "Remove events after reading", PK::Bool, "true", ""), p("limit", "Max events", PK::Num, "50", "")], doc: "Collects what other services pushed to your cloud inbox since the last run. **events** stays inactive when nothing arrived, so the rest of the flow is skipped – perfect for scheduled flows (Flow menu → run every N seconds)." },
+    Def { key: "cloud_out", label: "Cloud inbox (send)", cat: Cat::Network, ins: &["data"], outs: &["ok", "error"], params: &[p("server", "Server", PK::Text, "", "Empty = the website you are on (web)"), p("channel", "Channel", PK::Text, "inbox", ""), p("key", "Channel key (optional)", PK::Secret, "", "")], doc: "Stores the value as an event in a cloud channel so another flow, device or service can pick it up (the Android app and the web app share channels)." },
+    Def { key: "csv", label: "CSV → rows", cat: Cat::Data, ins: &["text"], outs: &["rows", "headers"], params: &[p("delim", "Separator", PK::Choice(&["comma", "semicolon", "tab"]), "comma", ""), p("header", "First line is a header", PK::Bool, "true", "")], doc: "Turns CSV text into a list of objects (one per line)." },
+    Def { key: "db_query", label: "Query database", cat: Cat::Workspace, ins: &[], outs: &["rows", "count", "first"], params: &[p("db", "Database", PK::Db, "", "Pick one of your databases"), p("prop", "Where property", PK::Prop, "", "Optional filter"), p("value", "equals", PK::Text, "", "{{templates}} allowed"), p("limit", "Limit", PK::Num, "200", "")], doc: "Reads rows of a database as a list of objects (property name → value, plus `title`)." },
+    Def { key: "db_add", label: "Add row / task", cat: Cat::Workspace, ins: &["data"], outs: &["row"], params: &[p("db", "Database", PK::Db, "", "Pick one of your databases"), p("fields", "Fields to set", PK::Fields, "", "Written over the incoming object. {{input.x}} reads the incoming value; with a list each item is handled separately.")], doc: "Creates a row (for example a task) from an object (`title`, property names …) and/or the fields below. A list creates one row per item." },
+    Def { key: "db_update", label: "Update row / task", cat: Cat::Workspace, ins: &["data"], outs: &["row", "missing"], params: &[p("db", "Database", PK::Db, "", "Pick one of your databases"), p("prop", "Find by property", PK::Prop, "title", ""), p("value", "equals", PK::Text, "{{input.title}}", ""), p("fields", "Fields to set", PK::Fields, "", "Merged with the incoming object")], doc: "Finds the first matching row and updates it with the incoming object and/or the fields below. Not found → **missing**." },
+
     Def { key: "db_query", label: "Query database", cat: Cat::Workspace, ins: &[], outs: &["rows", "count", "first"], params: &[p("db", "Database", PK::Text, "Tasks", "Name (case-insensitive)"), p("prop", "Where property", PK::Text, "", "Optional"), p("value", "equals", PK::Text, "", "{{templates}} allowed"), p("limit", "Limit", PK::Num, "200", "")], doc: "Reads rows of a database as a list of objects (property name → value, plus `title`)." },
     Def { key: "db_add", label: "Add row", cat: Cat::Workspace, ins: &["data"], outs: &["row"], params: &[p("db", "Database", PK::Text, "Tasks", "")], doc: "Creates a row from an object (`title`, property names …). A list creates one row per item." },
     Def { key: "db_update", label: "Update row", cat: Cat::Workspace, ins: &["data"], outs: &["row", "missing"], params: &[p("db", "Database", PK::Text, "Tasks", ""), p("prop", "Find by property", PK::Text, "title", ""), p("value", "equals", PK::Text, "{{input.title}}", "")], doc: "Finds the first matching row and updates it with the object. Not found → **missing**." },
@@ -529,7 +550,105 @@ fn tpl_parallel() -> Flow {
     f
 }
 
+
+fn tpl_digest() -> Flow {
+    let mut f = Flow::default();
+    let q = node(&mut f, "db_query", 0.0, 0.0, &[("db", "Tasks"), ("limit", "100")]);
+    let fl = node(&mut f, "filter", 290.0, 0.0, &[("expr", "str(item.Status ?? \"\") != \"Done\"")]);
+    let m = node(&mut f, "map", 580.0, 0.0, &[("expr", "\"• {item.title}\"")]);
+    let g = node(&mut f, "aggregate", 870.0, 0.0, &[("op", "join"), ("sep", "\n")]);
+    let n = node(&mut f, "notify", 1160.0, -60.0, &[]);
+    let c = node(&mut f, "create_page", 1160.0, 90.0, &[("title", "Open tasks – {{today}}")]);
+    let _ = (f.connect(q, 0, fl, 0), f.connect(fl, 0, m, 0), f.connect(m, 0, g, 0), f.connect(g, 0, n, 0), f.connect(g, 0, c, 0));
+    f
+}
+
+fn tpl_todos() -> Flow {
+    let mut f = Flow::default();
+    let a = node(&mut f, "api", 0.0, 0.0, &[("service", "JSONPlaceholder todos"), ("arg", "8")]);
+    let g = node(&mut f, "get", 290.0, 0.0, &[("path", ".")]);
+    let m = node(&mut f, "map", 560.0, 0.0, &[("expr", "{title: item.title}")]);
+    let d = node(&mut f, "db_add", 830.0, 0.0, &[("db", "Tasks")]);
+    let n = node(&mut f, "notify", 1100.0, 0.0, &[("text", "Imported demo tasks")]);
+    let _ = (f.connect(a, 0, g, 0), f.connect(g, 0, m, 0), f.connect(m, 0, d, 0), f.connect(d, 0, n, 0));
+    f
+}
+
+fn tpl_issues() -> Flow {
+    let mut f = Flow::default();
+    let a = node(&mut f, "api", 0.0, 0.0, &[("service", "GitHub open issues"), ("arg", "rust-lang/rust")]);
+    let l = node(&mut f, "limit", 290.0, 0.0, &[("n", "5")]);
+    let m = node(&mut f, "map", 560.0, 0.0, &[("expr", "{title: \"#{item.number} {item.title}\"}")]);
+    let d = node(&mut f, "db_add", 830.0, 0.0, &[("db", "Tasks")]);
+    let _ = (f.connect(a, 0, l, 0), f.connect(l, 0, m, 0), f.connect(m, 0, d, 0));
+    f
+}
+
+fn tpl_webhook() -> Flow {
+    let mut f = Flow::default();
+    let i = node(&mut f, "cloud_in", 0.0, 0.0, &[("channel", "tasks"), ("consume", "true")]);
+    let d = node(&mut f, "db_add", 290.0, 0.0, &[("db", "Tasks"), ("fields", "title = {{input.title}}")]);
+    let t = node(&mut f, "template", 580.0, 0.0, &[("text", "New task from the cloud: {{a.title}}")]);
+    let n = node(&mut f, "notify", 860.0, 0.0, &[]);
+    let _ = (f.connect(i, 0, d, 0), f.connect(d, 0, t, 0), f.connect(t, 0, n, 0));
+    let note = node(&mut f, "note", 0.0, 200.0, &[("text", "POST {\"title\": \"Buy milk\"} to  /api/hooks/tasks  from any service. Set “Run every N seconds” in the Flow menu to poll automatically.")]);
+    let _ = note;
+    f
+}
+
+fn tpl_news() -> Flow {
+    let mut f = Flow::default();
+    let r = node(&mut f, "rss", 0.0, 0.0, &[("url", "https://hnrss.org/frontpage"), ("limit", "10")]);
+    let l = node(&mut f, "limit", 290.0, 0.0, &[("n", "5")]);
+    let m = node(&mut f, "map", 560.0, 0.0, &[("expr", "\"• {item.title}\\n  {item.link}\"")]);
+    let g = node(&mut f, "aggregate", 840.0, 0.0, &[("op", "join"), ("sep", "\n")]);
+    let s = node(&mut f, "message", 1120.0, -40.0, &[("service", "ntfy.sh push"), ("target", "my-lumen-news"), ("chat", "Daily digest")]);
+    let o = node(&mut f, "output", 1120.0, 140.0, &[("label", "Digest")]);
+    let _ = (f.connect(r, 0, l, 0), f.connect(l, 0, m, 0), f.connect(m, 0, g, 0), f.connect(g, 0, s, 0), f.connect(g, 0, o, 0));
+    f
+}
+
+fn tpl_weather() -> Flow {
+    let mut f = Flow::default();
+    let a = node(&mut f, "api", 0.0, 0.0, &[("service", "Weather (Open-Meteo)"), ("arg", "52.52,13.41")]);
+    let t = node(&mut f, "template", 290.0, 0.0, &[("text", "Now {{a.current.temperature_2m}}°C, wind {{a.current.wind_speed_10m}} km/h")]);
+    let s = node(&mut f, "message", 580.0, 0.0, &[("service", "ntfy.sh push"), ("target", "my-lumen-weather")]);
+    let o = node(&mut f, "output", 580.0, 170.0, &[("label", "Weather")]);
+    let _ = (f.connect(a, 0, t, 0), f.connect(t, 0, s, 0), f.connect(t, 0, o, 0));
+    f
+}
+
+fn tpl_price() -> Flow {
+    let mut f = Flow::default();
+    let a = node(&mut f, "api", 0.0, 0.0, &[("service", "Crypto price (CoinGecko)"), ("arg", "bitcoin")]);
+    let g = node(&mut f, "get", 290.0, 0.0, &[("path", "bitcoin.usd")]);
+    let i = node(&mut f, "if", 560.0, 0.0, &[("test", "greater than"), ("rhs", "50000")]);
+    let t = node(&mut f, "template", 840.0, -50.0, &[("text", "Bitcoin is above $50,000: ${{a}}")]);
+    let o = node(&mut f, "output", 840.0, 120.0, &[("label", "Below the limit")]);
+    let n = node(&mut f, "notify", 1110.0, -50.0, &[]);
+    let _ = (f.connect(a, 0, g, 0), f.connect(g, 0, i, 0), f.connect(i, 0, t, 0), f.connect(i, 1, o, 0), f.connect(t, 0, n, 0));
+    f
+}
+
+fn tpl_csv() -> Flow {
+    let mut f = Flow::default();
+    let t = node(&mut f, "text", 0.0, 0.0, &[("value", "title,Priority\nWrite report,High\nCall the bank,Low\nBook flights,Medium")]);
+    let c = node(&mut f, "csv", 290.0, 0.0, &[]);
+    let d = node(&mut f, "db_add", 560.0, 0.0, &[("db", "Tasks")]);
+    let n = node(&mut f, "notify", 830.0, 0.0, &[("text", "CSV imported")]);
+    let _ = (f.connect(t, 0, c, 0), f.connect(c, 0, d, 0), f.connect(d, 0, n, 0));
+    f
+}
+
 pub const TEMPLATES: &[FlowTemplate] = &[
+    FlowTemplate { name: "Open tasks digest", desc: "Database → keep unfinished tasks → bullet list → notification and a new page.", build: tpl_digest },
+    FlowTemplate { name: "Public API → tasks", desc: "Fetch demo todos from a ready-made API and add them to your Tasks database.", build: tpl_todos },
+    FlowTemplate { name: "GitHub issues → tasks", desc: "Turn the newest open issues of a repository into tasks.", build: tpl_issues },
+    FlowTemplate { name: "Webhook inbox → tasks", desc: "Anything that POSTs to your cloud inbox creates a task here (Android, web and Windows share it).", build: tpl_webhook },
+    FlowTemplate { name: "News digest → phone push", desc: "RSS feed → top 5 → one message sent to your phone via ntfy.sh.", build: tpl_news },
+    FlowTemplate { name: "Weather → push message", desc: "Ready-made weather API → sentence → push notification.", build: tpl_weather },
+    FlowTemplate { name: "Price alert (If / Merge)", desc: "Crypto price API → compare → alert only when it is above your limit.", build: tpl_price },
+    FlowTemplate { name: "CSV → database", desc: "Paste CSV text, parse it, and create one row per line.", build: tpl_csv },
     FlowTemplate { name: "API → list → notification", desc: "Call a public API, keep some items, count them and notify you.", build: tpl_api },
     FlowTemplate { name: "Branch on a condition", desc: "If / Merge: two different texts depending on a number, joined again afterwards.", build: tpl_branch },
     FlowTemplate { name: "Database → report page", desc: "Read a database, sort it, and write the result into a new page.", build: tpl_report },
@@ -766,7 +885,7 @@ struct HttpRes {
 type Shared = Arc<Mutex<Option<Result<HttpRes, String>>>>;
 
 enum Pending {
-    Http { slot: Shared, proxied: bool },
+    Http { slot: Shared, proxied: bool, post: &'static str, req: ehttp::Request, left: u8 },
     Timer { until: f64, out: Vec<Option<Json>> },
 }
 
@@ -902,12 +1021,27 @@ impl Run {
         let mut copy = self.ws_copy.take();
         // 1) poll what is in flight
         let mut still = vec![];
-        for (id, pend, t0) in std::mem::take(&mut self.pending) {
-            let res: Option<Result<Vec<Option<Json>>, String>> = match &pend {
+        for (id, mut pend, t0) in std::mem::take(&mut self.pending) {
+            let res: Option<Result<Vec<Option<Json>>, String>> = match &mut pend {
                 Pending::Timer { until, out } => (now >= *until).then(|| Ok(out.clone())),
-                Pending::Http { slot, proxied } => {
+                Pending::Http { slot, proxied, post, req, left } => {
                     let got = slot.lock().ok().and_then(|mut g| g.take());
-                    got.map(|r| r.and_then(|h| http_outputs(h, *proxied)))
+                    match got {
+                        None => None,
+                        Some(r) => {
+                            let failed = match &r {
+                                Err(_) => true,
+                                Ok(h) => !*proxied && (h.status >= 500 || h.status == 429),
+                            };
+                            if failed && *left > 0 {
+                                *left -= 1;
+                                *slot = launch(req.clone());
+                                None
+                            } else {
+                                Some(r.and_then(|h| http_outputs(h, *proxied)).map(|o| shape(post, o)))
+                            }
+                        }
+                    }
                 }
             };
             match res {
@@ -1016,6 +1150,332 @@ impl Run {
         }
         self.finished = true;
     }
+}
+
+
+// ───────────────────────────── connector helpers ─────────────────────────────
+
+/// Percent-encoding for URL components.
+pub fn pct(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => o.push(b as char),
+            _ => o.push_str(&format!("%{b:02X}")),
+        }
+    }
+    o
+}
+
+pub fn b64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut o = String::new();
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        o.push(T[(n >> 18) as usize & 63] as char);
+        o.push(T[(n >> 12) as usize & 63] as char);
+        o.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        o.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    o
+}
+
+fn add_query(url: &mut String, q: &[(String, String)]) {
+    for (k, v) in q {
+        url.push(if url.contains('?') { '&' } else { '?' });
+        url.push_str(&pct(k));
+        url.push('=');
+        url.push_str(&pct(v));
+    }
+}
+
+/// Base URL of the cloud server: empty = same origin (web); a bare host gets `https://`.
+fn server_of(s: &str) -> String {
+    let t = s.trim().trim_end_matches('/');
+    if t.is_empty() || t.starts_with("http://") || t.starts_with("https://") {
+        t.to_owned()
+    } else {
+        format!("https://{t}")
+    }
+}
+
+fn preset_url(service: &str, arg: &str) -> Result<String, String> {
+    let need = |what: &str| -> Result<String, String> {
+        if arg.is_empty() {
+            Err(format!("{service} needs an argument: {what}"))
+        } else {
+            Ok(arg.to_owned())
+        }
+    };
+    Ok(match service {
+        "GitHub repository" => format!("https://api.github.com/repos/{}", need("owner/repo, e.g. rust-lang/rust")?),
+        "GitHub open issues" => format!("https://api.github.com/repos/{}/issues?state=open&per_page=30", need("owner/repo, e.g. rust-lang/rust")?),
+        "GitHub releases" => format!("https://api.github.com/repos/{}/releases?per_page=10", need("owner/repo, e.g. rust-lang/rust")?),
+        "Weather (Open-Meteo)" => {
+            let a = if arg.is_empty() { "52.52,13.41".to_owned() } else { arg.to_owned() };
+            let (la, lo) = a.split_once(',').ok_or("Weather needs “latitude,longitude”, e.g. 52.52,13.41")?;
+            format!("https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}&current=temperature_2m,wind_speed_10m,weather_code&daily=temperature_2m_max,temperature_2m_min&timezone=auto", pct(la.trim()), pct(lo.trim()))
+        }
+        "Hacker News front page" => "https://hn.algolia.com/api/v1/search?tags=front_page".to_owned(),
+        "Wikipedia summary" => format!("https://en.wikipedia.org/api/rest_v1/page/summary/{}", pct(&need("a page title, e.g. Rust (programming language)")?.replace(' ', "_"))),
+        "Exchange rates" => format!("https://open.er-api.com/v6/latest/{}", pct(&(if arg.is_empty() { "USD".to_owned() } else { arg.to_uppercase() }))),
+        "Crypto price (CoinGecko)" => format!("https://api.coingecko.com/api/v3/simple/price?ids={}&vs_currencies=usd,eur", pct(&(if arg.is_empty() { "bitcoin".to_owned() } else { arg.to_lowercase() }))),
+        "Random joke" => "https://official-joke-api.appspot.com/random_joke".to_owned(),
+        _ => format!("https://jsonplaceholder.typicode.com/todos?_limit={}", arg.parse::<u32>().unwrap_or(5).clamp(1, 50)),
+    })
+}
+
+fn launch(req: ehttp::Request) -> Shared {
+    let slot: Shared = Arc::new(Mutex::new(None));
+    let s2 = slot.clone();
+    ehttp::fetch(req, move |res| {
+        let r = res.map(|r| {
+            let mut bytes = r.bytes;
+            bytes.truncate(MAX_HTTP_BYTES);
+            HttpRes { status: r.status, ok: r.ok, text: String::from_utf8_lossy(&bytes).into_owned() }
+        });
+        if let Ok(mut g) = s2.lock() {
+            *g = Some(r);
+        }
+    });
+    slot
+}
+
+fn http_step(url: String, method: &str, headers: Vec<(String, String)>, body: String, proxy: bool, post: &'static str, retries: u8) -> Result<Step, String> {
+    let url = url.trim().to_owned();
+    // on the web an empty "Server" means "this website": /api/hooks/… is a same-origin URL
+    let same_origin = cfg!(target_arch = "wasm32") && url.starts_with("/api/hooks/");
+    if !(same_origin || url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(if url.starts_with("/api/hooks/") { "fill in the Server field (for example https://your-site.example) – only the web app can use the site it runs on".to_owned() } else { "the URL must start with http:// or https://".to_owned() });
+    }
+    let method = if method.is_empty() { "GET" } else { method };
+    let proxied = cfg!(target_arch = "wasm32") && proxy && !url.contains("/api/hooks/");
+    let req = if proxied {
+        let payload = json!({"url": url, "method": method, "headers": headers.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(), "body": body});
+        let mut r = ehttp::Request::post("/api/flow-proxy", payload.to_string().into_bytes());
+        r.headers.insert("Content-Type", "application/json");
+        r
+    } else {
+        let mut r = ehttp::Request::get(&url);
+        r.method = method.to_owned();
+        if !matches!(method, "GET" | "DELETE") || !body.is_empty() {
+            r.body = body.into_bytes();
+        }
+        for (k, v) in &headers {
+            r.headers.insert(k, v);
+        }
+        r
+    };
+    let slot = launch(req.clone());
+    Ok(Step::Wait(Pending::Http { slot, proxied, post, req, left: retries }))
+}
+
+/// Post-processing of an HTTP answer for the connector nodes. `o` = [body, status, error].
+fn shape(post: &str, o: Vec<Option<Json>>) -> Vec<Option<Json>> {
+    let body = o.first().cloned().flatten();
+    let err = o.get(2).cloned().flatten();
+    match post {
+        "msg" => vec![if err.is_none() { Some(body.unwrap_or(json!(true))) } else { None }, err],
+        "inbox" => {
+            if err.is_some() {
+                return vec![None, None, None, err];
+            }
+            let evs: Vec<Json> = body
+                .as_ref()
+                .and_then(|b| b.get("events"))
+                .and_then(|e| e.as_array())
+                .map(|a| a.iter().map(|e| e.get("payload").cloned().unwrap_or_else(|| e.clone())).collect())
+                .unwrap_or_default();
+            let count = evs.len();
+            vec![if count > 0 { Some(Json::Array(evs.clone())) } else { None }, evs.first().cloned(), Some(json!(count)), None]
+        }
+        p if p.starts_with("rss") => {
+            if let Some(e) = err {
+                return vec![None, None, Some(e)];
+            }
+            let text = body.as_ref().map(text_of).unwrap_or_default();
+            let (title, items) = parse_feed(&text, if p == "rss20" { 20 } else { 200 });
+            if items.is_empty() {
+                return vec![None, None, Some(json!("no feed items found – is this an RSS / Atom URL?"))];
+            }
+            vec![Some(Json::Array(items)), Some(json!(title)), None]
+        }
+        _ => o,
+    }
+}
+
+fn strip_tags(t: &str) -> String {
+    let mut o = String::with_capacity(t.len());
+    let mut in_tag = false;
+    for c in t.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => o.push(c),
+            _ => {}
+        }
+    }
+    o
+}
+
+fn xml_unescape(s: &str) -> String {
+    let t = s.trim();
+    let t = t.strip_prefix("<![CDATA[").and_then(|x| x.strip_suffix("]]>")).unwrap_or(t);
+    let t = strip_tags(t).replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'").replace("&apos;", "'").replace("&nbsp;", " ").replace("&amp;", "&");
+    // feeds often carry HTML as escaped text: strip that too
+    strip_tags(&t).trim().to_owned()
+}
+
+fn xml_tag(block: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}");
+    let mut from = 0;
+    while let Some(i) = block[from..].find(&open) {
+        let at = from + i;
+        let after = &block[at + open.len()..];
+        // must be exactly this tag (not <titleX>)
+        if !after.starts_with(|c: char| c == '>' || c == ' ' || c == '/' || c == '\n' || c == '\r' || c == '\t') {
+            from = at + open.len();
+            continue;
+        }
+        let gt = after.find('>')?;
+        if after[..gt].ends_with('/') {
+            return None;
+        }
+        let rest = &after[gt + 1..];
+        let end = rest.find(&format!("</{tag}>"))?;
+        return Some(xml_unescape(&rest[..end]));
+    }
+    None
+}
+
+fn atom_link(block: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(i) = block[from..].find("<link") {
+        let at = from + i;
+        let end = block[at..].find('>')? + at;
+        let tag = &block[at..end];
+        if let Some(h) = tag.find("href=") {
+            let v = &tag[h + 5..];
+            let q = v.chars().next()?;
+            if q == '"' || q == '\'' {
+                let inner = &v[1..];
+                return inner.find(q).map(|e| inner[..e].to_owned());
+            }
+        }
+        from = end;
+    }
+    None
+}
+
+/// Minimal RSS 2.0 / Atom reader: (feed title, items).
+pub fn parse_feed(xml: &str, limit: usize) -> (String, Vec<Json>) {
+    let atom = xml.contains("<entry");
+    let item_tag = if atom { "<entry" } else { "<item" };
+    let head_end = xml.find(item_tag).unwrap_or(xml.len());
+    let title = xml_tag(&xml[..head_end], "title").unwrap_or_default();
+    let mut items = vec![];
+    let mut rest = &xml[head_end..];
+    while let Some(i) = rest.find(item_tag) {
+        let after = &rest[i + item_tag.len()..];
+        let close = if atom { "</entry>" } else { "</item>" };
+        let Some(e) = after.find(close) else { break };
+        let block = &after[..e];
+        let link = if atom { atom_link(block) } else { xml_tag(block, "link").or_else(|| atom_link(block)) }.unwrap_or_default();
+        let date = xml_tag(block, "pubDate").or_else(|| xml_tag(block, "published")).or_else(|| xml_tag(block, "updated")).or_else(|| xml_tag(block, "dc:date")).unwrap_or_default();
+        let sum = xml_tag(block, "description").or_else(|| xml_tag(block, "summary")).or_else(|| xml_tag(block, "content")).unwrap_or_default();
+        let mut sum: String = sum.chars().take(400).collect();
+        if sum.chars().count() >= 400 {
+            sum.push('…');
+        }
+        items.push(json!({"title": xml_tag(block, "title").unwrap_or_default(), "link": link, "date": date, "summary": sum}));
+        if items.len() >= limit {
+            break;
+        }
+        rest = &after[e + close.len()..];
+    }
+    (title, items)
+}
+
+pub fn parse_csv(text: &str, delim: char, header: bool) -> (Json, Json) {
+    let mut rows: Vec<Vec<String>> = vec![];
+    let (mut cur, mut field, mut quoted) = (vec![], String::new(), false);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if quoted {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    field.push('"');
+                    chars.next();
+                } else {
+                    quoted = false;
+                }
+            } else {
+                field.push(c);
+            }
+        } else if c == '"' && field.is_empty() {
+            quoted = true;
+        } else if c == delim {
+            cur.push(std::mem::take(&mut field));
+        } else if c == '\n' || c == '\r' {
+            if c == '\r' && chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            cur.push(std::mem::take(&mut field));
+            if cur.iter().any(|f| !f.is_empty()) {
+                rows.push(std::mem::take(&mut cur));
+            } else {
+                cur.clear();
+            }
+        } else {
+            field.push(c);
+        }
+    }
+    cur.push(field);
+    if cur.iter().any(|f| !f.is_empty()) {
+        rows.push(cur);
+    }
+    let conv = |s: &str| -> Json {
+        match s.trim().parse::<f64>() {
+            Ok(n) if !s.trim().is_empty() && n.is_finite() => num_json(n),
+            _ => json!(s),
+        }
+    };
+    let heads: Vec<String> = if header && !rows.is_empty() { rows.remove(0).into_iter().map(|h| h.trim().to_owned()).collect() } else { (0..rows.iter().map(|r| r.len()).max().unwrap_or(0)).map(|i| format!("col{}", i + 1)).collect() };
+    let out: Vec<Json> = rows.iter().map(|r| Json::Object(heads.iter().enumerate().map(|(i, h)| (h.clone(), conv(r.get(i).map_or("", |s| s.as_str())))).collect::<Map<String, Json>>())).collect();
+    (Json::Array(out), json!(heads))
+}
+
+/// `Name = value` lines → object (values are templates, a lone `{{x}}` keeps its type).
+pub fn fields_obj(spec: &str, ctx: &Json) -> Map<String, Json> {
+    let mut m = Map::new();
+    for line in spec.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let k = k.trim();
+        if !k.is_empty() {
+            m.insert(k.to_owned(), render_value(v.trim(), ctx));
+        }
+    }
+    m
+}
+
+fn merge_fields(base: Json, spec: &str, ctx: &Json) -> Json {
+    let mut c = ctx.clone();
+    if let Some(m) = c.as_object_mut() {
+        m.insert("input".into(), base.clone());
+        m.insert("item".into(), base.clone());
+    }
+    let extra = fields_obj(spec, &c);
+    let mut m = match base {
+        Json::Object(m) => m,
+        Json::Null => Map::new(),
+        other => {
+            let mut m = Map::new();
+            m.insert("title".into(), json!(text_of(&other)));
+            m
+        }
+    };
+    m.extend(extra);
+    Json::Object(m)
 }
 
 fn http_outputs(h: HttpRes, proxied: bool) -> Result<Vec<Option<Json>>, String> {
@@ -1329,11 +1789,7 @@ fn exec(n: &FNode, d: &'static Def, ins: &[Option<Json>], env: &mut Env) -> Resu
                 Some(u) => text_of(&u),
                 None => tp("url"),
             };
-            let url = url.trim().to_owned();
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
-                return Err("the URL must start with http:// or https://".into());
-            }
-            let method = n.param("method");
+            let mut url = url.trim().to_owned();
             let body = match ins.get(1).cloned().flatten() {
                 Some(Json::String(s)) => s,
                 Some(other) => other.to_string(),
@@ -1346,40 +1802,113 @@ fn exec(n: &FNode, d: &'static Def, ins: &[Option<Json>], env: &mut Env) -> Resu
                 .map(|(k, v)| (k.trim().to_owned(), render(v.trim(), &ctx)))
                 .filter(|(k, _)| !k.is_empty())
                 .collect();
+            let query: Vec<(String, String)> = n.param("query").lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim().to_owned(), render(v.trim(), &ctx))).filter(|(k, _)| !k.is_empty()).collect();
+            add_query(&mut url, &query);
+            let token = tp("token");
+            if !token.is_empty() {
+                match n.param("auth").as_str() {
+                    "bearer token" => headers.push(("Authorization".into(), format!("Bearer {token}"))),
+                    "basic (user:password)" => headers.push(("Authorization".into(), format!("Basic {}", b64(token.as_bytes())))),
+                    "x-api-key header" => headers.push(("X-API-Key".into(), token)),
+                    "api_key query" => add_query(&mut url, &[("api_key".to_owned(), token)]),
+                    _ => {}
+                }
+            }
             let json_body = body.trim_start().starts_with('{') || body.trim_start().starts_with('[');
             if json_body && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
                 headers.push(("Content-Type".into(), "application/json".into()));
             }
-            let proxied = cfg!(target_arch = "wasm32") && n.param("proxy") == "true";
-            let req = if proxied {
-                let payload = json!({"url": url, "method": method, "headers": headers.iter().map(|(k, v)| json!([k, v])).collect::<Vec<_>>(), "body": body});
-                let mut r = ehttp::Request::post("/api/flow-proxy", payload.to_string().into_bytes());
-                r.headers.insert("Content-Type", "application/json");
-                r
-            } else {
-                let mut r = ehttp::Request::get(&url);
-                r.method = if method.is_empty() { "GET".to_owned() } else { method.clone() };
-                if !matches!(method.as_str(), "GET" | "DELETE") || !body.is_empty() {
-                    r.body = body.into_bytes();
-                }
-                for (k, v) in &headers {
-                    r.headers.insert(k, v);
-                }
-                r
+            let retries = n.param("retries").trim().parse::<u8>().unwrap_or(0).min(3);
+            http_step(url, &n.param("method"), headers, body, n.param("proxy") != "false", "", retries)
+        }
+        "api" => {
+            let arg = match ins.first().cloned().flatten() {
+                Some(a) => text_of(&a),
+                None => tp("arg"),
             };
-            let slot: Shared = Arc::new(Mutex::new(None));
-            let s2 = slot.clone();
-            ehttp::fetch(req, move |res| {
-                let r = res.map(|r| {
-                    let mut bytes = r.bytes;
-                    bytes.truncate(MAX_HTTP_BYTES);
-                    HttpRes { status: r.status, ok: r.ok, text: String::from_utf8_lossy(&bytes).into_owned() }
-                });
-                if let Ok(mut g) = s2.lock() {
-                    *g = Some(r);
+            let url = preset_url(&n.param("service"), arg.trim())?;
+            http_step(url, "GET", vec![("Accept".into(), "application/json".into())], String::new(), true, "", 1)
+        }
+        "rss" => {
+            let url = match ins.first().cloned().flatten() {
+                Some(u) => text_of(&u),
+                None => tp("url"),
+            };
+            let limit = num("limit").clamp(1.0, 200.0) as usize;
+            http_step(url.trim().to_owned(), "GET", vec![("Accept".into(), "application/rss+xml, application/atom+xml, application/xml, text/xml, */*".into())], String::new(), true, if limit <= 20 { "rss20" } else { "rss" }, 1)
+        }
+        "message" => {
+            let msg = match ins.first().cloned().flatten() {
+                Some(v) => text_of(&v),
+                None => tp("text"),
+            };
+            if msg.trim().is_empty() {
+                return Err("there is nothing to send – connect a message or fill the Message field".into());
+            }
+            let target = tp("target");
+            let target = target.trim();
+            if target.is_empty() {
+                return Err("fill in the webhook URL / topic / bot token".into());
+            }
+            let extra = tp("chat");
+            let json_h = vec![("Content-Type".to_owned(), "application/json".to_owned())];
+            match n.param("service").as_str() {
+                "Slack webhook" => http_step(target.to_owned(), "POST", json_h, json!({"text": msg}).to_string(), true, "msg", 1),
+                "Discord webhook" => http_step(target.to_owned(), "POST", json_h, json!({"content": msg}).to_string(), true, "msg", 1),
+                "Microsoft Teams webhook" => http_step(target.to_owned(), "POST", json_h, json!({"text": msg}).to_string(), true, "msg", 1),
+                "Telegram bot" => {
+                    if extra.trim().is_empty() {
+                        return Err("Telegram needs the chat id".into());
+                    }
+                    http_step(format!("https://api.telegram.org/bot{target}/sendMessage"), "POST", json_h, json!({"chat_id": extra.trim(), "text": msg}).to_string(), true, "msg", 1)
                 }
-            });
-            Ok(Step::Wait(Pending::Http { slot, proxied }))
+                "Generic JSON webhook" => http_step(target.to_owned(), "POST", json_h, json!({"title": extra, "text": msg}).to_string(), true, "msg", 1),
+                _ => {
+                    let mut h = vec![("Content-Type".to_owned(), "text/plain; charset=utf-8".to_owned())];
+                    if !extra.trim().is_empty() {
+                        h.push(("Title".into(), extra.trim().to_owned()));
+                    }
+                    http_step(format!("https://ntfy.sh/{}", pct(target)), "POST", h, msg, true, "msg", 1)
+                }
+            }
+        }
+        "cloud_in" => {
+            let ch = tp("channel");
+            if ch.trim().is_empty() {
+                return Err("choose a channel name".into());
+            }
+            let limit = num("limit").clamp(1.0, 200.0) as u32;
+            let url = format!("{}/api/hooks/{}?limit={limit}&consume={}", server_of(&tp("server")), pct(ch.trim()), if n.param("consume") == "false" { 0 } else { 1 });
+            let key = tp("key");
+            let mut h = vec![("Accept".to_owned(), "application/json".to_owned())];
+            if !key.trim().is_empty() {
+                h.push(("x-hook-key".into(), key.trim().to_owned()));
+            }
+            http_step(url, "GET", h, String::new(), false, "inbox", 1)
+        }
+        "cloud_out" => {
+            let ch = tp("channel");
+            if ch.trim().is_empty() {
+                return Err("choose a channel name".into());
+            }
+            let url = format!("{}/api/hooks/{}", server_of(&tp("server")), pct(ch.trim()));
+            let key = tp("key");
+            let mut h = vec![("Content-Type".to_owned(), "application/json".to_owned())];
+            if !key.trim().is_empty() {
+                h.push(("x-hook-key".into(), key.trim().to_owned()));
+            }
+            let body = input.clone().unwrap_or(Json::Null).to_string();
+            http_step(url, "POST", h, body, false, "msg", 1)
+        }
+        "csv" => {
+            let t = text_of(&input.unwrap_or(Json::Null));
+            let delim = match n.param("delim").as_str() {
+                "semicolon" => ';',
+                "tab" => '\t',
+                _ => ',',
+            };
+            let (rows, heads) = parse_csv(&t, delim, n.param("header") != "false");
+            done(vec![Some(rows), Some(heads)])
         }
         "db_query" => {
             let limit = num("limit").clamp(1.0, 2000.0);
@@ -1387,12 +1916,26 @@ fn exec(n: &FNode, d: &'static Def, ins: &[Option<Json>], env: &mut Env) -> Resu
             done(run_code(env, code, vec![("db_name", json!(tp("db"))), ("prop_name", json!(tp("prop"))), ("match_value", json!(tp("value"))), ("max_rows", json!(limit))], d.outs)?)
         }
         "db_add" => {
-            let data = input.unwrap_or(Json::Null);
+            let mut data = input.unwrap_or(Json::Null);
+            let spec = n.param("fields");
+            if !spec.trim().is_empty() {
+                data = match data {
+                    Json::Array(a) => Json::Array(a.into_iter().map(|x| merge_fields(x, &spec, &ctx)).collect()),
+                    other => merge_fields(other, &spec, &ctx),
+                };
+            }
+            if matches!(&data, Json::Null) {
+                return Err("nothing to add – connect data or set at least one field".into());
+            }
             let code = "let t = db(db_name)\nlet made = []\nlet items = type(data) == \"list\" ? data : [data]\nfor it in items { made.push(t.add(type(it) == \"map\" ? it : {title: str(it)}).props()) }\nemit(type(data) == \"list\" ? made : made[0])";
             done(run_code(env, code, vec![("db_name", json!(tp("db"))), ("data", data)], d.outs)?)
         }
         "db_update" => {
-            let data = input.unwrap_or(Json::Null);
+            let mut data = input.unwrap_or(Json::Null);
+            let spec = n.param("fields");
+            if !spec.trim().is_empty() {
+                data = merge_fields(if data.is_object() { data } else { Json::Null }, &spec, &ctx);
+            }
             if !data.is_object() {
                 return Err("Update row needs an object (property → value)".into());
             }
@@ -1577,6 +2120,77 @@ mod tests {
         let rows = r.values[&q][0].clone().unwrap();
         assert!(rows.as_array().unwrap().iter().any(|x| x["title"] == "b"), "{rows}");
         assert!(r.values[&q][1].clone().unwrap().as_i64().unwrap() >= 2);
+    }
+
+    #[test]
+    fn connectors_parse_and_encode() {
+        assert_eq!(pct("a b/ü"), "a%20b%2F%C3%BC");
+        assert_eq!(b64(b"user:pass"), "dXNlcjpwYXNz");
+        assert_eq!(b64(b"ab"), "YWI=");
+        let mut u = "https://x.test/p".to_owned();
+        add_query(&mut u, &[("q".into(), "a b".into()), ("n".into(), "1".into())]);
+        assert_eq!(u, "https://x.test/p?q=a%20b&n=1");
+        assert_eq!(server_of("example.com/"), "https://example.com");
+        assert_eq!(server_of(""), "");
+        let (rows, heads) = parse_csv("name;n\n\"a;b\";2\nc;3\n", ';', true);
+        assert_eq!(heads, json!(["name", "n"]));
+        assert_eq!(rows, json!([{"name": "a;b", "n": 2}, {"name": "c", "n": 3}]));
+        let rss = "<rss><channel><title>Feed</title><item><title><![CDATA[One &amp; two]]></title><link>https://a.test/1</link><description>&lt;p&gt;hi&lt;/p&gt;</description></item><item><title>Two</title><link>https://a.test/2</link></item></channel></rss>";
+        let (t, items) = parse_feed(rss, 10);
+        assert_eq!(t, "Feed");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["title"], "One & two");
+        assert_eq!(items[0]["summary"], "hi");
+        let atom = "<feed><title>A</title><entry><title>E1</title><link href=\"https://e.test/1\"/><updated>2025-01-01</updated></entry></feed>";
+        let (_, it) = parse_feed(atom, 10);
+        assert_eq!(it[0]["link"], "https://e.test/1");
+        assert!(preset_url("Weather (Open-Meteo)", "oops").is_err());
+        assert!(preset_url("GitHub repository", "").is_err());
+        assert!(preset_url("Exchange rates", "usd").unwrap().ends_with("/USD"));
+    }
+
+    #[test]
+    fn inbox_and_message_outputs_are_shaped() {
+        let body = json!({"events": [{"id": 1, "payload": {"title": "x"}}, {"id": 2, "payload": "y"}]});
+        let o = shape("inbox", vec![Some(body), Some(json!(200)), None]);
+        assert_eq!(o[0], Some(json!([{"title": "x"}, "y"])));
+        assert_eq!(o[1], Some(json!({"title": "x"})));
+        assert_eq!(o[2], Some(json!(2)));
+        let empty = shape("inbox", vec![Some(json!({"events": []})), Some(json!(200)), None]);
+        assert!(empty[0].is_none() && empty[1].is_none());
+        assert_eq!(empty[2], Some(json!(0)));
+        let bad = shape("msg", vec![None, Some(json!(500)), Some(json!("boom"))]);
+        assert!(bad[0].is_none() && bad[1].is_some());
+    }
+
+    #[test]
+    fn add_row_merges_fields_over_the_input() {
+        let mut ws = Workspace::seed();
+        let db = ws.add_database(None, crate::model::ViewKind::Table);
+        ws.page_mut(db).unwrap().title = "Tasks".into();
+        let mut f = Flow::default();
+        let m = node(&mut f, "manual", 0.0, 0.0, &[("payload", "[{\"title\": \"a\"}, {\"title\": \"b\"}]")]);
+        let add = node(&mut f, "db_add", 0.0, 0.0, &[("db", "Tasks"), ("fields", "title = Task: {{input.title}}")]);
+        f.connect(m, 0, add, 0).unwrap();
+        let r = run(&f, &mut ws);
+        assert_eq!(r.errors(), 0, "{:?}", r.log);
+        let mut g = Flow::default();
+        let q = node(&mut g, "db_query", 0.0, 0.0, &[("db", "Tasks")]);
+        let r = run(&g, &mut ws);
+        let rows = r.values[&q][0].clone().unwrap();
+        assert!(rows.as_array().unwrap().iter().any(|x| x["title"] == "Task: b"), "{rows}");
+    }
+
+    #[test]
+    fn db_nodes_accept_dropdown_kinds() {
+        for d in DEFS {
+            for pp in d.params {
+                if matches!(pp.kind, PK::Db | PK::Prop | PK::Fields) {
+                    assert!(d.cat == Cat::Workspace, "{} uses a database dropdown outside the workspace category", d.key);
+                }
+            }
+        }
+        assert!(def("api").is_some() && def("message").is_some() && def("cloud_in").is_some() && def("rss").is_some() && def("csv").is_some());
     }
 
     #[test]

@@ -1539,3 +1539,36 @@ fn shaping_bengali_hindi_arabic_thai() {
     });
     println!("{report}");
 }
+
+/// Regression test for the "dialogs stay as small as they were once" bug (vendor/egui/src/containers/area.rs, Lumen patch):
+/// an Area used to lay its content out inside the size of the previous frame, so a list that shrank (a search with one hit)
+/// could never grow back to its normal height.
+#[test]
+fn area_grows_back_after_it_was_small() {
+    use egui::{vec2, Align2, Id, Pos2, Rect};
+    let ctx = egui::Context::default();
+    let mut height_for = |n: usize| -> f32 {
+        let mut h = 0.0;
+        for _ in 0..4 {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))), ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                let r = egui::Area::new(Id::new("shape_test")).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+                    ui.set_width(200.0);
+                    egui::ScrollArea::vertical().max_height(400.0).auto_shrink([false, true]).show(ui, |ui| {
+                        for i in 0..n {
+                            ui.label(format!("row {i}"));
+                        }
+                    });
+                });
+                h = r.response.rect.height();
+            });
+        }
+        h
+    };
+    let big = height_for(60);
+    let small = height_for(1);
+    let big_again = height_for(60);
+    assert!(big > 300.0, "initial height {big}");
+    assert!(small < 60.0, "shrunk height {small}");
+    assert!((big_again - big).abs() < 2.0, "it must grow back to {big} but stayed at {big_again}");
+}
