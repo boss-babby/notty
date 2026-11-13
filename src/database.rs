@@ -60,6 +60,21 @@ thread_local! {
 }
 
 fn load_titles(ws: &Workspace) {
+    use std::hash::{Hash, Hasher};
+    thread_local! {
+        static FP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    // rebuild the title map only when a row title changed (it used to be rebuilt — with a String clone per row — on every frame)
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in ws.pages.iter().filter(|p| p.row && !p.trashed) {
+        p.id.hash(&mut h);
+        p.title.hash(&mut h);
+    }
+    let fp = h.finish();
+    if FP.with(|f| f.get()) == fp && TITLES.with(|t| !t.borrow().is_empty() || ws.pages.iter().all(|p| !p.row)) {
+        return;
+    }
+    FP.with(|f| f.set(fp));
     TITLES.with(|t| {
         let mut t = t.borrow_mut();
         t.clear();
@@ -670,6 +685,10 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, rows: &[u64], st
         for rid in rows {
             let Some(row) = ws.page(*rid) else { continue };
             let (rr, _) = ui.allocate_exact_size(vec2(total, zs(ROW_H)), Sense::hover());
+            // Virtualised: only the rows that are on screen are built (thousands of rows stay at 60 fps)
+            if !ui.is_rect_visible(rr) {
+                continue;
+            }
             let hovered = ui.rect_contains_pointer(rr);
             let t = ui.ctx().animate_bool_with_time(sid(("rowh", row.id)), hovered, 0.1);
             ui.painter().rect_filled(rr, 0.0, with_alpha(pal.hover, t * 0.6));
@@ -950,6 +969,9 @@ fn list(ui: &mut Ui, ws: &Workspace, db: &Database, rows: &[u64], pal: &Palette,
     for rid in rows {
         let Some(row) = ws.page(*rid) else { continue };
         let (rect, resp) = ui.allocate_exact_size(vec2(w, zs(36.0)), Sense::click());
+        if !ui.is_rect_visible(rect) {
+            continue;
+        }
         let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
         ui.painter().rect_filled(rect, 6.0, with_alpha(pal.hover, t));
         let icon = if row.icon.is_empty() { l::FILE_TEXT } else { icons::icon_text(&row.icon) };

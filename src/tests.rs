@@ -1572,3 +1572,40 @@ fn area_grows_back_after_it_was_small() {
     assert!(small < 60.0, "shrunk height {small}");
     assert!((big_again - big).abs() < 2.0, "it must grow back to {big} but stayed at {big_again}");
 }
+
+
+#[cfg(test)]
+mod perf_guard {
+    use crate::model::*;
+
+    /// Thousands of rows: page lookups and (cached) queries must stay far below a frame.
+    #[test]
+    fn large_database_queries_stay_fast() {
+        let mut ws = Workspace::seed();
+        let db = ws.pages.iter().find(|p| p.db.is_some()).map(|p| p.id).expect("seed has a database");
+        let base = ws.next_id;
+        let proto = ws.pages.iter().find(|p| p.row && p.parent == Some(db)).cloned();
+        let Some(proto) = proto else { return };
+        for i in 0..5000u64 {
+            let mut p = proto.clone();
+            p.id = base + i;
+            p.title = format!("row {i}");
+            ws.pages.push(p);
+        }
+        ws.next_id = base + 5000;
+        let t = std::time::Instant::now();
+        let mut sum = 0usize;
+        for i in 0..5000u64 {
+            sum += ws.page(base + i).map_or(0, |p| p.title.len());
+        }
+        let lookups = t.elapsed();
+        assert!(sum > 0);
+        assert!(lookups.as_millis() < 250, "5000 page lookups took {lookups:?}");
+        let _ = ws.query(db, 0);
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            assert!(ws.query(db, 0).len() >= 5000);
+        }
+        assert!(t.elapsed().as_millis() < 1500, "20 cached queries took {:?}", t.elapsed());
+    }
+}

@@ -336,13 +336,36 @@ impl Rich {
 
     /// Text layout of the rich text (what the user sees). The text of the job is exactly `self.plain`.
     pub fn job(&self, font: &FontId, color: Color32, pal: &Palette) -> LayoutJob {
+        self.job_ex(font, color, pal, None)
+    }
+
+    /// Visible `[[wiki link]]` chips (links the caret is *inside* of are shown as raw, editable text and are not chips).
+    pub fn wiki_chips(&self, caret: Option<usize>) -> Vec<WikiChip> {
+        let cb = caret.map(|c| self.byte(c));
+        wiki_spans(&self.plain)
+            .into_iter()
+            .filter(|(w, _)| !cb.map_or(false, |c| c > w.start && c < w.end))
+            .map(|(w, title)| {
+                let ls = wiki_label_start(&self.plain, &w);
+                let n = |b: usize| self.plain[..b].chars().count();
+                WikiChip { a: n(w.start), la: n(ls), b: n(w.end), title }
+            })
+            .collect()
+    }
+
+    /// Like [`Rich::job`]. `caret` is the caret (char index) of the field being edited: a wiki link containing it is laid out as raw
+    /// text so it can be edited, every other wiki link hides its brackets and leaves room for the page icon (see [`paint_wiki_chips`]).
+    pub fn job_ex(&self, font: &FontId, color: Color32, pal: &Palette, caret: Option<usize>) -> LayoutJob {
         let mut job = LayoutJob::default();
         let wikis = wiki_spans(&self.plain);
+        let labels: Vec<usize> = wikis.iter().map(|(w, _)| wiki_label_start(&self.plain, w)).collect();
+        let caret_b = caret.map(|c| self.byte(c));
+        let editing = |k: usize| caret_b.map_or(false, |c| c > wikis[k].0.start && c < wikis[k].0.end);
         for (range, f) in self.runs() {
-            // split the run at wiki-link boundaries so `[[Page]]` is drawn like a link
+            // split the run at wiki-link boundaries so a `[[Page]]` is drawn as a chip
             let mut cuts = vec![range.start];
-            for (w, _) in &wikis {
-                for e in [w.start, w.end] {
+            for (k, (w, _)) in wikis.iter().enumerate() {
+                for e in [w.start, w.end, labels[k], w.end - 2] {
                     if e > range.start && e < range.end {
                         cuts.push(e);
                     }
@@ -353,8 +376,18 @@ impl Rich {
             cuts.dedup();
             for seg in cuts.windows(2) {
                 let (a, b) = (seg[0], seg[1]);
-                let wiki = wikis.iter().any(|(w, _)| a >= w.start && b <= w.end);
-                let is_link = f.link != 0 || wiki;
+                let wk = wikis.iter().position(|(w, _)| a >= w.start && b <= w.end);
+                let raw_edit = wk.map_or(false, editing);
+                let hidden = wk.map_or(false, |k| !editing(k) && (b <= labels[k] || a >= wikis[k].0.end - 2));
+                if hidden {
+                    // brackets (and the `Target|` part of an aliased link): zero-width, invisible, still part of the text for the caret
+                    let lead = if wk.map_or(false, |k| a == wikis[k].0.start) { WIKI_ICON_W } else { 0.0 };
+                    let fmt = TextFormat { font_id: FontId::proportional(1.0), color: Color32::TRANSPARENT, ..Default::default() };
+                    job.append(&self.plain[a..b], lead, fmt);
+                    continue;
+                }
+                let chip = wk.is_some() && !raw_edit;
+                let is_link = f.link != 0 || raw_edit;
                 let code = f.flags & CODE != 0;
                 let fg = if is_link {
                     pal.accent
@@ -381,7 +414,14 @@ impl Rich {
                     },
                     italics: f.flags & ITALIC != 0,
                     strikethrough: if f.flags & STRIKE != 0 { Stroke::new(1.3_f32, color) } else { Stroke::NONE },
-                    underline: if f.flags & UNDERLINE != 0 || is_link { Stroke::new(1.2_f32, fg) } else { Stroke::NONE },
+                    underline: if chip {
+                        // a quiet, thin underline like Notion's page mentions — not a blue hyperlink
+                        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(pal.muted.r(), pal.muted.g(), pal.muted.b(), 120))
+                    } else if f.flags & UNDERLINE != 0 || is_link {
+                        Stroke::new(1.2_f32, fg)
+                    } else {
+                        Stroke::NONE
+                    },
                     ..Default::default()
                 };
                 job.append(&self.plain[a..b], 0.0, fmt);
@@ -392,6 +432,64 @@ impl Rich {
         }
         job
     }
+}
+
+/// Room (in points) reserved in front of a wiki chip for its page icon.
+pub const WIKI_ICON_W: f32 = 19.0;
+
+/// A rendered `[[wiki link]]`: char indices of the whole link (`a..b`), of its visible label start (`la`) and the target title.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WikiChip {
+    pub a: usize,
+    pub la: usize,
+    pub b: usize,
+    pub title: String,
+}
+
+/// Byte offset where the visible label of a wiki link starts (`[[Target|label]]` shows `label`, `[[Target]]` shows `Target`).
+fn wiki_label_start(plain: &str, w: &std::ops::Range<usize>) -> usize {
+    let inner = &plain[w.start + 2..w.end - 2];
+    match inner.find('|') {
+        Some(p) if !inner[p + 1..].trim().is_empty() => w.start + 2 + p + 1,
+        _ => w.start + 2,
+    }
+}
+
+/// Paints the chips of a laid-out text (`origin` = where the galley is drawn): a rounded, hoverable pill behind the label and a page
+/// icon in front. Returns the shapes so the caller can place them *under* the text.
+pub fn wiki_chip_rect(galley: &egui::Galley, origin: egui::Pos2, c: &WikiChip) -> egui::Rect {
+    let (s, e) = (galley.pos_from_ccursor(egui::text::CCursor::new(c.a)), galley.pos_from_ccursor(egui::text::CCursor::new(c.b)));
+    let same_row = (s.min.y - e.min.y).abs() < 2.0;
+    let x0 = s.min.x - WIKI_ICON_W;
+    let x1 = if same_row { e.min.x + 3.0 } else { galley.rect.max.x + 3.0 };
+    egui::Rect::from_min_max(egui::pos2(x0, s.min.y + 1.0), egui::pos2(x1.max(x0 + WIKI_ICON_W + 4.0), s.max.y - 1.0)).translate(origin.to_vec2())
+}
+
+/// Index of the chip under `p` (screen space).
+pub fn wiki_chip_at(galley: &egui::Galley, origin: egui::Pos2, chips: &[WikiChip], p: egui::Pos2) -> Option<usize> {
+    chips.iter().position(|c| wiki_chip_rect(galley, origin, c).contains(p))
+}
+
+pub fn wiki_chip_shapes(fonts: &egui::epaint::text::Fonts, galley: &egui::Galley, origin: egui::Pos2, chips: &[WikiChip], pal: &Palette, hover: Option<usize>) -> Vec<egui::Shape> {
+    let mut out = vec![];
+    for (i, c) in chips.iter().enumerate() {
+        let r = wiki_chip_rect(galley, origin, c);
+        let on = hover == Some(i);
+        let fill = if on { pal.active } else { pal.hover };
+        out.push(egui::Shape::rect_filled(r, 5.0, fill));
+        if on {
+            out.push(egui::Shape::rect_stroke(r, 5.0, Stroke::new(1.0_f32, pal.border), egui::StrokeKind::Inside));
+        }
+        out.push(egui::Shape::text(
+            fonts,
+            egui::pos2(r.left() + 10.0, r.center().y),
+            egui::Align2::CENTER_CENTER,
+            crate::lucide::FILE_TEXT,
+            crate::icons::font(12.5),
+            if on { pal.text } else { pal.muted },
+        ));
+    }
+    out
 }
 
 fn mark_of(bit: u8) -> &'static str {
@@ -421,6 +519,34 @@ fn escape_into(out: &mut String, text: &str, in_link: bool) {
             out.push('\\');
         }
         out.push(c);
+    }
+}
+
+#[cfg(test)]
+mod wiki_chip_tests {
+    use super::*;
+
+    #[test]
+    fn chips_hide_brackets_unless_the_caret_is_inside() {
+        let r = Rich::plain("a [[Page]] b [[X|label]]");
+        let chips = r.wiki_chips(None);
+        assert_eq!(chips.len(), 2);
+        assert_eq!((chips[0].a, chips[0].la, chips[0].b, chips[0].title.as_str()), (2, 4, 10, "Page"));
+        assert_eq!(chips[1].title, "X");
+        assert_eq!(chips[1].la - chips[1].a, 4, "the `[[X|` prefix is hidden for aliased links");
+        assert_eq!(r.wiki_chips(Some(5)).len(), 1, "the link under the caret is edited as raw text");
+        assert_eq!(r.wiki_chips(Some(10)).len(), 2, "a caret right after the link is outside of it");
+    }
+
+    #[test]
+    fn job_text_is_unchanged_by_chips() {
+        let pal = Palette::light();
+        let r = Rich::plain("x [[Page]] y");
+        let font = FontId::proportional(14.0);
+        for caret in [None, Some(4)] {
+            let job = r.job_ex(&font, Color32::BLACK, &pal, caret);
+            assert_eq!(job.text, r.plain, "the layout text must stay identical to the stored text (cursor mapping)");
+        }
     }
 }
 

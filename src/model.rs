@@ -934,12 +934,41 @@ impl Workspace {
         { let id = self.id(); Block::new(id, kind, text, indent) }
     }
 
+    /// Position of page `id` in `pages`. A thread-local id → index map makes this O(1) instead of a scan (every row loop of a
+    /// database / dashboard used to be O(rows²)). The map is *validated* on every hit (`pages[i].id == id`) and rebuilt on a miss, so it
+    /// is always correct no matter how `pages` was mutated.
+    fn index_of(&self, id: u64) -> Option<usize> {
+        thread_local! {
+            static IDX: std::cell::RefCell<std::collections::HashMap<u64, usize>> = std::cell::RefCell::new(std::collections::HashMap::new());
+        }
+        if self.pages.len() < 24 {
+            return self.pages.iter().position(|p| p.id == id);
+        }
+        IDX.with(|c| {
+            let mut c = c.borrow_mut();
+            if let Some(&i) = c.get(&id) {
+                if self.pages.get(i).map_or(false, |p| p.id == id) {
+                    return Some(i);
+                }
+            }
+            c.clear();
+            c.reserve(self.pages.len());
+            for (i, p) in self.pages.iter().enumerate().rev() {
+                c.insert(p.id, i);
+            }
+            c.get(&id).copied()
+        })
+    }
+
     pub fn page(&self, id: u64) -> Option<&Page> {
-        self.pages.iter().find(|p| p.id == id)
+        self.index_of(id).map(|i| &self.pages[i])
     }
 
     pub fn page_mut(&mut self, id: u64) -> Option<&mut Page> {
-        self.pages.iter_mut().find(|p| p.id == id)
+        match self.index_of(id) {
+            Some(i) => self.pages.get_mut(i),
+            None => None,
+        }
     }
 
     pub fn db(&self, id: u64) -> Option<&Database> {
@@ -1137,6 +1166,55 @@ impl Workspace {
 
     /// Rows of a database after applying the filters and sorts of view `vi`.
     pub fn query(&self, db: u64, vi: usize) -> Vec<u64> {
+        use std::hash::{Hash, Hasher};
+        thread_local! {
+            static QC: std::cell::RefCell<std::collections::HashMap<(u64, usize), (u64, Vec<u64>)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+        }
+        let Some(d) = self.db(db) else { return vec![] };
+        let Some(view) = d.views.get(vi) else { return self.query_uncached(db, vi) };
+        // Formulas / rollups read other rows: never cache what depends on them.
+        let derived = |p: u64| matches!(d.kind_of(p), PropKind::Formula | PropKind::Rollup | PropKind::Relation);
+        if view.filters.iter().any(|f| derived(f.prop)) || view.sorts.iter().any(|s| derived(s.prop)) {
+            return self.query_uncached(db, vi);
+        }
+        // fingerprint of everything the result depends on: the view, the property definitions, today's date and every row's title + values
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        crate::dashdata::today().hash(&mut h);
+        format!("{:?}", view.filters).hash(&mut h);
+        for s in &view.sorts {
+            (s.prop, s.asc).hash(&mut h);
+        }
+        serde_json::to_string(&d.props).unwrap_or_default().hash(&mut h);
+        for p in self.pages.iter().filter(|p| p.row && p.parent == Some(db) && !p.trashed) {
+            p.id.hash(&mut h);
+            p.title.hash(&mut h);
+            for (k, v) in &p.props {
+                k.hash(&mut h);
+                match v {
+                    Val::Text(s) => (0u8, s).hash(&mut h),
+                    Val::Num(n) => (1u8, n.to_bits()).hash(&mut h),
+                    Val::Sel(o) => (2u8, o).hash(&mut h),
+                    Val::Multi(m) => (3u8, m).hash(&mut h),
+                    Val::Check(b) => (4u8, b).hash(&mut h),
+                }
+            }
+        }
+        let fp = h.finish();
+        if let Some(v) = QC.with(|c| c.borrow().get(&(db, vi)).filter(|(f, _)| *f == fp).map(|(_, v)| v.clone())) {
+            return v;
+        }
+        let rows = self.query_uncached(db, vi);
+        QC.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() > 64 {
+                c.clear();
+            }
+            c.insert((db, vi), (fp, rows.clone()));
+        });
+        rows
+    }
+
+    fn query_uncached(&self, db: u64, vi: usize) -> Vec<u64> {
         let Some(d) = self.db(db) else { return vec![] };
         let mut rows: Vec<&Page> = self.pages.iter().filter(|p| p.row && p.parent == Some(db) && !p.trashed).collect();
         let Some(view) = d.views.get(vi) else { return rows.into_iter().map(|r| r.id).collect() };

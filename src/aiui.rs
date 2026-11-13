@@ -156,7 +156,7 @@ fn dropdown(ui: &mut Ui, pal: &Palette, id: Id, label: &str, items: &[Item], cur
         let pid = id.with("pop");
         let ph = ctx.data(|d| d.get_temp::<f32>(pid.with("h"))).unwrap_or(220.0);
         let pos = if up { pos2(rect.left(), rect.top() - ph - 6.0) } else { rect.left_bottom() + vec2(0.0, 6.0) };
-        let keep = crate::widgets::popup_area(&ctx, pid, pos, pal, &mut fresh, pop_w.max(rect.width()), |ui| {
+        let keep = crate::widgets::popup_area_on(&ctx, pid, pos, pal, &mut fresh, pop_w.max(rect.width()), Order::Tooltip, |ui| {
             for it in items {
                 let sel = it.key == cur;
                 let r = if it.sub.is_empty() {
@@ -171,7 +171,9 @@ fn dropdown(ui: &mut Ui, pal: &Palette, id: Id, label: &str, items: &[Item], cur
         });
         if !keep || pick.is_some() {
             open = false;
-            ctx.data_mut(|d| d.insert_temp(closed_id, ctx.input(|i| i.time)));
+            // NB: read the clock *before* taking the data lock — nesting ctx.input() inside ctx.data_mut() deadlocks egui's context lock.
+            let now = ctx.input(|i| i.time);
+            ctx.data_mut(|d| d.insert_temp(closed_id, now));
         }
     }
     if resp.clicked() {
@@ -693,7 +695,7 @@ pub fn panel(ui: &mut Ui, ctx: &Context, ai: &mut AiHost, ws: &mut Workspace, pa
     egui::CentralPanel::default().frame(Frame::NONE).show_inside(ui, |ui| {
         ai.thread();
         let cur = ai.st.cur;
-        let msgs = std::mem::take(&mut ai.st.threads[cur].msgs);
+        let msgs = ai.st.threads.get_mut(cur).map(|t| std::mem::take(&mut t.msgs)).unwrap_or_default();
         ScrollArea::vertical().id_salt("ai_scroll").auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
             ui.add_space(2.0);
             Frame::new().inner_margin(Margin::symmetric(16, 0)).show(ui, |ui| {
@@ -732,7 +734,9 @@ pub fn panel(ui: &mut Ui, ctx: &Context, ai: &mut AiHost, ws: &mut Workspace, pa
                 ui.add_space(16.0);
             });
         });
-        ai.st.threads[cur].msgs = msgs;
+        if let Some(t) = ai.st.threads.get_mut(cur) {
+            t.msgs = msgs;
+        }
     });
     run_acts(ctx, ai, ws, acts, &mut out);
     out
@@ -1153,3 +1157,64 @@ fn connect_tab(ui: &mut Ui, ctx: &Context, pal: &Palette, ai: &mut AiHost, toast
     }
 }
 
+
+#[cfg(test)]
+mod dropdown_tests {
+    use super::*;
+    use crate::theme::Palette;
+
+    fn frame(ctx: &Context, t: &mut f64, evs: Vec<egui::Event>, cur: &mut String, trig: &mut egui::Rect, picked: &mut Option<String>) {
+        *t += 0.05;
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 700.0)));
+        input.time = Some(*t);
+        input.events = evs;
+        let pal = Palette::light();
+        let items = vec![item("a", "Alpha", ""), item("b", "Beta", ""), item("c", "Gamma", "")];
+        let _ = ctx.run(input, |ctx| {
+            // the phone chat sheet: a full-screen Foreground area that drop-downs must open *above*
+            Area::new(Id::new("test_sheet")).order(Order::Foreground).fixed_pos(pos2(0.0, 0.0)).show(ctx, |ui| {
+                ui.set_min_size(vec2(400.0, 700.0));
+                let r = ui.scope(|ui| dropdown(ui, &pal, Id::new("test_dd"), "Alpha", &items, cur, false, true, 300.0));
+                *trig = r.response.rect;
+                if let Some(k) = r.inner {
+                    *cur = k.clone();
+                    *picked = Some(k);
+                }
+            });
+        });
+    }
+
+    fn click(ctx: &Context, t: &mut f64, p: egui::Pos2, cur: &mut String, trig: &mut egui::Rect, picked: &mut Option<String>) {
+        let ev = |pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        frame(ctx, t, vec![egui::Event::PointerMoved(p)], cur, trig, picked);
+        frame(ctx, t, vec![ev(true)], cur, trig, picked);
+        frame(ctx, t, vec![ev(false)], cur, trig, picked);
+        // let the 0.35 s "just closed" guard of the drop-down (it swallows double clicks) expire
+        for _ in 0..10 {
+            frame(ctx, t, vec![], cur, trig, picked);
+        }
+    }
+
+    /// Regression: choosing / closing an AI drop-down froze the app (nested egui context lock), and on phones the list opened behind
+    /// the full-screen chat sheet.
+    #[test]
+    fn ai_dropdown_opens_above_the_sheet_and_picks_without_locking() {
+        let ctx = Context::default();
+        crate::theme::setup_fonts(&ctx);
+        let (mut t, mut cur, mut trig, mut picked) = (0.0_f64, "a".to_owned(), egui::Rect::NOTHING, None);
+        for _ in 0..4 {
+            frame(&ctx, &mut t, vec![], &mut cur, &mut trig, &mut picked);
+        }
+        for round in 0..4 {
+            picked = None;
+            click(&ctx, &mut t, trig.center(), &mut cur, &mut trig, &mut picked);
+            let pop = ctx.memory(|m| m.area_rect(Id::new("test_dd").with("pop"))).expect("the list is open after clicking the trigger");
+            let target = pos2(pop.center().x, pop.min.y + 20.0);
+            let layer = ctx.layer_id_at(target).expect("something is under the pointer");
+            assert_eq!(layer.order, Order::Tooltip, "round {round}: the list must sit above the Foreground chat sheet");
+            click(&ctx, &mut t, target, &mut cur, &mut trig, &mut picked);
+            assert!(picked.is_some(), "round {round}: clicking an entry must pick it");
+        }
+    }
+}

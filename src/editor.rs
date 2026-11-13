@@ -64,6 +64,11 @@ pub struct EditorState {
     pub bar_grace: f64,
     pub slash_sel: usize,
     pub slash_moved: bool,
+    /// `[[` page suggestions: titles + icons of the workspace pages (filled on demand by `show_page`), selected row, dismissed trigger.
+    pub pages: Vec<(String, String)>,
+    pub want_pages: bool,
+    pub link_sel: usize,
+    pub link_dismiss: Option<(u64, usize)>,
     pub block_menu: Option<(u64, egui::Pos2)>,
     pub dragging: Option<u64>,
     pub icon_picker: Option<egui::Pos2>,
@@ -623,6 +628,10 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
     ed.rc_frame = false;
     ed.embed_rects.clear();
     ed.cur_page = id;
+    if std::mem::take(&mut ed.want_pages) {
+        ed.pages = ws.pages.iter().filter(|p| !p.trashed && !p.row && p.id != id).map(|p| (p.title.clone(), p.icon.clone())).collect();
+        ed.pages.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    }
     let avail = ui.available_width();
     // two-finger pinch on the page = content size (the same value as the slider in the ⋯ menu)
     if let Some(d) = ui.input(|i| i.multi_touch().map(|m| m.zoom_delta)) {
@@ -2252,7 +2261,7 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
 
     // Unfocused blocks with inline formatting render the styled text without the markers.
     if !focus_request && b.kind != BlockKind::Code && has_marks(&b.text) && !ctx.memory(|m| m.has_focus(id)) {
-        let mut job = rt.job(&font, color, pal);
+        let mut job = rt.job_ex(&font, color, pal, None);
         job.wrap.max_width = width;
         ui.fonts(|f| rich::align_baselines(f, &mut job, &font));
         let galley = ui.painter().layout_job(job);
@@ -2261,6 +2270,15 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         let row_h = ui.fonts(|f| f.row_height(&font));
         let (outer, resp) = ui.allocate_exact_size(vec2(width, galley.size().y.max(row_h) + 6.0), Sense::click());
         let rect = Rect::from_min_size(outer.min + vec2(0.0, 3.0), vec2(width, outer.height() - 6.0));
+        // `[[Page]]` links are hoverable chips (rounded pill + page icon), not blue hyperlinks
+        let chips = rt.wiki_chips(None);
+        let chip_hit = if chips.is_empty() { None } else { resp.hover_pos().or_else(|| resp.interact_pointer_pos()).and_then(|p| rich::wiki_chip_at(&galley, rect.min, &chips, p)) };
+        if !chips.is_empty() {
+            let shapes = ui.fonts(|f| rich::wiki_chip_shapes(f, &galley, rect.min, &chips, pal, if resp.hovered() { chip_hit } else { None }));
+            for sh in shapes {
+                ui.painter().add(sh);
+            }
+        }
         ui.painter().galley(rect.min, galley.clone(), color);
         // hovering a link shows a hand cursor; clicking it opens it
         let mut link_hit: Option<String> = None;
@@ -2268,8 +2286,11 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
             let idx = galley.cursor_from_pos(p - rect.min).ccursor.index;
             // only a click *on* the text of a link counts (not the empty space after it)
             if p.x - rect.min.x <= galley.rect.max.x + 2.0 {
-                link_hit = rt.link_at(idx).map(str::to_owned).or_else(|| rt.wiki_at(idx).map(|t| format!("wiki:{t}")));
+                link_hit = rt.link_at(idx).map(str::to_owned);
             }
+        }
+        if let Some(ci) = chip_hit {
+            link_hit = Some(format!("wiki:{}", chips[ci].title));
         }
         if link_hit.is_some() && resp.hovered() {
             ctx.set_cursor_icon(CursorIcon::PointingHand);
@@ -2358,6 +2379,16 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         }
         let range = TextEdit::load_state(&ctx, id).and_then(|s| s.cursor.char_range());
         let (cursor, collapsed) = range.map_or((nchars, true), |r| (r.primary.index, r.primary.index == r.secondary.index));
+        let link_trig = if b.kind != BlockKind::Code && !slash_active && collapsed { wiki_trigger(&rt.plain, cursor) } else { None };
+        if link_trig.is_none() && ed.link_dismiss.map_or(false, |d| d.0 == b.id) {
+            ed.link_dismiss = None;
+        }
+        ed.want_pages |= link_trig.is_some();
+        let link_sugs = match &link_trig {
+            Some((st, q)) if ed.link_dismiss != Some((b.id, *st)) => wiki_sugs(&ed.pages, q),
+            _ => vec![],
+        };
+        let link_active = !link_sugs.is_empty();
         if slash_active {
             let len = items.len();
             if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
@@ -2370,6 +2401,28 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
             }
             if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::Tab)) {
                 *act = Some(slash_act(idx, items[ed.slash_sel]));
+            }
+        } else if link_active {
+            let len = link_sugs.len();
+            ed.link_sel = ed.link_sel.min(len - 1);
+            if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+                ed.link_sel = (ed.link_sel + 1) % len;
+                ed.slash_moved = true;
+            }
+            if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+                ed.link_sel = (ed.link_sel + len - 1) % len;
+                ed.slash_moved = true;
+            }
+            let start = link_trig.as_ref().map_or(0, |t| t.0);
+            if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                ed.link_dismiss = Some((b.id, start));
+            }
+            if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::Tab)) {
+                let nc = insert_wiki(&mut rt, start, cursor, &link_sugs[ed.link_sel].title);
+                b.text = rt.markup();
+                ed.focus = Some((b.id, nc));
+                ed.link_sel = 0;
+                ctx.request_repaint();
             }
         } else {
             if b.kind != BlockKind::Code {
@@ -2416,6 +2469,9 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
     let hint_txt = if b.kind == BlockKind::Text && !focused { String::new() } else { hint.to_owned() };
     let (pal2, font2) = (*pal, font.clone());
     let pending_fmt = ed.pending.filter(|p| p.0 == b.id).map(|p| p.2);
+    // caret of the previous frame: a `[[link]]` that contains it is shown as raw, editable text; the others are chips
+    let caret_key = id.with("wl_caret");
+    let caret_prev: Option<usize> = if focused { ctx.data(|d| d.get_temp(caret_key)) } else { None };
     let rt_old = rt.clone();
     let mut buf = rt.plain.clone();
     // The layouter shows the formatted text *without any markers*; while the text changes inside a frame it adapts the formats.
@@ -2423,11 +2479,11 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         let mut job = if is_code {
             code_job(s, &font2, &pal2)
         } else if s == rt_old.plain {
-            rt_old.job(&font2, color, &pal2)
+            rt_old.job_ex(&font2, color, &pal2, caret_prev)
         } else {
             let mut r = rt_old.clone();
             r.adjust(s, pending_fmt, None);
-            r.job(&font2, color, &pal2)
+            r.job_ex(&font2, color, &pal2, caret_prev)
         };
         job.wrap.max_width = wrap;
         ui.fonts(|f| {
@@ -2437,6 +2493,7 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
             f.layout_job(job)
         })
     };
+    let chip_bg = ui.painter().add(egui::Shape::Noop);
     let out = TextEdit::multiline(&mut buf)
         .id(id)
         .frame(false)
@@ -2465,6 +2522,32 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         let cur = out.cursor_range.map(|c| c.primary.ccursor.index);
         if pb == b.id && cur.is_some() && cur != Some(pc) {
             ed.pending = None;
+        }
+    }
+
+    if !is_code && rt.plain.contains("[[") {
+        let chips = rt.wiki_chips(caret_prev);
+        if !chips.is_empty() {
+            let hover = ui.input(|i| i.pointer.hover_pos()).and_then(|p| rich::wiki_chip_at(&out.galley, out.galley_pos, &chips, p));
+            let shapes = ui.fonts(|f| rich::wiki_chip_shapes(f, &out.galley, out.galley_pos, &chips, pal, hover));
+            ui.painter().set(chip_bg, egui::Shape::Vec(shapes));
+            if let Some(hi) = hover {
+                ctx.set_cursor_icon(CursorIcon::PointingHand);
+                if out.response.clicked() && !out.response.changed() {
+                    ed.wiki = Some(chips[hi].title.clone());
+                }
+            }
+        }
+    }
+    if focused {
+        if let Some(cr) = out.cursor_range {
+            let c = cr.primary.ccursor.index;
+            if Some(c) != caret_prev {
+                ctx.data_mut(|d| d.insert_temp(caret_key, c));
+                if rt.plain.contains("[[") {
+                    ctx.request_repaint();
+                }
+            }
         }
     }
 
@@ -2586,7 +2669,116 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         reset_appear(&ctx, Id::new("slash_appear"));
     }
 
+    // `[[` page suggestions: a drop-down under the caret listing matching pages (and "Create …" for a new title)
+    if focused && !slash_active && b.kind != BlockKind::Code {
+        let caret = out.cursor_range.filter(|c| c.primary.ccursor.index == c.secondary.ccursor.index);
+        let trig = caret.and_then(|c| wiki_trigger(&rt.plain, c.primary.ccursor.index));
+        if let (Some(cr), Some((st, q))) = (caret, trig) {
+            let sugs = if ed.link_dismiss == Some((b.id, st)) { vec![] } else { wiki_sugs(&ed.pages, &q) };
+            ed.want_pages = true;
+            if !sugs.is_empty() {
+                let screen = ctx.screen_rect();
+                let c_rect = out.galley.pos_from_cursor(&cr.primary).translate(out.galley_pos.to_vec2());
+                let w = 300.0_f32.min(screen.width() - 16.0);
+                let est_h = (sugs.len() as f32 * if crate::touch::touchy() { 40.0 } else { 30.0 } + 44.0).min(380.0);
+                let below = c_rect.bottom() + 6.0;
+                let y = if below + est_h > screen.bottom() - 6.0 && c_rect.top() - est_h - 6.0 > screen.top() { c_rect.top() - est_h - 6.0 } else { below.min(screen.bottom() - est_h - 6.0).max(6.0) };
+                let x = c_rect.left().min(screen.right() - w - 8.0).max(8.0);
+                let t = appear(&ctx, Id::new("wiki_appear"), 0.12);
+                let moved = std::mem::take(&mut ed.slash_moved);
+                ed.link_sel = ed.link_sel.min(sugs.len() - 1);
+                let sel = ed.link_sel;
+                let pressed = ctx.input(|i| i.pointer.primary_pressed());
+                let mut pick: Option<usize> = None;
+                let area = egui::Area::new(Id::new("wiki_menu")).order(Order::Foreground).fixed_pos(pos2(x, y + (1.0 - t) * -4.0)).show(&ctx, |ui| {
+                    ui.set_opacity(t);
+                    crate::widgets::popup_frame(pal).show(ui, |ui| {
+                        ui.set_width(w);
+                        section_label(ui, pal, "Link to page");
+                        ScrollArea::vertical().id_salt("wiki_scroll").max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
+                            for (i, sg) in sugs.iter().enumerate() {
+                                let (lead, label) = if sg.create { (l::PLUS, format!("Create “{}”", sg.title)) } else { (if sg.icon.is_empty() { l::FILE_TEXT } else { sg.icon.as_str() }, sg.title.clone()) };
+                                let r = menu_item(ui, pal, lead, &label, None, i == sel, false);
+                                if i == sel && moved {
+                                    r.scroll_to_me(None);
+                                }
+                                let over = ui.rect_contains_pointer(r.rect) && ui.clip_rect().contains(r.rect.center());
+                                if over {
+                                    ed.link_sel = i;
+                                }
+                                if pressed && over {
+                                    pick = Some(i);
+                                }
+                            }
+                        });
+                    });
+                });
+                ctx.raise_layer(area.response.layer_id);
+                if let Some(i) = pick {
+                    let nc = insert_wiki(&mut rt, st, cr.primary.ccursor.index, &sugs[i].title);
+                    b.text = rt.markup();
+                    ed.focus = Some((b.id, nc));
+                    ed.link_sel = 0;
+                    ctx.request_repaint();
+                }
+            } else {
+                reset_appear(&ctx, Id::new("wiki_appear"));
+            }
+        } else {
+            reset_appear(&ctx, Id::new("wiki_appear"));
+        }
+    }
+
     out.response.changed()
+}
+
+/// The open `[[` before the caret: `(char index of the "[[", text typed after it)`; `None` when the caret is not inside an unclosed link.
+fn wiki_trigger(plain: &str, cursor: usize) -> Option<(usize, String)> {
+    let chars: Vec<char> = plain.chars().collect();
+    let cur = cursor.min(chars.len());
+    let mut i = cur;
+    while i >= 2 && cur - i <= 60 {
+        if chars[i - 1] == '[' && chars[i - 2] == '[' {
+            let q: String = chars[i..cur].iter().collect();
+            return if q.contains(['[', ']', '\n']) { None } else { Some((i - 2, q)) };
+        }
+        if chars[i - 1] == ']' || chars[i - 1] == '\n' {
+            return None;
+        }
+        i -= 1;
+    }
+    None
+}
+
+struct WikiSug {
+    title: String,
+    icon: String,
+    create: bool,
+}
+
+/// Pages matching what was typed after `[[` (prefix matches first), plus a "create" entry when the title does not exist yet.
+fn wiki_sugs(pages: &[(String, String)], q: &str) -> Vec<WikiSug> {
+    let ql = q.trim().to_lowercase();
+    let mut hits: Vec<&(String, String)> = pages.iter().filter(|(t, _)| ql.is_empty() || t.to_lowercase().contains(&ql)).collect();
+    hits.sort_by_key(|(t, _)| !t.to_lowercase().starts_with(&ql));
+    let mut v: Vec<WikiSug> = hits.into_iter().take(8).map(|(t, i)| WikiSug { title: t.clone(), icon: i.clone(), create: false }).collect();
+    if !ql.is_empty() && !pages.iter().any(|(t, _)| t.trim().to_lowercase() == ql) {
+        v.push(WikiSug { title: q.trim().to_owned(), icon: String::new(), create: true });
+    }
+    v
+}
+
+/// Replaces the open `[[query` (and a `]]` the user already typed after the caret) with `[[Title]]`; returns the new caret.
+fn insert_wiki(rt: &mut Rich, start: usize, cursor: usize, title: &str) -> usize {
+    let mut end = cursor;
+    if rt.plain.chars().skip(cursor).take(2).collect::<String>() == "]]" {
+        end += 2;
+    }
+    let clean: String = title.chars().filter(|c| !matches!(c, '|' | '[' | ']' | '\n')).collect();
+    let t = format!("[[{}]]", clean.trim());
+    let n = t.chars().count();
+    rt.replace(start, end, &Rich::plain(&t));
+    start + n
 }
 
 /// Bold / italic / … on the selection, or — with an empty selection — on the text typed next.
@@ -3248,6 +3440,37 @@ mod tests {
         bl[0].collapsed = true;
         assert!(hidden(&bl, 1));
         assert!(!hidden(&bl, 2));
+    }
+
+    #[test]
+    fn wiki_trigger_finds_the_open_brackets() {
+        assert_eq!(wiki_trigger("see [[Pro", 9), Some((4, "Pro".to_owned())));
+        assert_eq!(wiki_trigger("[[", 2), Some((0, String::new())));
+        assert_eq!(wiki_trigger("[[done]] and", 12), None, "a closed link is not a trigger");
+        assert_eq!(wiki_trigger("plain text", 5), None);
+        assert_eq!(wiki_trigger("[[a\nb", 6), None, "a trigger never spans lines");
+    }
+
+    #[test]
+    fn wiki_suggestions_rank_and_offer_create() {
+        let pages: Vec<(String, String)> = ["Project plan", "Roadmap", "My project"].iter().map(|t| (t.to_string(), String::new())).collect();
+        let s = wiki_sugs(&pages, "proj");
+        assert_eq!(s[0].title, "Project plan", "prefix matches first");
+        assert!(s.iter().any(|x| x.title == "My project"));
+        assert!(s.last().unwrap().create, "an unknown title offers Create");
+        assert!(!wiki_sugs(&pages, "roadmap").iter().any(|x| x.create), "an existing title does not");
+        assert_eq!(wiki_sugs(&pages, "").len(), 3);
+    }
+
+    #[test]
+    fn inserting_a_wiki_link_replaces_the_trigger_and_typed_closers() {
+        let mut rt = Rich::plain("see [[Pro]] now");
+        let caret = insert_wiki(&mut rt, 4, 9, "Project plan");
+        assert_eq!(rt.plain, "see [[Project plan]] now");
+        assert_eq!(caret, 4 + "[[Project plan]]".chars().count());
+        let mut rt = Rich::plain("[[x");
+        insert_wiki(&mut rt, 0, 3, "A|B]]");
+        assert_eq!(rt.plain, "[[AB]]", "separators are stripped from titles");
     }
 
     #[test]

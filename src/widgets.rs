@@ -78,6 +78,22 @@ pub fn popup_area(
     width: f32,
     add: impl FnOnce(&mut Ui),
 ) -> bool {
+    popup_area_on(ctx, id, pos, pal, fresh, width, HOST_ORDER, add)
+}
+
+/// Same as [`popup_area`] but on an explicit layer. The AI chat sheet lives on `Foreground`, so its drop-downs must use `Tooltip`
+/// (the topmost layer) or they open *behind* it on phones.
+#[allow(clippy::too_many_arguments)]
+pub fn popup_area_on(
+    ctx: &Context,
+    id: Id,
+    pos: Pos2,
+    pal: &Palette,
+    fresh: &mut bool,
+    width: f32,
+    order: Order,
+    add: impl FnOnce(&mut Ui),
+) -> bool {
     let t = appear(ctx, id.with("appear"), 0.16);
     let screen = ctx.screen_rect();
     // phones: a popup can never be wider than the screen
@@ -87,7 +103,7 @@ pub fn popup_area(
     let h = ctx.data(|d| d.get_temp::<f32>(id.with("h"))).unwrap_or(0.0);
     let y = if h > 0.0 { pos.y.min(screen.bottom() - h - 10.0).max(8.0) } else { pos.y };
     let resp = Area::new(id)
-        .order(HOST_ORDER)
+        .order(order)
         .fixed_pos(pos2(x, y + (1.0 - t) * -6.0))
         .show(ctx, |ui| {
             ui.set_opacity(t);

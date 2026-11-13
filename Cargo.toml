@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "11.0.0"
+version = "11.1.0"
 edition = "2021"
 description = "Lumen — a free Notion + Obsidian + Miro-lite alternative (infinite canvas) written entirely in Rust with egui (Windows + WebAssembly), with automations, reminders and the LumenScript scripting language"
 license = "MIT"
@@ -67,7 +67,9 @@ web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElemen
 [profile.release]
 opt-level = 3
 lto = "thin"
-codegen-units = 8
+codegen-units = 4
+# no incremental / debug info in release: smaller binary, smaller page-in footprint
+debug = false
 strip = true
 # unwind on native so a damaged PDF can never take the app down (the PDF engine catches panics); wasm always aborts
 panic = "unwind"
