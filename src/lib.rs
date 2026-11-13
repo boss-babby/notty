@@ -33,6 +33,7 @@ mod io;
 mod lock;
 mod lucide;
 mod math;
+mod outline;
 mod media;
 mod mediablocks;
 mod multisel;

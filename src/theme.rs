@@ -335,6 +335,11 @@ pub fn setup_fonts(ctx: &Context) {
     b.extend(scripts.iter().cloned());
     fonts.families.insert(FontFamily::Name("bold".into()), b);
     fonts.families.insert(FontFamily::Name("lucide".into()), vec!["lucide".to_owned()]);
+    // Math: XITS Math (STIX-derived, OFL) first, the UI fonts as a fallback for characters it lacks
+    fonts.font_data.insert("xits-math".to_owned(), Arc::new(FontData::from_static(include_bytes!("../assets/XITSMath-Regular.otf"))));
+    let mut m = vec!["xits-math".to_owned(), "inter".to_owned(), "lucide".to_owned()];
+    m.extend(scripts.iter().cloned());
+    fonts.families.insert(FontFamily::Name("math".into()), m);
     ctx.set_fonts(fonts);
 }
 

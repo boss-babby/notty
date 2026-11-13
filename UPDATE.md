@@ -1,3 +1,36 @@
+# Lumen 13.1 — scrolling, typesetting, outline
+
+## 1. Scrolling (`src/smooth.rs`)
+**Bug:** one mouse-wheel notch made the page run away (a tiny scroll → a huge jump), most visibly in the browser.
+**Cause:** Chrome / Edge report a wheel notch as one *pixel* delta (≈100). `take_wheel` treated every pixel delta as "touchpad", so the notch
+became a finger velocity of `100 px / frame-time ≈ 6000 px/s`, and the touchpad-fling code then glided `v · 0.38 s ≈ 2300 px`.
+**Fix:**
+* Classification: small pixel deltas (< 40) or fractional lines = touchpad; a big pixel delta or a whole number of lines = wheel notch (spring).
+  Big deltas *inside* a running touchpad gesture (a fast flick, 180 ms window) stay touchpad.
+* A synthetic fling needs a real swipe (≥ 4 events), is capped at 2600 px/s and decays faster; **never** on WebAssembly (browsers send their own inertia).
+* A wheel notch is capped at 420 px per frame. Regression test: `one_mouse_wheel_notch_is_never_a_touchpad_swipe`.
+* Jumps to a heading (table of contents / outline rail) leave 20 px of air above the heading.
+Structure review: the page scroll area, the dashboard and every nested area were checked — only the page and the dashboard use the spring;
+horizontal areas (tables, boards, calendars) never see the vertical wheel; popups sit on a higher layer so `rect_contains_pointer` keeps them scrollable.
+
+## 2. LaTeX (`src/math.rs`, `assets/XITSMath-Regular.otf`)
+* Formulas are set in **XITS Math** (STIX-derived, OFL): real Mathematical Italic / Bold alphabets instead of a skewed sans font.
+* Every box gets its **exact ink ascent / descent and advance** from the font (`ttf-parser`) instead of guessed proportions — scripts, fractions,
+  radicals and big operators no longer collide; big operators are centred on the math axis by their real ink box; italic correction before scripts.
+* Ordinary-size brackets are real glyphs (stroked curves only for tall delimiters). Fraction bars / rules are snapped to whole device pixels.
+* Equation block: no box and no border while reading; the shaded surface appears **only while the source is being edited** (the blue outline is gone).
+
+## 3. Table of contents (`src/editor.rs`)
+* Nested headings have a toggle (chevron) – fold / unfold sub-sections, `+N` shows how many are hidden; the state is saved in the block.
+* Tools: expand all, collapse all, text-colour picker (default + 9 colours); the heading currently in view is highlighted.
+
+## 4. Outline rail (`src/outline.rs`) — Notion's "page outline" at the side
+Slim bars on the page edge, one per heading (length = level), the current section highlighted. Hover opens the outline card (touch: tap),
+click jumps, the card scrolls to the current section and closes 0.3 s after the pointer leaves.
+
+## 5. Seamless top bar
+`TopBottomPanel::show_separator_line(false)` + no stroke: the bar shares the page surface like Notion.
+
 # Lumen 13.0 — math, universal text menus, file import, multi-block menu
 
 ## 1. Table block: ghost buttons fixed (`src/tableblock.rs`)

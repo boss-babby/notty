@@ -24,7 +24,15 @@ pub struct Spring {
     fling: f32,
     last_in: f64,
     pad_mode: bool,
+    /// Number of events of the running touchpad gesture (a fling is only synthesised after a real, multi-event swipe).
+    n_in: u32,
 }
+
+/// Fastest synthetic touchpad fling (points / s) and a wheel notch cap (points per frame): a defence against devices that report huge deltas.
+const MAX_FLING: f32 = 2600.0;
+const MAX_NOTCH: f32 = 420.0;
+/// Browsers (Chrome / Safari / Firefox) generate the inertia of a touchpad swipe themselves (as more wheel events), so the web build never adds one.
+const SYNTH_FLING: bool = !cfg!(target_arch = "wasm32");
 
 /// One step of a critically damped spring towards `target` (Game Programming Gems 4, "SmoothDamp").
 pub fn damp(pos: f32, vel: f32, target: f32, dt: f32) -> (f32, f32) {
@@ -70,15 +78,21 @@ impl Spring {
                 self.pos = (self.pos - wheel).clamp(0.0, max);
                 self.target = self.pos;
                 self.vel = 0.0;
-                let inst = -wheel / dt;
-                self.fling = if self.fling != 0.0 && self.fling.signum() == inst.signum() { self.fling * 0.55 + inst * 0.45 } else { inst };
+                let inst = (-wheel / dt).clamp(-MAX_FLING, MAX_FLING);
+                if now - self.last_in > 0.12 || (self.fling != 0.0 && self.fling.signum() != inst.signum()) {
+                    self.n_in = 0;
+                    self.fling = 0.0;
+                }
+                self.n_in += 1;
+                self.fling = if self.fling != 0.0 { self.fling * 0.55 + inst * 0.45 } else { inst };
                 self.last_in = now;
                 self.pad_mode = true;
             } else {
                 // Mouse wheel notch: critically damped spring towards the new target.
-                self.target = (self.target - wheel).clamp(0.0, max);
+                self.target = (self.target - wheel.clamp(-MAX_NOTCH, MAX_NOTCH)).clamp(0.0, max);
                 self.pad_mode = false;
                 self.fling = 0.0;
+                self.n_in = 0;
             }
         } else if self.pad_mode && !direct {
             let idle = now - self.last_in;
@@ -86,12 +100,12 @@ impl Spring {
                 // between two touchpad events of the same gesture: hold position
                 gliding = true;
                 ctx.request_repaint();
-            } else if self.fling.abs() > 30.0 {
+            } else if SYNTH_FLING && self.n_in >= 4 && self.fling.abs() > 80.0 {
                 // The fingers lifted while still moving: keep gliding and slow down with the friction of a real touchpad fling
                 // (the OS sends its own inertia on Windows / macOS — then the measured velocity is already ~0 and nothing is added).
                 self.pos = (self.pos + self.fling * dt).clamp(0.0, max);
                 self.target = self.pos;
-                self.fling *= (-dt / 0.38).exp();
+                self.fling *= (-dt / 0.32).exp();
                 if self.pos <= 0.0 || self.pos >= max {
                     self.fling = 0.0;
                 }
@@ -141,17 +155,50 @@ pub fn take_wheel(ctx: &Context, over: bool) -> f32 {
     if !over || ctx.input(|i| i.modifiers.command) {
         return 0.0;
     }
+    let now = ctx.input(|i| i.time);
+    let in_gesture = ctx.data(|d| d.get_temp::<f64>(Id::new("wheel_pad_until"))).map_or(false, |t| now < t);
     let (d, pad) = ctx.input_mut(|i| {
         let d = i.raw_scroll_delta.y;
-        // a touchpad reports points or fractional lines, a wheel notch is a whole number of lines
-        let pad = i.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, .. }) || matches!(e, egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta, .. } if delta.y.fract() != 0.0));
+        // Touchpad: small pixel deltas (or fractional lines). A mouse wheel notch is one BIG pixel delta (Chrome / Edge / Windows: 100-120,
+        // scaled by display zoom) or a whole number of lines (Firefox / native) — it must never be mistaken for a swipe: treating one
+        // 100 px notch as "finger velocity" used to fling the page ~2000 px (the "tiny scroll, huge jump" bug).
+        let mut pad = false;
+        let mut big = false;
+        for e in &i.events {
+            if let egui::Event::MouseWheel { unit, delta, .. } = e {
+                match unit {
+                    egui::MouseWheelUnit::Point => {
+                        if delta.y.abs() < 40.0 {
+                            pad = true;
+                        } else {
+                            big = true;
+                        }
+                    }
+                    egui::MouseWheelUnit::Line => {
+                        if delta.y.fract() != 0.0 {
+                            pad = true;
+                        }
+                    }
+                    egui::MouseWheelUnit::Page => {}
+                }
+            }
+        }
+        // big deltas inside a running touchpad gesture are still the touchpad (a fast flick)
+        let pad = pad || (big && in_gesture);
         if d != 0.0 {
             i.raw_scroll_delta.y = 0.0;
             i.smooth_scroll_delta.y = 0.0;
         }
         (d, pad)
     });
-    ctx.data_mut(|dm| dm.insert_temp(Id::new("wheel_is_pad"), pad));
+    if d != 0.0 {
+        ctx.data_mut(|dm| {
+            dm.insert_temp(Id::new("wheel_is_pad"), pad);
+            if pad {
+                dm.insert_temp(Id::new("wheel_pad_until"), now + 0.18);
+            }
+        });
+    }
     d
 }
 
@@ -211,5 +258,31 @@ mod tests {
             v = nv;
         }
         assert!(worst_jump < 8.0, "per-frame step changed by {worst_jump}px at most");
+    }
+
+    fn classify(unit: egui::MouseWheelUnit, dy: f32) -> (f32, bool) {
+        let ctx = Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::MouseWheel { unit, delta: egui::vec2(0.0, dy), modifiers: Default::default() });
+        let mut out = (0.0, false);
+        let _ = ctx.run(raw, |ctx| {
+            let d = take_wheel(ctx, true);
+            out = (d, ctx.data(|dm| dm.get_temp::<bool>(Id::new("wheel_is_pad"))).unwrap_or(false));
+        });
+        out
+    }
+
+    #[test]
+    fn one_mouse_wheel_notch_is_never_a_touchpad_swipe() {
+        // Chrome / Edge: one notch = one pixel event of ~100; Firefox / native: whole lines
+        for dy in [-100.0, -120.0, -125.0, -66.7] {
+            let (d, pad) = classify(egui::MouseWheelUnit::Point, dy);
+            assert!(d != 0.0 && !pad, "pixel notch {dy} was classified as a touchpad");
+        }
+        let (_, pad) = classify(egui::MouseWheelUnit::Line, -3.0);
+        assert!(!pad);
+        // a touchpad reports small pixel deltas
+        let (_, pad) = classify(egui::MouseWheelUnit::Point, -7.0);
+        assert!(pad);
     }
 }

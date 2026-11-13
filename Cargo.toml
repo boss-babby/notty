@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "13.0.0"
+version = "13.1.0"
 edition = "2021"
 description = "Lumen — a Notion + Obsidian + Miro-lite alternative (infinite canvas) written entirely in Rust with egui (Windows, Android + WebAssembly): Markdown tables, two-way relations, automations, reminders, LumenScript, AI + MCP"
 license = "MIT"
@@ -27,6 +27,7 @@ serde_json = "1"
 sha2 = "0.10"
 log = "0.4"
 hayro = "0.9"
+ttf-parser = "0.25"
 ehttp = "0.5"
 
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]

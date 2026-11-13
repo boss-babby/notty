@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn table_becomes_database_with_inferred_types() {
         let (_, tables) = extract(MD);
-        let mut ws = Workspace::default();
+        let mut ws = Workspace::seed();
         let page = ws.add_page(None, PageKind::Doc);
         let b = new_block(&mut ws, &tables[0]);
         let bid = b.id;
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn relation_backlinks_show_assigned_work() {
-        let mut ws = Workspace::default();
+        let mut ws = Workspace::seed();
         let people = ws.add_database(None, ViewKind::Table);
         let tasks = ws.add_database(None, ViewKind::Table);
         let ann = ws.add_row(people, None);

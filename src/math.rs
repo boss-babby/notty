@@ -9,9 +9,72 @@
 
 use egui::epaint::text::Fonts;
 use egui::text::{LayoutJob, TextFormat};
-use egui::{pos2, Color32, FontId, Painter, Pos2, Shape, Stroke};
+use egui::{pos2, Color32, FontFamily, FontId, Painter, Pos2, Shape, Stroke};
 
-use crate::theme::{body, bold};
+// ───────────────────────────── math font (XITS Math, OFL) ─────────────────────────────
+//
+// Formulas are set in a real math font: Latin / Greek letters are mapped to the Unicode "Mathematical Italic / Bold" alphabets (no
+// synthetic slant), and every box gets its EXACT ink extents (ascent / descent) and advance from the font's own tables. The old engine
+// guessed the extents from the sans-serif UI font, which is what made scripts, fractions and brackets collide.
+
+static MATH_TTF: &[u8] = include_bytes!("../assets/XITSMath-Regular.otf");
+
+fn mface() -> Option<&'static ttf_parser::Face<'static>> {
+    static F: std::sync::OnceLock<Option<ttf_parser::Face<'static>>> = std::sync::OnceLock::new();
+    F.get_or_init(|| ttf_parser::Face::parse(MATH_TTF, 0).ok()).as_ref()
+}
+
+/// Metrics of one glyph in em units: advance, ink top (above the baseline), ink bottom (below), right ink overhang beyond the advance.
+#[derive(Clone, Copy, Default, Debug)]
+struct Gm {
+    adv: f32,
+    top: f32,
+    bot: f32,
+    over: f32,
+    ink: bool,
+}
+
+fn gm(c: char) -> Option<Gm> {
+    let f = mface()?;
+    let gid = f.glyph_index(c)?;
+    let upem = f.units_per_em() as f32;
+    let adv = f.glyph_hor_advance(gid).unwrap_or(0) as f32 / upem;
+    Some(match f.glyph_bounding_box(gid) {
+        Some(r) => Gm { adv, top: r.y_max as f32 / upem, bot: -(r.y_min as f32) / upem, over: (r.x_max as f32 / upem - adv).max(0.0), ink: true },
+        None => Gm { adv, ..Default::default() },
+    })
+}
+
+/// Maps a character to the math alphabet that matches `face` (Mathematical Italic / Bold / Bold Italic).
+fn style_char(c: char, face: Face) -> char {
+    if face.mono {
+        return c;
+    }
+    let off = |base: u32, i: u32| char::from_u32(base + i).unwrap_or(c);
+    match (c, face.italic, face.bold) {
+        ('h', true, false) => '\u{210E}',
+        ('a'..='z', true, false) => off(0x1D44E, c as u32 - 'a' as u32),
+        ('A'..='Z', true, false) => off(0x1D434, c as u32 - 'A' as u32),
+        ('a'..='z', true, true) => off(0x1D482, c as u32 - 'a' as u32),
+        ('A'..='Z', true, true) => off(0x1D468, c as u32 - 'A' as u32),
+        ('a'..='z', false, true) => off(0x1D41A, c as u32 - 'a' as u32),
+        ('A'..='Z', false, true) => off(0x1D400, c as u32 - 'A' as u32),
+        ('0'..='9', _, true) => off(0x1D7CE, c as u32 - '0' as u32),
+        ('\u{3B1}'..='\u{3C1}', true, false) => off(0x1D6FC, c as u32 - 0x3B1),
+        ('\u{3C2}', true, false) => '\u{1D70D}',
+        ('\u{3C3}'..='\u{3C9}', true, false) => off(0x1D70E, c as u32 - 0x3C3),
+        _ => c,
+    }
+}
+
+/// Italic correction of the last glyph of a node (how far its ink leans over the advance) in px.
+fn italic_corr(n: &Node, size: f32) -> f32 {
+    match n {
+        Node::Sym { s, face, .. } => s.chars().last().and_then(|c| gm(style_char(c, *face))).map_or(0.0, |g| g.over * size),
+        Node::Row(v) => v.last().map_or(0.0, |l| italic_corr(l, size)),
+        _ => 0.0,
+    }
+}
 
 // ───────────────────────────── AST ─────────────────────────────
 
@@ -631,10 +694,8 @@ impl MathBox {
 fn font_of(size: f32, face: Face) -> FontId {
     if face.mono {
         FontId::monospace(size * 0.92)
-    } else if face.bold {
-        bold(size)
     } else {
-        body(size)
+        FontId::new(size, FontFamily::Name("math".into()))
     }
 }
 
@@ -645,14 +706,38 @@ struct Lay<'a> {
 impl Lay<'_> {
     fn text_w(&self, s: &str, size: f32, face: Face) -> f32 {
         let f = font_of(size, face);
-        s.chars().map(|c| self.fonts.glyph_width(&f, c)).sum()
+        s.chars()
+            .map(|c| if face.mono { self.fonts.glyph_width(&f, c) } else { gm(c).map_or_else(|| self.fonts.glyph_width(&f, c), |g| g.adv * size) })
+            .sum()
     }
 
     fn text_box(&self, s: &str, size: f32, face: Face) -> MathBox {
-        let w = self.text_w(s, size, face);
-        let big = s.chars().any(|c| matches!(c, '∑' | '∏' | '∫' | '∬' | '∭' | '∮' | '∐' | '⋃' | '⋂'));
-        let (asc, desc) = if big { (0.9 * size, 0.35 * size) } else if s.chars().any(|c| c.is_lowercase() && !"acemnorsuvwxz".contains(c)) || s.chars().any(|c| c.is_uppercase() || c.is_ascii_digit()) { (0.74 * size, if s.chars().any(|c| "gjpqy,;ςϕφβγμρχψ".contains(c)) { 0.22 * size } else { 0.02 * size }) } else { (0.55 * size, if s.chars().any(|c| "gjpqy,;ςϕφβγμρχψ".contains(c)) { 0.22 * size } else { 0.02 * size }) };
-        MathBox { w, asc, desc, items: vec![Item::Text { x: 0.0, y: 0.0, s: s.to_owned(), size, face }] }
+        let mapped: String = s.chars().map(|c| style_char(c, face)).collect();
+        let w = self.text_w(&mapped, size, face);
+        // exact ink extents from the font (fallback for characters the math font lacks: typical text proportions)
+        let (mut asc, mut desc) = (0.0f32, 0.0f32);
+        let mut any = false;
+        for c in mapped.chars() {
+            match gm(c) {
+                Some(g) if g.ink => {
+                    asc = asc.max(g.top * size);
+                    desc = desc.max(g.bot * size);
+                    any = true;
+                }
+                Some(_) => {}
+                None if !c.is_whitespace() => {
+                    asc = asc.max(0.72 * size);
+                    desc = desc.max(0.2 * size);
+                    any = true;
+                }
+                None => {}
+            }
+        }
+        if !any {
+            asc = 0.0;
+            desc = 0.0;
+        }
+        MathBox { w, asc, desc, items: vec![Item::Text { x: 0.0, y: 0.0, s: mapped, size, face }] }
     }
 
     fn axis(&self, size: f32) -> f32 {
@@ -741,6 +826,7 @@ impl Lay<'_> {
             return self.bigop(s, *limits && display, size, display, sub, sup);
         }
         let b = self.lay(base, size, display);
+        let ic = italic_corr(base, size);
         let ss = (size * 0.72).max(8.0);
         let sb = sub.map(|n| self.lay(n, ss, false));
         let sp = sup.map(|n| self.lay(n, ss, false));
@@ -763,13 +849,13 @@ impl Lay<'_> {
         let sw = sp.as_ref().map_or(0.0, |s| s.w).max(sb.as_ref().map_or(0.0, |s| s.w));
         if let (Some(s), Some(u)) = (sp, up) {
             out.asc = out.asc.max(u + s.asc);
-            out.push_box(s, bw + 0.04 * size, -u);
+            out.push_box(s, bw + 0.03 * size + ic, -u);
         }
         if let (Some(s), Some(d)) = (sb, down) {
             out.desc = out.desc.max(d + s.desc);
             out.push_box(s, bw + 0.02 * size, d);
         }
-        w += sw + 0.06 * size;
+        w += sw + 0.06 * size + ic * 0.5;
         out.w = w;
         out
     }
@@ -781,19 +867,20 @@ impl Lay<'_> {
             None => (s.to_owned(), false),
         };
         let is_int = txt.starts_with('∫') || txt.starts_with('∬') || txt.starts_with('∭') || txt.starts_with('∮');
-        let scale = if named || !display { 1.0 } else if is_int { 1.5 } else { 1.35 };
+        let scale = if named || !display { 1.0 } else if is_int { 1.3 } else { 1.25 };
         let op_face = Face::default();
         let mut base = self.text_box(&txt, size * scale, op_face);
         if !named {
-            // centre the big symbol on the math axis
-            let dy = (0.37 * scale - 0.26) * size;
+            // centre the ink of the big symbol on the math axis (exact extents, whatever the glyph looks like)
+            let ink_c = (base.asc - base.desc) / 2.0;
+            let dy = ink_c - self.axis(size);
             for it in base.items.iter_mut() {
                 if let Item::Text { y, .. } = it {
                     *y += dy;
                 }
             }
-            base.asc = (0.26 + 0.37 * scale) * size;
-            base.desc = (0.37 * scale - 0.26) * size + 0.05 * size;
+            base.asc = base.asc - ink_c + self.axis(size);
+            base.desc = base.desc + ink_c - self.axis(size);
         }
         let ss = (size * 0.72).max(8.0);
         let sb = sub.map(|n| self.lay(n, ss, false));
@@ -929,6 +1016,25 @@ impl Lay<'_> {
                 })
                 .collect()
         };
+        // ordinary-size brackets are real glyphs of the math font (crisp hinting-free outlines); only tall ones are drawn as strokes
+        if h <= 1.9 * size && matches!(d, "(" | ")" | "[" | "]" | "{" | "}" | "|" | "‖" | "⟨" | "⟩" | "⌊" | "⌋" | "⌈" | "⌉") {
+            let ch = match d {
+                "⟨" => '\u{27E8}',
+                "⟩" => '\u{27E9}',
+                "‖" => '\u{2016}',
+                other => other.chars().next().unwrap_or('('),
+            };
+            if let Some(g) = gm(ch) {
+                if g.ink {
+                    let ink = (g.top + g.bot).max(0.1);
+                    let fs = (h / ink).clamp(size, 1.9 * size);
+                    let y = mid + (g.top - g.bot) * 0.5 * fs;
+                    let pad = 0.03 * fs;
+                    let it = Item::Text { x: x + pad, y, s: ch.to_string(), size: fs, face: Face::default() };
+                    return (vec![it], g.adv * fs + 2.0 * pad);
+                }
+            }
+        }
         match d {
             "(" => {
                 let depth = (0.1 * size + h * 0.025).min(0.22 * size);
@@ -1172,26 +1278,44 @@ pub fn typeset(fonts: &Fonts, tex: &str, size: f32, display: bool) -> MathBox {
 
 /// Draws a laid-out formula; `origin` is the top-left corner of its bounding box.
 pub fn paint(p: &Painter, origin: Pos2, mb: &MathBox, color: Color32) {
+    let ppp = p.ctx().pixels_per_point().max(1.0);
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    // a stroke of `w` points becomes a whole number of device pixels, centred so that both edges sit on pixel boundaries (crisp bars)
+    let thick = |w: f32| (w * ppp).round().max(1.0);
+    let centre = |c: f32, wpx: f32| ((c * ppp - wpx / 2.0).round() + wpx / 2.0) / ppp;
     let base = origin + egui::vec2(0.0, mb.asc);
+    let base = pos2(snap(base.x), snap(base.y));
     for it in &mb.items {
         match it {
             Item::Text { x, y, s, size, face } => {
                 let font = font_of(*size, *face);
                 let mut job = LayoutJob::default();
-                job.append(s, 0.0, TextFormat { font_id: font, color, italics: face.italic, ..Default::default() });
+                job.append(s, 0.0, TextFormat { font_id: font, color, ..Default::default() });
                 job.wrap.max_width = f32::INFINITY;
                 let g = p.layout_job(job);
                 let off = g.rows.first().and_then(|r| r.glyphs.first()).map_or(*size * 0.97, |gl| gl.pos.y);
-                p.galley(pos2(base.x + x, base.y + y - off), g, color);
+                p.galley(pos2(snap(base.x + x), snap(base.y + y - off)), g, color);
             }
             Item::Line { a, b, w } => {
-                p.line_segment([base + a.to_vec2(), base + b.to_vec2()], Stroke::new(*w, color));
+                let (a, b) = (base + a.to_vec2(), base + b.to_vec2());
+                let wpx = thick(*w);
+                let (a, b) = if (a.y - b.y).abs() < 0.01 {
+                    let y = centre(a.y, wpx);
+                    (pos2(snap(a.x), y), pos2(snap(b.x), y))
+                } else if (a.x - b.x).abs() < 0.01 {
+                    let x = centre(a.x, wpx);
+                    (pos2(x, snap(a.y)), pos2(x, snap(b.y)))
+                } else {
+                    (a, b)
+                };
+                p.line_segment([a, b], Stroke::new(wpx / ppp, color));
             }
             Item::Poly { pts, w } => {
-                p.add(Shape::line(pts.iter().map(|q| base + q.to_vec2()).collect(), Stroke::new(*w, color)));
+                let wpx = thick(*w * 1.1);
+                p.add(Shape::line(pts.iter().map(|q| base + q.to_vec2()).collect(), Stroke::new(wpx / ppp, color)));
             }
             Item::Dot { c, r } => {
-                p.circle_filled(base + c.to_vec2(), *r, color);
+                p.circle_filled(base + c.to_vec2(), r.max(0.7 / ppp), color);
             }
         }
     }
@@ -1459,6 +1583,56 @@ mod tests {
             "\\sum_{i=1}^n \\binom{n}{k}",
         ] {
             let _ = to_unicode(t);
+        }
+    }
+}
+
+#[cfg(test)]
+mod typeset_tests {
+    use super::*;
+
+    fn boxed(tex: &str, size: f32) -> MathBox {
+        let ctx = egui::Context::default();
+        crate::theme::setup_fonts(&ctx);
+        let mut out = None;
+        let _ = ctx.run(Default::default(), |ctx| {
+            out = Some(ctx.fonts(|f| typeset(f, tex, size, true)));
+        });
+        out.unwrap()
+    }
+
+    #[test]
+    fn math_font_has_exact_metrics_and_math_alphabets() {
+        let g = gm('\u{1D465}').expect("math italic x is in the math font");
+        assert!(g.adv > 0.3 && g.top > 0.3 && g.top < 0.8, "{g:?}");
+        let sigma = gm('∑').unwrap();
+        assert!(sigma.top + sigma.bot > 0.8);
+        assert_eq!(style_char('x', Face { italic: true, ..Default::default() }), '\u{1D465}');
+        assert_eq!(style_char('α', Face { italic: true, ..Default::default() }), '\u{1D6FC}');
+        assert_eq!(style_char('7', Face::default()), '7');
+    }
+
+    #[test]
+    fn formulas_lay_out_finite_and_text_never_overlaps() {
+        for tex in ["E = mc^2", "\\frac{a+b}{c-d}", "\\sum_{i=0}^{n} i^2 = \\frac{n(n+1)(2n+1)}{6}", "\\int_0^\\infty e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}", "\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}", "\\left( \\frac{1}{2} \\right)^n", "x_{i}^{j} + \\alpha\\beta"] {
+            let b = boxed(tex, 24.0);
+            assert!(b.w.is_finite() && b.w > 10.0, "{tex}: w = {}", b.w);
+            assert!(b.asc.is_finite() && b.desc.is_finite() && b.height() > 10.0, "{tex}");
+            // texts that share a baseline are laid out left to right without overlapping (advance widths from the font)
+            let mut row: Vec<(f32, f32, f32, f32)> = b
+                .items
+                .iter()
+                .filter_map(|it| match it {
+                    Item::Text { x, y, s, size, face } if !face.mono => Some((*y, *x, *x + s.chars().filter_map(gm).map(|g| g.adv * size).sum::<f32>(), *size)),
+                    _ => None,
+                })
+                .collect();
+            row.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.partial_cmp(&b.1).unwrap()));
+            for p in row.windows(2) {
+                if (p[0].0 - p[1].0).abs() < 0.01 && (p[0].3 - p[1].3).abs() < 0.01 {
+                    assert!(p[0].2 <= p[1].1 + 0.6, "{tex}: overlap {:?}", p);
+                }
+            }
         }
     }
 }

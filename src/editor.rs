@@ -81,6 +81,10 @@ pub struct EditorState {
     /// A `[[Page title]]` that was clicked: the app opens the page (and creates it when it does not exist yet).
     pub wiki: Option<String>,
     pub scroll_to: Option<u64>,
+    /// Outline rail (see `outline.rs`): headings of the page + the one in view, refreshed every frame by `blocks`.
+    pub rail: Option<crate::outline::RailData>,
+    /// The heading currently in view (highlighted in table-of-contents blocks).
+    pub active_head: Option<u64>,
     pub scale: f32,
     pub db: DbState,
     /// Database UI state of every linked-view block on the page (block id → state).
@@ -766,6 +770,7 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
         }
     }
     ui.add_space(80.0);
+    crate::outline::show(ui, ed, pal);
     {
         let Workspace { pages, next_id, .. } = &mut *ws;
         changed |= popups(ui, &mut pages[idx], next_id, ed, pal);
@@ -1019,6 +1024,12 @@ fn blocks(ui: &mut Ui, page: &mut Page, ws: &mut Workspace, ed: &mut EditorState
     let mut cx = Pass { ws, ed, pal, links, heads, visible, rects: Vec::with_capacity(n), col_rects: vec![], nums: [0; 8], act: None, changed: false, pointer };
     draw_range(ui, page, &mut cx, 0, n, 0, w);
     let Pass { ws, ed, rects, col_rects, mut act, mut changed, .. } = cx;
+    {
+        // outline rail + "current heading" of the table-of-contents blocks
+        let o = crate::outline::collect(&page.blocks, &rects, ui.clip_rect());
+        ed.active_head = o.as_ref().and_then(|o| o.items.get(o.active).map(|h| h.0));
+        ed.rail = o;
+    }
 
     // drag & drop reorder (children travel with their parent; blocks can be dropped into any column)
     if let Some(did) = ed.dragging {
@@ -1243,7 +1254,8 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
             ui.painter().set(bg_slot, Shape::rect_filled(r, 4.0, tag_color(bgc as usize - 1).gamma_multiply(0.16)));
         }
         if cx.ed.scroll_to == Some(bid) {
-            ui.scroll_to_rect(rect, Some(Align::TOP));
+            // leave a little air above the heading (Notion lands a heading ~ 1 line below the top edge)
+            ui.scroll_to_rect(Rect::from_min_max(pos2(rect.left(), rect.top() - 20.0), rect.right_bottom()), Some(Align::TOP));
             cx.ed.scroll_to = None;
         }
 
@@ -2256,11 +2268,12 @@ fn draw_block(
             let ctx = ui.ctx().clone();
             let tid = Id::new(("blk", b.id));
             let editing = ctx.memory(|m| m.has_focus(tid)) || ed.focus.map_or(false, |(f, _)| f == b.id) || ed.restore_sel.map_or(false, |r| r.0 == b.id) || b.text.trim().is_empty();
-            let fr = Frame::new().fill(pal.code_bg).stroke(Stroke::new(1.0_f32, if editing { with_alpha(pal.accent, 0.6) } else { pal.border })).corner_radius(CornerRadius::same(6)).inner_margin(Margin::symmetric(16, 12)).show(ui, |ui| {
+            // Notion style: a typeset equation sits directly on the page (no box, no border); the shaded editing surface only exists while the source is being edited
+            let fr = Frame::new().fill(if editing { pal.code_bg } else { Color32::TRANSPARENT }).stroke(Stroke::NONE).corner_radius(CornerRadius::same(6)).inner_margin(Margin::symmetric(16, 12)).show(ui, |ui| {
                 let avail = w - 32.0;
                 ui.set_width(avail);
                 // typeset preview, scaled down when the formula is wider than the page
-                let mut size = 22.0 * s;
+                let mut size = 24.0 * s;
                 let mut mb = ui.fonts(|f| crate::math::typeset(f, &b.text, size, true));
                 if mb.w > avail && mb.w > 0.0 {
                     size = (size * avail / mb.w).max(10.0);
@@ -2288,26 +2301,132 @@ fn draw_block(
             ui.painter().line_segment([pos2(r.left(), r.center().y), pos2(r.right(), r.center().y)], Stroke::new(1.0_f32, pal.border.gamma_multiply(1.4)));
         }
         BlockKind::Toc => {
-            ui.add_space(4.0);
+            // Collapsed headings are stored in the block text as "id,id,…" (saved with the page, undoable, per table-of-contents block).
+            let mut collapsed: Vec<u64> = b.text.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            let before = collapsed.clone();
+            let tint = if b.color > 0 { Some(tag_color(b.color as usize - 1)) } else { None };
+            let touchy = crate::touch::touchy();
+            let row_h = if touchy { 32.0 } else { 26.0 } * s.max(0.8);
+            let pick_id = Id::new(("toc_pick", b.id));
+            let mut picking: bool = ui.ctx().data(|d| d.get_temp(pick_id)).unwrap_or(false);
+            let has_kids: Vec<bool> = (0..heads.len()).map(|i| heads.get(i + 1).map_or(false, |nx| nx.1 > heads[i].1)).collect();
+            ui.add_space(2.0);
+            // header: title + tools (collapse all / expand all / colour) — tools show on hover, always on touch screens
+            let (hr, hresp) = ui.allocate_exact_size(vec2(w, 24.0 * s.max(0.8)), Sense::hover());
+            let hov = ui.rect_contains_pointer(hr.expand2(vec2(0.0, 4.0)));
+            ui.painter().text(pos2(hr.left() + 2.0, hr.center().y), Align2::LEFT_CENTER, "Table of contents", bold(12.5 * s.max(0.8)), with_alpha(pal.muted, 0.9));
+            let _ = hresp;
+            if !heads.is_empty() && (crate::touch::reveal(hov) || picking) {
+                let mut x = hr.right() - 4.0;
+                let tools: [(&str, &str); 3] = [(l::PALETTE, "Text colour"), (l::CHEVRONS_UP_DOWN, "Expand all"), (l::LIST_TREE, "Collapse all")];
+                for (gl, tip) in tools {
+                    let br = Rect::from_center_size(pos2(x - 13.0, hr.center().y), vec2(26.0, 24.0));
+                    let resp = ui.interact(br, Id::new(("toc_tool", b.id, tip)), Sense::click());
+                    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+                    ui.painter().rect_filled(br, 5.0, with_alpha(pal.hover, t));
+                    icons::glyph(ui.painter(), br.center(), 14.0, gl, if resp.hovered() || (tip == "Text colour" && picking) { pal.text } else { pal.muted });
+                    if resp.on_hover_text(tip).on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                        match tip {
+                            "Text colour" => picking = !picking,
+                            "Expand all" => collapsed.clear(),
+                            _ => collapsed = heads.iter().enumerate().filter(|(i, _)| has_kids[*i]).map(|(_, h)| h.0).collect(),
+                        }
+                    }
+                    x -= 28.0;
+                }
+            }
+            if picking {
+                // colour row: default + the nine label colours
+                let (pr, _) = ui.allocate_exact_size(vec2(w, 30.0), Sense::hover());
+                let mut x = pr.left() + 8.0;
+                for ci in 0..=9u8 {
+                    let c = if ci == 0 { pal.muted } else { tag_color(ci as usize - 1) };
+                    let cr = Rect::from_center_size(pos2(x + 10.0, pr.center().y), vec2(24.0, 24.0));
+                    let resp = ui.interact(cr, Id::new(("toc_col", b.id, ci)), Sense::click());
+                    let sel = b.color == ci;
+                    let grow = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || sel, 0.1);
+                    ui.painter().circle_filled(cr.center(), 7.0 + 1.5 * grow, c);
+                    if sel {
+                        ui.painter().circle_stroke(cr.center(), 10.5, Stroke::new(1.5_f32, pal.text));
+                    }
+                    if resp.on_hover_text(if ci == 0 { "Default" } else { TAG_NAMES[ci as usize - 1] }).on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                        b.color = ci;
+                        changed = true;
+                    }
+                    x += 28.0;
+                }
+            }
             if heads.is_empty() {
                 ui.label(RichText::new("Add headings to your page and they will appear here.").color(pal.muted).font(body(14.0 * s)));
             }
-            for (hid, lvl, text) in heads {
-                let (r, resp) = ui.allocate_exact_size(vec2(w, 24.0 * s), Sense::click());
-                let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-                let x = r.left() + (*lvl as f32 - 1.0) * 18.0;
-                let label = if text.trim().is_empty() { "Untitled" } else { text.trim() };
-                let col = lerp_color(pal.muted, pal.text, t);
-                let gal = ui.painter().layout_no_wrap(label.to_owned(), body(14.5 * s), col);
-                let wd = gal.size().x;
-                ui.painter().galley(pos2(x, r.center().y - gal.size().y / 2.0), gal, col);
-                if t > 0.01 {
-                    ui.painter().line_segment([pos2(x, r.center().y + 9.0), pos2(x + wd, r.center().y + 9.0)], Stroke::new(1.0_f32, with_alpha(col, t)));
+            let min_lvl = heads.iter().map(|h| h.1).min().unwrap_or(1);
+            let mut hide_below: Option<u8> = None;
+            for (i, (hid, lvl, text)) in heads.iter().enumerate() {
+                if let Some(hl) = hide_below {
+                    if *lvl > hl {
+                        continue;
+                    }
+                    hide_below = None;
                 }
-                if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                    ed.scroll_to = Some(*hid);
+                let kids = has_kids[i];
+                let is_closed = kids && collapsed.contains(hid);
+                if is_closed {
+                    hide_below = Some(*lvl);
+                }
+                let (r, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
+                let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+                let x = r.left() + (*lvl - min_lvl) as f32 * 20.0 * s.max(0.8);
+                // toggle (only for headings that have sub-headings): its own hit area, rotates smoothly
+                let tr = Rect::from_min_size(pos2(x - 2.0, r.top()), vec2(if touchy { 30.0 } else { 22.0 }, row_h));
+                let mut toggled = false;
+                if kids {
+                    let tresp = ui.interact(tr, Id::new(("toc_tog", b.id, *hid)), Sense::click());
+                    let th = ui.ctx().animate_bool_with_time(tresp.id.with("a"), !is_closed, 0.14);
+                    if tresp.hovered() {
+                        ui.painter().rect_filled(Rect::from_center_size(tr.center(), vec2(20.0, 20.0)), 5.0, pal.hover);
+                    }
+                    icons::chevron(ui.painter(), tr.center(), 11.0, th * std::f32::consts::FRAC_PI_2, if tresp.hovered() { pal.text } else { pal.muted });
+                    if tresp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                        toggled = true;
+                        if is_closed {
+                            collapsed.retain(|k| k != hid);
+                        } else {
+                            collapsed.push(*hid);
+                        }
+                    }
+                }
+                let tx = x + if touchy { 30.0 } else { 22.0 };
+                let label = if text.trim().is_empty() { "Untitled" } else { text.trim() };
+                let current = ed.active_head == Some(*hid);
+                let rest = tint.unwrap_or(pal.muted);
+                let hot = tint.map_or(pal.text, |c| lerp_color(c, pal.text, 0.35));
+                let col = if current { tint.unwrap_or(pal.accent) } else { lerp_color(rest, hot, t) };
+                let font = if current { bold(14.5 * s) } else { body(14.5 * s) };
+                let avail = (r.right() - tx - if is_closed { 34.0 } else { 4.0 }).max(40.0);
+                let wd = crate::widgets::text_fit(ui.painter(), pos2(tx, r.center().y), Align2::LEFT_CENTER, label, font, col, avail);
+                if t > 0.01 {
+                    ui.painter().line_segment([pos2(tx, r.center().y + 9.0 * s.max(0.8)), pos2(tx + wd, r.center().y + 9.0 * s.max(0.8))], Stroke::new(1.0_f32, with_alpha(col, t)));
+                }
+                if is_closed {
+                    let n_hidden = heads[i + 1..].iter().take_while(|h| h.1 > *lvl).count();
+                    ui.painter().text(pos2(tx + wd + 8.0, r.center().y), Align2::LEFT_CENTER, format!("+{n_hidden}"), body(11.5 * s.max(0.8)), with_alpha(pal.muted, 0.8));
+                }
+                if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() && !toggled {
+                    // a click on the toggle never jumps
+                    if ui.input(|i| i.pointer.interact_pos()).map_or(true, |p| !(kids && tr.contains(p))) {
+                        ed.scroll_to = Some(*hid);
+                    }
                 }
             }
+            if collapsed != before {
+                // drop ids of headings that no longer exist, then save
+                collapsed.retain(|k| heads.iter().any(|h| h.0 == *k));
+                collapsed.sort_unstable();
+                collapsed.dedup();
+                b.text = collapsed.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(",");
+                changed = true;
+            }
+            ui.ctx().data_mut(|d| d.insert_temp(pick_id, picking));
             ui.add_space(4.0);
         }
         // laid out by `draw_range` / `draw_columns` / `draw_dbview`, never by this function

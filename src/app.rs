@@ -2574,9 +2574,11 @@ impl LumenApp {
         if !self.focus_mode {
             // Short screens (a phone in landscape, or a portrait phone with the keyboard up) get a slimmer bar so the page keeps its room.
             let bar_h = if crate::touch::touchy() && ctx.screen_rect().height() < 440.0 { 40.0 } else { 46.0 };
+            // Seamless like Notion: same surface as the page, no separator line (egui draws one by default)
             egui::TopBottomPanel::top("topbar")
                 .exact_height(bar_h)
-                .frame(Frame::new().fill(pal.bg))
+                .show_separator_line(false)
+                .frame(Frame::new().fill(pal.bg).stroke(Stroke::NONE))
                 .show(ctx, |ui| {
                     frozen_layout(ui, frozen_w, |ui| {
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| self.topbar(ui, &pal));

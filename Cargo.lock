@@ -2663,7 +2663,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "lumen"
-version = "13.0.0"
+version = "13.1.0"
 dependencies = [
  "android-activity",
  "android_logger",
@@ -2683,6 +2683,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "ttf-parser",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
