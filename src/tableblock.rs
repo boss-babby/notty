@@ -32,12 +32,24 @@ fn btn(ui: &mut Ui, pal: &Palette, id: Id, label: &str, on: bool, alpha: f32) ->
     let font = body(12.5);
     let gw = ui.painter().layout_no_wrap(label.to_owned(), font.clone(), pal.text).size().x;
     let (rect, _) = ui.allocate_exact_size(vec2(gw + 16.0, 24.0), Sense::hover());
-    let resp = ui.interact(rect, id, Sense::click());
-    let h = ui.ctx().animate_bool_with_time(id.with("h"), resp.hovered(), 0.1);
-    let fill = if on { with_alpha(pal.accent, 0.16) } else { with_alpha(pal.hover, h) };
-    ui.painter().rect_filled(rect, 6.0, fill);
+    // While the toolbar is faded out (pointer away / no cell selected) the buttons are completely inert and invisible:
+    // no background, no hover, no click, no cursor. (Previously the "on" buttons kept their accent fill at alpha 0.)
+    if alpha < 0.02 {
+        return false;
+    }
+    let live = alpha > 0.4;
+    let resp = ui.interact(rect, id, if live { Sense::click() } else { Sense::hover() });
+    let h = ui.ctx().animate_bool_with_time(id.with("h"), resp.hovered() && live, 0.1);
+    let fill = if on { with_alpha(pal.accent, 0.16 * alpha) } else { with_alpha(pal.hover, h * alpha) };
+    if fill.a() > 0 {
+        ui.painter().rect_filled(rect, 6.0, fill);
+    }
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, font, with_alpha(if on { pal.accent } else { pal.muted.lerp_to_gamma(pal.text, 0.4 + 0.6 * h) }, alpha));
-    resp.on_hover_cursor(CursorIcon::PointingHand).clicked() && alpha > 0.4
+    if live {
+        resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
+    } else {
+        false
+    }
 }
 
 /// Draws the table; returns true when the block changed.

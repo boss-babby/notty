@@ -1,42 +1,41 @@
-# Lumen 11.1 — AI-agent UI fixes, `[[page]]` chips, big-data performance, memory
+# Lumen 13.0 — math, universal text menus, file import, multi-block menu
 
-## AI agent UI
+## 1. Table block: ghost buttons fixed (`src/tableblock.rs`)
+The toolbar below a table (`+ Row`, `Header row ✓`, `Convert to database` …) fades out when the pointer is away and no cell is selected.
+The two *highlighted* buttons ("on" state: `Header row ✓`, `Convert to database`) painted their accent background **without** the fade alpha,
+so two blue pills stayed visible under every table. `btn()` now multiplies every fill by the alpha, returns early when the toolbar is
+invisible, and is inert (no hover, no click, no cursor) until it is mostly visible.
 
-* **Crash fixed** (`src/aiui.rs::dropdown`): closing / choosing an entry of *any* drop-down (chat history, model, behaviour/“What may
-  Lumen AI do?”, compact mode, provider, MCP access) called `ctx.input()` *inside* `ctx.data_mut()`. egui's context lock is not re-entrant, so
-  the app deadlocked / panicked at that moment. The clock is now read before the data lock is taken. A whole-source scan found no other
-  nested `Context` access of that kind.
-* The chat panel also no longer indexes `threads[cur]` blindly (e.g. after “Delete all chats”).
-* **Mobile layering fixed**: the full-screen chat sheet lives on `Order::Foreground`, drop-downs were on `Order::Middle` → they opened *behind*
-  the sheet (chat and settings). Drop-downs of the AI UI now use `widgets::popup_area_on(.., Order::Tooltip, ..)`, the topmost layer.
+## 2. LaTeX / math (`src/math.rs`, new)
+* **Equation block** (`BlockKind::Equation`, `/equation`, or typing `$$ ` at the start of a block): live 2-D typeset preview + TeX source field
+  while focused. Wide formulas are scaled down to fit the page (phones).
+* **Inline** `$…$` in any text block or table cell is shown typeset in Unicode (`x^2` → `x²`, `\alpha` → `α`, `\sqrt{x}` → `√x`,
+  `\frac{a}{b}` → `a⁄b`); the stored text is never changed. Pandoc rules: `costs $5 and $10` stays text, `\$` is a literal dollar.
+* **Engine**: tokenizer → parser → box layout → painter. Supports fractions (`\frac \dfrac \binom`), roots (`\sqrt[n]{}`), sub/superscripts, big operators with
+  limits (`\sum \prod \int \oint \bigcup \lim \max …`), stretchy `\left … \right` delimiters, `matrix / pmatrix / bmatrix / vmatrix / cases / aligned / array`,
+  accents (`\hat \bar \vec \tilde \dot \overline \underline \underbrace`), `\text`, `\mathrm \mathbf \mathbb \mathcal \mathtt`, Greek, ~150 symbols, spacing commands.
+* **Markdown**: `$$ … $$` (one or several lines) imports as Equation blocks and exports back (also in clipboard copy and print/PDF).
+* Shortcut `Ctrl+Shift+M` wraps the selection in `$…$` (again to unwrap).
 
-## `[[Page]]` links (editor)
+## 3. Formatting shortcuts everywhere
+* Page blocks: unchanged + `Ctrl+Shift+M`.
+* **Every multi-line text field** (table cells, notes, prompts, descriptions, import box …): `Ctrl+B` bold, `Ctrl+I` italic, `Ctrl+U` underline, `Ctrl+E` code,
+  `Ctrl+Shift+S` strikethrough, `Ctrl+Shift+H` highlight, `Ctrl+Shift+M` math — implemented once inside the vendored egui `TextEdit`
+  (`vendor/egui/src/widgets/text_edit/builder.rs`, "Lumen patch"); pressing again removes the markers. Code / equation sources opt out.
+* **Block selection**: the same shortcuts format *all* selected blocks.
 
-* A wiki link is rendered like a Notion page mention: a rounded, hoverable pill with a page icon and the page title; the brackets (and the
-  `Target|` part of `[[Target|label]]`) are hidden. Hover highlights the pill, click opens the page. No more blue underlined hyperlink.
-* While the caret is *inside* a link it turns into raw, editable text (`[[Title]]`); move away and it becomes a pill again.
-* Typing `[[` opens a drop-down under the caret with matching pages (prefix matches first, “Create “…”” for new titles).
-  ↑/↓ select, Enter/Tab insert, Esc dismisses, tap/click works on phones. The stored text stays `[[Title]]` (graph, search, AI unchanged).
-* Code: `rich.rs` (`job_ex`, `wiki_chips`, `wiki_chip_shapes`), `editor.rs` (`wiki_trigger`, `wiki_sugs`, `insert_wiki`).
+## 4. Right-click / long-press menu in every text input
+All text fields register themselves (vendored egui patch) → `widgets::universal_text_menu` opens **Undo · Redo · Cut · Copy · Paste · Select all**
+(+ formatting entries in multi-line fields) on right-click, or on a long press on touch screens. Commands are executed by feeding the field the
+standard egui events, so they behave exactly like the keyboard. Fields with their own richer menu (page blocks, titles, database cells) keep it.
 
-## Performance with thousands of rows / live streams
+## 5. Import from files
+The Import dialog (new page / database) has **Markdown / text file…**, **CSV / TSV file…** and **Backup (.json)…** buttons using the native dialog
+(Windows), the browser file picker (web) or the Storage Access Framework (Android), in addition to paste and drag & drop.
 
-| Hot spot | Before | Now |
-|---|---|---|
-| `Workspace::page(id)` | linear scan → every row loop O(rows²) | validated id→index map, O(1) |
-| `Workspace::query` (filters + sorts) | recomputed every frame | memoised by a fingerprint of view + rows (not used for formula/rollup/relation) |
-| relation titles (`database::load_titles`) | cloned every title every frame | rebuilt only when a title changes |
-| table / list view | built every row every frame | virtualised: only visible rows are built |
-| dashboards | O(rows²) filters per widget per frame | O(rows) on top of the cached query |
-
-## Memory (Windows)
-
-Most of the ~150 MB seen in Task Manager at start-up is *not* Rust heap: it is the OpenGL driver, the font atlas, the embedded fonts being
-paged in and start-up allocations that are never touched again. `main.rs` trims the working set 4 s, 20 s and 90 s after start
-(`SetProcessWorkingSetSize`), so Task Manager shows what is really needed; pages fault back on demand. The release profile no longer
-keeps debug info.
+## 6. Multi-block context menu
+Right-click or long-press on a block that belongs to a selection → one menu for the whole selection: copy / cut / duplicate / turn into / colour /
+bold · italic · underline · strikethrough · code · highlight / indent / outdent / move / undo / clear / delete.
 
 ## Build outputs
-
-`build-web.sh` → `public/webapp` (WebAssembly, served at `/app`), `build-windows.sh` → `public/downloads/Lumen-windows-x64.exe|zip`,
-`build-android.sh` → `public/downloads/Lumen-android-arm64.apk`. Font/icon assets that are not in git are fetched by `tools/fetch-assets.sh`.
+`./build-all.sh` → `../public/webapp` (WebAssembly), `../public/downloads/Lumen-android-arm64.apk`, `Lumen-windows-x64.exe|zip`, `SHA256SUMS.txt`.

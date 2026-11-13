@@ -347,6 +347,7 @@ pub fn page_html(ws: &Workspace, media: &MediaStore, id: u64, auto_print: bool) 
             BlockKind::Quote => o.push_str(&format!("<blockquote style=\"{pad}{st}\">{tx}</blockquote>")),
             BlockKind::Callout => o.push_str(&format!("<div class=\"callout\" style=\"{pad}{st}\"><span>💡</span><span>{tx}</span></div>")),
             BlockKind::Code => o.push_str(&format!("<pre style=\"{pad}\">{}</pre>", esc(&b.text))),
+            BlockKind::Equation => o.push_str(&format!("<p style=\"{pad};text-align:center;font-size:1.15em;font-style:italic\">{}</p>", esc(&crate::math::to_unicode(&b.text)))),
             BlockKind::Divider => o.push_str("<hr>"),
             BlockKind::Toc => {
                 o.push_str("<div class=\"toc\" style=\"margin:.6em 0\">");

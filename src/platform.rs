@@ -147,6 +147,8 @@ pub fn haptic(ctx: &egui::Context, ms: u32) {
 /// Where a picked file goes once the (asynchronous) dialog returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PickTarget {
+    /// Import dialog: a Markdown / text file (`mode` 0 → page), a CSV / TSV file (1 → database) or a JSON backup (2).
+    ImportFile { mode: u8 },
     BlockImage { page: u64, block: u64 },
     BlockFile { page: u64, block: u64 },
     Cover { page: u64 },
@@ -188,6 +190,13 @@ pub fn pick_file(ctx: &egui::Context, target: PickTarget, images_only: bool) {
             if images_only {
                 d = d.add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
             }
+            if let PickTarget::ImportFile { mode } = target {
+                d = match mode {
+                    0 => d.add_filter("Markdown / text", &["md", "markdown", "txt"]),
+                    1 => d.add_filter("CSV / TSV", &["csv", "tsv", "txt"]),
+                    _ => d.add_filter("Lumen backup", &["json"]),
+                };
+            }
             if let Some(path) = d.pick_file() {
                 if let Ok(bytes) = std::fs::read(&path) {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_owned();
@@ -204,6 +213,13 @@ pub fn pick_file(ctx: &egui::Context, target: PickTarget, images_only: bool) {
             let mut d = rfd::AsyncFileDialog::new();
             if images_only {
                 d = d.add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
+            }
+            if let PickTarget::ImportFile { mode } = target {
+                d = match mode {
+                    0 => d.add_filter("Markdown / text", &["md", "markdown", "txt"]),
+                    1 => d.add_filter("CSV / TSV", &["csv", "tsv", "txt"]),
+                    _ => d.add_filter("Lumen backup", &["json"]),
+                };
             }
             if let Some(h) = d.pick_file().await {
                 let bytes = h.read().await;

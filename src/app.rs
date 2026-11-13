@@ -293,10 +293,12 @@ impl LumenApp {
                 let size = self.media.get(id).map(|i| i.size).unwrap_or(size_hint);
                 self.ed.media_sizes.insert(id, size);
                 let page = match target {
+                    PickTarget::ImportFile { .. } => return,
                     PickTarget::BlockImage { page, .. } | PickTarget::BlockFile { page, .. } | PickTarget::Cover { page } | PickTarget::Icon { page } | PickTarget::CanvasImage { page, .. } => page,
                 };
                 if let Some(p) = self.ws.page_mut(page) {
                     match target {
+                        PickTarget::ImportFile { .. } => {}
                         PickTarget::BlockImage { block, .. } => {
                             if let Some(b) = p.blocks.iter_mut().find(|b| b.id == block) {
                                 b.kind = BlockKind::Image;
@@ -388,6 +390,10 @@ impl LumenApp {
             }
         }
         for pk in platform::take_picked() {
+            if let PickTarget::ImportFile { mode } = pk.target {
+                self.import_file(mode, &pk.name, &pk.bytes);
+                continue;
+            }
             self.set_media(ctx, pk.target, &pk.name, pk.bytes);
         }
         if let Some((id, name)) = self.ed.dl_req.take() {
@@ -484,6 +490,34 @@ impl LumenApp {
                 self.toast(msg, None);
             }
             Err(_) => self.toast("Could not create backup", None),
+        }
+    }
+
+    /// A file chosen with the import dialog's "Choose file" buttons (Markdown → page, CSV → database, JSON backup).
+    fn import_file(&mut self, mode: u8, file_name: &str, bytes: &[u8]) {
+        let text = String::from_utf8_lossy(bytes).trim_start_matches('\u{feff}').to_string();
+        let stem = file_name.rsplit_once('.').map(|x| x.0.to_owned()).unwrap_or_else(|| file_name.to_owned());
+        let typed = self.import.as_ref().map(|d| d.name.trim().to_owned()).unwrap_or_default();
+        let name = if typed.is_empty() { stem } else { typed };
+        if text.trim().is_empty() {
+            self.toast("That file is empty", None);
+            return;
+        }
+        match mode {
+            2 => match serde_json::from_str::<Workspace>(&text) {
+                Ok(mut w) => {
+                    w.migrate();
+                    self.ws = w;
+                    self.auto_rt.resync(&self.ws);
+                    self.import = None;
+                    self.toast("Workspace restored from backup", None);
+                }
+                Err(_) => self.toast("That isn't a valid Lumen backup", None),
+            },
+            m => {
+                self.import = None;
+                self.import_text(&name, &text, m == 1);
+            }
         }
     }
 
@@ -1804,7 +1838,7 @@ impl LumenApp {
             });
             ui.horizontal(|ui| {
                 ui.add_space(10.0);
-                ui.label(RichText::new("Paste Markdown, CSV or a Lumen backup — or just drop a file onto the window.").font(body(13.5)).color(pal.muted));
+                ui.label(RichText::new("Paste Markdown, CSV or a Lumen backup, choose a file from your device — or drop a file onto the window.").font(body(13.5)).color(pal.muted));
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -1821,6 +1855,23 @@ impl LumenApp {
                 });
             });
             ui.add_space(10.0);
+            if platform::can_pick_files() {
+                // choose a file from the device instead of pasting
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Or choose a file:").font(body(13.5)).color(pal.muted));
+                    if crate::widgets::ghost_button(ui, pal, "Markdown / text file…").clicked() {
+                        platform::pick_file(ui.ctx(), PickTarget::ImportFile { mode: 0 }, false);
+                    }
+                    if crate::widgets::ghost_button(ui, pal, "CSV / TSV file…").clicked() {
+                        platform::pick_file(ui.ctx(), PickTarget::ImportFile { mode: 1 }, false);
+                    }
+                    if crate::widgets::ghost_button(ui, pal, "Backup (.json)…").clicked() {
+                        platform::pick_file(ui.ctx(), PickTarget::ImportFile { mode: 2 }, false);
+                    }
+                });
+                ui.add_space(8.0);
+            }
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
                 if primary_button(ui, pal, "Markdown → page", 190.0).clicked() {
@@ -2156,6 +2207,12 @@ impl eframe::App for LumenApp {
         self.frame(ctx);
         self.sync_embeds(frame);
         crate::touch::paint_hold(ctx);
+        {
+            let target = if self.locked || self.ws.dark { 1.0 } else { 0.0 };
+            let t = ctx.animate_value_with_time(Id::new("theme_t"), target, 0.35);
+            let pal = theme::with_accent(Palette::mix(t), self.ws.accent, t);
+            crate::widgets::universal_text_menu(ctx, &pal);
+        }
         crate::widgets::end_frame(ctx);
         #[cfg(target_os = "android")]
         crate::android::after_frame(ctx, self.ws.dark || self.locked);

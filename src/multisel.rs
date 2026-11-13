@@ -39,6 +39,8 @@ pub enum Op {
     Del,
     Copy,
     Cut,
+    /// Toggle an inline format (`**`, `*`, `__`, `~~`, `` ` ``, `==`) on the whole text of every selected block.
+    Fmt(&'static str),
 }
 
 fn md_line(b: &Block) -> String {
@@ -53,6 +55,7 @@ fn md_line(b: &Block) -> String {
         BlockKind::Quote => format!("{pad}> {}", b.text),
         BlockKind::Callout => format!("{pad}> 💡 {}", b.text),
         BlockKind::Code => format!("{pad}```\n{}\n{pad}```", b.text),
+        BlockKind::Equation => format!("{pad}$$\n{}\n{pad}$$", b.text),
         BlockKind::Divider => format!("{pad}---"),
         BlockKind::Image => format!("{pad}![{}]({})", b.text, b.src()),
         BlockKind::Embed | BlockKind::Bookmark | BlockKind::File => format!("{pad}[{}]({})", if b.text.is_empty() { &b.url } else { &b.text }, b.url),
@@ -143,9 +146,87 @@ pub fn apply_op(ctx: &Context, page: &mut Page, next_id: &mut u64, ed: &mut Edit
             }
             ed.sel.clear();
         }
+        Op::Fmt(mark) => {
+            let flag = crate::rich::flag_for(mark);
+            let mut rts: Vec<(usize, crate::rich::Rich)> = vec![];
+            for &i in &idxs {
+                let b = &page.blocks[i];
+                if b.kind.has_text() && !b.kind.raw() && !b.text.is_empty() {
+                    rts.push((i, crate::rich::Rich::parse(&b.text)));
+                }
+            }
+            // every block already has it → remove it everywhere; otherwise add it where it is missing
+            let all = rts.iter().all(|(_, r)| r.len() == 0 || r.all_have(0, r.len(), flag));
+            for (i, mut r) in rts {
+                let n = r.len();
+                if n > 0 && (all || !r.all_have(0, n, flag)) {
+                    r.toggle(0, n, flag);
+                    page.blocks[i].text = r.markup();
+                }
+            }
+        }
         Op::Copy => {}
     }
     true
+}
+
+/// Right-click / long-press menu for a block selection: every entry acts on *all* selected blocks.
+pub fn menu(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState, pal: &Palette, pos: Pos2) -> bool {
+    use crate::widgets::CtxItem;
+    let ctx = ui.ctx().clone();
+    let n = page.blocks.iter().filter(|b| ed.sel.contains(&b.id)).count();
+    if n == 0 {
+        ed.menu = None;
+        return false;
+    }
+    let first = page.blocks.iter().position(|b| ed.sel.contains(&b.id)).unwrap_or(0);
+    let texty = page.blocks.iter().any(|b| ed.sel.contains(&b.id) && b.kind.has_text() && !b.kind.raw());
+    #[derive(Clone, Copy)]
+    enum Cmd {
+        Op(Op),
+        Turn,
+        Colour,
+        Clear,
+        Undo,
+    }
+    let mut list: Vec<(CtxItem, Cmd)> = vec![
+        (CtxItem::new(l::COPY, if n == 1 { "Copy block" } else { "Copy blocks" }).hint("Ctrl+C"), Cmd::Op(Op::Copy)),
+        (CtxItem::new(l::SCISSORS, if n == 1 { "Cut block" } else { "Cut blocks" }).hint("Ctrl+X"), Cmd::Op(Op::Cut)),
+        (CtxItem::new(l::COPY_PLUS, "Duplicate").hint("Ctrl+D"), Cmd::Op(Op::Dup)),
+        (CtxItem::new(l::REPLACE, "Turn into…").sep(), Cmd::Turn),
+        (CtxItem::new(l::PALETTE, "Colour & background…"), Cmd::Colour),
+    ];
+    if texty {
+        list.push((CtxItem::new(l::BOLD, "Bold").hint("Ctrl+B").sep(), Cmd::Op(Op::Fmt("**"))));
+        list.push((CtxItem::new(l::ITALIC, "Italic").hint("Ctrl+I"), Cmd::Op(Op::Fmt("*"))));
+        list.push((CtxItem::new(l::UNDERLINE, "Underline").hint("Ctrl+U"), Cmd::Op(Op::Fmt("__"))));
+        list.push((CtxItem::new(l::STRIKETHROUGH, "Strikethrough").hint("Ctrl+Shift+S"), Cmd::Op(Op::Fmt("~~"))));
+        list.push((CtxItem::new(l::CODE, "Inline code").hint("Ctrl+E"), Cmd::Op(Op::Fmt("`"))));
+        list.push((CtxItem::new(l::HIGHLIGHTER, "Highlight").hint("Ctrl+Shift+H"), Cmd::Op(Op::Fmt("=="))));
+    }
+    list.push((CtxItem::new(l::INDENT_INCREASE, "Indent").hint("Tab").sep().enabled(first > 0), Cmd::Op(Op::Indent(1))));
+    list.push((CtxItem::new(l::INDENT_DECREASE, "Outdent").hint("Shift+Tab"), Cmd::Op(Op::Indent(-1))));
+    list.push((CtxItem::new(l::ARROW_UP, "Move up"), Cmd::Op(Op::Up)));
+    list.push((CtxItem::new(l::ARROW_DOWN, "Move down"), Cmd::Op(Op::Down)));
+    list.push((CtxItem::new(l::UNDO_2, "Undo").hint("Ctrl+Z").enabled(ed.undo.iter().any(|(p, _)| *p == page.id)), Cmd::Undo));
+    list.push((CtxItem::new(l::X, "Clear selection").hint("Esc").sep(), Cmd::Clear));
+    list.push((CtxItem::new(l::TRASH_2, if n == 1 { "Delete block" } else { "Delete blocks" }).hint("Del").danger(), Cmd::Op(Op::Del)));
+    let items: Vec<CtxItem> = list.iter().map(|x| x.0).collect();
+    let (open, pick) = widgets::context_menu(&ctx, Id::new("ed_menu_multi"), pos, pal, &mut ed.menu_fresh, &items);
+    let mut changed = false;
+    if let Some(pi) = pick {
+        match list[pi].1 {
+            Cmd::Op(op) => changed |= apply_op(&ctx, page, next_id, ed, op),
+            Cmd::Turn => ed.sel_menu = 1,
+            Cmd::Colour => ed.sel_menu = 2,
+            Cmd::Clear => ed.sel.clear(),
+            Cmd::Undo => ed.want_undo = true,
+        }
+    }
+    if !open {
+        ed.menu = None;
+    }
+    changed
 }
 
 // ───────────────────────────── marquee + keyboard ─────────────────────────────
@@ -273,6 +354,22 @@ pub fn handle(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorSt
                 apply_op(&ctx, page, next_id, ed, Op::Copy);
             } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::D)) {
                 changed |= apply_op(&ctx, page, next_id, ed, Op::Dup);
+            } else {
+                // inline-format shortcuts act on every selected block
+                let marks: [(Modifiers, Key, &'static str); 6] = [
+                    (Modifiers::COMMAND | Modifiers::SHIFT, Key::S, "~~"),
+                    (Modifiers::COMMAND | Modifiers::SHIFT, Key::H, "=="),
+                    (Modifiers::COMMAND, Key::B, "**"),
+                    (Modifiers::COMMAND, Key::I, "*"),
+                    (Modifiers::COMMAND, Key::E, "`"),
+                    (Modifiers::COMMAND, Key::U, "__"),
+                ];
+                for (m, k, mark) in marks {
+                    if ctx.input_mut(|i| i.consume_key(m, k)) {
+                        changed |= apply_op(&ctx, page, next_id, ed, Op::Fmt(mark));
+                        break;
+                    }
+                }
             }
         } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::A)) {
             ed.sel = page.blocks.iter().map(|b| b.id).collect();

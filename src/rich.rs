@@ -309,6 +309,29 @@ impl Rich {
         Rich { plain: self.plain[ba..bb].to_owned(), fmts: self.fmts[a..b].to_vec(), links: self.links.clone() }
     }
 
+    /// Display copy where every `$…$` formula is replaced by its single-line Unicode rendering (`x^2` → `x²`, `\alpha` → `α`).
+    /// Used for the *unfocused* view of a block; the stored text is never changed.
+    pub fn with_math(&self) -> Rich {
+        if !self.plain.contains('$') {
+            return self.clone();
+        }
+        let spans = crate::math::inline_spans(&self.plain);
+        if spans.is_empty() {
+            return self.clone();
+        }
+        let mut out = Rich::default();
+        let mut at = 0;
+        for (a, b, tex, _) in spans {
+            out.append(&self.slice(at, a));
+            let u = crate::math::to_unicode(&tex);
+            let n = u.chars().count();
+            out.append(&Rich { plain: u, fmts: vec![Fmt { flags: ITALIC, link: 0 }; n], links: vec![] });
+            at = b;
+        }
+        out.append(&self.slice(at, self.len()));
+        out
+    }
+
     pub fn split(&self, at: usize) -> (Rich, Rich) {
         (self.slice(0, at), self.slice(at, self.len()))
     }

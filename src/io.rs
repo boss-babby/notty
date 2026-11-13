@@ -89,6 +89,7 @@ pub fn page_markdown(ws: &Workspace, id: u64) -> String {
             BlockKind::Quote => format!("{pad}> {}", cont(&b.text, "> ").replace('\n', "\n> ")),
             BlockKind::Callout => format!("{pad}> 💡 {}", b.text),
             BlockKind::Code => format!("{pad}```\n{}\n{pad}```", b.text),
+            BlockKind::Equation => format!("{pad}$$\n{}\n{pad}$$", b.text),
             BlockKind::Divider => format!("{pad}---"),
             BlockKind::Toc => String::new(),
             BlockKind::Image => format!("{pad}![{}]({})", b.text, if b.media != 0 { "(embedded image)".to_owned() } else { b.url.clone() }),
@@ -160,6 +161,9 @@ pub fn import_markdown(ws: &mut Workspace, name: &str, md: &str, parent: Option<
     let mut title = String::new();
     let mut in_code = false;
     let mut code = String::new();
+    // `$$ … $$` block equations (one line or several)
+    let mut in_math = false;
+    let mut math = String::new();
     let num_re = |s: &str| -> Option<usize> {
         let digits = s.chars().take_while(|c| c.is_ascii_digit()).count();
         if digits > 0 && s[digits..].starts_with(". ") {
@@ -182,6 +186,31 @@ pub fn import_markdown(ws: &mut Workspace, name: &str, md: &str, parent: Option<
             code.push_str(line);
             code.push('\n');
             continue;
+        }
+        if in_math {
+            if let Some(head) = line.trim_end().strip_suffix("$$") {
+                math.push_str(head);
+                blocks.push(ws.blk(BlockKind::Equation, math.trim(), 0));
+                math.clear();
+                in_math = false;
+            } else {
+                math.push_str(line);
+                math.push('\n');
+            }
+            continue;
+        }
+        {
+            let tl = line.trim();
+            if let Some(rest) = tl.strip_prefix("$$") {
+                if let Some(inner) = rest.strip_suffix("$$") {
+                    blocks.push(ws.blk(BlockKind::Equation, inner.trim(), 0));
+                } else {
+                    in_math = true;
+                    math.push_str(rest);
+                    math.push('\n');
+                }
+                continue;
+            }
         }
         if line.trim().is_empty() {
             continue;
@@ -220,6 +249,9 @@ pub fn import_markdown(ws: &mut Workspace, name: &str, md: &str, parent: Option<
     }
     if in_code && !code.is_empty() {
         blocks.push(ws.blk(BlockKind::Code, code.trim_end_matches('\n'), 0));
+    }
+    if in_math && !math.trim().is_empty() {
+        blocks.push(ws.blk(BlockKind::Equation, math.trim(), 0));
     }
     crate::mdtable::restore(&mut blocks, &tables);
     if blocks.is_empty() {

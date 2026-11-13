@@ -32,6 +32,7 @@ mod icons;
 mod io;
 mod lock;
 mod lucide;
+mod math;
 mod media;
 mod mediablocks;
 mod multisel;

@@ -24,7 +24,7 @@ use crate::rich::{self, Fmt, Rich};
 use crate::clip;
 use crate::platform;
 use crate::widgets::{
-    self, appear, context_menu, gradient_rect, menu_item, popup_area, replace_chars, reset_appear, right_clicked, section_label,
+    self, appear, context_menu, gradient_rect, menu_item, popup_area, replace_chars, reset_appear, right_clicked, right_clicked_any, section_label,
     slice_chars, with_alpha, CtxItem,
 };
 
@@ -193,6 +193,7 @@ fn slash_all() -> Vec<SlashItem> {
         .map(|k| SlashItem { act: Slash::Block(*k), label: k.label(), hint: k.hint(), glyph: k.glyph(), kw: k.keywords(), sec: "BASIC BLOCKS" })
         .collect();
     v.push(SlashItem { act: Slash::Block(BlockKind::Table), label: "Table", hint: "Simple table — paste Markdown tables, convert to a database.", glyph: l::TABLE, kw: "table grid rows columns markdown spreadsheet cells", sec: "BASIC BLOCKS" });
+    v.push(SlashItem { act: Slash::Block(BlockKind::Equation), label: "Equation", hint: "LaTeX math — $$ … $$ (inline: $x^2$).", glyph: l::SIGMA, kw: "equation math latex formula tex katex sigma integral fraction", sec: "BASIC BLOCKS" });
     v.push(SlashItem { act: Slash::Block(BlockKind::Divider), label: "Divider", hint: "Visually divide blocks.", glyph: l::MINUS, kw: "divider line hr separator", sec: "BASIC BLOCKS" });
     let med = "MEDIA";
     for (k, label, hint, glyph, kw) in [
@@ -278,7 +279,7 @@ fn byte_at(s: &str, chars: usize) -> usize {
 }
 
 fn md_shortcut(text: &str, cursor: usize) -> Option<(BlockKind, usize)> {
-    const RULES: [(&str, BlockKind); 11] = [
+    const RULES: [(&str, BlockKind); 12] = [
         ("### ", BlockKind::H3),
         ("## ", BlockKind::H2),
         ("# ", BlockKind::H1),
@@ -290,6 +291,7 @@ fn md_shortcut(text: &str, cursor: usize) -> Option<(BlockKind, usize)> {
         ("\" ", BlockKind::Quote),
         ("| ", BlockKind::Callout),
         ("```", BlockKind::Code),
+        ("$$", BlockKind::Equation),
     ];
     if text == "---" {
         return Some((BlockKind::Divider, 3));
@@ -478,6 +480,28 @@ fn has_marks(s: &str) -> bool {
 
 pub fn rich_job(text: &str, font: &FontId, color: Color32, pal: &Palette, strip: bool) -> LayoutJob {
     let mut job = LayoutJob::default();
+    let math_text;
+    let text = if strip && text.contains('$') {
+        // inline `$…$` formulas of table cells: single-line Unicode typesetting
+        let spans = crate::math::inline_spans(text);
+        if spans.is_empty() {
+            text
+        } else {
+            let cs: Vec<char> = text.chars().collect();
+            let mut o = String::new();
+            let mut at = 0;
+            for (a, b, tex, _) in spans {
+                o.extend(cs[at..a].iter());
+                o.push_str(&crate::math::to_unicode(&tex));
+                at = b;
+            }
+            o.extend(cs[at..].iter());
+            math_text = o;
+            math_text.as_str()
+        }
+    } else {
+        text
+    };
     for sp in parse_spans(text) {
         if strip && sp.marker {
             continue;
@@ -921,7 +945,7 @@ fn font_for(kind: BlockKind, scale: f32) -> FontId {
         BlockKind::H1 => bold(30.0 * s),
         BlockKind::H2 => bold(24.0 * s),
         BlockKind::H3 => bold(19.0 * s),
-        BlockKind::Code => FontId::monospace(13.5 * s),
+        BlockKind::Code | BlockKind::Equation => FontId::monospace(13.5 * s),
         BlockKind::Quote => body(17.0 * s),
         _ => body(16.0 * s),
     }
@@ -1136,7 +1160,7 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
                 BlockKind::H1 => 18.0,
                 BlockKind::H2 => 12.0,
                 BlockKind::H3 => 8.0,
-                BlockKind::Callout | BlockKind::Code | BlockKind::Quote => 6.0,
+                BlockKind::Callout | BlockKind::Code | BlockKind::Quote | BlockKind::Equation => 6.0,
                 BlockKind::Columns | BlockKind::DbView | BlockKind::Widget => 8.0,
                 _ => 1.0,
             });
@@ -1214,7 +1238,7 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
             }
         }
         let bgc = page.blocks[cur].bg;
-        if bgc > 0 && !matches!(kind, BlockKind::Divider | BlockKind::Callout | BlockKind::Code) {
+        if bgc > 0 && !matches!(kind, BlockKind::Divider | BlockKind::Callout | BlockKind::Code | BlockKind::Equation) {
             let r = Rect::from_min_max(pos2(rect.left() + gutter() + ind_px - 6.0, rect.top()), pos2(rect.right() + 4.0, rect.bottom()));
             ui.painter().set(bg_slot, Shape::rect_filled(r, 4.0, tag_color(bgc as usize - 1).gamma_multiply(0.16)));
         }
@@ -1237,7 +1261,7 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
                     BlockKind::H2 => 5.0,
                     BlockKind::H3 => 3.0,
                     BlockKind::Callout => 11.0,
-                    BlockKind::Code => 14.0,
+                    BlockKind::Code | BlockKind::Equation => 14.0,
                     _ => 1.0,
                 };
             let tiny = crate::touch::compact();
@@ -2228,6 +2252,37 @@ fn draw_block(
                 }
             }
         }
+        BlockKind::Equation => {
+            let ctx = ui.ctx().clone();
+            let tid = Id::new(("blk", b.id));
+            let editing = ctx.memory(|m| m.has_focus(tid)) || ed.focus.map_or(false, |(f, _)| f == b.id) || ed.restore_sel.map_or(false, |r| r.0 == b.id) || b.text.trim().is_empty();
+            let fr = Frame::new().fill(pal.code_bg).stroke(Stroke::new(1.0_f32, if editing { with_alpha(pal.accent, 0.6) } else { pal.border })).corner_radius(CornerRadius::same(6)).inner_margin(Margin::symmetric(16, 12)).show(ui, |ui| {
+                let avail = w - 32.0;
+                ui.set_width(avail);
+                // typeset preview, scaled down when the formula is wider than the page
+                let mut size = 22.0 * s;
+                let mut mb = ui.fonts(|f| crate::math::typeset(f, &b.text, size, true));
+                if mb.w > avail && mb.w > 0.0 {
+                    size = (size * avail / mb.w).max(10.0);
+                    mb = ui.fonts(|f| crate::math::typeset(f, &b.text, size, true));
+                }
+                let (r, resp) = ui.allocate_exact_size(vec2(avail, mb.height().max(28.0 * s) + 4.0), Sense::click());
+                if b.text.trim().is_empty() {
+                    ui.painter().text(r.center(), Align2::CENTER_CENTER, "Write a TeX equation below, e.g. E = mc^2", body(14.0 * s), pal.muted);
+                } else {
+                    let x = (r.center().x - mb.w / 2.0).max(r.left());
+                    crate::math::paint(&ui.painter().with_clip_rect(r.expand(2.0)), pos2(x, r.center().y - mb.height() / 2.0), &mb, pal.text);
+                }
+                if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                    ed.focus = Some((b.id, usize::MAX));
+                }
+                if editing {
+                    ui.add_space(6.0);
+                    changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: pal.muted, hint: "TeX, e.g. \\frac{a}{b} + \\sqrt{x}", width: avail }, act);
+                }
+            });
+            let _ = fr;
+        }
         BlockKind::Divider => {
             let (r, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
             ui.painter().line_segment([pos2(r.left(), r.center().y), pos2(r.right(), r.center().y)], Stroke::new(1.0_f32, pal.border.gamma_multiply(1.4)));
@@ -2314,14 +2369,20 @@ struct Tx<'a> {
 fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorState, pal: &Palette, tx: Tx, act: &mut Option<Act>) -> bool {
     let ctx = ui.ctx().clone();
     let id = Id::new(("blk", b.id));
-    let is_code = b.kind == BlockKind::Code;
+    let is_code = b.kind == BlockKind::Code || b.kind == BlockKind::Equation;
+    if is_code {
+        // raw source field: no Markdown shortcuts inside (egui patch checks this flag)
+        ctx.data_mut(|d| d.insert_temp(id.with("nomd"), true));
+    }
     let mut rt = if is_code { Rich::plain(&b.text) } else { Rich::parse(&b.text) };
     let nchars = rt.len();
     let Tx { font, color, hint, width } = tx;
     let focus_request = ed.focus.map_or(false, |(f, _)| f == b.id) || ed.restore_sel.map_or(false, |r| r.0 == b.id);
 
     // Unfocused blocks with inline formatting render the styled text without the markers.
-    if !focus_request && b.kind != BlockKind::Code && has_marks(&b.text) && !ctx.memory(|m| m.has_focus(id)) {
+    if !focus_request && !b.kind.raw() && (has_marks(&b.text) || b.text.contains('$')) && !ctx.memory(|m| m.has_focus(id)) {
+        // `$…$` formulas are shown typeset (Unicode); this display copy is self-consistent (links, chips) and never stored
+        let rt = rt.with_math();
         let mut job = rt.job_ex(&font, color, pal, None);
         job.wrap.max_width = width;
         ui.fonts(|f| rich::align_baselines(f, &mut job, &font));
@@ -2365,7 +2426,7 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
             }
         }
         if !ed.rc_frame {
-            if let Some(p) = right_clicked(ui, rect) {
+            if let Some(p) = right_clicked_any(ui, rect) {
                 open_text_menu(ed, &ctx, id, b.id, nchars, p);
             }
         }
@@ -2403,7 +2464,7 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
 
     if focused {
         // inline formatting shortcuts
-        if b.kind != BlockKind::Code {
+        if !b.kind.raw() {
             let marks: [(Modifiers, Key, &str); 6] = [
                 (Modifiers::COMMAND | Modifiers::SHIFT, Key::S, "~~"),
                 (Modifiers::COMMAND, Key::B, "**"),
@@ -2419,6 +2480,24 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
                     b.text = rt.markup();
                     ed.slash_sel = 0;
                 }
+            }
+            // Ctrl+Shift+M: wrap the selection in `$…$` (inline math) — pressing it again inside a formula removes the `$`
+            if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::M)) {
+                let (sa, sb) = widgets::selection(&ctx, id).unwrap_or((nchars, nchars));
+                let frag = rt.slice(sa, sb);
+                let surrounded = sa >= 1 && sb < nchars && rt.plain.chars().nth(sa - 1) == Some('$') && rt.plain.chars().nth(sb) == Some('$');
+                if surrounded {
+                    rt.replace(sa - 1, sb + 1, &frag);
+                    ed.restore_sel = Some((b.id, sa - 1, sb - 1));
+                } else {
+                    let mut ins = Rich::plain("$");
+                    ins.append(&frag);
+                    ins.append(&Rich::plain("$"));
+                    rt.replace(sa, sb, &ins);
+                    ed.restore_sel = Some((b.id, sa + 1, sb + 1));
+                }
+                b.text = rt.markup();
+                ed.slash_sel = 0;
             }
             // Copy / Cut of a formatted fragment: remember the exact formatting for the next paste.
             let copying = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy | egui::Event::Cut)));
@@ -2440,7 +2519,7 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         }
         let range = TextEdit::load_state(&ctx, id).and_then(|s| s.cursor.char_range());
         let (cursor, collapsed) = range.map_or((nchars, true), |r| (r.primary.index, r.primary.index == r.secondary.index));
-        let link_trig = if b.kind != BlockKind::Code && !slash_active && collapsed { wiki_trigger(&rt.plain, cursor) } else { None };
+        let link_trig = if !b.kind.raw() && !slash_active && collapsed { wiki_trigger(&rt.plain, cursor) } else { None };
         if link_trig.is_none() && ed.link_dismiss.map_or(false, |d| d.0 == b.id) {
             ed.link_dismiss = None;
         }
@@ -2486,7 +2565,7 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
                 ctx.request_repaint();
             }
         } else {
-            if b.kind != BlockKind::Code {
+            if !b.kind.raw() {
                 let shift = ui.input(|i| i.modifiers.shift);
                 if !shift && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
                     let listy = matches!(b.kind, BlockKind::Todo | BlockKind::Bullet | BlockKind::Numbered | BlockKind::Quote | BlockKind::Callout | BlockKind::Toggle);
@@ -2515,7 +2594,7 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
                     *act = Some(Act::Merge(idx));
                 }
             }
-            if b.kind != BlockKind::Code {
+            if !b.kind.raw() {
                 let (row, rows) = ctx.data(|d| d.get_temp::<(usize, usize)>(id.with("rows"))).unwrap_or((1, 1));
                 if row == 0 && idx > 0 && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
                     *act = Some(Act::FocusPrev(idx));
@@ -2645,13 +2724,13 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
     }
 
     if !ed.rc_frame {
-        if let Some(p) = right_clicked(ui, out.response.rect) {
+        if let Some(p) = right_clicked_any(ui, out.response.rect) {
             open_text_menu(ed, &ctx, id, b.id, rt.len(), p);
         }
     }
 
     // floating selection toolbar
-    if focused && b.kind != BlockKind::Code {
+    if focused && !b.kind.raw() {
         // NOTE: `cursor_range` is `None` on the frame where a press *outside* the field (e.g. on the toolbar itself)
         // makes it surrender focus. That must NOT dismiss the toolbar, otherwise its buttons could never be clicked.
         match out.cursor_range {
@@ -2731,7 +2810,7 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
     }
 
     // `[[` page suggestions: a drop-down under the caret listing matching pages (and "Create …" for a new title)
-    if focused && !slash_active && b.kind != BlockKind::Code {
+    if focused && !slash_active && !b.kind.raw() {
         let caret = out.cursor_range.filter(|c| c.primary.ccursor.index == c.secondary.ccursor.index);
         let trig = caret.and_then(|c| wiki_trigger(&rt.plain, c.primary.ccursor.index));
         if let (Some(cr), Some((st, q))) = (caret, trig) {
@@ -2921,6 +3000,10 @@ fn ed_menu(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState
         EdMenu::Text { bid, a, b, pos } => (bid, pos, Some((a, b))),
         EdMenu::Block { bid, pos } => (bid, pos, None),
     };
+    // right-click on one of several selected blocks: the menu acts on the whole selection
+    if !ed.sel.is_empty() && ed.sel.contains(&bid) {
+        return multisel::menu(ui, page, next_id, ed, pal, pos);
+    }
     let Some(idx) = page.blocks.iter().position(|b| b.id == bid) else {
         ed.menu = None;
         return false;
@@ -2938,11 +3021,13 @@ fn ed_menu(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState
                 list.push((CtxItem::new(l::TEXT_SELECT, "Select word"), Cmd::SelWord));
             }
             list.push((CtxItem::new(l::TEXT_SELECT, "Select all").hint("Ctrl+A"), Cmd::SelAll));
-            if kind != BlockKind::Code {
+            if !kind.raw() {
                 list.push((CtxItem::new(l::BOLD, "Bold").hint("Ctrl+B").enabled(has_sel).sep(), Cmd::Fmt("**")));
                 list.push((CtxItem::new(l::ITALIC, "Italic").hint("Ctrl+I").enabled(has_sel), Cmd::Fmt("*")));
                 list.push((CtxItem::new(l::STRIKETHROUGH, "Strikethrough").hint("Ctrl+Shift+S").enabled(has_sel), Cmd::Fmt("~~")));
+                list.push((CtxItem::new(l::UNDERLINE, "Underline").hint("Ctrl+U").enabled(has_sel), Cmd::Fmt("__")));
                 list.push((CtxItem::new(l::CODE, "Inline code").hint("Ctrl+E").enabled(has_sel), Cmd::Fmt("`")));
+                list.push((CtxItem::new(l::HIGHLIGHTER, "Highlight").hint("Ctrl+Shift+H").enabled(has_sel), Cmd::Fmt("==")));
             }
         } else {
             list.push((CtxItem::new(l::COPY, "Copy text"), Cmd::CopyBlock));
@@ -3065,7 +3150,7 @@ fn finish_paste(page: &mut Page, next_id: &mut u64, ed: &mut EditorState) -> boo
         return false;
     }
     let (a, b) = (a.min(b), a.max(b));
-    let is_code = page.blocks[idx].kind == BlockKind::Code;
+    let is_code = page.blocks[idx].kind.raw();
     // 1. our own blocks come back as exactly the same blocks
     if !is_code {
         if let Some(blocks) = clip::blocks_for(&clip) {

@@ -49,9 +49,16 @@ pub enum BlockKind {
     Button,
     /// Markdown-style table: cells live in `text` (see `mdtable.rs`), `url` = column alignment (`l`/`c`/`r`), `checked` = first row is a header.
     Table,
+    /// Block equation (LaTeX): `text` = the TeX source, typeset by `math.rs` (Markdown: `$$ … $$`).
+    Equation,
 }
 
 impl BlockKind {
+    /// Kinds whose text is raw source (no inline formatting / links): code and equations.
+    pub fn raw(self) -> bool {
+        matches!(self, BlockKind::Code | BlockKind::Equation)
+    }
+
     /// Kinds that carry editable text and can be chosen in "Turn into".
     pub const TEXTY: [BlockKind; 11] = [
         BlockKind::Text,
@@ -97,6 +104,7 @@ impl BlockKind {
             BlockKind::Widget => "Dashboard widget",
             BlockKind::Button => "Button",
             BlockKind::Table => "Table",
+            BlockKind::Equation => "Equation",
         }
     }
 
@@ -126,6 +134,7 @@ impl BlockKind {
             BlockKind::Widget => "Place a dashboard widget (chart, number, tasks …) in the page.",
             BlockKind::Button => "One click runs actions: set properties, create tasks, move rows, notify.",
             BlockKind::Table => "A simple table. Paste Markdown tables here, or turn one into a database.",
+            BlockKind::Equation => "Write a LaTeX / math formula ($$ … $$).",
         }
     }
 
@@ -154,6 +163,7 @@ impl BlockKind {
             BlockKind::Widget => l::CHART_PIE,
             BlockKind::Button => l::MOUSE_POINTER_2,
             BlockKind::Table => l::TABLE,
+            BlockKind::Equation => l::SIGMA,
         }
     }
 
@@ -182,6 +192,7 @@ impl BlockKind {
             BlockKind::Widget => "widget chart kpi number gauge stats dashboard",
             BlockKind::Button => "button automation action click run rule trigger macro",
             BlockKind::Table => "table grid rows columns markdown spreadsheet cells",
+            BlockKind::Equation => "equation math latex formula tex katex sigma integral fraction",
         }
     }
 }

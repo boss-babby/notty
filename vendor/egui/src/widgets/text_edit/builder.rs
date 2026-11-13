@@ -571,6 +571,15 @@ impl TextEdit<'_> {
         let mut response = ui.interact(outer_rect, id, sense);
         response.intrinsic_size = Some(Vec2::new(desired_width, desired_outer_size.y));
 
+        // Lumen patch: every text field of the application announces itself (id, rect, layer, multiline, password, mutable) so that
+        // one universal right-click / long-press menu (Cut / Copy / Paste / Select all) works in *all* text inputs.
+        {
+            let entry = (id, outer_rect.intersect(ui.clip_rect()), ui.layer_id(), multiline, password, interactive && text.is_mutable());
+            ui.ctx().data_mut(|d| {
+                d.get_temp_mut_or_default::<Vec<(Id, Rect, crate::LayerId, bool, bool, bool)>>(Id::new("lumen_textedits")).push(entry);
+            });
+        }
+
         // Don't sent `OutputEvent::Clicked` when a user presses the space bar
         response.flags -= response::Flags::FAKE_PRIMARY_CLICKED;
         let text_clip_rect = rect;
@@ -629,6 +638,73 @@ impl TextEdit<'_> {
             } else {
                 CursorRange::default()
             };
+
+            // Lumen patch: inline-formatting shortcuts (Markdown markers) in every multi-line text field (table cells, notes,
+            // prompts, descriptions …): Ctrl+B bold, Ctrl+I italic, Ctrl+E code, Ctrl+U underline, Ctrl+Shift+S strike,
+            // Ctrl+Shift+H highlight, Ctrl+Shift+M math. Pressing it again on the same text removes the markers.
+            let mut fmt_changed = false;
+            if multiline
+                && !password
+                && text.is_mutable()
+                && !ui.ctx().data(|d| d.get_temp::<bool>(id.with("nomd")).unwrap_or(false))
+            {
+                let marks: [(crate::Modifiers, crate::Key, &str); 7] = [
+                    (crate::Modifiers::COMMAND | crate::Modifiers::SHIFT, crate::Key::S, "~~"),
+                    (crate::Modifiers::COMMAND | crate::Modifiers::SHIFT, crate::Key::H, "=="),
+                    (crate::Modifiers::COMMAND | crate::Modifiers::SHIFT, crate::Key::M, "$"),
+                    (crate::Modifiers::COMMAND, crate::Key::B, "**"),
+                    (crate::Modifiers::COMMAND, crate::Key::I, "*"),
+                    (crate::Modifiers::COMMAND, crate::Key::E, "`"),
+                    (crate::Modifiers::COMMAND, crate::Key::U, "__"),
+                ];
+                for (m, k, mark) in marks {
+                    if !ui.input_mut(|i| i.consume_key(m, k)) {
+                        continue;
+                    }
+                    let cr = state.cursor.range(&galley).unwrap_or(default_cursor_range);
+                    let (p, s) = (cr.primary.ccursor.index, cr.secondary.ccursor.index);
+                    let (lo, hi) = (p.min(s), p.max(s));
+                    let chars: Vec<char> = text.as_str().chars().collect();
+                    let mk: Vec<char> = mark.chars().collect();
+                    let ml = mk.len();
+                    let hi = hi.min(chars.len());
+                    let lo = lo.min(hi);
+                    let surrounded = lo >= ml && hi + ml <= chars.len() && chars[lo - ml..lo] == mk[..] && chars[hi..hi + ml] == mk[..];
+                    let inside = hi - lo >= 2 * ml && chars[lo..lo + ml] == mk[..] && chars[hi - ml..hi] == mk[..];
+                    let mut out: Vec<char> = Vec::with_capacity(chars.len() + 2 * ml);
+                    let (na, nb);
+                    if surrounded {
+                        out.extend_from_slice(&chars[..lo - ml]);
+                        out.extend_from_slice(&chars[lo..hi]);
+                        out.extend_from_slice(&chars[hi + ml..]);
+                        (na, nb) = (lo - ml, hi - ml);
+                    } else if inside {
+                        out.extend_from_slice(&chars[..lo]);
+                        out.extend_from_slice(&chars[lo + ml..hi - ml]);
+                        out.extend_from_slice(&chars[hi..]);
+                        (na, nb) = (lo, hi - 2 * ml);
+                    } else {
+                        out.extend_from_slice(&chars[..lo]);
+                        out.extend_from_slice(&mk);
+                        out.extend_from_slice(&chars[lo..hi]);
+                        out.extend_from_slice(&mk);
+                        out.extend_from_slice(&chars[hi..]);
+                        (na, nb) = (lo + ml, hi + ml);
+                    }
+                    let new_text: String = out.into_iter().collect();
+                    text.replace_with(&new_text);
+                    state.cursor.set_char_range(Some(CCursorRange::two(
+                        crate::text::CCursor::new(na),
+                        crate::text::CCursor::new(nb),
+                    )));
+                    galley = layouter(ui, text.as_str(), wrap_width);
+                    fmt_changed = true;
+                    break;
+                }
+            }
+            if fmt_changed {
+                response.mark_changed();
+            }
 
             let (changed, new_cursor_range) = events(
                 ui,

@@ -333,6 +333,12 @@ pub fn filter_raw_input(ctx: &Context, raw: &mut RawInput) {
         ctx.data_mut(|d| d.insert_temp(Id::new(RC_KEY), p));
         ctx.request_repaint();
     }
+    // events scheduled by the universal text-field menu (Cut / Copy / Paste / Select all / Undo / Redo) for the focused field
+    let pending: Vec<Event> = ctx.data_mut(|d| d.remove_temp::<Vec<Event>>(Id::new("lumen_pending_events"))).unwrap_or_default();
+    if !pending.is_empty() {
+        raw.events.extend(pending);
+        ctx.request_repaint();
+    }
 }
 
 /// A press-and-hold on a touch screen counts as a right-click at `p` (see `touch.rs`): every context menu that reacts to
@@ -349,13 +355,34 @@ pub fn rclick(ctx: &Context) -> Option<Pos2> {
 
 /// Must be called once at the end of every frame.
 pub fn end_frame(ctx: &Context) {
-    ctx.data_mut(|d| d.remove::<Pos2>(Id::new(RC_KEY)));
+    ctx.data_mut(|d| {
+        d.remove::<Pos2>(Id::new(RC_KEY));
+        d.remove::<bool>(Id::new("lumen_rc_claimed"));
+    });
+}
+
+fn text_under(ctx: &Context, p: Pos2) -> bool {
+    ctx.data(|d| d.get_temp::<Vec<TxEntry>>(Id::new("lumen_textedits"))).map_or(false, |v| v.iter().any(|e| e.1.contains(p)))
 }
 
 /// A right-click landed on `rect` (and that part of the screen is not covered by a popup / other layer).
+/// A right-click on a text field is *not* reported here (the universal text menu owns it) — handlers that really are text-field
+/// handlers use [`right_clicked_any`].
 pub fn right_clicked(ui: &Ui, rect: Rect) -> Option<Pos2> {
+    let p = right_clicked_any(ui, rect)?;
+    if text_under(ui.ctx(), p) {
+        // give the click back to the universal text menu
+        ui.ctx().data_mut(|d| d.remove::<bool>(Id::new("lumen_rc_claimed")));
+        return None;
+    }
+    Some(p)
+}
+
+/// Like [`right_clicked`] but also for clicks on text fields; the caller owns the click (the universal text menu stays closed).
+pub fn right_clicked_any(ui: &Ui, rect: Rect) -> Option<Pos2> {
     let p = rclick(ui.ctx())?;
     if rect.contains(p) && ui.clip_rect().contains(p) && ui.ctx().layer_id_at(p).map_or(true, |l| l == ui.layer_id()) {
+        claim_rc(ui.ctx());
         Some(p)
     } else {
         None
@@ -574,7 +601,7 @@ pub fn field_menu(ui: &Ui, pal: &Palette, resp: &Response, text: &mut String) ->
             changed = true;
         }
     }
-    if let Some(p) = right_clicked(ui, resp.rect) {
+    if let Some(p) = right_clicked_any(ui, resp.rect) {
         let sel = selection(&ctx, id).unwrap_or((text.chars().count(), text.chars().count()));
         ctx.data_mut(|d| {
             d.insert_temp(mkey, (p, sel.0, sel.1));
@@ -696,5 +723,124 @@ pub fn size_control(ui: &mut Ui, pal: &Palette, zoom: &mut f32) -> bool {
         true
     } else {
         false
+    }
+}
+
+
+// ───────────────────────────── universal text-field menu ─────────────────────────────
+//
+// Every `TextEdit` of the application (vendored egui patch) announces itself each frame. A right-click / long-press that no
+// specific menu has claimed (see [`claim_rc`]) on one of them opens this menu: Undo / Redo / Cut / Copy / Paste / Select all.
+// The commands are executed by feeding the standard egui events (Cut, Copy, Paste, Ctrl+A, Ctrl+Z …) to the focused field, so they
+// behave exactly like the keyboard shortcuts in every text input of every screen (title, search, cells, dialogs, AI prompt …).
+
+type TxEntry = (Id, Rect, egui::LayerId, bool, bool, bool);
+
+#[derive(Clone, Copy)]
+struct UMenu {
+    pos: Pos2,
+    id: Id,
+    a: usize,
+    b: usize,
+    multiline: bool,
+    password: bool,
+    mutable: bool,
+}
+
+/// A specific right-click handler took this right-click: the universal text menu stays closed this frame.
+pub fn claim_rc(ctx: &Context) {
+    ctx.data_mut(|d| d.insert_temp(Id::new("lumen_rc_claimed"), true));
+}
+
+fn push_event(ctx: &Context, e: Event) {
+    ctx.data_mut(|d| d.get_temp_mut_or_default::<Vec<Event>>(Id::new("lumen_pending_events")).push(e));
+    ctx.request_repaint();
+}
+
+fn key_event(key: Key, modifiers: Modifiers) -> Event {
+    Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+}
+
+/// Call once per frame, after the UI was built (the text fields of this frame have registered themselves).
+pub fn universal_text_menu(ctx: &Context, pal: &Palette) {
+    let entries: Vec<TxEntry> = ctx.data_mut(|d| d.remove_temp::<Vec<TxEntry>>(Id::new("lumen_textedits"))).unwrap_or_default();
+    let claimed = ctx.data(|d| d.get_temp::<bool>(Id::new("lumen_rc_claimed"))).unwrap_or(false);
+    let mkey = Id::new("lumen_umenu");
+    let wkey = Id::new("lumen_umenu_wait");
+
+    // a Paste requested from the menu finished (immediately on desktop / Android, a moment later in the browser)
+    if let Some(multiline) = ctx.data(|d| d.get_temp::<bool>(wkey)) {
+        if let Some(clip) = crate::platform::take_paste() {
+            let clip = if multiline { clip.replace('\r', "") } else { clip.replace(['\r', '\n'], " ") };
+            if !clip.is_empty() {
+                push_event(ctx, Event::Paste(clip));
+            }
+            ctx.data_mut(|d| d.remove::<bool>(wkey));
+        }
+    }
+
+    if !claimed {
+        if let Some(p) = rclick(ctx) {
+            let top = ctx.layer_id_at(p);
+            let hit = entries.iter().rev().find(|e| e.1.contains(p) && top.map_or(true, |l| l == e.2));
+            if let Some(&(id, _, _, multiline, password, mutable)) = hit {
+                let (a, b) = selection(ctx, id).unwrap_or((0, 0));
+                ctx.data_mut(|d| {
+                    d.insert_temp(mkey, UMenu { pos: p, id, a, b, multiline, password, mutable });
+                    d.insert_temp(mkey.with("fresh"), true);
+                });
+            }
+        }
+    }
+    let Some(m) = ctx.data(|d| d.get_temp::<UMenu>(mkey)) else { return };
+    let mut fresh = ctx.data(|d| d.get_temp::<bool>(mkey.with("fresh"))).unwrap_or(false);
+    let has_sel = m.a != m.b;
+    let fmt = m.multiline && m.mutable && !m.password;
+    let mut list: Vec<(CtxItem, u8)> = vec![
+        (CtxItem::new(crate::lucide::UNDO_2, "Undo").hint("Ctrl+Z").enabled(m.mutable), 0),
+        (CtxItem::new(crate::lucide::REDO_2, "Redo").hint("Ctrl+Y").enabled(m.mutable), 1),
+        (CtxItem::new(crate::lucide::SCISSORS, "Cut").hint("Ctrl+X").sep().enabled(has_sel && m.mutable && !m.password), 2),
+        (CtxItem::new(crate::lucide::COPY, "Copy").hint("Ctrl+C").enabled(has_sel && !m.password), 3),
+        (CtxItem::new(crate::lucide::CLIPBOARD_PASTE, "Paste").hint("Ctrl+V").enabled(m.mutable), 4),
+        (CtxItem::new(crate::lucide::TEXT_SELECT, "Select all").hint("Ctrl+A").sep(), 5),
+    ];
+    if fmt {
+        // Markdown formatting for multi-line fields (also reachable by touch: long-press → menu)
+        list.push((CtxItem::new(crate::lucide::BOLD, "Bold").hint("Ctrl+B").sep(), 10));
+        list.push((CtxItem::new(crate::lucide::ITALIC, "Italic").hint("Ctrl+I"), 11));
+        list.push((CtxItem::new(crate::lucide::UNDERLINE, "Underline").hint("Ctrl+U"), 12));
+        list.push((CtxItem::new(crate::lucide::STRIKETHROUGH, "Strikethrough").hint("Ctrl+Shift+S"), 13));
+        list.push((CtxItem::new(crate::lucide::CODE, "Inline code").hint("Ctrl+E"), 14));
+        list.push((CtxItem::new(crate::lucide::HIGHLIGHTER, "Highlight").hint("Ctrl+Shift+H"), 15));
+        list.push((CtxItem::new(crate::lucide::SIGMA, "Math  $…$").hint("Ctrl+Shift+M"), 16));
+    }
+    let items: Vec<CtxItem> = list.iter().map(|x| x.0).collect();
+    let (open, pick) = context_menu(ctx, mkey, m.pos, pal, &mut fresh, &items);
+    ctx.data_mut(|d| d.insert_temp(mkey.with("fresh"), fresh));
+    if let Some(i) = pick {
+        // the field keeps its selection while the menu is open (right-click events never reach egui): restore it and focus
+        set_selection(ctx, m.id, m.a, m.b);
+        let sc = Modifiers::COMMAND | Modifiers::SHIFT;
+        match list[i].1 {
+            0 => push_event(ctx, key_event(Key::Z, Modifiers::COMMAND)),
+            1 => push_event(ctx, key_event(Key::Z, sc)),
+            2 => push_event(ctx, Event::Cut),
+            3 => push_event(ctx, Event::Copy),
+            4 => {
+                crate::platform::request_paste(ctx);
+                ctx.data_mut(|d| d.insert_temp(wkey, m.multiline));
+            }
+            5 => push_event(ctx, key_event(Key::A, Modifiers::COMMAND)),
+            10 => push_event(ctx, key_event(Key::B, Modifiers::COMMAND)),
+            11 => push_event(ctx, key_event(Key::I, Modifiers::COMMAND)),
+            12 => push_event(ctx, key_event(Key::U, Modifiers::COMMAND)),
+            13 => push_event(ctx, key_event(Key::S, sc)),
+            14 => push_event(ctx, key_event(Key::E, Modifiers::COMMAND)),
+            15 => push_event(ctx, key_event(Key::H, sc)),
+            _ => push_event(ctx, key_event(Key::M, sc)),
+        }
+    }
+    if !open {
+        ctx.data_mut(|d| d.remove::<UMenu>(mkey));
     }
 }
