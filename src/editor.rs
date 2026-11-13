@@ -71,6 +71,8 @@ pub struct EditorState {
     pub fresh: bool,
     pub req: Option<Req>,
     pub nav: Option<u64>,
+    /// A `[[Page title]]` that was clicked: the app opens the page (and creates it when it does not exist yet).
+    pub wiki: Option<String>,
     pub scroll_to: Option<u64>,
     pub scale: f32,
     pub db: DbState,
@@ -2266,7 +2268,7 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
             let idx = galley.cursor_from_pos(p - rect.min).ccursor.index;
             // only a click *on* the text of a link counts (not the empty space after it)
             if p.x - rect.min.x <= galley.rect.max.x + 2.0 {
-                link_hit = rt.link_at(idx).map(str::to_owned);
+                link_hit = rt.link_at(idx).map(str::to_owned).or_else(|| rt.wiki_at(idx).map(|t| format!("wiki:{t}")));
             }
         }
         if link_hit.is_some() && resp.hovered() {
@@ -2275,6 +2277,7 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         let resp = resp.on_hover_cursor(CursorIcon::Text);
         if resp.clicked() {
             match link_hit {
+                Some(url) if url.starts_with("wiki:") => ed.wiki = Some(url[5..].to_owned()),
                 Some(url) => platform::open_url(&ctx, &url),
                 None => ed.focus = Some((b.id, usize::MAX)),
             }

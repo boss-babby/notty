@@ -46,7 +46,29 @@ pub fn flag_for(mark: &str) -> u8 {
 }
 
 pub fn has_marks(s: &str) -> bool {
-    s.contains('*') || s.contains('`') || s.contains("~~") || s.contains("==") || s.contains("__") || s.contains("](") || s.contains('\\')
+    s.contains('*') || s.contains('`') || s.contains("~~") || s.contains("==") || s.contains("__") || s.contains("](") || s.contains('\\') || s.contains("[[")
+}
+
+/// `[[Page title]]` / `[[Page title|label]]` mentions in a plain text: `(byte range incl. brackets, page title)`.
+pub fn wiki_spans(plain: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    let mut out = vec![];
+    let mut from = 0usize;
+    while let Some(a) = plain[from..].find("[[") {
+        let a = from + a;
+        let Some(len) = plain[a + 2..].find("]]") else { break };
+        let inner = &plain[a + 2..a + 2 + len];
+        if inner.trim().is_empty() || inner.contains('\n') || inner.contains("[[") {
+            from = a + 2;
+            continue;
+        }
+        let title = inner.split('|').next().unwrap_or("").trim().to_owned();
+        let end = a + 2 + len + 2;
+        if !title.is_empty() {
+            out.push((a..end, title));
+        }
+        from = end;
+    }
+    out
 }
 
 /// Plain text of a marked-up string (markers removed). Used for search, outlines, titles …
@@ -111,6 +133,12 @@ impl Rich {
         } else {
             self.links.get(f.link as usize - 1).map(|s| s.as_str())
         }
+    }
+
+    /// Title of the `[[wiki link]]` under character `i`, if any.
+    pub fn wiki_at(&self, i: usize) -> Option<String> {
+        let b = self.byte(i);
+        wiki_spans(&self.plain).into_iter().find(|(r, _)| r.contains(&b)).map(|(_, t)| t)
     }
 
     fn byte(&self, chars: usize) -> usize {
@@ -309,38 +337,55 @@ impl Rich {
     /// Text layout of the rich text (what the user sees). The text of the job is exactly `self.plain`.
     pub fn job(&self, font: &FontId, color: Color32, pal: &Palette) -> LayoutJob {
         let mut job = LayoutJob::default();
+        let wikis = wiki_spans(&self.plain);
         for (range, f) in self.runs() {
-            let is_link = f.link != 0;
-            let code = f.flags & CODE != 0;
-            let fg = if is_link {
-                pal.accent
-            } else if code {
-                tag_color(5)
-            } else {
-                color
-            };
-            let fmt = TextFormat {
-                font_id: if code {
-                    FontId::monospace(font.size * 0.88)
-                } else if f.flags & BOLD != 0 {
-                    bold(font.size)
-                } else {
-                    font.clone()
-                },
-                color: fg,
-                background: if f.flags & HIGHLIGHT != 0 {
-                    Color32::from_rgba_unmultiplied(255, 208, 0, 100)
+            // split the run at wiki-link boundaries so `[[Page]]` is drawn like a link
+            let mut cuts = vec![range.start];
+            for (w, _) in &wikis {
+                for e in [w.start, w.end] {
+                    if e > range.start && e < range.end {
+                        cuts.push(e);
+                    }
+                }
+            }
+            cuts.push(range.end);
+            cuts.sort_unstable();
+            cuts.dedup();
+            for seg in cuts.windows(2) {
+                let (a, b) = (seg[0], seg[1]);
+                let wiki = wikis.iter().any(|(w, _)| a >= w.start && b <= w.end);
+                let is_link = f.link != 0 || wiki;
+                let code = f.flags & CODE != 0;
+                let fg = if is_link {
+                    pal.accent
                 } else if code {
-                    pal.hover
+                    tag_color(5)
                 } else {
-                    Color32::TRANSPARENT
-                },
-                italics: f.flags & ITALIC != 0,
-                strikethrough: if f.flags & STRIKE != 0 { Stroke::new(1.3_f32, color) } else { Stroke::NONE },
-                underline: if f.flags & UNDERLINE != 0 || is_link { Stroke::new(1.2_f32, fg) } else { Stroke::NONE },
-                ..Default::default()
-            };
-            job.append(&self.plain[range], 0.0, fmt);
+                    color
+                };
+                let fmt = TextFormat {
+                    font_id: if code {
+                        FontId::monospace(font.size * 0.88)
+                    } else if f.flags & BOLD != 0 {
+                        bold(font.size)
+                    } else {
+                        font.clone()
+                    },
+                    color: fg,
+                    background: if f.flags & HIGHLIGHT != 0 {
+                        Color32::from_rgba_unmultiplied(255, 208, 0, 100)
+                    } else if code {
+                        pal.hover
+                    } else {
+                        Color32::TRANSPARENT
+                    },
+                    italics: f.flags & ITALIC != 0,
+                    strikethrough: if f.flags & STRIKE != 0 { Stroke::new(1.3_f32, color) } else { Stroke::NONE },
+                    underline: if f.flags & UNDERLINE != 0 || is_link { Stroke::new(1.2_f32, fg) } else { Stroke::NONE },
+                    ..Default::default()
+                };
+                job.append(&self.plain[a..b], 0.0, fmt);
+            }
         }
         if job.sections.is_empty() {
             job.append("", 0.0, TextFormat::simple(font.clone(), color));
@@ -365,7 +410,9 @@ fn escape_into(out: &mut String, text: &str, in_link: bool) {
     for (i, &c) in ch.iter().enumerate() {
         let doubled = |d: char| (i > 0 && ch[i - 1] == d) || (i + 1 < ch.len() && ch[i + 1] == d);
         let esc = match c {
-            '\\' | '*' | '`' | '[' => true,
+            '\\' | '*' | '`' => true,
+            // `[[wiki links]]` stay readable in the stored text (the graph, search and the AI look for them)
+            '[' => !doubled('['),
             ']' => in_link,
             '_' | '~' | '=' => doubled(c),
             _ => false,
@@ -523,5 +570,29 @@ mod baseline_tests {
             assert!(ys.iter().all(|y| (*y - ys[0]).abs() < 0.01), "size {size}: one baseline, got {ys:?}");
             assert!((g.rows[0].rect.height() - plain.rows[0].rect.height()).abs() < 0.01, "size {size}: row height {} vs plain {}", g.rows[0].rect.height(), plain.rows[0].rect.height());
         }
+    }
+}
+
+#[cfg(test)]
+mod wiki_tests {
+    use super::*;
+
+    #[test]
+    fn wiki_links_inside_text_are_found_styled_and_survive_editing() {
+        let text = "see [[Project plan]] and [[Notes|my notes]] later, [[ ]] and [[open";
+        assert!(has_marks(text));
+        let r = Rich::parse(text);
+        assert_eq!(r.plain, text, "brackets stay visible and the text is unchanged");
+        assert_eq!(r.markup(), text, "[[links]] are stored exactly as typed");
+        let at = text.find("Project").unwrap();
+        assert_eq!(r.wiki_at(at), Some("Project plan".to_owned()));
+        assert_eq!(r.wiki_at(text.find("my notes").unwrap()), Some("Notes".to_owned()));
+        assert_eq!(r.wiki_at(0), None);
+        assert_eq!(wiki_spans(text).len(), 2);
+        // bold + wiki link together
+        let mut b = Rich::plain("a [[B]] c");
+        b.toggle(0, 1, BOLD);
+        assert_eq!(Rich::parse(&b.markup()).plain, "a [[B]] c");
+        assert!(b.markup().contains("[[B]]"));
     }
 }

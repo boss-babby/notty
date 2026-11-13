@@ -283,7 +283,7 @@ pub fn scripts_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Pale
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if widgets::primary_button(ui, pal, "+ New script", 118.0).clicked() {
                     let id = ws.id();
-                    ws.auto.scripts.push(Script { id, name: "New script".into(), code: scripthost::EXAMPLES[1].code.to_owned(), runs: 0, last_run: 0.0 });
+                    ws.auto.scripts.push(Script { id, name: "New script".into(), code: scripthost::EXAMPLES[1].code.to_owned(), runs: 0, last_run: 0.0, every: 0 });
                     st(|s| s.open = Some(id));
                 }
             });
@@ -304,7 +304,7 @@ pub fn scripts_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Pale
                     for ex in scripthost::EXAMPLES.iter() {
                         if widgets::ghost_button(ui, pal, ex.name).on_hover_text(ex.desc).clicked() {
                             let id = ws.id();
-                            ws.auto.scripts.push(Script { id, name: ex.name.into(), code: ex.code.into(), runs: 0, last_run: 0.0 });
+                            ws.auto.scripts.push(Script { id, name: ex.name.into(), code: ex.code.into(), runs: 0, last_run: 0.0, every: 0 });
                             st(|s| s.open = Some(id));
                         }
                     }
@@ -364,6 +364,11 @@ pub fn scripts_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Pale
                     if let Some(n) = combo(ui, ("script_target", id), 210.0, &shown, &cur) {
                         st(|s| s.target.insert(id, n));
                     }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    label(ui, pal, "Repeat every");
+                    ui.add(egui::DragValue::new(&mut sc.every).range(0..=86_400).suffix(" s"));
+                    ui.label(RichText::new(if sc.every == 0 { "off — runs only when you press Run" } else { "● repeats in the background, on every page, while the app is open" }).font(body(12.0)).color(if sc.every == 0 { pal.muted } else { pal.accent }));
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.add_enabled_ui(err.is_none(), |ui| {
@@ -452,7 +457,7 @@ pub fn scripts_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Pale
         for ex in scripthost::EXAMPLES.iter() {
             if widgets::ghost_button(ui, pal, &format!("+ {}", ex.name)).on_hover_text(ex.desc).clicked() {
                 let id = ws.id();
-                ws.auto.scripts.push(Script { id, name: ex.name.into(), code: ex.code.into(), runs: 0, last_run: 0.0 });
+                ws.auto.scripts.push(Script { id, name: ex.name.into(), code: ex.code.into(), runs: 0, last_run: 0.0, every: 0 });
                 st(|s| s.open = Some(id));
             }
         }

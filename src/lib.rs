@@ -14,6 +14,8 @@ mod canvasdraw;
 mod canvasui;
 mod flow;
 mod flowui;
+mod flowbg;
+mod demo;
 mod automation;
 mod autoui;
 mod uploader;

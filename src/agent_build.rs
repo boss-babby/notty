@@ -733,6 +733,6 @@ fn tool_save_script(ws: &mut Workspace, a: &Json) -> Result<Json, String> {
     crate::script::check(&code).map_err(|e| format!("Syntax error: {e}"))?;
     let name = str_of(a, "name").ok_or("name required")?.to_owned();
     let id = ws.id();
-    ws.auto.scripts.push(Script { id, name, code, runs: 0, last_run: 0.0 });
+    ws.auto.scripts.push(Script { id, name, code, runs: 0, last_run: 0.0, every: 0 });
     Ok(json!({"script": id}))
 }

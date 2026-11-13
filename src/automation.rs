@@ -504,6 +504,9 @@ pub struct Script {
     pub runs: u32,
     #[serde(default)]
     pub last_run: f64,
+    /// Repeat every N seconds in the background (0 = only when started by hand).
+    #[serde(default)]
+    pub every: u32,
 }
 
 const MAX_INBOX: usize = 120;

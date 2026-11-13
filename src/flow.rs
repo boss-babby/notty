@@ -118,6 +118,7 @@ const MATH: &[&str] = &["add", "subtract", "multiply", "divide", "modulo", "powe
 const AUTH: &[&str] = &["none", "bearer token", "basic (user:password)", "x-api-key header", "api_key query"];
 const SERVICES: &[&str] = &["JSONPlaceholder todos", "GitHub repository", "GitHub open issues", "GitHub releases", "Weather (Open-Meteo)", "Hacker News front page", "Wikipedia summary", "Exchange rates", "Crypto price (CoinGecko)", "Random joke"];
 const MSG_SERVICES: &[&str] = &["ntfy.sh push", "Slack webhook", "Discord webhook", "Microsoft Teams webhook", "Telegram bot", "Generic JSON webhook"];
+const MOCK_PRESETS: &[&str] = &["Sensor telemetry", "Stock ticker", "Server metrics", "Shop orders", "Custom template"];
 const LOGIC: &[&str] = &["and", "or", "xor", "not"];
 
 pub static DEFS: &[Def] = &[
@@ -126,6 +127,7 @@ pub static DEFS: &[Def] = &[
     Def { key: "number", label: "Number", cat: Cat::Input, ins: &[], outs: &["out"], params: &[p("value", "Value", PK::Num, "0", "")], doc: "A constant number." },
     Def { key: "now", label: "Date & time", cat: Cat::Input, ins: &[], outs: &["text", "date", "ms"], params: &[p("days", "Offset (days)", PK::Num, "0", "Negative = past")], doc: "Local date and time at the moment of the run: `YYYY-MM-DD HH:MM`, `YYYY-MM-DD` and the Unix time in milliseconds." },
     Def { key: "random", label: "Random number", cat: Cat::Input, ins: &[], outs: &["out"], params: &[p("min", "Minimum", PK::Num, "0", ""), p("max", "Maximum", PK::Num, "100", ""), p("int", "Whole numbers", PK::Bool, "true", "")], doc: "A random number between minimum and maximum." },
+    Def { key: "mock_api", label: "Mock API stream", cat: Cat::Input, ins: &[], outs: &["data", "error"], params: &[p("preset", "Stream", PK::Choice(MOCK_PRESETS), "Sensor telemetry", "Pick a ready-made stream or 'Custom template'."), p("template", "Custom template (JSON)", PK::Long, "{\"id\": \"EVT-{{seq}}\", \"time\": \"{{time}}\", \"value\": {{walk:50,20,40}}, \"kind\": \"{{pick:a|b|c}}\"}", "Placeholders: {{seq}} · {{time}} · {{date}} · {{ms}} · {{rand:0..100}} · {{walk:base,amplitude,period_s}} · {{pick:a|b|c}} · {{uuid}}")], doc: "Replicates any API data stream without a network: every run produces one fresh JSON record (smooth random walks, random picks, counters, timestamps). Run the flow every second (Flow menu → Run every N seconds) and add a Add-row node to watch a dashboard update live. Deterministic per second, so two nodes in one flow agree." },
     Def { key: "if", label: "If", cat: Cat::Logic, ins: &["value", "other"], outs: &["true", "false"], params: &[p("test", "Test", PK::Choice(TESTS), "truthy", ""), p("rhs", "Compare with", PK::Text, "", "Used when 'other' is not connected")], doc: "Routes the value to **true** or **false**. The other branch stays inactive and everything behind it is skipped." },
     Def { key: "switch", label: "Switch", cat: Cat::Logic, ins: &["value"], outs: &["case 1", "case 2", "case 3", "default"], params: &[p("c1", "Case 1 equals", PK::Text, "", ""), p("c2", "Case 2 equals", PK::Text, "", ""), p("c3", "Case 3 equals", PK::Text, "", "")], doc: "Sends the value to the first output whose case matches (text comparison), otherwise to **default**." },
     Def { key: "merge", label: "Merge", cat: Cat::Logic, ins: &["a", "b", "c", "d"], outs: &["out"], params: &[p("mode", "Mode", PK::Choice(&["list", "object", "concat", "first"]), "list", "list: [a, b …] · object: merge objects · concat: join lists · first: first active input")], doc: "Combines up to four branches. Inactive inputs are ignored, so Merge also re-joins the branches of an If." },
@@ -1582,6 +1584,14 @@ fn exec(n: &FNode, d: &'static Def, ins: &[Option<Json>], env: &mut Env) -> Resu
             let date = crate::dates::iso_of_day(day);
             done(vec![Some(json!(format!("{date} {}", crate::dates::hhmm(min)))), Some(json!(date)), Some(json!(env.now + num("days") * 86_400_000.0))])
         }
+        "mock_api" => {
+            let preset = n.param("preset");
+            let tpl = if preset == "Custom template" { n.param("template") } else { mock_template(&preset).to_owned() };
+            match mock_json(&tpl, env.now) {
+                Ok(v) => done(vec![Some(v), None]),
+                Err(e) => done(vec![None, Some(json!(e))]),
+            }
+        }
         "random" => {
             let (lo, hi) = (num("min"), num("max"));
             let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
@@ -2233,5 +2243,105 @@ mod tests {
         f.wires.push(Wire { from: 77, fp: 0, to: b, tp: 0 });
         f.repair();
         assert_eq!(f.wires.len(), 1);
+    }
+}
+
+
+// ───────────────────────────── mock API streams ─────────────────────────────
+
+fn mock_template(preset: &str) -> &'static str {
+    match preset {
+        "Stock ticker" => r#"{"symbol": "{{pick:ACME|GLOBX|INIT|ZETA}}", "time": "{{time}}", "price": {{walk:120,18,31}}, "change": {{walk:0,3,17}}, "volume": {{rand:100..9000}}}"#,
+        "Server metrics" => r#"{"host": "web-{{pick:1|2|3}}", "time": "{{time}}", "cpu": {{walk:45,30,23}}, "memory": {{walk:62,14,61}}, "rps": {{walk:320,160,19}}, "latency_ms": {{walk:90,60,13}}, "status": "{{pick:ok|ok|ok|ok|degraded}}"}"#,
+        "Shop orders" => r#"{"order_id": "ORD-{{seq}}", "time": "{{time}}", "customer": "{{pick:Ava|Noah|Mia|Liam|Zoe|Omar}}", "amount": {{rand:5..250}}, "items": {{rand:1..6}}, "channel": "{{pick:web|app|store}}"}"#,
+        _ => r#"{"device": "sensor-{{pick:A|B|C}}", "time": "{{time}}", "temperature": {{walk:22,6,45}}, "humidity": {{walk:55,15,70}}, "pressure": {{walk:1013,12,90}}, "battery": {{rand:60..100}}, "status": "{{pick:ok|ok|ok|warn}}"}"#,
+    }
+}
+
+fn mix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+fn unit(x: u64) -> f64 {
+    (mix64(x) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Expands the `{{…}}` placeholders of a mock template for the instant `now_ms` and parses the result as JSON.
+pub fn mock_json(tpl: &str, now_ms: f64) -> Result<Json, String> {
+    let sec = (now_ms / 1000.0).floor();
+    let secs_i = sec as i64;
+    let t = sec;
+    let mut out = String::new();
+    let mut rest = tpl;
+    let mut k: u64 = 0;
+    while let Some(a) = rest.find("{{") {
+        out.push_str(&rest[..a]);
+        let Some(b) = rest[a + 2..].find("}}") else {
+            out.push_str(&rest[a..]);
+            rest = "";
+            break;
+        };
+        let tag = rest[a + 2..a + 2 + b].trim();
+        rest = &rest[a + 2 + b + 2..];
+        k += 1;
+        let seed = (secs_i as u64).wrapping_mul(1_000_003).wrapping_add(k * 7919);
+        let (name, arg) = tag.split_once(':').map_or((tag, ""), |(n, x)| (n.trim(), x.trim()));
+        let day_s = secs_i.rem_euclid(86_400);
+        match name {
+            "seq" => out.push_str(&secs_i.to_string()),
+            "ms" => out.push_str(&(now_ms as i64).to_string()),
+            "time" => out.push_str(&format!("{:02}:{:02}:{:02}", day_s / 3600, day_s / 60 % 60, day_s % 60)),
+            "date" => out.push_str(&crate::dates::today_iso()),
+            "uuid" => out.push_str(&format!("{:016x}{:016x}", mix64(seed), mix64(seed ^ 0xABCD))),
+            "rand" => {
+                let (lo, hi) = arg.split_once("..").unwrap_or(("0", "100"));
+                let (lo, hi) = (lo.trim().parse::<f64>().unwrap_or(0.0), hi.trim().parse::<f64>().unwrap_or(100.0));
+                let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+                let v = lo + unit(seed) * (hi - lo);
+                if lo.fract() == 0.0 && hi.fract() == 0.0 {
+                    out.push_str(&(v.round() as i64).to_string());
+                } else {
+                    out.push_str(&format!("{v:.2}"));
+                }
+            }
+            "walk" => {
+                let p: Vec<f64> = arg.split(',').map(|x| x.trim().parse::<f64>().unwrap_or(0.0)).collect();
+                let base = p.first().copied().unwrap_or(50.0);
+                let amp = p.get(1).copied().unwrap_or(10.0);
+                let period = p.get(2).copied().filter(|x| *x > 0.5).unwrap_or(30.0);
+                let phase = (k as f64) * 1.7;
+                let w = 0.65 * (t / period + phase).sin() + 0.35 * (t / (period * 0.37) + phase * 0.6).sin() + (unit(seed) - 0.5) * 0.25;
+                out.push_str(&format!("{:.2}", base + amp * w));
+            }
+            "pick" => {
+                let opts: Vec<&str> = arg.split('|').collect();
+                let i = (unit(seed) * opts.len() as f64) as usize;
+                out.push_str(opts.get(i.min(opts.len() - 1)).copied().unwrap_or(""));
+            }
+            _ => return Err(format!("unknown placeholder {{{{{tag}}}}} — use seq, time, date, ms, rand, walk, pick or uuid")),
+        }
+    }
+    out.push_str(rest);
+    serde_json::from_str(&out).map_err(|e| format!("the template is not valid JSON after filling it in: {e}"))
+}
+
+#[cfg(test)]
+mod mock_tests {
+    use super::*;
+
+    #[test]
+    fn presets_are_valid_json_and_change_every_second() {
+        for p in MOCK_PRESETS {
+            let tpl = if *p == "Custom template" { "{\"v\": {{walk:50,20,40}}, \"s\": \"{{pick:a|b}}\", \"n\": {{rand:1..6}}}".to_owned() } else { mock_template(p).to_owned() };
+            let a = mock_json(&tpl, 1_700_000_000_000.0).expect(p);
+            let b = mock_json(&tpl, 1_700_000_001_000.0).expect(p);
+            assert!(a.is_object());
+            assert_ne!(a, b, "{p}: every second must bring new data");
+            assert_eq!(a, mock_json(&tpl, 1_700_000_000_400.0).unwrap(), "{p}: stable within the second");
+        }
+        assert!(mock_json("{\"x\": {{nope}}}", 0.0).is_err());
     }
 }

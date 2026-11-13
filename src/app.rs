@@ -58,6 +58,7 @@ enum PalAct {
     NewDb,
     NewCanvas,
     NewFlow,
+    LiveDemo,
     Journal,
     Templates,
     Import,
@@ -148,6 +149,7 @@ pub struct LumenApp {
     prev_sidebar_page: Option<u64>,
     /// Automation engine state (change snapshot, rate limits) — never saved.
     auto_rt: crate::automation::Runtime,
+    bg: crate::flowbg::Bg,
     last_auto: f64,
     last_push: f64,
     /// Lumen AI: provider settings, chats, the agent loop and the MCP transports (see `ai.rs`, `aiui.rs`, `mcp.rs`).
@@ -224,6 +226,7 @@ impl LumenApp {
             calc_dirty: true,
             prev_sidebar_page: None,
             auto_rt: crate::automation::Runtime::new(),
+            bg: crate::flowbg::Bg::default(),
             last_auto: 0.0,
             last_push: 0.0,
             ai,
@@ -512,6 +515,15 @@ impl LumenApp {
             PalAct::NewDb => self.new_page(None, PageKind::Database),
             PalAct::NewCanvas => self.new_page(None, PageKind::Canvas),
             PalAct::NewFlow => self.new_page(None, PageKind::Flow),
+            PalAct::LiveDemo => match crate::demo::build(&mut self.ws) {
+                Ok(id) => {
+                    crate::views::set(crate::views::Mode::Page, None);
+                    self.ws.current = Some(id);
+                    self.calc_dirty = true;
+                    self.toast("Live demo started — a mock API feeds the dashboard every second, even when you switch pages", None);
+                }
+                Err(e) => self.toast(format!("Could not build the demo: {e}"), None),
+            },
             PalAct::Journal => self.ws.open_today(),
             PalAct::Dashboard => crate::views::toggle(crate::views::Mode::Dashboard, self.ws.current),
             PalAct::Graph => crate::views::toggle(crate::views::Mode::Graph, self.ws.current),
@@ -903,7 +915,7 @@ impl LumenApp {
             scored.sort_by_key(|s| s.0);
             out.extend(scored.into_iter().take(8).map(|(_, a, i, t, s)| (a, i, t, s)));
         }
-        let actions: [(PalAct, &str, &str, &str); 26] = [
+        let actions: [(PalAct, &str, &str, &str); 27] = [
             (PalAct::Ai, l::SPARKLES, "Ask Lumen AI", "Chat with the agent that can build pages, databases, dashboards and automations  (Ctrl+Shift+J)"),
             (PalAct::AiSettings, l::KEY_ROUND, "AI settings & agent connections", "API keys (Gemini, OpenAI, Claude, OpenRouter …), access level, MCP server"),
             (PalAct::Automations, l::ZAP, "Automations", "Rules, buttons, recurring tasks, reminders  (Ctrl+Shift+A)"),
@@ -918,6 +930,7 @@ impl LumenApp {
             (PalAct::NewDb, l::KANBAN, "New database", "Table, board, list, gallery or calendar"),
             (PalAct::NewCanvas, l::NETWORK, "New canvas", "Infinite whiteboard of cards, pages, images and connectors"),
             (PalAct::NewFlow, l::ZAP, "New flow", "Node-based automation: APIs, data, logic and your workspace, wired together"),
+            (PalAct::LiveDemo, l::ZAP, "Live data demo", "A mock API stream → flow → database → dashboard that updates every second"),
             (PalAct::Journal, l::BOOK_OPEN, "Today's journal", "Open or create today's entry  (Ctrl+J)"),
             (PalAct::Templates, l::LAYOUT_TEMPLATE, "Browse templates", "Meeting notes, trackers, wiki…"),
             (PalAct::Import, l::FILE_DOWN, "Import…", "Markdown, CSV or a workspace backup"),
@@ -2089,6 +2102,18 @@ impl LumenApp {
 
     fn frame(&mut self, ctx: &Context) {
         self.run_automation(ctx);
+        // repeating flows / scripts keep running whatever page is open
+        {
+            let t = now_ms();
+            let shown_flow = self.ws.current.filter(|c| !self.locked && crate::views::mode() == crate::views::Mode::Page && self.ws.page(*c).map_or(false, |p| p.kind == PageKind::Flow));
+            let o = self.bg.tick(&mut self.ws, ctx, t, shown_flow);
+            if o.output.changed || !o.output.notices.is_empty() {
+                self.after_auto(ctx, o.output);
+            }
+            for m in o.toasts {
+                self.toast(m, None);
+            }
+        }
         self.run_ai(ctx);
         // theme (animated)
         let target = if self.locked || self.ws.dark { 1.0 } else { 0.0 };
@@ -2310,7 +2335,7 @@ impl LumenApp {
                 .resizable(true)
                 .default_width(400.0)
                 .width_range(320.0..=680.0)
-                .frame(Frame::new().fill(pal.bg).stroke(Stroke::new(1.0_f32, pal.border)))
+                .frame(Frame::new().fill(crate::aiui::panel_bg(&pal)))
                 .show(ctx, |ui| out = crate::aiui::panel(ui, ctx, &mut self.ai, &mut self.ws, &pal));
             if out.close {
                 self.ai.rt.open = false;
@@ -2462,6 +2487,19 @@ impl LumenApp {
             if self.ws.page(id).map_or(false, |p| !p.trashed) {
                 self.ws.current = Some(id);
             }
+        }
+        if let Some(title) = self.ed.wiki.take() {
+            let key = title.trim().to_lowercase();
+            let hit = self.ws.pages.iter().filter(|p| !p.trashed && p.title.trim().to_lowercase() == key).map(|p| (p.row, p.id)).min().map(|(_, id)| id);
+            let id = hit.unwrap_or_else(|| {
+                let id = self.ws.add_page(None, crate::model::PageKind::Doc);
+                if let Some(p) = self.ws.page_mut(id) {
+                    p.title = title.trim().to_owned();
+                }
+                id
+            });
+            crate::views::set(crate::views::Mode::Page, None);
+            self.ws.current = Some(id);
         }
         if let (Some(req), Some(cur)) = (self.ed.req.take(), self.ws.current) {
             self.handle_req(req, cur);

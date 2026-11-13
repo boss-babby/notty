@@ -1531,7 +1531,7 @@ fn menu(ctx: &Context, ws: &mut Workspace, page: u64, pal: &Palette, f: &mut Flo
                 ui.horizontal(|ui| {
                     ui.label("Run every");
                     ui.add(egui::DragValue::new(&mut f.every).range(0..=86_400).suffix(" s"));
-                    ui.label(egui::RichText::new(if f.every == 0 { "off" } else { "while this page is open" }).small().color(pal.muted));
+                    ui.label(egui::RichText::new(if f.every == 0 { "off" } else { "keeps running in the background on every page" }).small().color(pal.muted));
                 });
                 ui.label(egui::RichText::new("Scheduled runs are live runs. Lumen has to be open: browsers and phones do not run apps in the background.").small().color(pal.muted));
                 ui.separator();

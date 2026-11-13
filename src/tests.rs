@@ -1193,7 +1193,7 @@ fn automation_views_buttons_and_popovers_render_on_desktop_and_phone() {
     let mut t = 0.0;
     // a saved script (open in the Scripts tab) and a rule whose action is a script (expanded in the Rules tab)
     let sid = ws.id();
-    ws.auto.scripts.push(au::Script { id: sid, name: "Demo".into(), code: crate::scripthost::EXAMPLES[1].code.to_owned(), runs: 0, last_run: 0.0 });
+    ws.auto.scripts.push(au::Script { id: sid, name: "Demo".into(), code: crate::scripthost::EXAMPLES[1].code.to_owned(), runs: 0, last_run: 0.0, every: 0 });
     crate::scriptui::open_script(sid);
     let srid = ws.id();
     ws.auto.rules.push(au::Rule::new(srid, "Scripted", db, au::Trigger::RowAdded, vec![au::Action::Script { code: crate::scripthost::EXAMPLES[2].code.to_owned() }]));
