@@ -204,6 +204,70 @@ pub fn load_web_fonts(ctx: &Context) {
     }
 }
 
+/// Scripts whose fonts are loaded **on demand** (the first time text in that script appears): (name, code point ranges).
+/// Keeping them out of the start-up font set saves memory (the system CJK fonts alone are 50+ MB on Windows / Android) and start-up time;
+/// Latin, Cyrillic, Greek, Vietnamese and the icon font are always present.
+const SCRIPTS: &[(&str, &[(u32, u32)])] = &[
+    ("bengali", &[(0x980, 0x9FF)]),
+    ("devanagari", &[(0x900, 0x97F), (0xA8E0, 0xA8FF)]),
+    ("arabic", &[(0x600, 0x6FF), (0x750, 0x77F), (0x8A0, 0x8FF), (0xFB50, 0xFDFF), (0xFE70, 0xFEFF)]),
+    ("hebrew", &[(0x590, 0x5FF), (0xFB1D, 0xFB4F)]),
+    ("thai", &[(0xE00, 0xE7F)]),
+    ("tamil", &[(0xB80, 0xBFF)]),
+    ("telugu", &[(0xC00, 0xC7F)]),
+    ("kannada", &[(0xC80, 0xCFF)]),
+    ("malayalam", &[(0xD00, 0xD7F)]),
+    ("gujarati", &[(0xA80, 0xAFF)]),
+    ("gurmukhi", &[(0xA00, 0xA7F)]),
+    ("oriya", &[(0xB00, 0xB7F)]),
+    ("sinhala", &[(0xD80, 0xDFF)]),
+    ("khmer", &[(0x1780, 0x17FF), (0x19E0, 0x19FF)]),
+    ("lao", &[(0xE80, 0xEFF)]),
+    ("myanmar", &[(0x1000, 0x109F)]),
+    ("armenian", &[(0x530, 0x58F)]),
+    ("georgian", &[(0x10A0, 0x10FF), (0x1C90, 0x1CBF)]),
+    ("ethiopic", &[(0x1200, 0x139F)]),
+    ("cjk", &[(0x2E80, 0x2FDF), (0x3000, 0x30FF), (0x3100, 0x31FF), (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xAC00, 0xD7AF), (0xF900, 0xFAFF), (0xFF00, 0xFFEF), (0x20000, 0x2FFFF)]),
+];
+
+/// Bit set of the script groups whose fonts are currently registered.
+static LOADED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn script_bit(c: char) -> Option<u32> {
+    let u = c as u32;
+    if u < 0x530 {
+        return None;
+    }
+    SCRIPTS.iter().position(|(_, r)| r.iter().any(|(a, b)| u >= *a && u <= *b)).map(|i| 1u32 << i)
+}
+
+/// Makes sure the fonts for every script that occurs in `text` are loaded. Cheap for Latin text (one pass, no allocation); the first time a
+/// new script shows up the font set is rebuilt (and a repaint is requested).
+pub fn ensure_scripts(ctx: &Context, text: &str) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if text.is_ascii() {
+        return;
+    }
+    let have = LOADED.load(Relaxed);
+    let mut need = 0u32;
+    for c in text.chars() {
+        if let Some(bit) = script_bit(c) {
+            if have & bit == 0 {
+                need |= bit;
+            }
+        }
+    }
+    if need != 0 {
+        LOADED.fetch_or(need, Relaxed);
+        setup_fonts(ctx);
+        ctx.request_repaint();
+    }
+}
+
+fn group_loaded(name: &str) -> bool {
+    SCRIPTS.iter().position(|(n, _)| *n == name).map_or(false, |i| LOADED.load(std::sync::atomic::Ordering::Relaxed) & (1 << i) != 0)
+}
+
 pub fn setup_fonts(ctx: &Context) {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert(
@@ -220,11 +284,9 @@ pub fn setup_fonts(ctx: &Context) {
     // Inter v4 ships 700+ private-use stylistic alternates (e.g. U+E286 = an accented 'u'); they were stripped from the bundled
     // Inter files (assets/) so that they can no longer shadow Lucide. Lucide is also subset to the private-use range only. Otherwise some
     // icons render as other symbols, dots or empty boxes.
-    // Scripts Inter does not cover: Bengali, Devanagari (Hindi, Marathi, Nepali), Arabic (also Persian, Urdu) and Hebrew are embedded, every
-    // other script (CJK, Thai, Tamil, Telugu, Gujarati, Khmer, …) comes from the fonts of the operating system (Android / Windows).
-    let mut scripts: Vec<String> = vec![];
     // Every script with complex shaping (Indic, Arabic, Hebrew, Thai, Khmer, Myanmar …) is shaped by HarfBuzz (vendor/epaint), so each of
-    // them needs its own font. Order matters only for shared code points (the danda).
+    // them needs its own font. They are registered lazily (see `ensure_scripts`). Order matters only for shared code points (the danda).
+    let mut scripts: Vec<String> = vec![];
     for (name, bytes) in [
         ("noto-bengali", &include_bytes!("../assets/NotoSansBengali-Regular.ttf")[..]),
         ("noto-devanagari", &include_bytes!("../assets/NotoSansDevanagari-Regular.ttf")[..]),
@@ -246,6 +308,9 @@ pub fn setup_fonts(ctx: &Context) {
         ("noto-georgian", &include_bytes!("../assets/NotoSansGeorgian-Regular.ttf")[..]),
         ("noto-ethiopic", &include_bytes!("../assets/NotoSansEthiopic-Regular.ttf")[..]),
     ] {
+        if !group_loaded(&name["noto-".len()..]) {
+            continue;
+        }
         fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
         scripts.push(name.to_owned());
     }
@@ -274,47 +339,37 @@ pub fn setup_fonts(ctx: &Context) {
 }
 
 /// Fonts of the operating system for the scripts that are not embedded. Registers the files it finds and returns their names
-/// (in fallback order). Web has no access to system fonts; the embedded Noto fonts cover the most used scripts there.
+/// (in fallback order). Symbol fonts are small and always loaded; the big CJK files are read only once CJK text appears.
+/// Web has no access to system fonts; the embedded Noto fonts cover the most used scripts there.
 #[allow(unused_variables)]
 fn system_fonts(fonts: &mut FontDefinitions) -> Vec<String> {
     let mut names = vec![];
     #[cfg(any(target_os = "android", windows))]
     {
+        // (path, needs the CJK group)
         #[cfg(target_os = "android")]
-        let candidates: &[&str] = &[
-            "/system/fonts/NotoSansCJK-Regular.ttc",
-            "/system/fonts/NotoSansCJKjp-Regular.otf",
-            "/system/fonts/NotoSansCJKsc-Regular.otf",
-            "/system/fonts/NotoSansThai-Regular.ttf",
-            "/system/fonts/NotoSansTamil-Regular.ttf",
-            "/system/fonts/NotoSansTelugu-Regular.ttf",
-            "/system/fonts/NotoSansKannada-Regular.ttf",
-            "/system/fonts/NotoSansMalayalam-Regular.ttf",
-            "/system/fonts/NotoSansGujarati-Regular.ttf",
-            "/system/fonts/NotoSansGurmukhi-Regular.ttf",
-            "/system/fonts/NotoSansSinhala-Regular.ttf",
-            "/system/fonts/NotoSansKhmer-Regular.ttf",
-            "/system/fonts/NotoSansLao-Regular.ttf",
-            "/system/fonts/NotoSansMyanmar-Regular.ttf",
-            "/system/fonts/NotoSansArmenian-Regular.ttf",
-            "/system/fonts/NotoSansGeorgian-Regular.ttf",
-            "/system/fonts/NotoSansEthiopic-Regular.ttf",
-            "/system/fonts/NotoSansSymbols-Regular-Subsetted.ttf",
-            "/system/fonts/DroidSansFallback.ttf",
-            "/system/fonts/DroidSansFallbackFull.ttf",
+        let candidates: &[(&str, bool)] = &[
+            ("/system/fonts/NotoSansCJK-Regular.ttc", true),
+            ("/system/fonts/NotoSansCJKjp-Regular.otf", true),
+            ("/system/fonts/NotoSansCJKsc-Regular.otf", true),
+            ("/system/fonts/NotoSansSymbols-Regular-Subsetted.ttf", false),
+            ("/system/fonts/DroidSansFallback.ttf", true),
+            ("/system/fonts/DroidSansFallbackFull.ttf", true),
         ];
         #[cfg(windows)]
-        let candidates: &[&str] = &[
-            "C:\\Windows\\Fonts\\Nirmala.ttc",
-            "C:\\Windows\\Fonts\\msyh.ttc",
-            "C:\\Windows\\Fonts\\YuGothR.ttc",
-            "C:\\Windows\\Fonts\\meiryo.ttc",
-            "C:\\Windows\\Fonts\\malgun.ttf",
-            "C:\\Windows\\Fonts\\leelawui.ttf",
-            "C:\\Windows\\Fonts\\segoeui.ttf",
-            "C:\\Windows\\Fonts\\seguisym.ttf",
+        let candidates: &[(&str, bool)] = &[
+            ("C:\\Windows\\Fonts\\msyh.ttc", true),
+            ("C:\\Windows\\Fonts\\YuGothR.ttc", true),
+            ("C:\\Windows\\Fonts\\meiryo.ttc", true),
+            ("C:\\Windows\\Fonts\\malgun.ttf", true),
+            ("C:\\Windows\\Fonts\\segoeui.ttf", false),
+            ("C:\\Windows\\Fonts\\seguisym.ttf", false),
         ];
-        for (i, path) in candidates.iter().enumerate() {
+        let cjk = group_loaded("cjk");
+        for (i, (path, is_cjk)) in candidates.iter().enumerate() {
+            if *is_cjk && !cjk {
+                continue;
+            }
             let Ok(meta) = std::fs::metadata(path) else { continue };
             if meta.len() > 40 * 1024 * 1024 {
                 continue;

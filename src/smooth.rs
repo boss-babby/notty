@@ -20,6 +20,10 @@ pub struct Spring {
     max: f32,
     active: bool,
     init: bool,
+    /// Touchpad physics: velocity (points / s) estimated from the finger, time of the last touchpad event, "a touchpad gesture is running".
+    fling: f32,
+    last_in: f64,
+    pad_mode: bool,
 }
 
 /// One step of a critically damped spring towards `target` (Game Programming Gems 4, "SmoothDamp").
@@ -47,20 +51,59 @@ impl Spring {
             self.pos = self.actual;
             self.target = self.actual;
             self.vel = 0.0;
+            self.fling = 0.0;
+            self.pad_mode = false;
         }
+        let now = ctx.input(|i| i.time);
+        let dt = ctx.input(|i| i.unstable_dt).clamp(0.002, 0.05);
+        let max = self.max.max(0.0);
+        let pad = wheel != 0.0 && ctx.data(|d| d.get_temp::<bool>(Id::new("wheel_is_pad"))).unwrap_or(false);
+        let mut gliding = false;
         if wheel != 0.0 {
-            let max = self.max.max(0.0);
             if direct {
                 self.pos = (self.pos - wheel).clamp(0.0, max);
                 self.target = self.pos;
                 self.vel = 0.0;
+                self.pad_mode = false;
+            } else if pad {
+                // Touchpad: the content follows the fingers 1:1 (no smoothing = no latency) while the finger velocity is tracked.
+                self.pos = (self.pos - wheel).clamp(0.0, max);
+                self.target = self.pos;
+                self.vel = 0.0;
+                let inst = -wheel / dt;
+                self.fling = if self.fling != 0.0 && self.fling.signum() == inst.signum() { self.fling * 0.55 + inst * 0.45 } else { inst };
+                self.last_in = now;
+                self.pad_mode = true;
             } else {
+                // Mouse wheel notch: critically damped spring towards the new target.
                 self.target = (self.target - wheel).clamp(0.0, max);
+                self.pad_mode = false;
+                self.fling = 0.0;
+            }
+        } else if self.pad_mode && !direct {
+            let idle = now - self.last_in;
+            if idle <= 0.045 {
+                // between two touchpad events of the same gesture: hold position
+                gliding = true;
+                ctx.request_repaint();
+            } else if self.fling.abs() > 30.0 {
+                // The fingers lifted while still moving: keep gliding and slow down with the friction of a real touchpad fling
+                // (the OS sends its own inertia on Windows / macOS — then the measured velocity is already ~0 and nothing is added).
+                self.pos = (self.pos + self.fling * dt).clamp(0.0, max);
+                self.target = self.pos;
+                self.fling *= (-dt / 0.38).exp();
+                if self.pos <= 0.0 || self.pos >= max {
+                    self.fling = 0.0;
+                }
+                gliding = true;
+                ctx.request_repaint();
+            } else {
+                self.pad_mode = false;
+                self.fling = 0.0;
             }
         }
-        let moving = !direct && ((self.target - self.pos).abs() > 0.25 || self.vel.abs() > 2.0);
+        let moving = !direct && !self.pad_mode && ((self.target - self.pos).abs() > 0.25 || self.vel.abs() > 2.0);
         if moving {
-            let dt = ctx.input(|i| i.unstable_dt).clamp(0.002, 0.05);
             let (p, v) = damp(self.pos, self.vel, self.target, dt);
             self.pos = p;
             self.vel = v;
@@ -71,7 +114,7 @@ impl Spring {
                 ctx.request_repaint();
             }
         }
-        self.active = wheel != 0.0 || moving;
+        self.active = wheel != 0.0 || moving || gliding;
         if self.active {
             Some(self.pos)
         } else {
@@ -98,14 +141,18 @@ pub fn take_wheel(ctx: &Context, over: bool) -> f32 {
     if !over || ctx.input(|i| i.modifiers.command) {
         return 0.0;
     }
-    ctx.input_mut(|i| {
+    let (d, pad) = ctx.input_mut(|i| {
         let d = i.raw_scroll_delta.y;
+        // a touchpad reports points or fractional lines, a wheel notch is a whole number of lines
+        let pad = i.events.iter().any(|e| matches!(e, egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, .. }) || matches!(e, egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta, .. } if delta.y.fract() != 0.0));
         if d != 0.0 {
             i.raw_scroll_delta.y = 0.0;
             i.smooth_scroll_delta.y = 0.0;
         }
-        d
-    })
+        (d, pad)
+    });
+    ctx.data_mut(|dm| dm.insert_temp(Id::new("wheel_is_pad"), pad));
+    d
 }
 
 /// A vertical scroll area with spring physics (wheel / touchpad) and 1:1 finger panning.

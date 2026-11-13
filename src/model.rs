@@ -47,6 +47,8 @@ pub enum BlockKind {
     Widget,
     /// One-click automation button: `text` = label, `acts` = what it does (see `automation.rs`).
     Button,
+    /// Markdown-style table: cells live in `text` (see `mdtable.rs`), `url` = column alignment (`l`/`c`/`r`), `checked` = first row is a header.
+    Table,
 }
 
 impl BlockKind {
@@ -66,7 +68,7 @@ impl BlockKind {
     ];
 
     pub fn has_text(self) -> bool {
-        !matches!(self, BlockKind::Divider | BlockKind::Toc | BlockKind::PageLink | BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File | BlockKind::Columns | BlockKind::Column | BlockKind::DbView | BlockKind::Widget | BlockKind::Button)
+        !matches!(self, BlockKind::Divider | BlockKind::Toc | BlockKind::PageLink | BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File | BlockKind::Columns | BlockKind::Column | BlockKind::DbView | BlockKind::Widget | BlockKind::Button | BlockKind::Table)
     }
 
     pub fn label(self) -> &'static str {
@@ -94,6 +96,7 @@ impl BlockKind {
             BlockKind::DbView => "Linked database view",
             BlockKind::Widget => "Dashboard widget",
             BlockKind::Button => "Button",
+            BlockKind::Table => "Table",
         }
     }
 
@@ -122,6 +125,7 @@ impl BlockKind {
             BlockKind::DbView => "Show a filtered view of any database right here.",
             BlockKind::Widget => "Place a dashboard widget (chart, number, tasks …) in the page.",
             BlockKind::Button => "One click runs actions: set properties, create tasks, move rows, notify.",
+            BlockKind::Table => "A simple table. Paste Markdown tables here, or turn one into a database.",
         }
     }
 
@@ -149,6 +153,7 @@ impl BlockKind {
             BlockKind::DbView => l::TABLE_2,
             BlockKind::Widget => l::CHART_PIE,
             BlockKind::Button => l::MOUSE_POINTER_2,
+            BlockKind::Table => l::TABLE,
         }
     }
 
@@ -176,6 +181,7 @@ impl BlockKind {
             BlockKind::DbView => "linked database view filter embed table inline",
             BlockKind::Widget => "widget chart kpi number gauge stats dashboard",
             BlockKind::Button => "button automation action click run rule trigger macro",
+            BlockKind::Table => "table grid rows columns markdown spreadsheet cells",
         }
     }
 }
@@ -1344,6 +1350,29 @@ impl Workspace {
             .filter(|p| !p.trashed && p.id != id && p.blocks.iter().any(|b| b.kind == BlockKind::PageLink && b.link == Some(id)))
             .map(|p| p.id)
             .collect()
+    }
+
+    /// Relation backlinks: every row (of any database) whose Relation property points at row `id`.
+    /// Returns `(database page id, relation property id, rows)` — this is what makes relations behave in both directions:
+    /// open a person and see the tasks assigned to them.
+    pub fn relation_backlinks(&self, id: u64) -> Vec<(u64, u64, Vec<u64>)> {
+        let Some(target_db) = self.page(id).filter(|p| p.row).and_then(|p| p.parent) else { return vec![] };
+        let mut out = vec![];
+        for dbp in self.pages.iter().filter(|p| !p.trashed && p.db.is_some()) {
+            let Some(d) = dbp.db.as_ref() else { continue };
+            for pr in d.props.iter().filter(|p| p.kind == PropKind::Relation && p.cfg.relation == target_db) {
+                let rows: Vec<u64> = self
+                    .pages
+                    .iter()
+                    .filter(|r| r.row && !r.trashed && r.parent == Some(dbp.id) && r.id != id && matches!(r.props.get(&pr.id), Some(Val::Multi(ids)) if ids.contains(&id)))
+                    .map(|r| r.id)
+                    .collect();
+                if !rows.is_empty() {
+                    out.push((dbp.id, pr.id, rows));
+                }
+            }
+        }
+        out
     }
 
     pub fn display_title(&self, id: u64) -> String {

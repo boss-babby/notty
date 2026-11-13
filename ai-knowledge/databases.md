@@ -31,3 +31,9 @@ calendar, timeline) and **rows** (pages). The row *title* is the built-in "Name"
 * Use relations instead of repeating text (Task → Project).
 * Add a board view grouped by status, a calendar by date, and a table sorted by priority — one data set, several lenses.
 * Show a database on a dashboard (`table`, `board`, `calendar` widgets) rather than copying data.
+
+
+## Relations work both ways (v12)
+A Relation property stores the ids of rows of another database. The related row's page automatically lists every row that points at it
+(grouped by database and property) — e.g. a *Person* page shows the *Tasks* whose *Assignee* relation contains that person. You never need a
+second "reverse" property; to count or summarise the reverse side use a rollup on the forward relation or open the person's page.

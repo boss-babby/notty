@@ -318,6 +318,8 @@ impl InputState {
                     delta,
                     modifiers,
                 } => {
+                    // Lumen patch: the unit as the OS reported it (used below to tell touchpads from wheel notches)
+                    let reported = *delta;
                     let mut delta = match unit {
                         MouseWheelUnit::Point => *delta,
                         MouseWheelUnit::Line => options.line_scroll_speed * *delta,
@@ -337,9 +339,15 @@ impl InputState {
                     // So we smooth it out over several frames for a nicer user experience when scrolling in egui.
                     // BUT: if the user is using a nice smooth mac trackpad, we don't add smoothing,
                     // because it adds latency.
+                    // Lumen patch (the cause of "laggy / stuck" scrolling on laptop touchpads): Windows precision touchpads report their
+                    // pixel-precise motion as *fractional line deltas* (0.05, 0.3 …) and fast flicks on macOS / Linux exceed the old 8 px limit.
+                    // Both were routed through the exponential smoothing below, which adds ~100 ms of latency and makes a swipe feel glued
+                    // to the content with a delay. A real wheel notch is a whole number of lines (1, 2, 3 …) and keeps its smoothing;
+                    // everything else is applied immediately, 1:1, exactly like a native touchpad scroll (the OS already supplies inertia).
                     let is_smooth = match unit {
-                        MouseWheelUnit::Point => delta.length() < 8.0, // a bit arbitrary here
-                        MouseWheelUnit::Line | MouseWheelUnit::Page => false,
+                        MouseWheelUnit::Point => true,
+                        MouseWheelUnit::Line => reported.x.fract() != 0.0 || reported.y.fract() != 0.0,
+                        MouseWheelUnit::Page => false,
                     };
 
                     let is_zoom = modifiers.ctrl || modifiers.mac_cmd || modifiers.command;

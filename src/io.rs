@@ -15,6 +15,31 @@ fn table_cell(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
 }
 
+/// A database as a GFM table (rows of its active view).
+pub fn db_table_md(ws: &Workspace, id: u64) -> String {
+    let mut out = String::new();
+    let Some(d) = ws.db(id) else { return out };
+    let rows = ws.query(id, d.active);
+    out.push_str("| Name |");
+    for pr in &d.props {
+        out.push_str(&format!(" {} |", table_cell(&pr.name)));
+    }
+    out.push_str("\n|---|");
+    for _ in &d.props {
+        out.push_str("---|");
+    }
+    out.push('\n');
+    for r in rows.iter().filter_map(|r| ws.page(*r)) {
+        out.push_str(&format!("| {} |", table_cell(&r.title)));
+        for pr in &d.props {
+            let t = r.props.get(&pr.id).map(|v| d.val_text(pr.id, v)).unwrap_or_default();
+            out.push_str(&format!(" {} |", table_cell(&t)));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Page → Markdown (databases become a table).
 pub fn page_markdown(ws: &Workspace, id: u64) -> String {
     let Some(p) = ws.page(id) else { return String::new() };
@@ -22,25 +47,8 @@ pub fn page_markdown(ws: &Workspace, id: u64) -> String {
     if !p.title.is_empty() {
         out.push_str(&format!("# {}\n\n", p.title));
     }
-    if let Some(d) = &p.db {
-        let rows = ws.query(id, d.active);
-        out.push_str("| Name |");
-        for pr in &d.props {
-            out.push_str(&format!(" {} |", table_cell(&pr.name)));
-        }
-        out.push_str("\n|---|");
-        for _ in &d.props {
-            out.push_str("---|");
-        }
-        out.push('\n');
-        for r in rows.iter().filter_map(|r| ws.page(*r)) {
-            out.push_str(&format!("| {} |", table_cell(&r.title)));
-            for pr in &d.props {
-                let t = r.props.get(&pr.id).map(|v| d.val_text(pr.id, v)).unwrap_or_default();
-                out.push_str(&format!(" {} |", table_cell(&t)));
-            }
-            out.push('\n');
-        }
+    if p.db.is_some() {
+        out.push_str(&db_table_md(ws, id));
         return out;
     }
     let mut counters = [0usize; 8];
@@ -90,7 +98,11 @@ pub fn page_markdown(ws: &Workspace, id: u64) -> String {
             BlockKind::Columns | BlockKind::Column => String::new(),
             BlockKind::Widget => format!("{pad}[Dashboard widget]"),
             BlockKind::Button => format!("{pad}[Button: {}]", if b.text.is_empty() { "Button" } else { &b.text }),
-            BlockKind::DbView => format!("{pad}[Database view: {}]", b.link.map(|l| ws.display_title(l)).unwrap_or_else(|| "none".into())),
+            BlockKind::Table => crate::mdtable::to_markdown(b).lines().map(|l| format!("{pad}{l}")).collect::<Vec<_>>().join("\n"),
+            BlockKind::DbView => match b.link.filter(|l| ws.db(*l).is_some()) {
+                Some(l) => db_table_md(ws, l).lines().map(|x| format!("{pad}{x}")).collect::<Vec<_>>().join("\n"),
+                None => format!("{pad}[Database view: none]"),
+            },
         };
         let tight = matches!(b.kind, BlockKind::Bullet | BlockKind::Numbered | BlockKind::Todo | BlockKind::Toggle);
         if !line.is_empty() {
@@ -141,6 +153,8 @@ pub fn db_csv(ws: &Workspace, id: u64) -> String {
 // ───────────────────────────── import ─────────────────────────────
 
 pub fn import_markdown(ws: &mut Workspace, name: &str, md: &str, parent: Option<u64>) -> u64 {
+    let (md, tables) = crate::mdtable::extract(md);
+    let md = md.as_str();
     let id = ws.add_page(parent, PageKind::Doc);
     let mut blocks: Vec<Block> = vec![];
     let mut title = String::new();
@@ -207,6 +221,7 @@ pub fn import_markdown(ws: &mut Workspace, name: &str, md: &str, parent: Option<
     if in_code && !code.is_empty() {
         blocks.push(ws.blk(BlockKind::Code, code.trim_end_matches('\n'), 0));
     }
+    crate::mdtable::restore(&mut blocks, &tables);
     if blocks.is_empty() {
         blocks.push(ws.blk(BlockKind::Text, "", 0));
     }

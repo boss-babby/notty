@@ -124,7 +124,7 @@ impl FileStorage {
         let ron_filepath: PathBuf = ron_filepath.into();
         log::debug!("Loading app state from {:?}…", ron_filepath);
         Self {
-            kv: read_ron(&ron_filepath).unwrap_or_default(),
+            kv: read_with_recovery(&ron_filepath).unwrap_or_default(),
             ron_filepath,
             dirty: false,
             last_save_join_handle: None,
@@ -194,6 +194,9 @@ impl crate::Storage for FileStorage {
     }
 }
 
+/// Lumen data safety: the state is written to a temporary file, flushed to the disk and only then renamed over the real file, so a crash,
+/// a power cut or a full disk can never leave a half-written `app.ron` behind. The previous good file is kept as `app.ron.bak` and a
+/// rolling set of hourly snapshots lives in `backups/` (see `read_with_recovery` for how they are used).
 fn save_to_disk(file_path: &PathBuf, kv: &HashMap<String, String>) {
     profiling::function_scope!();
 
@@ -205,24 +208,102 @@ fn save_to_disk(file_path: &PathBuf, kv: &HashMap<String, String>) {
         }
     }
 
-    match std::fs::File::create(file_path) {
-        Ok(file) => {
-            let mut writer = std::io::BufWriter::new(file);
-            let config = Default::default();
-
-            profiling::scope!("ron::serialize");
-            if let Err(err) = ron::ser::to_writer_pretty(&mut writer, &kv, config)
-                .and_then(|_| writer.flush().map_err(|err| err.into()))
-            {
-                log::warn!("Failed to serialize app state: {}", err);
-            } else {
-                log::trace!("Persisted to {:?}", file_path);
+    let text = {
+        profiling::scope!("ron::serialize");
+        match ron::ser::to_string_pretty(&kv, Default::default()) {
+            Ok(t) => t,
+            Err(err) => {
+                log::warn!("Failed to serialize app state: {err}");
+                return;
             }
         }
-        Err(err) => {
-            log::warn!("Failed to create file {file_path:?}: {err}");
+    };
+    // never replace a good file by something that does not parse back
+    if ron::de::from_str::<HashMap<String, String>>(&text).is_err() {
+        log::warn!("Refusing to write an app state that does not read back");
+        return;
+    }
+    let tmp = file_path.with_extension("ron.tmp");
+    let write = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = write {
+        log::warn!("Failed to write {tmp:?}: {err} (the previous state is untouched)");
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    // previous good state -> .bak, then the atomic swap
+    if file_path.exists() {
+        let _ = std::fs::copy(file_path, file_path.with_extension("ron.bak"));
+    }
+    if let Err(err) = std::fs::rename(&tmp, file_path) {
+        log::warn!("Failed to move {tmp:?} into place: {err}");
+        return;
+    }
+    log::trace!("Persisted to {:?}", file_path);
+    rotate_backups(file_path);
+}
+
+fn backup_dir(file_path: &Path) -> Option<PathBuf> {
+    file_path.parent().map(|p| p.join("backups"))
+}
+
+/// One snapshot per hour (kept: the newest 72 = three days of hourly states).
+fn rotate_backups(file_path: &Path) {
+    let Some(dir) = backup_dir(file_path) else { return };
+    let hour = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 3600).unwrap_or(0);
+    let target = dir.join(format!("app-{hour:08}.ron"));
+    if target.exists() || std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    if std::fs::copy(file_path, &target).is_err() {
+        return;
+    }
+    let mut names: Vec<PathBuf> = std::fs::read_dir(&dir).map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().map_or(false, |x| x == "ron")).collect()).unwrap_or_default();
+    names.sort();
+    while names.len() > 72 {
+        let _ = std::fs::remove_file(names.remove(0));
+    }
+}
+
+/// Reads the state; when the file is damaged the damaged copy is set aside (`app.corrupt-<time>.ron`) and the newest readable of
+/// `app.ron.bak` / `backups/*` is used instead — a damaged file is never silently replaced by an empty workspace.
+fn read_with_recovery(path: &Path) -> Option<HashMap<String, String>> {
+    if let Some(v) = read_ron::<HashMap<String, String>>(path) {
+        if !v.is_empty() {
+            return Some(v);
         }
     }
+    let exists = std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false);
+    if !exists {
+        // first start, or the file vanished: a leftover temp file / backup is still better than nothing
+        if !path.with_extension("ron.bak").exists() && !backup_dir(path).map_or(false, |d| d.exists()) {
+            return None;
+        }
+    } else {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let _ = std::fs::copy(path, path.with_file_name(format!("app.corrupt-{stamp}.ron")));
+        log::warn!("{path:?} is damaged — recovering from a backup");
+    }
+    let mut candidates = vec![path.with_extension("ron.bak")];
+    if let Some(dir) = backup_dir(path) {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(&dir).map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).collect()).unwrap_or_default();
+        v.sort();
+        v.reverse();
+        candidates.extend(v);
+    }
+    for c in candidates {
+        if let Some(v) = read_ron::<HashMap<String, String>>(&c) {
+            if !v.is_empty() {
+                log::warn!("Recovered the workspace from {c:?}");
+                return Some(v);
+            }
+        }
+    }
+    None
 }
 
 // ----------------------------------------------------------------------------

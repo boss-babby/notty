@@ -13,7 +13,7 @@ use egui::{
 use crate::database::{self, DbState};
 use crate::dates;
 use crate::icons::{self, Icon};
-use crate::model::{Block, BlockKind, Page, PageKind, ViewKind, Workspace, ICONS};
+use crate::model::{Block, BlockKind, Page, PageKind, PropKind, Val, ViewKind, Workspace, ICONS};
 use crate::theme::{bold, body, lerp_color, tag_color, Palette, COVERS, TAG_NAMES};
 use crate::lucide as l;
 use crate::media;
@@ -48,6 +48,8 @@ pub enum Req {
 
 #[derive(Default)]
 pub struct EditorState {
+    /// Table blocks: the block the user asked to convert into a database (handled by `show_page`, which owns the workspace).
+    pub table_to_db: Option<u64>,
     /// Set by the `/dashboard` command: the page gets a widget grid.
     pub want_dash: bool,
     /// Button blocks: the block whose actions should run (set by a click, consumed by the app) / whose editor should open.
@@ -190,6 +192,7 @@ fn slash_all() -> Vec<SlashItem> {
         .iter()
         .map(|k| SlashItem { act: Slash::Block(*k), label: k.label(), hint: k.hint(), glyph: k.glyph(), kw: k.keywords(), sec: "BASIC BLOCKS" })
         .collect();
+    v.push(SlashItem { act: Slash::Block(BlockKind::Table), label: "Table", hint: "Simple table — paste Markdown tables, convert to a database.", glyph: l::TABLE, kw: "table grid rows columns markdown spreadsheet cells", sec: "BASIC BLOCKS" });
     v.push(SlashItem { act: Slash::Block(BlockKind::Divider), label: "Divider", hint: "Visually divide blocks.", glyph: l::MINUS, kw: "divider line hr separator", sec: "BASIC BLOCKS" });
     let med = "MEDIA";
     for (k, label, hint, glyph, kw) in [
@@ -669,6 +672,7 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
             changed |= header(ui, &mut ws.pages[idx], ed, pal, content_w);
             if is_row {
                 changed |= database::row_props(ui, ws, id, ed, pal, content_w);
+                relation_links(ui, ws, id, ed, pal, content_w);
             }
             if let Some(b) = dash_board {
                 // this page is a dashboard: the widget grid sits between the header and the blocks
@@ -708,6 +712,13 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
         });
     });
 
+    if let Some(bid) = ed.table_to_db.take() {
+        if let Some(db) = crate::mdtable::to_database(ws, id, bid) {
+            crate::dashcfg::set_toast(&format!("Table converted to the database “{}”", ws.display_title(db)));
+            changed = true;
+            ui.ctx().request_repaint();
+        }
+    }
     if std::mem::take(&mut ed.want_dash) && kind == PageKind::Doc {
         ws.dash.ensure_page_board(id, "Dashboard");
         if let Some(p) = ws.pages.get_mut(idx) {
@@ -739,6 +750,47 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
         }
     }
     changed
+}
+
+/// Reverse relations: everything (in any database) that points at this row through a Relation property, grouped by database + property.
+/// Open a person and see the tasks assigned to them — relations work in both directions without a second property.
+fn relation_links(ui: &mut Ui, ws: &Workspace, id: u64, ed: &mut EditorState, pal: &Palette, w: f32) {
+    let groups = ws.relation_backlinks(id);
+    if groups.is_empty() {
+        return;
+    }
+    ui.add_space(10.0);
+    for (db, prop, rows) in groups {
+        let dbt = ws.display_title(db);
+        let pname = ws.db(db).and_then(|d| d.prop(prop)).map(|p| p.name.clone()).unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.add_space(gutter());
+            ui.label(RichText::new(format!("{}  ·  {}  ·  {}", dbt.to_uppercase(), pname.to_uppercase(), rows.len())).font(bold(11.5)).color(pal.muted));
+        });
+        for r in rows.into_iter().take(60) {
+            let Some(p) = ws.page(r) else { continue };
+            let (rect, resp) = ui.allocate_exact_size(vec2(w + gutter(), 28.0), Sense::click());
+            let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+            let rr = Rect::from_min_max(pos2(rect.left() + gutter() - 6.0, rect.top()), rect.right_bottom());
+            ui.painter().rect_filled(rr, 6.0, with_alpha(pal.hover, t));
+            let icon = if p.icon.is_empty() { l::TABLE } else { &p.icon };
+            icons::paint_page_icon(ui, pos2(rr.left() + 18.0, rr.center().y), icon, 16.0, pal.text);
+            let title = if p.title.is_empty() { "Untitled" } else { &p.title };
+            ui.painter().text(pos2(rr.left() + 38.0, rr.center().y), Align2::LEFT_CENTER, title, body(14.5), pal.text);
+            // the row's status-like value (first select property) as a quiet hint on the right
+            if let Some(d) = ws.db(db) {
+                if let Some((pr, Val::Sel(o))) = d.props.iter().find(|x| x.kind == PropKind::Select).and_then(|x| p.props.get(&x.id).map(|v| (x, v))) {
+                    if let Some(op) = d.opt(pr.id, *o) {
+                        ui.painter().text(pos2(rr.right() - 10.0, rr.center().y), Align2::RIGHT_CENTER, &op.name, body(12.5), pal.muted);
+                    }
+                }
+            }
+            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                ed.nav = Some(r);
+            }
+        }
+        ui.add_space(6.0);
+    }
 }
 
 fn backlinks(ui: &mut Ui, ws: &Workspace, id: u64, ed: &mut EditorState, pal: &Palette, w: f32) {
@@ -1743,6 +1795,12 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
             bl[i].kind = kind;
             if !kind.has_text() {
                 bl[i].text.clear();
+                if kind == BlockKind::Table {
+                    let t = crate::mdtable::blank();
+                    bl[i].text = crate::mdtable::encode(&t.rows);
+                    bl[i].url = t.align;
+                    bl[i].checked = true;
+                }
                 if kind == BlockKind::Button {
                     bl[i].text = "New button".into();
                     ed.edit_button = Some(bl[i].id);
@@ -2043,6 +2101,9 @@ fn draw_block(
     match b.kind {
         BlockKind::Button => {
             changed |= crate::autoui::button_block(ui, b, ed, pal, w);
+        }
+        BlockKind::Table => {
+            changed |= crate::tableblock::draw(ui, b, ed, pal, w);
         }
         BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File => {
             let pid = ed.cur_page;

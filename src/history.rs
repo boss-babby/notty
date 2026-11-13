@@ -233,6 +233,7 @@ fn plain_line(b: &Block) -> String {
         BlockKind::Embed | BlockKind::Bookmark => format!("{pad}[link] {}", if t.is_empty() { &b.url } else { &t }),
         BlockKind::Toc => format!("{pad}[table of contents]"),
         BlockKind::PageLink => format!("{pad}[page link]"),
+        BlockKind::Table => format!("{pad}[table] {}", t.replace([crate::mdtable::CELL, crate::mdtable::ROW], " ")),
         _ => format!("{pad}{t}"),
     }
 }

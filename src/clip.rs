@@ -54,6 +54,22 @@ pub fn rich_for(pasted: &str) -> Option<Rich> {
 
 /// Parses pasted Markdown into blocks (ids are assigned on insertion). `None` when the text has no block-level Markdown.
 pub fn markdown_blocks(md: &str) -> Option<Vec<Block>> {
+    // spreadsheet cells (tab separated) become a table block
+    if let Some(t) = crate::mdtable::from_tsv(md) {
+        let mut b = Block::new(0, crate::model::BlockKind::Table, "", 0);
+        b.kind = crate::model::BlockKind::Table;
+        b.text = crate::mdtable::encode(&t.rows);
+        b.url = t.align;
+        b.checked = true;
+        return Some(vec![b]);
+    }
+    let (rest, tables) = crate::mdtable::extract(md);
+    let mut out = markdown_blocks_inner(&rest, !tables.is_empty())?;
+    crate::mdtable::restore(&mut out, &tables);
+    Some(out)
+}
+
+fn markdown_blocks_inner(md: &str, force: bool) -> Option<Vec<Block>> {
     use crate::model::BlockKind as K;
     let mut out: Vec<Block> = vec![];
     let (mut in_code, mut code, mut structured) = (false, String::new(), false);
@@ -111,5 +127,5 @@ pub fn markdown_blocks(md: &str) -> Option<Vec<Block>> {
     if in_code && !code.is_empty() {
         out.push(Block::new(0, K::Code, code.trim_end_matches('\n'), 0));
     }
-    (structured && !out.is_empty()).then_some(out)
+    ((structured || force) && !out.is_empty()).then_some(out)
 }

@@ -33,3 +33,15 @@ Inline formatting inside any text: `**bold**`, `*italic*`, `~~strike~~`, `` `cod
 * Meeting note: H1 title, callout with the goal, `## Agenda` bullets, `## Notes`, `## Decisions`, `## Action items` as to-dos.
 * Project hub: callout (goal/owner/deadline), `[toc]`, linked database (see `databases`), `## Risks`, `## Links`.
 * Wiki / docs: one parent page with a `toc`, children for each topic, `[[links]]` between related pages.
+
+
+## Tables (v12)
+GitHub-style Markdown tables are understood everywhere markdown is accepted (`create_page`, `append_markdown`, `replace_page_content`, pasted text):
+
+```
+| Task | Owner | Done |
+|:-----|:-----:|-----:|
+| Ship | Ann   | yes  |
+```
+They become a `table` block (cells are plain text with inline markdown). The user can convert a table block into a database with *Convert to database*.
+For structured data prefer `create_database` (typed properties, relations, views); use tables for small, static, presentational grids.

@@ -84,3 +84,15 @@ A good first message for an agent: *"Call workspace_overview, read the `overview
 | "The Lumen app is offline" | Open the app, unlock it, keep the tab/app in the foreground (mobile OSes pause background tabs). |
 | Tools missing | Access level is *Read only*, or the app is older than 11.0. |
 | Timeout on long jobs | Big builds are split into tool calls of seconds each; ask the agent to proceed step by step. |
+
+
+## Loopback relay for the WebAssembly app (v12)
+
+```
+lumen-mcp --relay 7979 --token lmn_<token from AI → Connect> --origin https://your-site
+```
+* Listens on **127.0.0.1 only**. Every request needs `Authorization: Bearer <token>` (constant-time compare).
+* A request with an `Origin` header must come from `--origin` or a loopback page; the `Host` header must be a loopback name (DNS-rebinding guard).
+* Answers CORS and Chrome's *Private Network Access* preflight (`Access-Control-Allow-Private-Network`) for that single origin.
+* Lumen (web, bridge on, bridge URL `http://127.0.0.1:7979`) long-polls `/api/bridge/poll`; an MCP client posts JSON-RPC to `http://127.0.0.1:7979/mcp`.
+* The same protocol is served by the website (`/api/mcp`, `/api/bridge/poll`) for remote use.

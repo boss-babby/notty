@@ -388,6 +388,21 @@ pub fn page_html(ws: &Workspace, media: &MediaStore, id: u64, auto_print: bool) 
             BlockKind::Widget => {
                 o.push_str(&format!("<p style=\"{pad};color:#888\"><em>[Dashboard widget]</em></p>"));
             }
+            BlockKind::Table => {
+                let rows = crate::mdtable::grid(b);
+                let al: Vec<char> = b.url.chars().collect();
+                o.push_str(&format!("<table style=\"{pad};border-collapse:collapse;width:100%;margin:6px 0\">"));
+                for (ri, r) in rows.iter().enumerate() {
+                    o.push_str("<tr>");
+                    for (ci, c) in r.iter().enumerate() {
+                        let tag = if ri == 0 && b.checked { "th" } else { "td" };
+                        let a = match al.get(ci) { Some('c') => "center", Some('r') => "right", _ => "left" };
+                        o.push_str(&format!("<{tag} style=\"border:1px solid #ccc;padding:5px 9px;text-align:{a};{}\">{}</{tag}>", if tag == "th" { "background:#f3f3f2" } else { "" }, esc(&crate::rich::strip(c))));
+                    }
+                    o.push_str("</tr>");
+                }
+                o.push_str("</table>");
+            }
             BlockKind::Button => {
                 o.push_str(&format!("<p style=\"{pad}\"><span style=\"display:inline-block;padding:6px 14px;border-radius:8px;background:#2383e2;color:#fff;font-weight:600\">{}</span></p>", esc(if b.text.is_empty() { "Button" } else { &b.text })));
             }

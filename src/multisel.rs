@@ -56,6 +56,7 @@ fn md_line(b: &Block) -> String {
         BlockKind::Divider => format!("{pad}---"),
         BlockKind::Image => format!("{pad}![{}]({})", b.text, b.src()),
         BlockKind::Embed | BlockKind::Bookmark | BlockKind::File => format!("{pad}[{}]({})", if b.text.is_empty() { &b.url } else { &b.text }, b.url),
+        BlockKind::Table => crate::mdtable::to_markdown(b).lines().map(|l| format!("{pad}{l}")).collect::<Vec<_>>().join("\n"),
         _ => format!("{pad}{}", b.text),
     }
 }

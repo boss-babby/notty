@@ -1,3 +1,33 @@
+# Lumen 12.0 — Markdown tables, two-way relations, data safety, Android-optimised
+
+* **Markdown everywhere** — GFM tables are parsed by *every* entry point (paste, import, AI tools, MCP, `append_markdown`) through one pre-pass
+  (`src/mdtable.rs`): `| a | b |` + `|---|:-:|` becomes a real **Table block**; tab-separated spreadsheet cells paste as a table too; export (page, copy,
+  print, history) writes GFM tables back. Table block: click-to-edit cells with inline Markdown, Tab / Shift+Tab / Enter navigation, add / remove
+  row & column, sort, alignment, header row, *Copy Markdown* and **Convert to database** (header → properties with inferred types: number, checkbox,
+  date, URL, select; the block becomes a linked database view). `/table` inserts a blank one.
+* **Relations work in both directions** — `Workspace::relation_backlinks`: a row page lists every row (in any database) that points at it through a
+  Relation property, grouped by database + property (assign a task to a person → the person's page shows the task). No second property to maintain.
+* **Data safety on every build** — native/Android: atomic writes (temp file → fsync → rename), `app.ron.bak`, hourly rolling snapshots in `backups/`
+  (72 kept), automatic recovery from the newest readable copy when the main file is damaged (the damaged file is kept as `app.corrupt-*.ron`).
+  All builds: a "previous state" slot (≥ 10 min old), a once-per-upgrade copy of the previous version's data, unreadable state kept raw under its own
+  key (never overwritten silently), and on the web `navigator.storage.persist()` so the browser will not evict the workspace.
+* **Scrolling** — root cause of the laggy / stuck feel on laptops: egui treated Windows precision-touchpad deltas (fractional "lines") and fast
+  touchpad flicks (> 8 px per event) like mouse-wheel notches and ran them through ~100 ms of exponential smoothing. `vendor/egui` now applies
+  touchpad motion 1:1, only whole-line wheel notches are smoothed; the page scroller (`src/smooth.rs`) follows the fingers directly, measures their
+  velocity and glides with real fling friction when they lift (OS inertia is respected: no double momentum).
+* **Start-up memory** — nothing web-engine related starts with the app (WebView2 is created only while a *website embed* preview is open). The real
+  costs were fonts: the 50+ MB system CJK fonts (Windows / Android) were read into RAM at start, and 19 embedded script fonts were registered.
+  Script fonts are now **lazy** (`theme::ensure_scripts`): a font is loaded the first time text in that script is typed, pasted, imported or opened.
+* **UI** — the four "New …" rows became one **New ▸** entry with a fly-out (hover or tap); the AI panel slides in / out (cubic ease, content keeps its
+  width while it moves, the page does not re-wrap).
+* **MCP from WebAssembly** — a browser tab cannot listen on a port, but it can *call* `127.0.0.1`. `lumen-mcp --relay 7979 --token … --origin <site>` is a
+  loopback relay (127.0.0.1 only, bearer token, Origin + Host checks, CORS / Private-Network-Access for exactly one origin). Set the app's bridge URL to
+  `http://127.0.0.1:7979`; desktop AI clients use `http://127.0.0.1:7979/mcp`. The website also hosts the same relay (`/api/mcp`, `/api/bridge/poll`).
+
+Build everything: `./build-all.sh` (WebAssembly → `../public/webapp`, signed arm64 APK → `../public/downloads`, Windows x64 exe + zip).
+
+---
+
 # Lumen 11.0 — Agents: built-in AI, MCP server, Android-optimised build
 
 * **Lumen AI** (`src/ai.rs`, `src/aiui.rs`) — an agent panel that builds pages, databases, dashboards, canvases, flows, automations and scripts through one tool registry (`src/agent_tools.rs`, `src/agent_build.rs`). Providers: Gemini, OpenAI, Claude, OpenRouter, Groq, Mistral, DeepSeek, xAI, Together, Fireworks, Cerebras, Ollama, LM Studio, custom OpenAI-compatible. Access levels, approvals, undo.

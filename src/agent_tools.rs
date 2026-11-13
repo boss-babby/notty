@@ -395,6 +395,7 @@ const BLOCK_TYPES: &[(&str, BlockKind)] = &[
     ("image", BlockKind::Image),
     ("embed", BlockKind::Embed),
     ("bookmark", BlockKind::Bookmark),
+    ("table", BlockKind::Table),
 ];
 
 fn kind_name(k: BlockKind) -> &'static str {
@@ -405,6 +406,7 @@ fn kind_name(k: BlockKind) -> &'static str {
         BlockKind::DbView => "db_view",
         BlockKind::Widget => "widget",
         BlockKind::Button => "button",
+        BlockKind::Table => "table",
         _ => "text",
     })
 }
@@ -508,6 +510,13 @@ pub fn parse_filters(ws: &Workspace, db: u64, list: &[&Json]) -> Result<Vec<Filt
 
 /// Converts the Lumen markdown dialect into blocks. With `title_from_h1` the first `# ` line is returned as the title instead.
 pub fn md_blocks(ws: &mut Workspace, md: &str, title_from_h1: bool) -> (Option<String>, Vec<Block>) {
+    let (rest, tables) = crate::mdtable::extract(md);
+    let (title, mut blocks) = md_blocks_inner(ws, &rest, title_from_h1);
+    crate::mdtable::restore(&mut blocks, &tables);
+    (title, blocks)
+}
+
+fn md_blocks_inner(ws: &mut Workspace, md: &str, title_from_h1: bool) -> (Option<String>, Vec<Block>) {
     let mut blocks: Vec<Block> = vec![];
     let mut title: Option<String> = None;
     let mut in_code = false;

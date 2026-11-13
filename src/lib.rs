@@ -44,6 +44,8 @@ mod script;
 mod scripthost;
 mod scriptui;
 mod clip;
+mod mdtable;
+mod tableblock;
 mod model;
 mod platform;
 mod dashboard;

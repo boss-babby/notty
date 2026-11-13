@@ -27,6 +27,40 @@ use crate::widgets::{
 
 const SIDEBAR_W: f32 = 264.0;
 const STORAGE_KEY: &str = "lumen_v1";
+/// Data safety (see `LumenApp::save` / `load_saved`): the state as it was before the newest save (refreshed at most every 10 minutes),
+/// the state of the previous app version (kept once on every upgrade) and the raw text of a state that could not be read.
+const PREV_KEY: &str = "lumen_v1_prev";
+const PREV_AT_KEY: &str = "lumen_v1_prev_at";
+const UPGRADE_KEY: &str = "lumen_v1_before_upgrade";
+const UPGRADE_VER_KEY: &str = "lumen_v1_before_upgrade_version";
+const VERSION_KEY: &str = "lumen_version";
+const UNREADABLE_KEY: &str = "lumen_v1_unreadable";
+
+/// Reads the workspace; when the newest state is damaged (or written by an incompatible version) the next older copy is used.
+/// Returns the state and, when the primary copy existed but could not be read, its raw text so that it can be preserved.
+fn load_saved(s: &dyn eframe::Storage) -> (Option<Saved>, Option<String>) {
+    let mut rescued = None;
+    for (i, key) in [STORAGE_KEY, PREV_KEY, UPGRADE_KEY].into_iter().enumerate() {
+        let Some(raw) = s.get_string(key) else { continue };
+        if raw.trim().is_empty() {
+            continue;
+        }
+        match eframe::get_value::<Saved>(s, key) {
+            Some(v) => {
+                if i > 0 {
+                    log::warn!("workspace restored from the backup slot {key}");
+                }
+                return (Some(v), rescued);
+            }
+            None => {
+                if i == 0 {
+                    rescued = Some(raw);
+                }
+            }
+        }
+    }
+    (None, rescued)
+}
 
 #[derive(Serialize)]
 struct SavedRef<'a> {
@@ -122,6 +156,8 @@ pub struct LumenApp {
     row_menu: Option<(u64, Pos2)>,
     side_menu: Option<Pos2>,
     ws_menu: Option<Pos2>,
+    /// Raw text of a stored workspace that could not be parsed (kept under its own storage key on the next save).
+    rescued: Option<String>,
     trash_open: bool,
     security: Option<SecurityDialog>,
     fresh: bool,
@@ -165,13 +201,26 @@ impl LumenApp {
         #[cfg(target_arch = "wasm32")]
         theme::load_web_fonts(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
-        let saved: Option<Saved> = cc.storage.and_then(|s| eframe::get_value(s, STORAGE_KEY));
+        let (saved, rescued) = cc.storage.map(|s| load_saved(s)).unwrap_or((None, None));
+        crate::platform::request_persistent_storage();
         let (ws, cred, skipped) = match saved {
             Some(s) => (s.ws, s.cred, s.skipped),
             None => (Workspace::seed(), None, false),
         };
         let mut ws = ws;
         ws.migrate();
+        // fonts for the scripts that are really used in this workspace (the others are never loaded = less memory)
+        for pg in &ws.pages {
+            theme::ensure_scripts(&cc.egui_ctx, &pg.title);
+            for b in pg.blocks.iter().filter(|b| b.kind.has_text()) {
+                theme::ensure_scripts(&cc.egui_ctx, &b.text);
+            }
+            for v in pg.props.values() {
+                if let crate::model::Val::Text(t) = v {
+                    theme::ensure_scripts(&cc.egui_ctx, t);
+                }
+            }
+        }
         if ws.current.map_or(true, |c| ws.page(c).is_none()) {
             ws.current = ws.pages.iter().find(|p| !p.trashed && !p.row).map(|p| p.id);
         }
@@ -207,6 +256,7 @@ impl LumenApp {
             toasts: vec![],
             last_theme_t: -1.0,
             theme_applied: false,
+            rescued,
             last_active: now_ms() / 1000.0,
             shown_page: None,
             focus_title: None,
@@ -578,6 +628,129 @@ impl LumenApp {
 
     // ───────────── sidebar ─────────────
 
+    /// One concise "New" entry in the sidebar: hovering (or tapping) it opens a fly-out on its right with page · database · canvas · flow.
+    fn new_flyout(&mut self, ui: &mut Ui, pal: &Palette, w: f32) {
+        let key = Id::new("sr_new");
+        let ctx = ui.ctx().clone();
+        let (_, rect) = ui.allocate_space(vec2(w, 28.0));
+        let resp = ui.interact(rect, key, Sense::click());
+        let open_id = Id::new("new_fly_open");
+        let last_id = Id::new("new_fly_last");
+        let mut open: bool = ctx.data(|d| d.get_temp(open_id)).unwrap_or(false);
+        let mut last: f64 = ctx.data(|d| d.get_temp(last_id)).unwrap_or(0.0);
+        let now = ctx.input(|i| i.time);
+        let touch = crate::touch::touchy();
+        let (_, t) = row_bg(ui, pal, key, rect, open);
+        let col = lerp_color(pal.muted, pal.text, 0.35 + 0.65 * t);
+        icons::paint(ui.painter(), pos2(rect.left() + 20.0, rect.center().y), 15.0, Icon::Plus, col);
+        ui.painter().text(pos2(rect.left() + 38.0, rect.center().y), Align2::LEFT_CENTER, "New", body(14.5), col);
+        ui.painter().text(pos2(rect.right() - 12.0, rect.center().y), Align2::RIGHT_CENTER, "›", bold(17.0), col);
+        let hov = resp.hovered();
+        if resp.clicked() {
+            open = !open;
+        } else if hov && !touch {
+            open = true;
+        }
+        if hov || (open && last == 0.0) {
+            last = now;
+        }
+        if open {
+            let a = ctx.animate_bool_with_time(Id::new("new_fly_t"), true, 0.12);
+            let pos = pos2(rect.right() + 6.0, rect.top() - 6.0);
+            let mut pick: Option<u8> = None;
+            let area = Area::new(Id::new("new_fly")).order(Order::Foreground).fixed_pos(pos + vec2((1.0 - a) * -6.0, 0.0)).show(&ctx, |ui| {
+                ui.set_opacity(a);
+                crate::widgets::popup_frame(pal).show(ui, |ui| {
+                    ui.set_width(236.0);
+                    section_label(ui, pal, "CREATE");
+                    if menu_item(ui, pal, l::FILE_PLUS, "Page", Some("Notes, docs, wikis — Markdown, tables, blocks"), false, false).clicked() {
+                        pick = Some(0);
+                    }
+                    if menu_item(ui, pal, l::KANBAN, "Database", Some("Table, board, list, gallery, calendar, timeline"), false, false).clicked() {
+                        pick = Some(1);
+                    }
+                    if menu_item(ui, pal, l::NETWORK, "Canvas", Some("Infinite whiteboard with connectors"), false, false).clicked() {
+                        pick = Some(2);
+                    }
+                    if menu_item(ui, pal, l::ZAP, "Flow", Some("Node-based automation and data pipelines"), false, false).clicked() {
+                        pick = Some(3);
+                    }
+                    ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top() + 2.0, Stroke::new(1.0_f32, pal.border));
+                    ui.add_space(5.0);
+                    if menu_item(ui, pal, l::LAYOUT_TEMPLATE, "From template…", None, false, false).clicked() {
+                        pick = Some(4);
+                    }
+                    if menu_item(ui, pal, l::FILE_DOWN, "Import Markdown / CSV…", None, false, false).clicked() {
+                        pick = Some(5);
+                    }
+                });
+            });
+            let over = ctx.pointer_hover_pos().map_or(false, |p| area.response.rect.expand(8.0).contains(p));
+            if over || hov {
+                last = now;
+            }
+            if (!touch && now - last > 0.28) || (ctx.input(|i| i.pointer.any_pressed()) && !over && !hov) {
+                open = false;
+            }
+            if let Some(k) = pick {
+                open = false;
+                match k {
+                    0 => self.new_page(None, PageKind::Doc),
+                    1 => self.new_page(None, PageKind::Database),
+                    2 => self.new_page(None, PageKind::Canvas),
+                    3 => self.new_page(None, PageKind::Flow),
+                    4 => self.templates_open = true,
+                    _ => self.run(PalAct::Import),
+                }
+            }
+            if open {
+                ctx.request_repaint_after(std::time::Duration::from_millis(60));
+            }
+        }
+        if !open {
+            ctx.animate_bool_with_time(Id::new("new_fly_t"), false, 0.0);
+            last = 0.0;
+        }
+        ctx.data_mut(|d| {
+            d.insert_temp(open_id, open);
+            d.insert_temp(last_id, last);
+        });
+    }
+
+    /// Loads the font of any script that shows up in typed / pasted / IME text, or on the page being viewed (imports, AI, MCP, sync).
+    fn load_script_fonts(&mut self, ctx: &Context) {
+        let typed: Vec<String> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Text(t) | egui::Event::Paste(t) | egui::Event::Ime(egui::ImeEvent::Commit(t)) if !t.is_ascii() => Some(t.clone()),
+                    _ => None,
+                })
+                .collect()
+        });
+        for t in typed {
+            theme::ensure_scripts(ctx, &t);
+        }
+        let now = ctx.input(|i| i.time);
+        let last: f64 = ctx.data(|d| d.get_temp(Id::new("script_scan_t"))).unwrap_or(-10.0);
+        if now - last > 2.0 && !self.locked {
+            ctx.data_mut(|d| d.insert_temp(Id::new("script_scan_t"), now));
+            if let Some(p) = self.ws.current.and_then(|c| self.ws.page(c)) {
+                theme::ensure_scripts(ctx, &p.title);
+                for b in p.blocks.iter().filter(|b| b.kind.has_text()) {
+                    theme::ensure_scripts(ctx, &b.text);
+                }
+            }
+            if self.ai.rt.open {
+                let texts: Vec<String> = self.ai.st.threads.iter().max_by(|a, b| a.updated.total_cmp(&b.updated)).map(|t| t.msgs.iter().rev().take(3).map(|m| m.text.clone()).collect()).unwrap_or_default();
+                for t in texts {
+                    theme::ensure_scripts(ctx, &t);
+                }
+            }
+            ctx.request_repaint_after(Duration::from_secs(2));
+        }
+    }
+
     fn sidebar(&mut self, ui: &mut Ui, pal: &Palette) {
         let w = SIDEBAR_W - 16.0;
         let mut ev: Vec<Ev> = vec![];
@@ -620,18 +793,7 @@ impl LumenApp {
         if simple_row(ui, pal, "sr_search", w, Icon::Search, "Search", Some("Ctrl K")) {
             self.palette = Some(PaletteState { query: String::new(), sel: 0, focused: false, pick: None });
         }
-        if simple_row(ui, pal, "sr_new", w, Icon::Plus, "New page", None) {
-            self.new_page(None, PageKind::Doc);
-        }
-        if simple_row(ui, pal, "sr_board", w, Icon::Board, "New database", None) {
-            self.new_page(None, PageKind::Database);
-        }
-        if simple_row(ui, pal, "sr_canvas", w, Icon::Canvas, "New canvas", None) {
-            self.new_page(None, PageKind::Canvas);
-        }
-        if simple_row(ui, pal, "sr_flow", w, Icon::Flow, "New flow", None) {
-            self.new_page(None, PageKind::Flow);
-        }
+        self.new_flyout(ui, pal, w);
         if simple_row(ui, pal, "sr_journal", w, Icon::Page, "Today's journal", Some("Ctrl J")) {
             self.run(PalAct::Journal);
         }
@@ -1935,6 +2097,32 @@ impl LumenApp {
 
 impl eframe::App for LumenApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        // ── data safety ──
+        // 1. a state that could not be read is never thrown away: its raw text is kept under its own key
+        if let Some(raw) = self.rescued.take() {
+            storage.set_string(UNREADABLE_KEY, raw);
+        }
+        let old = storage.get_string(STORAGE_KEY).filter(|o| !o.trim().is_empty());
+        if let Some(old) = old {
+            // 2. first save after an app update: keep the previous version's data untouched in its own slot
+            let ver = env!("CARGO_PKG_VERSION");
+            if storage.get_string(VERSION_KEY).as_deref() != Some(ver) {
+                if let Some(prev_ver) = storage.get_string(VERSION_KEY) {
+                    storage.set_string(UPGRADE_KEY, old.clone());
+                    storage.set_string(UPGRADE_VER_KEY, prev_ver);
+                }
+                storage.set_string(VERSION_KEY, ver.to_owned());
+            }
+            // 3. rolling "previous state" slot: at most one rotation every 10 minutes, so it is always a state from before the latest edits
+            let now = now_ms();
+            let last: f64 = storage.get_string(PREV_AT_KEY).and_then(|t| t.parse().ok()).unwrap_or(0.0);
+            if now - last > 10.0 * 60.0 * 1000.0 {
+                storage.set_string(PREV_KEY, old);
+                storage.set_string(PREV_AT_KEY, format!("{now}"));
+            }
+        } else {
+            storage.set_string(VERSION_KEY, env!("CARGO_PKG_VERSION").to_owned());
+        }
         eframe::set_value(storage, STORAGE_KEY, &SavedRef { ws: &self.ws, cred: &self.cred, skipped: self.skipped_setup });
         self.media.save(storage);
         eframe::set_value(storage, crate::ai::STORAGE_KEY, &self.ai.st.for_save());
@@ -1962,6 +2150,7 @@ impl eframe::App for LumenApp {
 
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
         self.ed.embed_rects.clear();
+        self.load_script_fonts(ctx);
         #[cfg(target_os = "android")]
         self.android_back(ctx);
         self.frame(ctx);
@@ -2277,6 +2466,16 @@ impl LumenApp {
         } else {
             None
         };
+        let ai_target = self.ai.rt.open && !self.locked && ctx.screen_rect().width() >= 720.0;
+        let ai_t = ctx.animate_bool_with_time_and_easing(Id::new("ai_slide_t"), ai_target, 0.32, egui::emath::easing::cubic_in_out);
+        let ai_w: f32 = ctx.data(|d| d.get_temp::<f32>(Id::new("ai_panel_w"))).unwrap_or(400.0).clamp(320.0, 680.0);
+        // the page is laid out once at the width it will have when the AI panel has finished sliding
+        let frozen_w: Option<f32> = if frozen_w.is_none() && ai_t > 0.003 && ai_t < 0.997 {
+            let side = if !narrow && self.ws.sidebar_open && !self.focus_mode { SIDEBAR_W } else { 0.0 };
+            Some(screen_w - side - if ai_target { ai_w } else { 0.0 })
+        } else {
+            frozen_w
+        };
         if narrow {
             if st > 0.003 {
                 let sw = SIDEBAR_W.min(screen_w * 0.88);
@@ -2328,15 +2527,25 @@ impl LumenApp {
                 });
         }
 
-        let ai_wide = self.ai.rt.open && !self.locked && ctx.screen_rect().width() >= 720.0;
-        if ai_wide {
+        // AI panel: slides in / out (the content keeps its width and is revealed from the right edge, so nothing re-wraps while it moves)
+        if ai_t > 0.003 {
+            let animating = ai_t < 0.997;
             let mut out = crate::aiui::PanelOut::default();
-            egui::SidePanel::right("ai_panel")
-                .resizable(true)
-                .default_width(400.0)
-                .width_range(320.0..=680.0)
-                .frame(Frame::new().fill(crate::aiui::panel_bg(&pal)))
-                .show(ctx, |ui| out = crate::aiui::panel(ui, ctx, &mut self.ai, &mut self.ws, &pal));
+            let mut panel = egui::SidePanel::right("ai_panel").frame(Frame::new().fill(crate::aiui::panel_bg(&pal)).shadow(egui::epaint::Shadow { offset: [-4, 0], blur: 24, spread: 0, color: Color32::from_black_alpha((38.0 * (1.0 - ai_t * 0.6)) as u8) }));
+            panel = if animating { panel.resizable(false).exact_width(ai_w * ai_t) } else { panel.resizable(true).default_width(ai_w).width_range(320.0..=680.0) };
+            let shown = panel.show(ctx, |ui| {
+                let r = ui.max_rect();
+                let lw = if animating { ai_w } else { r.width() };
+                let lr = Rect::from_min_size(pos2(r.right() - lw, r.top()), vec2(lw, r.height()));
+                let clip = ui.clip_rect().intersect(r);
+                ui.scope_builder(egui::UiBuilder::new().id_salt("ai_content").max_rect(lr), |ui| {
+                    ui.set_clip_rect(clip);
+                    out = crate::aiui::panel(ui, ctx, &mut self.ai, &mut self.ws, &pal);
+                });
+            });
+            if !animating {
+                ctx.data_mut(|d| d.insert_temp(Id::new("ai_panel_w"), shown.response.rect.width()));
+            }
             if out.close {
                 self.ai.rt.open = false;
             }

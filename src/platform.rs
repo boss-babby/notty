@@ -452,6 +452,23 @@ pub fn coarse_pointer() -> bool {
     js_sys::Reflect::get(&mq, &"matches".into()).ok().and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
+/// Web: asks the browser not to evict this site's storage under disk pressure (`navigator.storage.persist()`), so the workspace in
+/// localStorage / IndexedDB survives. Other targets store in files and need nothing.
+#[cfg(target_arch = "wasm32")]
+pub fn request_persistent_storage() {
+    let Some(w) = web_sys::window() else { return };
+    let nav = w.navigator();
+    if let Ok(st) = js_sys::Reflect::get(&nav, &"storage".into()) {
+        use wasm_bindgen::JsCast;
+        if let Some(f) = js_sys::Reflect::get(&st, &"persist".into()).ok().and_then(|f| f.dyn_into::<js_sys::Function>().ok()) {
+            let _ = f.call0(&st);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn request_persistent_storage() {}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub fn coarse_pointer() -> bool {
     cfg!(target_os = "android")
