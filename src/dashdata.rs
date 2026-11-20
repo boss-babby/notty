@@ -443,6 +443,7 @@ pub fn histogram(ws: &Workspace, cfg: &Cfg, global: Range) -> Dataset {
     ds
 }
 
+#[derive(Clone, Debug, Default)]
 pub struct Scatter {
     /// (x, y, record, category index)
     pub pts: Vec<(f64, f64, u64, usize)>,
@@ -494,6 +495,7 @@ pub fn heat(ws: &Workspace, cfg: &Cfg, global: Range) -> BTreeMap<i64, Vec<u64>>
     m
 }
 
+#[derive(Clone, Debug, Default)]
 pub struct Num {
     pub value: f64,
     pub prev: Option<f64>,

@@ -284,10 +284,8 @@ pub fn paint_page_icon(ui: &Ui, c: Pos2, icon: &str, size: f32, color: Color32) 
         if !ui.is_rect_visible(r) {
             return;
         }
-        let st = paint_image(ui, r.shrink(size * 0.04), &crate::media::twemoji_url(icon), 0.0);
-        if st == ImgState::Failed {
-            ui.painter().text(c, Align2::CENTER_CENTER, icon, crate::theme::body(size * 0.9), color);
-        }
+        // colour emoji come from the bundled Noto pack through the text engine (no network, same look as in text)
+        ui.painter().text(c, Align2::CENTER_CENTER, icon, crate::theme::body(size * 0.82), color);
         return;
     }
     ui.painter().text(c, Align2::CENTER_CENTER, icon, crate::theme::body(size), color);

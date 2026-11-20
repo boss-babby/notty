@@ -688,7 +688,13 @@ impl FontsImpl {
                     .map(|font_name| self.font_impl_cache.font_impl(size, font_name))
                     .collect();
 
-                Font::new(fonts)
+                let mut f = Font::new(fonts);
+                if let FontFamily::Name(n) = family {
+                    if n.starts_with("emoji-bw") {
+                        f.set_color_emoji(false);
+                    }
+                }
+                f
             })
     }
 

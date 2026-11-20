@@ -593,6 +593,7 @@ pub fn inspector(ctx: &egui::Context, ws: &mut Workspace, pal: &Palette, id: u64
                     }
                     if has(Opt::Legend) {
                         check(ui, &mut w.cfg.legend, "Show legend");
+                        check(ui, &mut w.cfg.trend, "Trend line (bar / line)");
                     }
                     if has(Opt::Cumulative) {
                         check(ui, &mut w.cfg.cumulative, "Running total");

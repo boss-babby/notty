@@ -10,7 +10,7 @@ use egui::{pos2, vec2, Align2, Color32, CornerRadius, CursorIcon, Id, LayerId, M
 
 use crate::dashdata::{fmt_agg, fmt_num, Dataset, Scatter};
 use crate::dates;
-use crate::theme::{body, bold, Palette};
+use crate::theme::{body, bold, tag_color, Palette};
 use crate::widgets::{appear, text_fit, with_alpha};
 
 fn c(r: u8, g: u8, b: u8) -> Color32 {
@@ -48,6 +48,10 @@ pub struct Style {
     pub labels: bool,
     pub legend: bool,
     pub palette: u8,
+    /// Horizontal reference line (0 = none).
+    pub goal: f64,
+    /// Least-squares trend line over the category totals.
+    pub trend: bool,
 }
 
 // ───────────────────────────── helpers ─────────────────────────────
@@ -345,6 +349,32 @@ pub fn chart(ui: &mut Ui, pal: &Palette, id: Id, size: Vec2, ds: &Dataset, st: &
                     if tot > 0.0 {
                         p.text(pos2(area.left() + slot * (ci as f32 + 0.5), y_of(tot) - 8.0), Align2::CENTER_CENTER, fmt_v(tot, ds), bold(11.0), pal.text);
                     }
+                }
+            }
+            // reference line (the widget's goal) and least-squares trend line over the category totals
+            if st.goal > 0.0 && st.goal >= lo && st.goal <= top {
+                let gy = y_of(st.goal);
+                let col = with_alpha(pal.text, 0.55);
+                let mut x = area.left();
+                while x < area.right() {
+                    p.line_segment([pos2(x, gy), pos2((x + 6.0).min(area.right()), gy)], Stroke::new(1.4_f32, col));
+                    x += 11.0;
+                }
+                p.text(pos2(area.right() - 2.0, gy - 8.0), Align2::RIGHT_CENTER, format!("goal {}", fmt_v(st.goal, ds)), body(10.5), col);
+            }
+            if st.trend && n >= 3 && t > 0.95 {
+                let ys: Vec<f64> = (0..n).map(top_of).collect();
+                let nf = n as f64;
+                let (sx, sy) = (nf * (nf - 1.0) / 2.0, ys.iter().sum::<f64>());
+                let sxx = (0..n).map(|i| (i * i) as f64).sum::<f64>();
+                let sxy = ys.iter().enumerate().map(|(i, y)| i as f64 * y).sum::<f64>();
+                let den = nf * sxx - sx * sx;
+                if den.abs() > 1e-9 {
+                    let m = (nf * sxy - sx * sy) / den;
+                    let b = (sy - m * sx) / nf;
+                    let at = |i: f64| pos2(area.left() + slot * (i as f32 + 0.5), y_of((m * i + b).clamp(lo, top)));
+                    p.line_segment([at(0.0), at(nf - 1.0)], Stroke::new(2.2_f32, tag_color(5)));
+                    p.text(at(nf - 1.0) + vec2(-4.0, -10.0), Align2::RIGHT_CENTER, "trend", body(10.5), tag_color(5));
                 }
             }
             if let Some((s, ci)) = hv {

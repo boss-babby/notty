@@ -235,11 +235,14 @@ pub struct Block {
     /// Button blocks: the automation actions one click runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acts: Vec<crate::automation::Action>,
+    /// Table blocks: user-set column widths and minimum row heights in points, `"w1,w2,w3|h1,h2"` (0 = automatic). See `tableblock.rs`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cols: String,
 }
 
 impl Block {
     pub fn new(id: u64, kind: BlockKind, text: &str, indent: u8) -> Block {
-        Block { id, kind, text: text.into(), checked: false, indent, collapsed: false, color: 0, bg: 0, link: None, url: String::new(), media: 0, size: 0, start: 0, vopts: 0, acts: vec![] }
+        Block { id, kind, text: text.into(), checked: false, indent, collapsed: false, color: 0, bg: 0, link: None, url: String::new(), media: 0, size: 0, start: 0, vopts: 0, acts: vec![], cols: String::new() }
     }
 
     /// Source string of a media block: `media:<id>` for local files, otherwise the URL.
@@ -817,11 +820,22 @@ impl Page {
     }
 }
 
+/// Where the rows of a large dataset are stored (a directory under the app's data folder; in the browser, memory for the session).
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub struct BigMeta {
+    pub dir: String,
+    #[serde(default)]
+    pub volatile: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Workspace {
     pub name: String,
     pub pages: Vec<Page>,
     pub next_id: u64,
+    /// Large datasets: database page id → where its rows live (`bigtable.rs`). The rows are not pages.
+    #[serde(default)]
+    pub bigs: BTreeMap<u64, BigMeta>,
     pub current: Option<u64>,
     pub dark: bool,
     pub sidebar_open: bool,
@@ -895,7 +909,7 @@ pub const TEMPLATES: [(&str, &str, &str); 13] = [
     ("OKRs & goals", "🏆", "Objectives with quarter, owner, status and progress — charted on the dashboard."),
 ];
 
-fn blank_page(id: u64, parent: Option<u64>, kind: PageKind) -> Page {
+pub(crate) fn blank_page(id: u64, parent: Option<u64>, kind: PageKind) -> Page {
     Page {
         id,
         parent,
@@ -932,6 +946,7 @@ impl Workspace {
             return;
         }
         self.icons_v2 = true;
+        crate::bigdata::bump();
         for p in self.pages.iter_mut() {
             if p.icon.chars().next().map_or(false, |c| (c as u32) >= 0x2000 && !(0xE000..=0xF8FF).contains(&(c as u32))) {
                 let m = l::migrate(&p.icon);
@@ -982,6 +997,8 @@ impl Workspace {
     }
 
     pub fn page_mut(&mut self, id: u64) -> Option<&mut Page> {
+        #[cfg(test)]
+        crate::bigdata::bump();
         match self.index_of(id) {
             Some(i) => self.pages.get_mut(i),
             None => None,
@@ -1046,6 +1063,7 @@ impl Workspace {
 
     /// Repairs flows loaded from disk (dangling wires, loops, flow pages without a graph).
     pub fn fix_flows(&mut self) {
+        crate::bigdata::bump();
         for p in self.pages.iter_mut().filter(|p| p.kind == PageKind::Flow) {
             match p.flow.as_mut() {
                 Some(f) => f.repair(),
@@ -1056,6 +1074,7 @@ impl Workspace {
 
     /// Repairs canvases loaded from disk (damaged geometry, dangling connectors, canvas pages without a board).
     pub fn fix_canvases(&mut self) {
+        crate::bigdata::bump();
         for p in self.pages.iter_mut().filter(|p| p.kind == PageKind::Canvas) {
             match p.canvas.as_mut() {
                 Some(c) => {
@@ -1135,6 +1154,7 @@ impl Workspace {
     /// Drops the hidden views of linked blocks that no longer exist on any page.
     pub fn prune_linked_views(&mut self) {
         let live: std::collections::HashSet<u64> = self.pages.iter().filter(|p| !p.trashed).flat_map(|p| p.blocks.iter()).filter(|b| b.kind == BlockKind::DbView).map(|b| b.id).collect();
+        crate::bigdata::bump();
         for p in self.pages.iter_mut() {
             if let Some(d) = p.db.as_mut() {
                 if d.views.iter().any(|v| v.linked != 0 && !live.contains(&v.linked)) {
@@ -1178,7 +1198,24 @@ impl Workspace {
     }
 
     pub fn rows(&self, db: u64) -> Vec<u64> {
-        self.pages.iter().filter(|p| p.row && p.parent == Some(db) && !p.trashed).map(|p| p.id).collect()
+        // cached per (data revision, page count): the scan over every page happens once per change, not once per call
+        thread_local! {
+            static RC: std::cell::RefCell<std::collections::HashMap<u64, (u64, usize, std::sync::Arc<Vec<u64>>)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+        }
+        let rev = crate::bigdata::rev();
+        let len = self.pages.len();
+        if let Some(v) = RC.with(|c| c.borrow().get(&db).filter(|e| e.0 == rev && e.1 == len).map(|e| e.2.clone())) {
+            return (*v).clone();
+        }
+        let v: Vec<u64> = self.pages.iter().filter(|p| p.row && p.parent == Some(db) && !p.trashed).map(|p| p.id).collect();
+        RC.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() > 64 {
+                c.clear();
+            }
+            c.insert(db, (rev, len, std::sync::Arc::new(v.clone())));
+        });
+        v
     }
 
     /// Rows of a database after applying the filters and sorts of view `vi`.
@@ -1202,20 +1239,9 @@ impl Workspace {
             (s.prop, s.asc).hash(&mut h);
         }
         serde_json::to_string(&d.props).unwrap_or_default().hash(&mut h);
-        for p in self.pages.iter().filter(|p| p.row && p.parent == Some(db) && !p.trashed) {
-            p.id.hash(&mut h);
-            p.title.hash(&mut h);
-            for (k, v) in &p.props {
-                k.hash(&mut h);
-                match v {
-                    Val::Text(s) => (0u8, s).hash(&mut h),
-                    Val::Num(n) => (1u8, n.to_bits()).hash(&mut h),
-                    Val::Sel(o) => (2u8, o).hash(&mut h),
-                    Val::Multi(m) => (3u8, m).hash(&mut h),
-                    Val::Check(b) => (4u8, b).hash(&mut h),
-                }
-            }
-        }
+        // the data revision (bumped by every mutation entry point) + the page count replace the old O(rows) hash of every value
+        crate::bigdata::rev().hash(&mut h);
+        self.pages.len().hash(&mut h);
         let fp = h.finish();
         if let Some(v) = QC.with(|c| c.borrow().get(&(db, vi)).filter(|(f, _)| *f == fp).map(|(_, v)| v.clone())) {
             return v;
@@ -1270,6 +1296,7 @@ impl Workspace {
     pub fn set_trashed(&mut self, id: u64, trashed: bool) {
         let mut ids = self.descendants(id);
         ids.push(id);
+        crate::bigdata::bump();
         for p in self.pages.iter_mut().filter(|p| ids.contains(&p.id)) {
             p.trashed = trashed;
         }
@@ -1294,6 +1321,7 @@ impl Workspace {
         let mut ids = self.descendants(id);
         ids.push(id);
         self.pages.retain(|p| !ids.contains(&p.id));
+        crate::bigdata::bump();
         for p in self.pages.iter_mut() {
             for b in p.blocks.iter_mut() {
                 if b.link.map_or(false, |l| ids.contains(&l)) {
@@ -1828,7 +1856,7 @@ impl Workspace {
     // ───────── first-run content ─────────
 
     pub fn seed() -> Self {
-        let mut ws = Workspace { name: "My Workspace".into(), pages: vec![], next_id: 0, current: None, dark: false, sidebar_open: true, accent: 0, icons_v2: false, pdf_annots: BTreeMap::new(), dash: Default::default(), auto: Default::default() };
+        let mut ws = Workspace { name: "My Workspace".into(), pages: vec![], next_id: 0, bigs: BTreeMap::new(), current: None, dark: false, sidebar_open: true, accent: 0, icons_v2: false, pdf_annots: BTreeMap::new(), dash: Default::default(), auto: Default::default() };
         use BlockKind::*;
 
         let start = ws.add_page(None, PageKind::Doc);

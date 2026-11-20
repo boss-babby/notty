@@ -310,6 +310,10 @@ impl FontImage {
         // Maybe we need to implement the ideas in https://hikogui.org/2022/10/24/the-trouble-with-anti-aliasing.html
         let gamma = gamma.unwrap_or(0.55);
         self.pixels.iter().map(move |coverage| {
+            // Lumen: colour emoji texels are NaN-boxed (see text/emoji.rs)
+            if let Some(c) = crate::text::emoji::unpack_texel(*coverage) {
+                return c;
+            }
             let alpha = coverage.powf(gamma);
             // We want to multiply with `vec4(alpha)` in the fragment shader:
             let a = fast_round(alpha * 255.0);

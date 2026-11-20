@@ -232,7 +232,14 @@ pub fn layout_md(p: &Painter, text: &str, width: f32, px: f32, pal: &Palette, bo
             }
             Line::Plain(t) => (RowKind::Plain, 0.0, if bold_all { bold(px) } else { body(px) }, pal.text, t),
         };
-        let g = p.layout(if body_txt.is_empty() { " ".to_owned() } else { body_txt.to_owned() }, font, color, (width - x).max(10.0));
+        // inline formatting (bold, italic, underline, strike, code, highlight, links) is rendered, never shown as markers
+        let g = if crate::rich::has_marks(body_txt) {
+            let mut job = crate::editor::rich_job(body_txt, &font, color, pal, true);
+            job.wrap.max_width = (width - x).max(10.0);
+            p.layout_job(job)
+        } else {
+            p.layout(if body_txt.is_empty() { " ".to_owned() } else { body_txt.to_owned() }, font, color, (width - x).max(10.0))
+        };
         let h = g.size().y.max(px * 1.2);
         rows.push(MdRow { kind, x, y, h, line: i, galley: Some(g) });
         y += h + gap;

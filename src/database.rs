@@ -682,10 +682,24 @@ fn table(ui: &mut Ui, ws: &Workspace, db: &Database, vi: usize, rows: &[u64], st
         ui.painter().hline(hr.x_range(), hr.bottom(), Stroke::new(1.0_f32, pal.border));
 
         // rows
-        for rid in rows {
+        // Windowed: rows above / below the screen are one spacer each, so 100 000 rows cost the same as 40
+        let row_step = zs(ROW_H) + ui.spacing().item_spacing.y;
+        let gap_y = ui.spacing().item_spacing.y;
+        let clip_now = ui.clip_rect();
+        let top_now = ui.cursor().top();
+        let first_row = (((clip_now.top() - top_now) / row_step).floor() as isize - 3).max(0) as usize;
+        let last_row = ((((clip_now.bottom() - top_now) / row_step).ceil() as isize) + 3).max(0) as usize;
+        let n_rows = rows.len();
+        if first_row > 0 {
+            ui.allocate_exact_size(vec2(total, (first_row.min(n_rows) as f32 * row_step - gap_y).max(0.0)), Sense::hover());
+        }
+        for (ri, rid) in rows.iter().enumerate().skip(first_row) {
+            if ri >= last_row {
+                ui.allocate_exact_size(vec2(total, ((n_rows - ri) as f32 * row_step - gap_y).max(0.0)), Sense::hover());
+                break;
+            }
             let Some(row) = ws.page(*rid) else { continue };
             let (rr, _) = ui.allocate_exact_size(vec2(total, zs(ROW_H)), Sense::hover());
-            // Virtualised: only the rows that are on screen are built (thousands of rows stay at 60 fps)
             if !ui.is_rect_visible(rr) {
                 continue;
             }
@@ -2000,6 +2014,7 @@ fn apply(ws: &mut Workspace, db_id: u64, a: A, ed: &mut EditorState) {
                     x.opts.clear();
                 }
             }
+            crate::bigdata::bump();
             for r in ws.pages.iter_mut().filter(|r| r.row && r.parent == Some(db_id)) {
                 let Some(v) = r.props.remove(&p) else { continue };
                 let nv = match (&v, from, k) {
@@ -2040,6 +2055,7 @@ fn apply(ws: &mut Workspace, db_id: u64, a: A, ed: &mut EditorState) {
                     }
                 }
             }
+            crate::bigdata::bump();
             for r in ws.pages.iter_mut().filter(|r| r.row && r.parent == Some(db_id)) {
                 r.props.remove(&p);
             }
@@ -2053,6 +2069,7 @@ fn apply(ws: &mut Workspace, db_id: u64, a: A, ed: &mut EditorState) {
             if let Some(x) = ws.db_mut(db_id).and_then(|d| d.props.iter_mut().find(|x| x.id == p)) {
                 if x.cfg.relation != target {
                     x.cfg.relation = target;
+                    crate::bigdata::bump();
                     for r in ws.pages.iter_mut().filter(|r| r.row && r.parent == Some(db_id)) {
                         r.props.remove(&p);
                     }
@@ -2196,6 +2213,7 @@ fn apply(ws: &mut Workspace, db_id: u64, a: A, ed: &mut EditorState) {
             if let Some(x) = ws.db_mut(db_id).and_then(|d| d.props.iter_mut().find(|x| x.id == p)) {
                 x.opts.retain(|x| x.id != o);
             }
+            crate::bigdata::bump();
             for r in ws.pages.iter_mut().filter(|r| r.row && r.parent == Some(db_id)) {
                 match r.props.get_mut(&p) {
                     Some(Val::Sel(x)) if *x == o => {

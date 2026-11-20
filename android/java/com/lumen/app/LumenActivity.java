@@ -68,6 +68,20 @@ public class LumenActivity extends NativeActivity {
     private static final String CHANNEL = "lumen-reminders";
 
     // Rust callbacks (src/android.rs)
+    private static native void nativeTrim(int level);
+
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        try { nativeTrim(level); } catch (Throwable ignored) { }
+    }
+
+    @Override
+    public void onLowMemory() {
+        super.onLowMemory();
+        try { nativeTrim(80); } catch (Throwable ignored) { }
+    }
+
     private static native void nativeMetrics(float density, int tzMinutes);
     private static native void nativeInsets(int left, int top, int right, int bottom, boolean imeVisible);
     private static native void nativeText(String text);

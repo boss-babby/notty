@@ -259,6 +259,9 @@ enum Act {
     UrlBlock(usize),
     /// Paste the exact blocks that were copied (kind, indent, colours, media … preserved).
     PasteBlocks(usize, Vec<Block>),
+    /// Markdown pasted at a caret / selection `(block, blocks, from, to)`: inserted where it belongs — before the block when the caret is at its
+    /// start, after it at its end, and splitting the paragraph (head, pasted blocks, tail) when the caret is in the middle.
+    PasteMd(usize, Vec<Block>, usize, usize),
     /// Move a block (with its children) and adopt the nesting level of its new place (used when it enters / leaves a column).
     MoveAs(usize, usize, u8),
     /// Column layouts: add a column after the column block, remove a column, equal widths, unwrap, delete.
@@ -714,6 +717,7 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
                 ui.add_space(16.0);
             }
             match kind {
+                PageKind::Database if ws.bigs.contains_key(&id) => changed |= crate::bigui::show(ui, ws, id, pal, col_w),
                 PageKind::Database => changed |= database::show(ui, ws, id, ed, pal, col_w),
                 _ => {
                     let mut links: Links = HashMap::new();
@@ -2036,6 +2040,62 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
                 ed.focus = Some((id, usize::MAX));
             }
         }
+        Act::PasteMd(i, blocks, a, b) => {
+            if blocks.is_empty() {
+                return;
+            }
+            let (cur_kind, base) = (bl[i].kind, bl[i].indent);
+            let plain_lines = blocks.iter().all(|x| x.kind == BlockKind::Text);
+            let mut new = blocks;
+            for nb in new.iter_mut() {
+                *next_id += 1;
+                nb.id = *next_id;
+                nb.indent = (nb.indent + base).min(6);
+                // plain lines pasted into a list continue the list
+                if plain_lines && matches!(cur_kind, BlockKind::Todo | BlockKind::Bullet | BlockKind::Numbered) {
+                    nb.kind = cur_kind;
+                }
+            }
+            let focus_last = new.last().filter(|b| b.kind.has_text()).map(|b| b.id);
+            let editable = cur_kind.has_text() && !cur_kind.raw();
+            let rt = Rich::parse(&bl[i].text);
+            let n = rt.len();
+            let (a, b) = (a.min(b).min(n), a.max(b).min(n));
+            let (head, tail) = (rt.slice(0, a), rt.slice(b, n));
+            let mut tail_block: Option<Block> = None;
+            let at;
+            if !editable || n == 0 || (head.is_empty() && tail.is_empty()) {
+                // an empty (or fully selected) text block is replaced, anything else gets the blocks after it
+                if editable && bl[i].text.is_empty() || editable && head.is_empty() && tail.is_empty() {
+                    bl.remove(i);
+                    at = i;
+                } else {
+                    at = subtree_end(bl, i);
+                }
+            } else if a == 0 && b == 0 {
+                at = i; // caret at the very start: the paragraph moves down
+            } else if tail.is_empty() {
+                bl[i].text = head.markup();
+                at = subtree_end(bl, i);
+            } else {
+                bl[i].text = head.markup();
+                let mut tb = new_block(next_id, cur_kind, tail.markup(), base);
+                tb.checked = false;
+                tail_block = Some(tb);
+                at = subtree_end(bl, i);
+            }
+            let mut pos = at;
+            for nb in new.into_iter() {
+                bl.insert(pos, nb);
+                pos += 1;
+            }
+            if let Some(tb) = tail_block {
+                bl.insert(pos, tb);
+            }
+            if let Some(id) = focus_last {
+                ed.focus = Some((id, usize::MAX));
+            }
+        }
         Act::SetColor(i, c, is_bg) => {
             if is_bg {
                 bl[i].bg = c;
@@ -2633,6 +2693,23 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
                 if let Some(blocks) = clip::blocks_for(&t) {
                     ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Paste(_))));
                     *act = Some(Act::PasteBlocks(idx, blocks));
+                } else if !is_code {
+                    // Markdown / HTML-ish text from elsewhere: real blocks or formatted inline text, placed at the caret
+                    let (sa, sb) = widgets::selection(&ctx, id).unwrap_or((nchars, nchars));
+                    match clip::classify(&t) {
+                        clip::Pasted::Blocks(blocks) => {
+                            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Paste(_))));
+                            *act = Some(Act::PasteMd(idx, blocks, sa, sb));
+                        }
+                        clip::Pasted::Inline(frag) => {
+                            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Paste(_))));
+                            rt.replace(sa.min(sb), sa.max(sb), &frag);
+                            b.text = rt.markup();
+                            let at = sa.min(sb) + frag.len();
+                            ed.restore_sel = Some((b.id, at, at));
+                        }
+                        clip::Pasted::Plain => {}
+                    }
                 }
             }
         }
@@ -3283,8 +3360,8 @@ fn finish_paste(page: &mut Page, next_id: &mut u64, ed: &mut EditorState) -> boo
         return true;
     }
     // 2. a formatted fragment copied inside the app keeps its formatting
-    if !clip.contains('\n') {
-        let frag = clip::rich_for(&clip).unwrap_or_else(|| Rich::plain(&clip));
+    if !clip.trim_end_matches('\n').contains('\n') {
+        let frag = clip::rich_for(&clip).or_else(|| if let clip::Pasted::Inline(f) = clip::classify(&clip) { Some(f) } else { None }).unwrap_or_else(|| Rich::plain(&clip));
         let mut rt = Rich::parse(&page.blocks[idx].text);
         rt.replace(a, b, &frag);
         page.blocks[idx].text = rt.markup();
@@ -3293,8 +3370,8 @@ fn finish_paste(page: &mut Page, next_id: &mut u64, ed: &mut EditorState) -> boo
         return true;
     }
     // 3. Markdown from elsewhere becomes real blocks (headings, lists, to-dos, quotes, code …)
-    if let Some(blocks) = clip::markdown_blocks(&clip) {
-        apply(page, Act::PasteBlocks(idx, blocks), next_id, ed);
+    if let clip::Pasted::Blocks(blocks) = clip::classify(&clip) {
+        apply(page, Act::PasteMd(idx, blocks, a, b), next_id, ed);
         return true;
     }
     // 4. plain multi-line text: one block per line (list items continue the list)

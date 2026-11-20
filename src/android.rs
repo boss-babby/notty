@@ -104,6 +104,13 @@ pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeMetrics(_env: JNIE
     wake();
 }
 
+/// `Activity.onTrimMemory`: shrink the row caches / dashboard results (see `memgov.rs`).
+#[no_mangle]
+pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeTrim(_env: JNIEnv, _c: JClass, level: jint) {
+    crate::memgov::request_trim(if level >= 60 { 2 } else if level >= 15 { 1 } else { 0 });
+    wake();
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeInsets(_env: JNIEnv, _c: JClass, l: jint, t: jint, r: jint, b: jint, ime: jboolean) {
     for (slot, v) in INSETS.iter().zip([l, t, r, b]) {

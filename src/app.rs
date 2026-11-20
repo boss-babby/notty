@@ -90,6 +90,7 @@ enum PalAct {
     Open(u64),
     NewPage,
     NewDb,
+    NewBigSample,
     NewCanvas,
     NewFlow,
     LiveDemo,
@@ -597,6 +598,17 @@ impl LumenApp {
             PalAct::Open(id) => self.ws.current = Some(id),
             PalAct::NewPage => self.new_page(None, PageKind::Doc),
             PalAct::NewDb => self.new_page(None, PageKind::Database),
+            PalAct::NewBigSample => {
+                let n = if cfg!(target_arch = "wasm32") { 200_000 } else { 1_000_000 };
+                match crate::bigtable::create_sample(&mut self.ws, "Large dataset (sample)", n, None) {
+                    Some(id) => {
+                        crate::views::set(crate::views::Mode::Page, None);
+                        self.ws.current = Some(id);
+                        self.toast(format!("Created a large dataset with {n} rows — rows stay on disk, only the visible ones are in memory"), None);
+                    }
+                    None => self.toast("Could not create the dataset (is the data folder writable?)", None),
+                }
+            }
             PalAct::NewCanvas => self.new_page(None, PageKind::Canvas),
             PalAct::NewFlow => self.new_page(None, PageKind::Flow),
             PalAct::LiveDemo => match crate::demo::build(&mut self.ws) {
@@ -1111,7 +1123,7 @@ impl LumenApp {
             scored.sort_by_key(|s| s.0);
             out.extend(scored.into_iter().take(8).map(|(_, a, i, t, s)| (a, i, t, s)));
         }
-        let actions: [(PalAct, &str, &str, &str); 27] = [
+        let actions: [(PalAct, &str, &str, &str); 28] = [
             (PalAct::Ai, l::SPARKLES, "Ask Lumen AI", "Chat with the agent that can build pages, databases, dashboards and automations  (Ctrl+Shift+J)"),
             (PalAct::AiSettings, l::KEY_ROUND, "AI settings & agent connections", "API keys (Gemini, OpenAI, Claude, OpenRouter …), access level, MCP server"),
             (PalAct::Automations, l::ZAP, "Automations", "Rules, buttons, recurring tasks, reminders  (Ctrl+Shift+A)"),
@@ -1124,6 +1136,7 @@ impl LumenApp {
             (PalAct::Print, l::PRINTER, "Print / Save as PDF", "Print-ready version with images and databases"),
             (PalAct::NewPage, l::PLUS, "New page", "Create a blank page"),
             (PalAct::NewDb, l::KANBAN, "New database", "Table, board, list, gallery or calendar"),
+            (PalAct::NewBigSample, l::KANBAN, "New large dataset (sample)", "1,000,000 rows kept on disk, windowed table, exact charts"),
             (PalAct::NewCanvas, l::NETWORK, "New canvas", "Infinite whiteboard of cards, pages, images and connectors"),
             (PalAct::NewFlow, l::ZAP, "New flow", "Node-based automation: APIs, data, logic and your workspace, wired together"),
             (PalAct::LiveDemo, l::ZAP, "Live data demo", "A mock API stream → flow → database → dashboard that updates every second"),
@@ -2148,6 +2161,8 @@ impl LumenApp {
 
 impl eframe::App for LumenApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        // pending edits of large datasets are folded into their chunks before the workspace (which only references them) is saved
+        crate::bigtable::flush_all();
         // ── data safety ──
         // 1. a state that could not be read is never thrown away: its raw text is kept under its own key
         if let Some(raw) = self.rescued.take() {
@@ -2417,6 +2432,8 @@ impl LumenApp {
         }
 
         self.ws.migrate_icons();
+        crate::bigdata::frame_tick(ctx, self.calc_dirty);
+        crate::memgov::tick(ctx);
         self.poll_media(ctx);
 
         // global shortcuts (suspended while the PDF reader is open — it has its own keys)
@@ -2463,6 +2480,15 @@ impl LumenApp {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::P)) {
             self.palette = Some(PaletteState { query: String::new(), sel: 0, focused: false, pick: None });
         }
+        }
+
+        // The PDF reader is exclusive: while it is open nothing of the workspace behind it is built or hit-tested — no outline rail, no
+        // hover cards, no sidebar, no floating toolbars, and (Windows) the native web-embed windows are hidden because no embed rect is
+        // registered. The workspace state (scroll positions, selections) is kept and reappears the moment the reader is closed.
+        if self.ed.pdf_req.is_some() {
+            crate::pdf::reader_ui(ctx, &mut self.ed.pdf_req, &mut self.ws.pdf_annots, &pal);
+            self.toasts_ui(ctx, &pal);
+            return;
         }
 
         // files dropped onto the window

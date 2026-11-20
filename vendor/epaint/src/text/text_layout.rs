@@ -163,6 +163,44 @@ fn layout_section(
     let mut ci = 0;
     while ci < chars.len() {
         let chr = chars[ci];
+        // Lumen: colour emoji sequences (one bitmap, several characters)
+        if font.color_emoji() && super::emoji::may_start(chr, chars.get(ci + 1).copied()) {
+            if let Some((n, u)) = font.emoji_unit(&chars[ci..]) {
+                let (font_impl, _) = font.font_impl_and_glyph_info(chars[ci]);
+                let (fh, fa) = font_impl.map_or((0.0, 0.0), |f| (f.row_height(), f.ascent()));
+                let left = paragraph.cursor_x;
+                let share = u.adv / n as f32;
+                for j in 0..n {
+                    let mut sd = ShapeData { class: 2, ..Default::default() };
+                    let mut uv_rect = UvRect::default();
+                    if j == 0 {
+                        sd.unit_n = n as u16;
+                        sd.emoji = true;
+                        if let Some((uv, _)) = u.quads.first() {
+                            uv_rect = *uv;
+                        }
+                    }
+                    paragraph.glyphs.push(Glyph {
+                        chr: chars[ci + j],
+                        pos: pos2(left + share * j as f32, f32::NAN),
+                        advance_width: share,
+                        line_height,
+                        font_impl_height: fh,
+                        font_impl_ascent: fa,
+                        font_height: font.row_height(),
+                        font_ascent: font.ascent(),
+                        uv_rect,
+                        section_index,
+                        shape: sd,
+                    });
+                }
+                paragraph.cursor_x += u.adv + extra_letter_spacing * n as f32;
+                paragraph.cursor_x = font.round_to_pixel(paragraph.cursor_x);
+                last_glyph_id = None;
+                ci += n;
+                continue;
+            }
+        }
         // Lumen: complex scripts (Indic, Arabic, Hebrew, Thai, Khmer, Myanmar, …) are shaped with HarfBuzz, a word at a time.
         if is_complex(chr) && !(job.break_on_newline && chr == '\n') {
             let mut cj = ci + 1;
@@ -1057,9 +1095,9 @@ fn tessellate_glyphs(point_scale: PointScale, job: &LayoutJob, row: &Row, mesh: 
 
             let format = &job.sections[glyph.section_index as usize].format;
 
-            let color = format.color;
+            let color = if qi == 0 && glyph.shape.emoji { super::emoji::EMOJI_MARK } else { format.color };
 
-            if format.italics {
+            if format.italics && !(qi == 0 && glyph.shape.emoji) {
                 let idx = mesh.vertices.len() as u32;
                 mesh.add_triangle(idx, idx + 1, idx + 2);
                 mesh.add_triangle(idx + 2, idx + 1, idx + 3);

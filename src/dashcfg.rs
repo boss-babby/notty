@@ -317,6 +317,9 @@ pub struct Cfg {
     // ── look ──
     #[serde(default = "yes")]
     pub legend: bool,
+    /// Trend line on bar / line charts.
+    #[serde(default)]
+    pub trend: bool,
     #[serde(default = "yes")]
     pub labels: bool,
     #[serde(default)]
@@ -357,6 +360,7 @@ impl Default for Cfg {
             items: vec![],
             target: String::new(),
             legend: true,
+            trend: false,
             labels: true,
             palette: 0,
             cumulative: false,

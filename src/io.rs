@@ -124,7 +124,7 @@ pub fn file_safe(name: &str) -> String {
     }
 }
 
-fn csv_escape(s: &str) -> String {
+pub(crate) fn csv_escape(s: &str) -> String {
     if s.contains([',', '"', '\n']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
@@ -311,6 +311,12 @@ pub fn parse_csv(text: &str) -> Vec<Vec<String>> {
 }
 
 pub fn import_csv(ws: &mut Workspace, name: &str, text: &str, parent: Option<u64>) -> Option<u64> {
+    // many lines → a disk-backed large dataset (streamed, never a Vec<Vec<String>> of the whole file)
+    if text.as_bytes().iter().filter(|b| **b == b'\n').count() >= crate::bigtable::BIG_ROWS {
+        if let Some(id) = crate::bigtable::import_csv(ws, name, text, parent) {
+            return Some(id);
+        }
+    }
     let rows = parse_csv(text);
     if rows.len() < 2 || rows[0].len() < 2 {
         return None;

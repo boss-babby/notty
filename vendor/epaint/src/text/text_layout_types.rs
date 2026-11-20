@@ -651,6 +651,8 @@ pub struct ShapeData {
     pub unit_n: u16,
     /// Bidi class: 0 = L, 1 = R, 2 = neutral, 3 = number.
     pub class: u8,
+    /// Lumen: the first quad of this entry is a colour emoji bitmap (drawn untinted).
+    pub emoji: bool,
 }
 
 impl Glyph {

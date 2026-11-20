@@ -116,6 +116,8 @@ struct St {
     want_paste: bool,
     checked_visible: bool,
     last_tap: f64,
+    /// Screen rectangle of the text format bar while a node is edited (a press inside it must not end the edit).
+    fmt_rect: Option<Rect>,
 }
 
 thread_local! {
@@ -1700,10 +1702,21 @@ fn edit_overlay(ui: &mut Ui, ctx: &Context, c: &mut Canvas, st: &mut St, pal: &P
             if multiline && ctx.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift && !i.modifiers.command) && ctx.memory(|m| m.has_focus(eid)) && list_continue(ctx, eid, &mut text) {
                 ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
             }
+            // keyboard shortcuts (Ctrl/⌘ + B / I / U / Shift+S / E / Shift+H)
+            let mut fmt_changed = n.kind != Kind::Group && crate::canvasfmt::shortcuts(ctx, eid, &mut text);
             let (resp_lost, galley_h) = {
+                // live styling: the text is shown formatted, the markers stay in the text (dimmed) so the caret maps 1:1
+                let lfont = font.clone();
+                let lpal = pal.clone();
+                let ltext = pal.text;
+                let mut layouter = move |ui: &Ui, s: &str, wrap: f32| {
+                    let mut job = crate::editor::rich_job(s, &lfont, ltext, &lpal, false);
+                    job.wrap.max_width = wrap;
+                    ui.fonts(|f| f.layout_job(job))
+                };
                 let inner_resp = ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
                     let te = if multiline { TextEdit::multiline(&mut text) } else { TextEdit::singleline(&mut text) };
-                    te.id(eid).frame(false).font(font).text_color(pal.text).desired_width(inner.width()).margin(Margin::ZERO).lock_focus(multiline).show(ui)
+                    te.id(eid).frame(false).font(font).text_color(pal.text).desired_width(inner.width()).margin(Margin::ZERO).lock_focus(multiline).layouter(&mut layouter).show(ui)
                 });
                 let o = inner_resp.inner;
                 if focus_now {
@@ -1713,7 +1726,21 @@ fn edit_overlay(ui: &mut Ui, ctx: &Context, c: &mut Canvas, st: &mut St, pal: &P
                         s.store(ctx, eid);
                     }
                 }
-                (o.response.lost_focus() && !focus_now, o.galley.size().y)
+                // format bar (touch friendly); pressing it keeps the text field focused and the selection intact
+                let mut lost = o.response.lost_focus() && !focus_now;
+                if n.kind != Kind::Group {
+                    let bounds = st.rect.unwrap_or(ctx.screen_rect());
+                    let bar = crate::canvasfmt::format_bar(ctx, pal, eid, &mut text, r, bounds, multiline);
+                    fmt_changed |= bar.changed;
+                    let pressed_in_bar = ctx.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().map_or(false, |p| bar.rect.expand(2.0).contains(p)));
+                    if pressed_in_bar || bar.changed || st.fmt_rect.map_or(false, |fr| ctx.input(|i| i.pointer.any_released() && i.pointer.interact_pos().map_or(false, |p| fr.expand(2.0).contains(p)))) {
+                        lost = false;
+                        ctx.memory_mut(|m| m.request_focus(eid));
+                    }
+                    st.fmt_rect = Some(bar.rect);
+                }
+                let _ = fmt_changed;
+                (lost, o.galley.size().y)
             };
             if text != n.text {
                 if let Some(nn) = c.node_mut(id) {
@@ -1758,6 +1785,7 @@ fn edit_overlay(ui: &mut Ui, ctx: &Context, c: &mut Canvas, st: &mut St, pal: &P
         }
     }
     if done {
+        st.fmt_rect = None;
         end_edit(ctx, st, c);
     }
 }

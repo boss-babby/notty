@@ -2075,7 +2075,10 @@ impl Tessellator {
                     .map(|(i, vertex)| {
                         let Vertex { pos, uv, mut color } = *vertex;
 
-                        if let Some(override_text_color) = override_text_color {
+                        if color == crate::text::emoji::EMOJI_MARK {
+                            // Lumen: colour emoji bitmap — never tinted, only faded with the widget
+                            color = Color32::WHITE;
+                        } else if let Some(override_text_color) = override_text_color {
                             // Only override the glyph color (not background color, strike-through color, etc)
                             if row.visuals.glyph_vertex_range.contains(&i) {
                                 color = *override_text_color;

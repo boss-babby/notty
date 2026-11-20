@@ -1,0 +1,3 @@
+assets/emoji-noto.pack contains the Noto Color Emoji artwork (Google, Apache License 2.0, https://github.com/googlefonts/noto-emoji),
+taken from the npm package emoji-datasource-google 15.1.2 and re-encoded as 64 px WebP by tools/build-emoji-pack.py.
+Copyright 2013 Google Inc. Licensed under the Apache License, Version 2.0: https://www.apache.org/licenses/LICENSE-2.0

@@ -288,6 +288,8 @@ struct Reader {
     hstart: Option<Pos2>,
     hend: Option<Pos2>,
     hdrag: u8,
+    /// Draggable scroll bars (touch + mouse), see `pdfbar.rs`.
+    sbar: crate::pdfbar::SBar,
     #[cfg(test)]
     dbg_shown: Vec<(usize, Rect)>,
 }
@@ -365,6 +367,7 @@ impl Reader {
             hstart: None,
             hend: None,
             hdrag: 0,
+            sbar: Default::default(),
             #[cfg(test)]
             dbg_shown: vec![],
         };
@@ -493,6 +496,12 @@ impl Reader {
         let tool = self.notes.tool;
         if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Touch { .. }))) {
             self.touch = true;
+        }
+        // a scroll bar owns the pointer: no text selection, panning or drawing may start under it
+        if self.sbar.busy {
+            self.text_drag = false;
+            self.pan = false;
+            return true;
         }
         if !matches!(tool, Tool::Hand | Tool::Highlight | Tool::Underline | Tool::Strike) {
             self.text_drag = false;
@@ -1576,7 +1585,15 @@ fn reading_view(
             }
         }
     }
-    let mut sa = ScrollArea::both().id_salt("pdf_scroll").auto_shrink([false, false]).drag_to_scroll(false);
+    // draggable scroll bars: input first (so the reader ignores presses that start on a bar), painted after the pages
+    if let Some(o) = rd.sbar.input(ctx, view, rd.off, vec2(lay.content_w, lay.content_h)) {
+        rd.pending_off = Some(o);
+    }
+    let mut sa = ScrollArea::both()
+        .id_salt("pdf_scroll")
+        .auto_shrink([false, false])
+        .drag_to_scroll(false)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
     if let Some(o) = rd.pending_off.take() {
         sa = sa.scroll_offset(o);
     }
@@ -1721,6 +1738,7 @@ fn reading_view(
     rd.find_bar(ui, ctx, pal, view);
     rd.off = out.state.offset;
     rd.vp = out.inner_rect;
+    rd.sbar.paint(ctx, ui.painter(), pal, view, rd.off, vec2(lay.content_w, lay.content_h), (rd.page, dims.len()), night);
 
     // retire stale scales of completed pages
     for (i, qs, sig) in completed {

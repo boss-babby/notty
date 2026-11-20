@@ -403,6 +403,9 @@ pub struct Font {
     pixels_per_point: f32,
     row_height: f32,
     glyph_info_cache: ahash::HashMap<char, (FontIndex, GlyphInfo)>,
+    /// Lumen: colour emoji bitmaps are substituted for emoji sequences (off for the `emoji-bw` families).
+    color_emoji: bool,
+    emoji_cache: ahash::HashMap<String, Option<(UvRect, f32)>>,
 }
 
 impl Font {
@@ -415,6 +418,8 @@ impl Font {
                 pixels_per_point: 1.0,
                 row_height: 0.0,
                 glyph_info_cache: Default::default(),
+                color_emoji: false,
+                emoji_cache: Default::default(),
             };
         }
 
@@ -428,6 +433,8 @@ impl Font {
             pixels_per_point,
             row_height,
             glyph_info_cache: Default::default(),
+            color_emoji: true,
+            emoji_cache: Default::default(),
         };
 
         const PRIMARY_REPLACEMENT_CHAR: char = '◻'; // white medium square
@@ -476,6 +483,64 @@ impl Font {
             }
             characters
         })
+    }
+
+    /// Lumen: enables / disables colour emoji bitmaps for this font (default on).
+    pub fn set_color_emoji(&mut self, on: bool) {
+        self.color_emoji = on;
+    }
+
+    pub(crate) fn color_emoji(&self) -> bool {
+        self.color_emoji && !self.fonts.is_empty()
+    }
+
+    /// Lumen: recognises a colour emoji sequence at the start of `chars`. Returns the characters consumed and its drawing
+    /// (one atlas rectangle, `adv` points wide). The bitmap is resampled to this font's size and cached in the glyph atlas.
+    pub(crate) fn emoji_unit(&mut self, chars: &[char]) -> Option<(usize, ShapedUnit)> {
+        let (load, exists) = super::emoji::provider()?;
+        let (n, key) = super::emoji::recognise(chars, &|k: &str| match self.emoji_cache.get(k) {
+            Some(v) => v.is_some(),
+            None => exists(k),
+        })?;
+        if !self.emoji_cache.contains_key(&key) {
+            let entry = self.allocate_emoji(&key, load);
+            self.emoji_cache.insert(key.clone(), entry);
+        }
+        let (uv, adv) = (*self.emoji_cache.get(&key)?)?;
+        Some((n, ShapedUnit { chars: n, adv, quads: vec![(uv, Vec2::ZERO)] }))
+    }
+
+    fn allocate_emoji(&self, key: &str, load: super::emoji::EmojiProvider) -> Option<(UvRect, f32)> {
+        let first = self.fonts.first()?;
+        let bmp = load(key)?;
+        if bmp.w == 0 || bmp.h == 0 {
+            return None;
+        }
+        let ppp = self.pixels_per_point;
+        let em_px = first.scale_in_pixels as f32;
+        // Noto-style emoji are drawn ~1.14 em wide; they sit on the baseline with a small descent
+        let side = ((em_px * 1.14).round() as usize).clamp(6, 1024);
+        let pixels = super::emoji::resample(&bmp, side, side);
+        let pos = {
+            let mut atlas = first.atlas.lock();
+            let (pos, image) = atlas.allocate((side, side));
+            for y in 0..side {
+                for x in 0..side {
+                    let [r, g, b, a] = pixels[y * side + x];
+                    image[(pos.0 + x, pos.1 + y)] = super::emoji::pack_texel(r, g, b, a);
+                }
+            }
+            pos
+        };
+        let size = side as f32 / ppp;
+        let em = em_px / ppp;
+        let uv = UvRect {
+            offset: vec2(em * 0.03, -em * 0.93 + first.y_offset_in_points),
+            size: vec2(size, size),
+            min: [pos.0 as u16, pos.1 as u16],
+            max: [(pos.0 + side) as u16, (pos.1 + side) as u16],
+        };
+        Some((uv, size + em * 0.08))
     }
 
     /// Lumen: shapes a run of complex-script characters into clusters (logical order). Characters are grouped by the font that

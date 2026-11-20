@@ -13,6 +13,7 @@ use crate::auth::now_ms;
 use crate::dashboard::Nav;
 use crate::dashcfg::{Agg, Bucket, Cat, Cfg, Item, Opt, Range, Widget};
 use crate::dashcharts::{self as ch, Kind, Style};
+use crate::bigdata as bd;
 use crate::dashdata::{self as dd, fmt_agg, fmt_full, Dataset, Ser};
 use crate::dates;
 use crate::lucide as l;
@@ -482,7 +483,7 @@ fn draw_activity(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
     }
     ds.series.push(ser);
     let size = ui.available_size();
-    let style = Style { kind: Kind::Bar, labels: w.cfg.labels, legend: false, palette: w.cfg.palette };
+    let style = Style { kind: Kind::Bar, labels: w.cfg.labels, legend: false, palette: w.cfg.palette, goal: 0.0, trend: false };
     if let Some((s, c)) = ch::chart(ui, cx.pal, Id::new(("dash_chart", cx.wid)), size, &ds, &style) {
         let at = pointer(ui);
         open_drill(cx, format!("Edited on {}", ds.cats[c]), ds.series[s].rows[c].clone(), at);
@@ -507,7 +508,7 @@ fn draw_number(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
     if !ensure_db(cx, w, ui) {
         return;
     }
-    let n = dd::number(cx.ws, &w.cfg, cx.global);
+    let n = bd::number(ui.ctx(), cx.wid, &*cx.ws, &w.cfg, cx.global);
     let size = ui.available_size();
     let (r, resp) = ui.allocate_exact_size(size, Sense::click());
     let p = ui.painter_at(r);
@@ -537,14 +538,14 @@ fn draw_number(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
     // sparkline of the trend (weekly buckets) when the widget has a date property
     if w.cfg.date != 0 && r.width() > 230.0 {
         let cfg = Cfg { group: w.cfg.date, stack: 0, bucket: Bucket::Week, limit: 14, cumulative: false, hide_empty: false, ..w.cfg.clone() };
-        let ds = dd::grouped(cx.ws, &cfg, cx.global);
+        let ds = bd::grouped(ui.ctx(), cx.wid, 77, &*cx.ws, &cfg, cx.global);
         if let Some(s) = ds.series.first() {
             ch::sparkline(&p, Rect::from_min_max(pos2(r.right() - (r.width() * 0.42).min(180.0), r.top() + 6.0), pos2(r.right() - 2.0, (r.top() + 6.0 + fs * 1.4).min(r.bottom()))), &s.vals, col);
         }
     }
     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
         let at = pointer(ui);
-        open_drill(cx, agg_caption(cx, w), n.rows, at);
+        open_drill(cx, agg_caption(cx, w), n.rows.clone(), at);
     }
 }
 
@@ -552,7 +553,7 @@ fn draw_gauge(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
     if !ensure_db(cx, w, ui) {
         return;
     }
-    let n = dd::number(cx.ws, &w.cfg, cx.global);
+    let n = bd::number(ui.ctx(), cx.wid, &*cx.ws, &w.cfg, cx.global);
     let goal = if w.cfg.goal > 0.0 { w.cfg.goal } else if w.cfg.agg.is_percent() { 100.0 } else { 0.0 };
     let size = ui.available_size();
     let val = if w.cfg.agg.is_percent() { fmt_agg(n.value, true) } else { dd::fmt_num(n.value) };
@@ -569,7 +570,7 @@ fn draw_gauge(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
     let resp = ch::gauge(ui, cx.pal, Id::new(("dash_gauge", cx.wid)), size, n.value / goal, &val, &format!("{cap} · goal {}", dd::fmt_num(goal)), ch::series_color(w.cfg.palette, 0));
     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
         let at = pointer(ui);
-        open_drill(cx, cap, n.rows, at);
+        open_drill(cx, cap, n.rows.clone(), at);
     }
 }
 
@@ -579,16 +580,21 @@ fn chart_widget(cx: &mut Cx, w: &mut Widget, ui: &mut Ui, kind: Kind, histogram:
     if !ensure_db(cx, w, ui) {
         return;
     }
-    let ds = if histogram { dd::histogram(cx.ws, &w.cfg, cx.global) } else { dd::grouped(cx.ws, &w.cfg, cx.global) };
+    let ds = if histogram { bd::histogram(ui.ctx(), cx.wid, &*cx.ws, &w.cfg, cx.global) } else { bd::grouped(ui.ctx(), cx.wid, 0, &*cx.ws, &w.cfg, cx.global) };
     if ds.is_empty() {
-        let none = dd::rows(cx.ws, &w.cfg, cx.global).is_empty();
+        let none = bd::rows(ui.ctx(), cx.wid, 0, &*cx.ws, &w.cfg, cx.global).is_empty();
         if empty(ui, cx.pal, if none { "No records match the filters" } else if histogram { "Pick a number property" } else { "Nothing to plot yet" }, Some("Configure")) {
             cx.configure = true;
         }
         return;
     }
+    let status = ds.status();
+    if !status.is_empty() {
+        let rr = ui.max_rect();
+        ui.painter().text(rr.right_top() + vec2(-4.0, 2.0), Align2::RIGHT_TOP, status, body(10.5), cx.pal.muted);
+    }
     let size = ui.available_size();
-    let style = Style { kind, labels: w.cfg.labels, legend: w.cfg.legend, palette: w.cfg.palette };
+    let style = Style { kind, labels: w.cfg.labels, legend: w.cfg.legend, palette: w.cfg.palette, goal: w.cfg.goal, trend: w.cfg.trend };
     if let Some((s, c)) = ch::chart(ui, cx.pal, Id::new(("dash_chart", cx.wid)), size, &ds, &style) {
         let at = pointer(ui);
         let rows = if matches!(kind, Kind::Pie | Kind::Donut | Kind::Funnel) { ds.cat_rows(c) } else { ds.series[s].rows[c].clone() };
@@ -642,7 +648,7 @@ fn draw_scatter(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
         }
         return;
     }
-    let sc = dd::scatter(cx.ws, &w.cfg, cx.global);
+    let sc = bd::scatter(ui.ctx(), cx.wid, &*cx.ws, &w.cfg, cx.global);
     let size = ui.available_size();
     let (xn, yn) = (prop_name(cx.ws, w.cfg.db, w.cfg.x), prop_name(cx.ws, w.cfg.db, w.cfg.y));
     let ws: &Workspace = &*cx.ws;
@@ -653,7 +659,7 @@ fn draw_scatter(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
 }
 
 fn draw_heatmap(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
-    let m = dd::heat(cx.ws, &w.cfg, cx.global);
+    let m = bd::heat(ui.ctx(), cx.wid, &*cx.ws, &w.cfg, cx.global);
     let size = ui.available_size();
     let col = ch::series_color(w.cfg.palette, 0);
     if let Some(day) = ch::heatmap(ui, cx.pal, Id::new(("dash_chart", cx.wid)), size, &m, dates::today_day(), col) {
@@ -778,7 +784,7 @@ fn draw_table(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
     if !ensure_db(cx, w, ui) {
         return;
     }
-    let ids = dd::sorted_rows(cx.ws, &w.cfg, cx.global);
+    let ids = bd::sorted_rows(ui.ctx(), cx.wid, &*cx.ws, &w.cfg, cx.global).v.to_vec();
     let width = ui.available_width();
     let cols = columns(cx, w, (((width - 140.0) / 90.0).floor().max(0.0)) as usize);
     let rowh = 30.0;
@@ -845,7 +851,7 @@ fn draw_list(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
     if !ensure_db(cx, w, ui) {
         return;
     }
-    let ids = dd::sorted_rows(cx.ws, &w.cfg, cx.global);
+    let ids = bd::sorted_rows(ui.ctx(), cx.wid, &*cx.ws, &w.cfg, cx.global).v.to_vec();
     let width = ui.available_width();
     let cols = columns(cx, w, 1);
     let per = fit_rows(ui, 24.0, ROW_H);
@@ -881,7 +887,7 @@ fn draw_progress(cx: &mut Cx, w: &mut Widget, ui: &mut Ui) {
         }
         return;
     }
-    let ids = dd::sorted_rows(cx.ws, &w.cfg, cx.global);
+    let ids = bd::sorted_rows(ui.ctx(), cx.wid, &*cx.ws, &w.cfg, cx.global).v.to_vec();
     let goal = if w.cfg.goal > 0.0 { w.cfg.goal } else { 100.0 };
     let width = ui.available_width();
     let rowh = 38.0;

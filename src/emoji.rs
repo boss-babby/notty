@@ -72,6 +72,57 @@ pub const CATS: &[Cat] = &[
     ]),
 ];
 
+// ───────────────────────────── bundled colour emoji ─────────────────────────────
+
+/// Noto-style colour emoji, 64 px WebP, ~3,800 pictures (see `tools/build-emoji-pack.py`). Embedded on every platform: no network, no system font.
+static PACK: &[u8] = include_bytes!("../assets/emoji-noto.pack");
+
+fn pack_index() -> &'static std::collections::HashMap<&'static str, (u32, u32)> {
+    static IDX: std::sync::OnceLock<std::collections::HashMap<&'static str, (u32, u32)>> = std::sync::OnceLock::new();
+    IDX.get_or_init(|| {
+        let mut m = std::collections::HashMap::new();
+        if PACK.len() < 8 || &PACK[..4] != b"LEMO" {
+            return m;
+        }
+        let n = u32::from_le_bytes([PACK[4], PACK[5], PACK[6], PACK[7]]) as usize;
+        let mut p = 8usize;
+        for _ in 0..n {
+            let Some(&kl) = PACK.get(p) else { break };
+            let kl = kl as usize;
+            let (Some(k), Some(rest)) = (PACK.get(p + 1..p + 1 + kl), PACK.get(p + 1 + kl..p + 9 + kl)) else { break };
+            let (Ok(k), off, len) = (
+                std::str::from_utf8(k),
+                u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]),
+                u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]),
+            ) else {
+                break;
+            };
+            m.insert(k, (off, len));
+            p += 9 + kl;
+        }
+        m
+    })
+}
+
+/// Is there a colour picture for this normalised key (lower-case hex code points joined by '-', FE0F removed)?
+pub fn has_color(key: &str) -> bool {
+    pack_index().contains_key(key)
+}
+
+/// Decodes the colour picture for a normalised key.
+pub fn color_bitmap(key: &str) -> Option<egui::epaint::text::emoji::EmojiBitmap> {
+    let &(off, len) = pack_index().get(key)?;
+    let bytes = PACK.get(off as usize..(off + len) as usize)?;
+    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::WebP).ok()?.to_rgba8();
+    Some(egui::epaint::text::emoji::EmojiBitmap { w: img.width() as usize, h: img.height() as usize, rgba: img.into_raw() })
+}
+
+/// Registers the bundled colour emoji with the text engine (idempotent). Emoji in any text — pages, canvas nodes, databases,
+/// dashboards — are then drawn in colour; `FontFamily::Name("emoji-bw")` keeps the monochrome glyph look.
+pub fn install() {
+    egui::epaint::text::emoji::set_emoji_provider(color_bitmap, has_color);
+}
+
 /// All emoji matching `q` (case-insensitive substring of the keywords or the emoji itself).
 pub fn search(q: &str) -> Vec<&'static str> {
     let q = q.trim().to_lowercase();
@@ -124,5 +175,20 @@ mod tests {
         assert_eq!(first_emoji("👩‍💻 dev").as_deref(), Some("👩‍💻"));
         assert_eq!(first_emoji("🇩🇪x").as_deref(), Some("🇩🇪"));
         assert_eq!(first_emoji("hello"), None);
+    }
+
+    #[test]
+    fn bundled_pack_covers_the_catalogue() {
+        for (_, _, list) in CATS {
+            for (e, _) in list.iter() {
+                let chars: Vec<char> = e.chars().collect();
+                let key = egui::epaint::text::emoji::key(&chars);
+                assert!(has_color(&key), "no colour picture for {e} ({key})");
+            }
+        }
+        let b = color_bitmap("1f600").expect("decode");
+        assert_eq!((b.w, b.h), (64, 64));
+        assert!(b.rgba.chunks(4).any(|p| p[3] > 200));
+        assert!(has_color("1f469-200d-1f4bb") && has_color("1f1e9-1f1ea") && has_color("23-20e3"));
     }
 }

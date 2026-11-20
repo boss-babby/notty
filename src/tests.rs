@@ -369,6 +369,63 @@ fn clicking_a_slash_menu_item_applies_it() {
     assert!(worked >= 3, "clicking slash menu items must apply them ({worked}/5)");
 }
 
+/// Markdown pasted into the middle of a paragraph becomes real blocks in the right place; inline Markdown keeps its formatting.
+#[test]
+fn pasting_markdown_splits_the_paragraph_and_formats() {
+    fn run(md: &str) -> Vec<(BlockKind, String)> {
+        let ctx = test_ctx();
+        let mut ws = Workspace::seed();
+        let id = ws.current.unwrap();
+        let mut ed = EditorState::default();
+        let b = ws.blk(BlockKind::Text, "hello world", 0);
+        ws.page_mut(id).unwrap().blocks = vec![b];
+        let bid = ws.page(id).unwrap().blocks[0].id;
+        ed.focus = Some((bid, 5));
+        let mut t = 0.0;
+        let mut frame = |ctx: &egui::Context, ws: &mut Workspace, ed: &mut EditorState, evs: Vec<Event>| {
+            t += 0.05;
+            let mut input = RawInput::default();
+            input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 820.0)));
+            input.time = Some(t);
+            input.events = evs;
+            crate::widgets::filter_raw_input(ctx, &mut input);
+            let pal = Palette::light();
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().drag_to_scroll(false).show(ui, |ui| {
+                        editor::show_page(ui, ws, id, ed, &pal);
+                    });
+                });
+            });
+            crate::widgets::end_frame(ctx);
+        };
+        frame(&ctx, &mut ws, &mut ed, vec![]);
+        frame(&ctx, &mut ws, &mut ed, vec![]);
+        frame(&ctx, &mut ws, &mut ed, vec![Event::Paste(md.to_owned())]);
+        frame(&ctx, &mut ws, &mut ed, vec![]);
+        frame(&ctx, &mut ws, &mut ed, vec![]);
+        ws.page(id).unwrap().blocks.iter().map(|b| (b.kind, b.text.clone())).collect()
+    }
+    let k = run("## Title\n\n- a\n- b **bold**");
+    let want = vec![
+        (BlockKind::Text, "hello".to_owned()),
+        (BlockKind::H2, "Title".to_owned()),
+        (BlockKind::Bullet, "a".to_owned()),
+        (BlockKind::Bullet, "b **bold**".to_owned()),
+        (BlockKind::Text, " world".to_owned()),
+    ];
+    assert_eq!(k, want, "blocks after a Markdown paste in the middle of a paragraph");
+    let k = run("**bold** :rocket:");
+    assert_eq!(k.len(), 1);
+    let rt = crate::rich::Rich::parse(&k[0].1);
+    assert_eq!(rt.plain, "hellobold 🚀 world");
+    assert!(rt.fmts[5].flags & crate::rich::BOLD != 0 && rt.fmts[0].flags & crate::rich::BOLD == 0, "only the pasted word is bold");
+    // plain text stays untouched
+    let k = run("just words");
+    assert_eq!(k.len(), 1);
+    assert_eq!(k[0].1, "hellojust words world");
+}
+
 /// Right-click must never collapse an existing text selection, and must open the context menu.
 #[test]
 fn right_click_keeps_selection_and_opens_menu() {

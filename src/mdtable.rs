@@ -171,6 +171,10 @@ pub fn extract(md: &str) -> (String, Vec<Table>) {
     (out, tables)
 }
 
+pub fn is_placeholder(text: &str) -> bool {
+    placeholder_index(text.trim()).is_some()
+}
+
 fn placeholder_index(text: &str) -> Option<usize> {
     text.strip_prefix(MARK)?.strip_prefix("TBL")?.strip_suffix(MARK)?.parse().ok()
 }
