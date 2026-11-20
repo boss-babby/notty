@@ -397,9 +397,16 @@ pub fn draw_node(f: &Frame, ws: &Workspace, n: &Node, st: &NodeSt, out: &mut Dra
             if n.pts.len() >= 2 {
                 let pts: Vec<Pos2> = n.pts.iter().map(|p| f.pt(pos2(n.x + p[0], n.y + p[1]))).collect();
                 let w = ((2.2 + n.size as f32 * 1.9) * z).clamp(1.0, 14.0);
-                f.p.add(Shape::line(pts, Stroke::new(w, accent(pal, n.color).unwrap_or(pal.text))));
+                let col = accent(pal, n.color).unwrap_or(pal.text);
+                if n.hl {
+                    // highlighter: wide, translucent, drawn under the text of the cards on top of it
+                    f.p.add(Shape::line(pts, Stroke::new((w * 4.5).clamp(4.0, 60.0), with_alpha(col, if is_dark(pal) { 0.42 } else { 0.36 }))));
+                } else {
+                    f.p.add(Shape::line(pts, Stroke::new(w, col)));
+                }
             }
         }
+        Kind::Shape => draw_shape(f, n, st, r, lod),
         Kind::Text => {
             if st.selected || st.hovered {
                 f.p.rect_stroke(r, 6.0, Stroke::new(1.0_f32, with_alpha(pal.muted, 0.5)), StrokeKind::Inside);
@@ -599,4 +606,143 @@ pub fn minimap(f: &Frame, c: &Canvas, rect: Rect, view_world: Rect) -> (f32, Pos
     f2.rect_filled(vr, 3.0, with_alpha(f.pal.accent, 0.10));
     f2.rect_stroke(vr, 3.0, Stroke::new(1.4_f32, f.pal.accent), StrokeKind::Inside);
     (s, pos2(off.x, off.y))
+}
+
+
+// ───────────────────────────── shapes ─────────────────────────────
+
+fn hash01(seed: u64, a: usize, b: usize) -> f32 {
+    let mut h = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (a as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ (b as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 32;
+    (h & 0xFFFF) as f32 / 65535.0
+}
+
+/// Hand-drawn look: every edge is split into short pieces that wobble a little, like a marker line.
+fn sketchy(pts: &[Pos2], seed: u64, amp: f32) -> Vec<Pos2> {
+    let mut out = Vec::with_capacity(pts.len() * 4);
+    let n = pts.len();
+    for i in 0..n {
+        let (a, b) = (pts[i], pts[(i + 1) % n]);
+        let d = b - a;
+        let len = d.length();
+        if len < 0.01 {
+            continue;
+        }
+        let nrm = vec2(-d.y, d.x) / len;
+        let parts = ((len / (amp * 9.0).max(10.0)) as usize).clamp(1, 24);
+        for k in 0..parts {
+            let t = k as f32 / parts as f32;
+            let off = (hash01(seed, i, k) - 0.5) * 2.0 * amp;
+            out.push(a + d * t + nrm * off);
+        }
+    }
+    if let Some(first) = out.first().copied() {
+        out.push(first);
+    }
+    out
+}
+
+fn draw_shape(f: &Frame, n: &Node, st: &NodeSt, r: Rect, lod: bool) {
+    let z = f.z();
+    let pal = f.pal;
+    let dark = is_dark(pal);
+    let col = accent(pal, n.color).unwrap_or(pal.text);
+    let pts = cv::geo_points(n.geo, r);
+    let fill = match n.style {
+        1 | 3 => Color32::TRANSPARENT,
+        2 => col,
+        _ => with_alpha(col, if dark { 0.24 } else { 0.15 }),
+    };
+    if fill.a() > 0 {
+        let mut m = egui::epaint::Mesh::default();
+        m.colored_vertex(r.center(), fill);
+        for p in &pts {
+            m.colored_vertex(*p, fill);
+        }
+        let k = pts.len() as u32;
+        for i in 0..k {
+            m.add_triangle(0, 1 + i, 1 + (i + 1) % k);
+        }
+        f.p.add(Shape::mesh(m));
+    } else if st.hovered {
+        // an outline-only shape would be hard to grab: faint wash while hovered
+        let mut m = egui::epaint::Mesh::default();
+        let wash = with_alpha(col, 0.06);
+        m.colored_vertex(r.center(), wash);
+        for p in &pts {
+            m.colored_vertex(*p, wash);
+        }
+        let k = pts.len() as u32;
+        for i in 0..k {
+            m.add_triangle(0, 1 + i, 1 + (i + 1) % k);
+        }
+        f.p.add(Shape::mesh(m));
+    }
+    let w = (2.0 * z).clamp(1.0, 6.0);
+    let stroke = Stroke::new(w, col);
+    let mut closed = pts.clone();
+    closed.push(pts[0]);
+    if n.style == 3 {
+        let amp = (1.9 * z).clamp(0.6, 3.5);
+        for pass in 0..2u64 {
+            f.p.add(Shape::line(sketchy(&pts, n.id.wrapping_add(pass * 7919), amp), Stroke::new(w * 0.8, with_alpha(col, if pass == 0 { 1.0 } else { 0.7 }))));
+        }
+    } else {
+        match n.dash {
+            1 => {
+                f.p.extend(Shape::dashed_line(&closed, stroke, 10.0 * z.max(0.4), 7.0 * z.max(0.4)));
+            }
+            2 => {
+                f.p.extend(Shape::dotted_line(&closed, col, 6.0 * z.max(0.4), w * 0.6));
+            }
+            _ => {
+                f.p.add(Shape::closed_line(pts.clone(), stroke));
+            }
+        }
+    }
+    if !st.editing && !lod && !n.text.trim().is_empty() {
+        let px = [15.0, 21.0, 30.0][n.size.min(2) as usize] * z;
+        let tcol = if n.style == 2 { if n.color == 0 { pal.bg } else { Color32::WHITE } } else { pal.text };
+        let inner = match n.geo {
+            2 => 0.72,
+            3 | 4 | 6 => 0.58,
+            _ => 0.86,
+        };
+        let mut job = LayoutJob::simple(n.text.clone(), bold(px), tcol, (r.width() * inner).max(8.0));
+        job.halign = egui::Align::Center;
+        let g = f.p.layout_job(job);
+        let size = g.size();
+        let cy = if n.geo == 4 { r.center().y + r.height() * 0.14 } else { r.center().y };
+        f.p.galley(pos2(r.center().x - size.x / 2.0, cy - size.y / 2.0), g, tcol);
+    }
+}
+
+// ───────────────────────────── thumbnail (whiteboard embedded in a page) ─────────────────────────────
+
+/// Paints the whole board, fitted into `rect`, without any interaction. Used by the whiteboard block of the page editor.
+pub fn thumbnail(ui: &Ui, ws: &Workspace, c: &Canvas, rect: Rect, pal: &Palette) {
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, canvas_bg(pal));
+    let mut out = DrawOut::default();
+    let view = match c.bounds(None) {
+        Some(b) => {
+            let v = Canvas::fit(b, rect.size(), 18.0);
+            View { zoom: v.zoom.min(1.0), x: b.center().x - rect.width() / v.zoom.min(1.0) / 2.0, y: b.center().y - rect.height() / v.zoom.min(1.0) / 2.0 }
+        }
+        None => View::default(),
+    };
+    let f = Frame { p: &painter, ui, pal, view, origin: rect.min, clip: rect };
+    grid(&f, c.grid);
+    let ns = NodeSt::default();
+    for n in c.nodes.iter().filter(|n| n.kind == Kind::Group) {
+        draw_node(&f, ws, n, &ns, &mut out);
+    }
+    for e in &c.edges {
+        draw_edge(&f, c, e, false, false);
+    }
+    for n in c.nodes.iter().filter(|n| n.kind != Kind::Group) {
+        draw_node(&f, ws, n, &ns, &mut out);
+    }
 }

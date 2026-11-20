@@ -39,6 +39,8 @@ pub enum Kind {
     Group,
     /// Free-hand pen stroke.
     Ink,
+    /// Vector shape (rectangle, ellipse, diamond, triangle, hexagon, star …) with centred text, fill / outline / hand-drawn styles.
+    Shape,
 }
 
 impl Kind {
@@ -52,6 +54,7 @@ impl Kind {
             Kind::Link => vec2(288.0, 84.0),
             Kind::Group => vec2(480.0, 320.0),
             Kind::Ink => vec2(10.0, 10.0),
+            Kind::Shape => vec2(176.0, 112.0),
         }
     }
     pub fn min_size(self) -> Vec2 {
@@ -60,6 +63,7 @@ impl Kind {
             Kind::Group => vec2(160.0, 100.0),
             Kind::Image => vec2(60.0, 40.0),
             Kind::Ink => vec2(4.0, 4.0),
+            Kind::Shape => vec2(28.0, 28.0),
             _ => vec2(120.0, 56.0),
         }
     }
@@ -132,6 +136,88 @@ pub struct Node {
     /// Pen stroke points relative to the node's top-left corner.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pts: Vec<[f32; 2]>,
+    /// [`Kind::Shape`] geometry, see [`GEO_NAMES`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub geo: u8,
+    /// [`Kind::Shape`] look: 0 tinted, 1 outline, 2 solid, 3 hand-drawn.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub style: u8,
+    /// Outline of a shape: 0 solid, 1 dashed, 2 dotted.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dash: u8,
+    /// Highlighter stroke (wide, translucent) instead of a pen stroke.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hl: bool,
+}
+
+fn is_zero(v: &u8) -> bool {
+    *v == 0
+}
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+/// Names of the shape geometries ([`Node::geo`]).
+pub const GEO_NAMES: [&str; 9] = ["Rectangle", "Rounded", "Ellipse", "Diamond", "Triangle", "Hexagon", "Star", "Parallelogram", "Pill"];
+pub const SHAPE_STYLES: [&str; 4] = ["Tinted", "Outline", "Solid", "Hand-drawn"];
+
+/// Outline of a shape geometry inside `r` as a closed polygon (curves are sampled). Every outline is star-shaped around the centre of `r`,
+/// so a triangle fan from the centre is a correct fill.
+pub fn geo_points(geo: u8, r: Rect) -> Vec<Pos2> {
+    let (cx, cy) = (r.center().x, r.center().y);
+    let (hw, hh) = (r.width() / 2.0, r.height() / 2.0);
+    let at = |u: f32, v: f32| pos2(r.min.x + u * r.width(), r.min.y + v * r.height());
+    match geo {
+        2 => (0..56).map(|i| {
+            let a = i as f32 / 56.0 * std::f32::consts::TAU;
+            pos2(cx + hw * a.cos(), cy + hh * a.sin())
+        }).collect(),
+        3 => vec![at(0.5, 0.0), at(1.0, 0.5), at(0.5, 1.0), at(0.0, 0.5)],
+        4 => vec![at(0.5, 0.0), at(1.0, 1.0), at(0.0, 1.0)],
+        5 => vec![at(0.25, 0.0), at(0.75, 0.0), at(1.0, 0.5), at(0.75, 1.0), at(0.25, 1.0), at(0.0, 0.5)],
+        6 => (0..10).map(|i| {
+            let a = -std::f32::consts::FRAC_PI_2 + i as f32 / 10.0 * std::f32::consts::TAU;
+            let k = if i % 2 == 0 { 1.0 } else { 0.42 };
+            pos2(cx + hw * k * a.cos(), cy + hh * k * a.sin())
+        }).collect(),
+        7 => vec![at(0.2, 0.0), at(1.0, 0.0), at(0.8, 1.0), at(0.0, 1.0)],
+        _ => {
+            // rectangle (0), rounded rectangle (1), pill (8)
+            let rad = match geo {
+                1 => (r.width().min(r.height()) * 0.18).min(28.0),
+                8 => r.width().min(r.height()) / 2.0,
+                _ => 0.0,
+            };
+            if rad < 0.5 {
+                return vec![r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()];
+            }
+            let rad = rad.min(hw).min(hh);
+            let mut v = Vec::new();
+            let corners = [(r.max.x - rad, r.min.y + rad, -90.0_f32), (r.max.x - rad, r.max.y - rad, 0.0), (r.min.x + rad, r.max.y - rad, 90.0), (r.min.x + rad, r.min.y + rad, 180.0)];
+            for (ccx, ccy, a0) in corners {
+                for k in 0..=7 {
+                    let a = (a0 + k as f32 / 7.0 * 90.0).to_radians();
+                    v.push(pos2(ccx + rad * a.cos(), ccy + rad * a.sin()));
+                }
+            }
+            v
+        }
+    }
+}
+
+/// Is `p` inside the outline of a shape node (used for hit testing: ellipses and diamonds are not their bounding boxes).
+pub fn geo_contains(geo: u8, r: Rect, p: Pos2) -> bool {
+    if !r.contains(p) {
+        return false;
+    }
+    let u = (p.x - r.min.x) / r.width().max(1.0);
+    let v = (p.y - r.min.y) / r.height().max(1.0);
+    match geo {
+        2 => ((u - 0.5) * 2.0).powi(2) + ((v - 0.5) * 2.0).powi(2) <= 1.0,
+        3 => (u - 0.5).abs() + (v - 0.5).abs() <= 0.5,
+        4 => (u - 0.5).abs() <= v / 2.0,
+        _ => true,
+    }
 }
 
 impl Node {
@@ -268,10 +354,16 @@ pub enum Tpl {
     Swot,
     Flow,
     Week,
+    /// Flowchart built from real shapes (terminators, processes, decisions).
+    Diagram,
+    /// Sprint retrospective: three frames with sticky notes.
+    Retro,
+    /// Organisation chart from rounded shapes.
+    Org,
 }
 
 impl Tpl {
-    pub const ALL: [Tpl; 5] = [Tpl::MindMap, Tpl::Kanban, Tpl::Swot, Tpl::Flow, Tpl::Week];
+    pub const ALL: [Tpl; 8] = [Tpl::MindMap, Tpl::Kanban, Tpl::Swot, Tpl::Flow, Tpl::Week, Tpl::Diagram, Tpl::Retro, Tpl::Org];
     pub fn name(self) -> &'static str {
         match self {
             Tpl::MindMap => "Mind map",
@@ -279,6 +371,9 @@ impl Tpl {
             Tpl::Swot => "SWOT analysis",
             Tpl::Flow => "Flowchart",
             Tpl::Week => "Weekly plan",
+            Tpl::Diagram => "Diagram (shapes)",
+            Tpl::Retro => "Retrospective",
+            Tpl::Org => "Org chart",
         }
     }
 }
@@ -526,6 +621,7 @@ impl Canvas {
         match kind {
             Kind::Todo => n.text = "[ ] ".into(),
             Kind::Group => n.text = "Group".into(),
+            Kind::Shape => n.color = 5,
             _ => {}
         }
         if kind == Kind::Group {
@@ -639,6 +735,12 @@ impl Canvas {
     pub fn hit_node(&self, p: Pos2, slack: f32, strip: f32) -> Option<u64> {
         for n in self.nodes.iter().rev() {
             if n.kind == Kind::Group {
+                continue;
+            }
+            if n.kind == Kind::Shape {
+                if geo_contains(n.geo, n.rect().expand(slack), p) {
+                    return Some(n.id);
+                }
                 continue;
             }
             if n.rect().expand(slack).contains(p) {
@@ -907,6 +1009,11 @@ impl Canvas {
 
     /// Ink points → compact stroke node. `pts` are world points.
     pub fn add_ink(&mut self, pts: &[Pos2], color: u8, size: u8) -> Option<u64> {
+        self.add_stroke(pts, color, size, false)
+    }
+
+    /// Pen (`hl` false) or highlighter (`hl` true) stroke.
+    pub fn add_stroke(&mut self, pts: &[Pos2], color: u8, size: u8, hl: bool) -> Option<u64> {
         if pts.len() < 2 {
             return None;
         }
@@ -934,6 +1041,7 @@ impl Canvas {
             h: r.height().max(1.0),
             color,
             size,
+            hl,
             pts: kept.iter().map(|p| [p.x - r.min.x, p.y - r.min.y]).collect(),
             ..Default::default()
         });
@@ -973,6 +1081,11 @@ impl Canvas {
             o.insert("lumen".into(), json!(format!("{:?}", n.kind)));
             if let Some(p) = n.page {
                 o.insert("page".into(), json!(p));
+            }
+            if n.kind == Kind::Shape {
+                o.insert("geo".into(), json!(n.geo));
+                o.insert("style".into(), json!(n.style));
+                o.insert("dash".into(), json!(n.dash));
             }
             nodes.push(v);
         }
@@ -1054,6 +1167,7 @@ impl Canvas {
                 Some("Image") => Kind::Image,
                 Some("Link") => Kind::Link,
                 Some("Group") => Kind::Group,
+                Some("Shape") => Kind::Shape,
                 Some("Note") => Kind::Note,
                 _ => match ty {
                     "group" => Kind::Group,
@@ -1089,6 +1203,11 @@ impl Canvas {
             node.url = n["url"].as_str().or_else(|| n["file"].as_str()).unwrap_or("").to_owned();
             if kind == Kind::Page {
                 node.page = n["page"].as_u64();
+            }
+            if kind == Kind::Shape {
+                node.geo = n["geo"].as_u64().unwrap_or(0).min(GEO_NAMES.len() as u64 - 1) as u8;
+                node.style = n["style"].as_u64().unwrap_or(0).min(3) as u8;
+                node.dash = n["dash"].as_u64().unwrap_or(0).min(2) as u8;
             }
             if node.w < 20.0 || !node.w.is_finite() {
                 node.w = 240.0;
@@ -1222,9 +1341,76 @@ impl Canvas {
                     self.tpl_node(Kind::Todo, x + 16.0, oy + 60.0, 216.0, 110.0, 0, "[ ] \n[ ] \n[ ] ");
                 }
             }
+            Tpl::Diagram => {
+                ox -= 330.0;
+                oy -= 260.0;
+                let a = self.tpl_shape(8, ox + 20.0, oy, 200.0, 64.0, 4, "Start");
+                let b = self.tpl_shape(0, ox + 20.0, oy + 130.0, 200.0, 72.0, 5, "Collect input");
+                let c = self.tpl_shape(3, ox - 10.0, oy + 270.0, 260.0, 150.0, 3, "Valid?");
+                let d = self.tpl_shape(1, ox + 380.0, oy + 300.0, 200.0, 72.0, 1, "Show error");
+                let e = self.tpl_shape(0, ox + 20.0, oy + 490.0, 200.0, 72.0, 5, "Save result");
+                let f = self.tpl_shape(8, ox + 20.0, oy + 620.0, 200.0, 64.0, 4, "Done");
+                for (x, y, fs, ts, label) in [(a, b, Side::Bottom, Side::Top, ""), (b, c, Side::Bottom, Side::Top, ""), (c, d, Side::Right, Side::Left, "No"), (c, e, Side::Bottom, Side::Top, "Yes"), (e, f, Side::Bottom, Side::Top, "")] {
+                    if let Some(id) = self.connect(x, y, fs, ts) {
+                        if let Some(ed) = self.edge_mut(id) {
+                            ed.label = label.into();
+                            ed.shape = Shape::Elbow;
+                        }
+                    }
+                }
+                if let Some(id) = self.connect(d, b, Side::Top, Side::Right) {
+                    if let Some(ed) = self.edge_mut(id) {
+                        ed.dashed = true;
+                        ed.shape = Shape::Elbow;
+                    }
+                }
+            }
+            Tpl::Retro => {
+                ox -= 520.0;
+                oy -= 260.0;
+                for (i, (name, col, sticky)) in [("Went well", 4u8, "## Shipped on time\nGreat teamwork"), ("To improve", 2, "## Slow reviews\nUnclear scope"), ("Actions", 5, "[ ] Daily 15 min sync\n[ ] Write the checklist")].iter().enumerate() {
+                    let x = ox + i as f32 * 360.0;
+                    self.tpl_node(Kind::Group, x, oy, 340.0, 520.0, *col, name);
+                    let k = if i == 2 { Kind::Todo } else { Kind::Note };
+                    self.tpl_node(k, x + 24.0, oy + 64.0, 292.0, 130.0, *col, sticky);
+                    self.tpl_node(k, x + 24.0, oy + 214.0, 292.0, 130.0, *col, if i == 2 { "[ ] " } else { "Add a thought…" });
+                }
+            }
+            Tpl::Org => {
+                ox -= 400.0;
+                oy -= 200.0;
+                let ceo = self.tpl_shape(1, ox + 300.0, oy, 200.0, 70.0, 5, "CEO");
+                let mut y_ids = vec![];
+                for (i, t) in ["Product", "Engineering", "Design", "Growth"].iter().enumerate() {
+                    y_ids.push(self.tpl_shape(1, ox + i as f32 * 230.0 - 60.0, oy + 180.0, 190.0, 64.0, [4u8, 6, 2, 3][i], t));
+                }
+                for (i, id) in y_ids.iter().enumerate() {
+                    if let Some(e) = self.connect(ceo, *id, Side::Bottom, Side::Top) {
+                        if let Some(ed) = self.edge_mut(e) {
+                            ed.shape = Shape::Elbow;
+                            ed.arrow = Arrow::None;
+                        }
+                    }
+                    for j in 0..2 {
+                        let m = self.tpl_shape(0, ox + i as f32 * 230.0 - 40.0, oy + 320.0 + j as f32 * 100.0, 150.0, 60.0, 0, if j == 0 { "Lead" } else { "Team" });
+                        if let Some(e) = self.connect(*id, m, Side::Bottom, Side::Top) {
+                            if let Some(ed) = self.edge_mut(e) {
+                                ed.shape = Shape::Elbow;
+                                ed.arrow = Arrow::None;
+                            }
+                        }
+                    }
+                }
+            }
         }
         self.rev += 1;
         self.nodes.iter().filter(|n| !before.contains(&n.id)).map(|n| n.id).collect()
+    }
+
+    fn tpl_shape(&mut self, geo: u8, x: f32, y: f32, w: f32, h: f32, color: u8, text: &str) -> u64 {
+        let id = self.new_id();
+        self.nodes.push(Node { id, kind: Kind::Shape, x, y, w, h, color, geo, text: text.to_owned(), ..Default::default() });
+        id
     }
 
     fn tpl_node(&mut self, kind: Kind, x: f32, y: f32, w: f32, h: f32, color: u8, text: &str) -> u64 {

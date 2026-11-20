@@ -98,6 +98,7 @@ pub fn page_markdown(ws: &Workspace, id: u64) -> String {
             BlockKind::PageLink => format!("{pad}[{}]", b.link.map(|l| ws.display_title(l)).unwrap_or_else(|| "Missing page".into())),
             BlockKind::Columns | BlockKind::Column => String::new(),
             BlockKind::Widget => format!("{pad}[Dashboard widget]"),
+            BlockKind::Whiteboard => format!("{pad}[Whiteboard: {}]", b.link.map(|l| ws.display_title(l)).unwrap_or_else(|| "empty".into())),
             BlockKind::Button => format!("{pad}[Button: {}]", if b.text.is_empty() { "Button" } else { &b.text }),
             BlockKind::Table => crate::mdtable::to_markdown(b).lines().map(|l| format!("{pad}{l}")).collect::<Vec<_>>().join("\n"),
             BlockKind::DbView => match b.link.filter(|l| ws.db(*l).is_some()) {

@@ -51,6 +51,8 @@ pub enum BlockKind {
     Table,
     /// Block equation (LaTeX): `text` = the TeX source, typeset by `math.rs` (Markdown: `$$ … $$`).
     Equation,
+    /// An embedded whiteboard: `link` = the canvas page it shows (live thumbnail in the page, full editor in a peek view), see `whiteboard.rs`.
+    Whiteboard,
 }
 
 impl BlockKind {
@@ -75,7 +77,7 @@ impl BlockKind {
     ];
 
     pub fn has_text(self) -> bool {
-        !matches!(self, BlockKind::Divider | BlockKind::Toc | BlockKind::PageLink | BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File | BlockKind::Columns | BlockKind::Column | BlockKind::DbView | BlockKind::Widget | BlockKind::Button | BlockKind::Table)
+        !matches!(self, BlockKind::Divider | BlockKind::Toc | BlockKind::PageLink | BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File | BlockKind::Columns | BlockKind::Column | BlockKind::DbView | BlockKind::Widget | BlockKind::Button | BlockKind::Table | BlockKind::Whiteboard)
     }
 
     pub fn label(self) -> &'static str {
@@ -105,6 +107,7 @@ impl BlockKind {
             BlockKind::Button => "Button",
             BlockKind::Table => "Table",
             BlockKind::Equation => "Equation",
+            BlockKind::Whiteboard => "Whiteboard",
         }
     }
 
@@ -135,6 +138,7 @@ impl BlockKind {
             BlockKind::Button => "One click runs actions: set properties, create tasks, move rows, notify.",
             BlockKind::Table => "A simple table. Paste Markdown tables here, or turn one into a database.",
             BlockKind::Equation => "Write a LaTeX / math formula ($$ … $$).",
+            BlockKind::Whiteboard => "An infinite board inside the page: shapes, sticky notes, ink, frames, connectors.",
         }
     }
 
@@ -164,6 +168,7 @@ impl BlockKind {
             BlockKind::Button => l::MOUSE_POINTER_2,
             BlockKind::Table => l::TABLE,
             BlockKind::Equation => l::SIGMA,
+            BlockKind::Whiteboard => l::NETWORK,
         }
     }
 
@@ -193,6 +198,7 @@ impl BlockKind {
             BlockKind::Button => "button automation action click run rule trigger macro",
             BlockKind::Table => "table grid rows columns markdown spreadsheet cells",
             BlockKind::Equation => "equation math latex formula tex katex sigma integral fraction",
+            BlockKind::Whiteboard => "whiteboard canvas edgeless draw sketch diagram miro board affine shapes frame",
         }
     }
 }

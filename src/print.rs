@@ -389,6 +389,13 @@ pub fn page_html(ws: &Workspace, media: &MediaStore, id: u64, auto_print: bool) 
             BlockKind::Widget => {
                 o.push_str(&format!("<p style=\"{pad};color:#888\"><em>[Dashboard widget]</em></p>"));
             }
+            BlockKind::Whiteboard => match b.link.and_then(|l| ws.page(l)).and_then(|p| p.canvas.as_ref()) {
+                Some(c) => {
+                    let svg = crate::canvasexport::to_svg(c, false, &|id| ws.display_title(id)).replacen("<svg", "<svg style=\"max-width:100%;height:auto;border:1px solid #ddd;border-radius:8px\"", 1);
+                    o.push_str(&format!("<div style=\"{pad};margin:8px 0\">{svg}</div>"));
+                }
+                None => o.push_str(&format!("<p style=\"{pad};color:#888\"><em>[Whiteboard]</em></p>")),
+            },
             BlockKind::Table => {
                 let rows = crate::mdtable::grid(b);
                 let al: Vec<char> = b.url.chars().collect();

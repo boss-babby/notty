@@ -33,7 +33,12 @@ enum Tool {
     #[default]
     Select,
     Hand,
+    /// Pen / highlighter / eraser (see `St::pen_mode`).
     Pen,
+    /// Drag a rectangle to draw the chosen shape (`St::geo`).
+    Shape,
+    /// Drag a rectangle to create a frame (= slide).
+    Frame,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -81,6 +86,10 @@ enum Drag {
     Resize { id: u64, corner: u8, orig: Rect, pts: Vec<[f32; 2]>, changed: bool },
     Connect { from: u64, side: Side, to: Pos2 },
     Ink { pts: Vec<Pos2> },
+    /// Rubber-band of the shape / frame tool (world coordinates).
+    Draw { from: Pos2, to: Pos2 },
+    /// Eraser: deletes every pen stroke it touches.
+    Erase,
 }
 
 #[derive(Default)]
@@ -106,6 +115,15 @@ struct St {
     space: bool,
     pen_color: u8,
     pen_size: u8,
+    /// 0 pen, 1 highlighter, 2 eraser.
+    pen_mode: u8,
+    /// Shape tool: geometry, look (see `canvas::SHAPE_STYLES`), outline, colour, size step of the text.
+    geo: u8,
+    shape_style: u8,
+    shape_dash: u8,
+    shape_color: u8,
+    geo_open: bool,
+    frames_open: bool,
     color_open: bool,
     rect: Option<Rect>,
     hover: Option<u64>,
@@ -140,7 +158,7 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, page: u64, pal: &Palette) -> Out {
     let Some(mut c) = ws.page_mut(page).map(|p| p.canvas.take().unwrap_or_else(Canvas::new)) else { return out };
     let mut st = ST.with(|s| std::mem::take(&mut *s.borrow_mut()));
     if st.page != page {
-        st = St { page, pen_size: 1, ..Default::default() };
+        st = St { page, pen_size: 1, shape_color: 5, ..Default::default() };
     }
     let rev0 = c.rev;
     run(ui, ws, page, pal, &mut c, &mut st, &mut out);
@@ -211,7 +229,7 @@ fn center_world(st: &St, c: &Canvas) -> Pos2 {
 }
 
 fn is_text_kind(k: Kind) -> bool {
-    matches!(k, Kind::Note | Kind::Todo | Kind::Text)
+    matches!(k, Kind::Note | Kind::Todo | Kind::Text | Kind::Shape)
 }
 
 fn animate_to(st: &mut St, v: View) {
@@ -265,10 +283,25 @@ fn begin_edit(st: &mut St, c: &mut Canvas, e: Edit) {
 fn add_at(st: &mut St, c: &mut Canvas, kind: Kind, at: Pos2) -> u64 {
     c.checkpoint();
     let id = c.add_node(kind, at);
+    if kind == Kind::Group {
+        let k = c.nodes.iter().filter(|n| n.kind == Kind::Group).count();
+        if let Some(n) = c.node_mut(id) {
+            n.text = format!("Frame {k}");
+        }
+    }
+    if kind == Kind::Shape {
+        let (geo, style, dash, color) = (st.geo, st.shape_style, st.shape_dash, st.shape_color);
+        if let Some(n) = c.node_mut(id) {
+            n.geo = geo;
+            n.style = style;
+            n.dash = dash;
+            n.color = color;
+        }
+    }
     select_only(st, [id]);
     st.tool = Tool::Select;
     match kind {
-        Kind::Note | Kind::Text | Kind::Todo | Kind::Group => {
+        Kind::Note | Kind::Text | Kind::Todo | Kind::Group | Kind::Shape => {
             st.edit = Some(Edit::Node(id));
             st.focus_edit = true;
         }
@@ -296,6 +329,24 @@ fn spawn_point(st: &mut St, c: &Canvas) -> Pos2 {
     let k = (st.spawn_n % 7) as f32;
     st.spawn_n += 1;
     p + vec2(k * 28.0, k * 28.0) - vec2(84.0, 84.0)
+}
+
+/// Eraser: removes every pen / highlighter stroke whose line passes within `tol` (world units) of `p`.
+fn erase_at(c: &mut Canvas, p: Pos2, tol: f32) {
+    let hit: BTreeSet<u64> = c
+        .nodes
+        .iter()
+        .filter(|n| n.kind == Kind::Ink && !n.locked && n.rect().expand(tol + 3.0).contains(p))
+        .filter(|n| {
+            let pts: Vec<Pos2> = n.pts.iter().map(|q| pos2(n.x + q[0], n.y + q[1])).collect();
+            let reach = if n.hl { tol + 6.0 } else { tol };
+            pts.len() == 1 || cv::dist_to_path(&pts, p) <= reach
+        })
+        .map(|n| n.id)
+        .collect();
+    if !hit.is_empty() {
+        c.delete_nodes(&hit);
+    }
 }
 
 fn hit_slack(st: &St, c: &Canvas) -> f32 {
@@ -358,6 +409,9 @@ enum Act {
     EdgeShape,
     EdgeLabel,
     EdgeReverse,
+    AddShape,
+    ExportSvg,
+    CopySvg,
 }
 
 fn act(a: Act, st: &mut St, c: &mut Canvas, ws: &mut Workspace, ctx: &Context, page: u64, out: &mut Out, at: Pos2) {
@@ -383,6 +437,21 @@ fn act(a: Act, st: &mut St, c: &mut Canvas, ws: &mut Workspace, ctx: &Context, p
         }
         Act::AddGroup => {
             add_at(st, c, Kind::Group, at);
+        }
+        Act::AddShape => {
+            add_at(st, c, Kind::Shape, at);
+        }
+        Act::ExportSvg | Act::CopySvg => {
+            let svg = crate::canvasexport::to_svg(c, ctx.style().visuals.dark_mode, &|id| ws.page(id).map(|p| p.title.clone()).unwrap_or_default());
+            if a == Act::CopySvg {
+                ctx.copy_text(svg);
+                out.toast = Some("Board copied as SVG".into());
+            } else {
+                let title = ws.page(page).map(|p| p.title.trim().to_owned()).unwrap_or_default();
+                let stem: String = title.chars().map(|ch| if ch.is_alphanumeric() || ch == '-' || ch == '_' { ch } else { '-' }).collect();
+                let name = format!("{}.svg", if stem.trim_matches('-').is_empty() { "whiteboard".to_owned() } else { stem });
+                out.toast = Some(platform::save_download(&name, svg.as_bytes(), "image/svg+xml"));
+            }
         }
         Act::Templates => {
             let pos = st.rect.map_or(Pos2::ZERO, |r| r.center() - vec2(110.0, 120.0));
@@ -786,7 +855,7 @@ fn run(ui: &mut Ui, ws: &mut Workspace, page: u64, pal: &Palette, c: &mut Canvas
             }
         }
     }
-    if st.tool == Tool::Pen && !st.present.is_some() {
+    if matches!(st.tool, Tool::Pen | Tool::Shape | Tool::Frame) && !st.present.is_some() {
         touch::set_passthrough(true);
     }
 
@@ -796,7 +865,7 @@ fn run(ui: &mut Ui, ws: &mut Workspace, page: u64, pal: &Palette, c: &mut Canvas
             (Drag::Pan, _) => CursorIcon::Grabbing,
             (Drag::Move { .. }, _) => CursorIcon::Grabbing,
             (Drag::Connect { .. }, _) => CursorIcon::Crosshair,
-            (Drag::Ink { .. }, _) | (_, Tool::Pen) => CursorIcon::Crosshair,
+            (Drag::Ink { .. } | Drag::Draw { .. } | Drag::Erase, _) | (_, Tool::Pen | Tool::Shape | Tool::Frame) => CursorIcon::Crosshair,
             (_, Tool::Hand) => CursorIcon::Grab,
             _ if st.space => CursorIcon::Grab,
             _ => {
@@ -828,6 +897,8 @@ fn run(ui: &mut Ui, ws: &mut Workspace, page: u64, pal: &Palette, c: &mut Canvas
             find_bar(ui, &ctx, c, st, pal, rect);
         }
         dock(ui, &ctx, ws, page, c, st, out, pal, rect, compact);
+        zoom_bar(ui, c, st, pal, rect, compact);
+        frames_panel(ui, c, st, pal, rect, compact);
         if !compact && c.minimap && !c.nodes.is_empty() {
             minimap(ui, c, st, pal, rect);
         }
@@ -921,6 +992,23 @@ fn handle_keys(ctx: &Context, ui: &Ui, ws: &mut Workspace, page: u64, c: &mut Ca
     key!(Modifiers::SHIFT, Key::Num1, Act::Fit);
     key!(Modifiers::SHIFT, Key::Num2, Act::FitSel);
     key!(cmd, Key::Num0, Act::Reset);
+    if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::P)) {
+        st.tool = Tool::Pen;
+        st.pen_mode = 1;
+    }
+    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::P)) {
+        st.tool = Tool::Pen;
+        st.pen_mode = 0;
+    }
+    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::E)) {
+        st.tool = Tool::Pen;
+        st.pen_mode = 2;
+    }
+    for (k, t) in [(Key::S, Tool::Shape), (Key::F, Tool::Frame)] {
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k)) {
+            st.tool = t;
+        }
+    }
     let mut tool_key = |k: Key, t: Tool| {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k)) {
             st.tool = t;
@@ -928,7 +1016,6 @@ fn handle_keys(ctx: &Context, ui: &Ui, ws: &mut Workspace, page: u64, c: &mut Ca
     };
     tool_key(Key::V, Tool::Select);
     tool_key(Key::H, Tool::Hand);
-    tool_key(Key::P, Tool::Pen);
     if over_canvas {
         let spawn = |st: &mut St, c: &mut Canvas, k: Kind, ctx: &Context| {
             let at = ctx.input(|i| i.pointer.hover_pos()).map(|p| c.view.to_world(st.rect.map_or(Pos2::ZERO, |r| r.min), p)).unwrap_or_else(|| center_world(st, c));
@@ -1075,9 +1162,18 @@ fn pointer(ctx: &Context, ui: &Ui, ws: &mut Workspace, page: u64, resp: &egui::R
         st.pop = None;
         st.menu = None;
         st.color_open = false;
+        st.geo_open = false;
         let pan_mode = st.tool == Tool::Hand || st.space || middle || resp.drag_started_by(PointerButton::Middle);
         if st.tool == Tool::Pen && !pan_mode {
-            st.drag = Drag::Ink { pts: vec![w0] };
+            if st.pen_mode == 2 {
+                c.checkpoint();
+                erase_at(c, w0, 9.0 / z);
+                st.drag = Drag::Erase;
+            } else {
+                st.drag = Drag::Ink { pts: vec![w0] };
+            }
+        } else if matches!(st.tool, Tool::Shape | Tool::Frame) && !pan_mode {
+            st.drag = Drag::Draw { from: w0, to: w0 };
         } else if pan_mode {
             st.drag = Drag::Pan;
             st.anim = None;
@@ -1267,6 +1363,13 @@ fn pointer(ctx: &Context, ui: &Ui, ws: &mut Workspace, page: u64, resp: &egui::R
                 Drag::Resize { id, corner, orig, pts, changed }
             }
             Drag::Connect { from, side, .. } => Drag::Connect { from, side, to: cur.map(|p| to_w(&c.view, p)).unwrap_or(Pos2::ZERO) },
+            Drag::Draw { from, .. } => Drag::Draw { from, to: cur.map(|p| to_w(&c.view, p)).unwrap_or(from) },
+            Drag::Erase => {
+                if let Some(p) = cur {
+                    erase_at(c, to_w(&c.view, p), 9.0 / z);
+                }
+                Drag::Erase
+            }
             Drag::Ink { mut pts } => {
                 if let Some(p) = cur {
                     let w = to_w(&c.view, p);
@@ -1332,8 +1435,25 @@ fn finish_pointer(ctx: &Context, ui: &Ui, ws: &mut Workspace, page: u64, resp: &
             Drag::Ink { pts } => {
                 if pts.len() >= 2 {
                     c.checkpoint();
-                    c.add_ink(&pts, st.pen_color, st.pen_size);
+                    c.add_stroke(&pts, st.pen_color, st.pen_size, st.pen_mode == 1);
                 }
+            }
+            Drag::Erase => {
+                c.rev += 1;
+            }
+            Drag::Draw { from, to } => {
+                let r = Rect::from_two_pos(from, to);
+                let kind = if st.tool == Tool::Frame { Kind::Group } else { Kind::Shape };
+                let at = if r.width() < 8.0 && r.height() < 8.0 { from } else { r.center() };
+                let id = add_at(st, c, kind, at);
+                if r.width() >= 8.0 || r.height() >= 8.0 {
+                    if let Some(n) = c.node_mut(id) {
+                        let r = Rect::from_min_size(r.min, vec2(r.width().max(kind.min_size().x), r.height().max(kind.min_size().y)));
+                        n.set_rect(r);
+                    }
+                    st.edit = None;
+                }
+                st.tool = Tool::Select;
             }
             Drag::Move { moved: true, orig, .. } => {
                 // a card dropped inside a group stays selected; nothing else to do — connectors follow automatically
@@ -1601,9 +1721,31 @@ fn draw_overlays_world(f: &Frame, c: &Canvas, st: &St, ctx: &Context) {
             if pts.len() >= 2 {
                 let sp: Vec<Pos2> = pts.iter().map(|p| f.pt(*p)).collect();
                 let w = ((2.2 + st.pen_size as f32 * 1.9) * f.z()).clamp(1.0, 14.0);
-                f.p.add(egui::Shape::line(sp, Stroke::new(w, draw::accent(pal, st.pen_color).unwrap_or(pal.text))));
+                let col = draw::accent(pal, st.pen_color).unwrap_or(pal.text);
+                if st.pen_mode == 1 {
+                    f.p.add(egui::Shape::line(sp, Stroke::new((w * 4.5).clamp(4.0, 60.0), with_alpha(col, 0.38))));
+                } else {
+                    f.p.add(egui::Shape::line(sp, Stroke::new(w, col)));
+                }
             }
         }
+        Drag::Draw { from, to } => {
+            let r = Rect::from_two_pos(f.pt(*from), f.pt(*to));
+            if st.tool == Tool::Frame {
+                f.p.rect_filled(r, 8.0, with_alpha(pal.accent, 0.07));
+                f.p.rect_stroke(r, 8.0, Stroke::new(1.5_f32, with_alpha(pal.accent, 0.9)), StrokeKind::Inside);
+            } else {
+                let col = draw::accent(pal, st.shape_color).unwrap_or(pal.text);
+                let pts = cv::geo_points(st.geo, r);
+                let mut closed = pts.clone();
+                if let Some(p0) = pts.first() {
+                    closed.push(*p0);
+                }
+                f.p.add(egui::Shape::line(closed, Stroke::new(2.0_f32, col)));
+            }
+            let _ = cv::SHAPE_STYLES;
+        }
+        Drag::Erase => {}
         _ => {}
     }
 }
@@ -1693,6 +1835,12 @@ fn edit_overlay(ui: &mut Ui, ctx: &Context, c: &mut Canvas, st: &mut St, pal: &P
             let (font, inner) = match n.kind {
                 Kind::Text => (bold(px * [1.25, 1.9, 2.8][n.size.min(2) as usize]), r.shrink2(vec2(4.0 * z, 4.0 * z))),
                 Kind::Group => (bold(13.5 * z.max(0.8)), r.shrink2(vec2(6.0, 2.0))),
+                Kind::Shape => {
+                    let spx = [15.0, 21.0, 30.0][n.size.min(2) as usize] * z;
+                    let lines = n.text.lines().count().max(1) as f32;
+                    let ih = (lines * spx * 1.4).min(r.height() * 0.9);
+                    (bold(spx), Rect::from_min_size(pos2(r.left() + r.width() * 0.12, r.center().y - ih / 2.0), vec2(r.width() * 0.76, ih)))
+                }
                 _ => (body(px), r.shrink2(vec2(14.0 * z, 12.0 * z))),
             };
             if n.kind == Kind::Group {
@@ -1707,16 +1855,20 @@ fn edit_overlay(ui: &mut Ui, ctx: &Context, c: &mut Canvas, st: &mut St, pal: &P
             let (resp_lost, galley_h) = {
                 // live styling: the text is shown formatted, the markers stay in the text (dimmed) so the caret maps 1:1
                 let lfont = font.clone();
+                let centered = n.kind == Kind::Shape;
                 let lpal = pal.clone();
                 let ltext = pal.text;
                 let mut layouter = move |ui: &Ui, s: &str, wrap: f32| {
                     let mut job = crate::editor::rich_job(s, &lfont, ltext, &lpal, false);
                     job.wrap.max_width = wrap;
+                    if centered {
+                        job.halign = egui::Align::Center;
+                    }
                     ui.fonts(|f| f.layout_job(job))
                 };
                 let inner_resp = ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
                     let te = if multiline { TextEdit::multiline(&mut text) } else { TextEdit::singleline(&mut text) };
-                    te.id(eid).frame(false).font(font).text_color(pal.text).desired_width(inner.width()).margin(Margin::ZERO).lock_focus(multiline).layouter(&mut layouter).show(ui)
+                    te.id(eid).frame(false).font(font).text_color(pal.text).horizontal_align(if n.kind == Kind::Shape { egui::Align::Center } else { egui::Align::Min }).desired_width(inner.width()).margin(Margin::ZERO).lock_focus(multiline).layouter(&mut layouter).show(ui)
                 });
                 let o = inner_resp.inner;
                 if focus_now {
@@ -1748,7 +1900,7 @@ fn edit_overlay(ui: &mut Ui, ctx: &Context, c: &mut Canvas, st: &mut St, pal: &P
                 }
                 c.rev += 1;
             }
-            if multiline {
+            if multiline && n.kind != Kind::Shape {
                 let pad = if n.kind == Kind::Text { 10.0 } else if n.kind == Kind::Todo { 34.0 } else { 24.0 };
                 let need = galley_h / z + pad;
                 if let Some(nn) = c.node_mut(id) {
@@ -1848,9 +2000,8 @@ fn title_chip(ui: &mut Ui, ws: &mut Workspace, page: u64, pal: &Palette, rect: R
 fn top_right(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canvas, st: &mut St, out: &mut Out, pal: &Palette, rect: Rect, compact: bool) {
     let m = if compact { 8.0 } else { 14.0 };
     let bs = if touch::touchy() { 40.0 } else { 34.0 };
-    let n = if compact { 2 } else { 5 };
-    let pct_w = if compact { 0.0 } else { 52.0 };
-    let w = bs * (n as f32 - if compact { 0.0 } else { 1.0 }) + pct_w + 10.0;
+    let n = 3;
+    let w = bs * n as f32 + 10.0;
     let r = Rect::from_min_size(pos2(rect.right() - m - w, rect.top() + m), vec2(w, bs + 4.0));
     pill(ui, pal, r, 12.0);
     let mut x = r.left() + 5.0;
@@ -1862,32 +2013,10 @@ fn top_right(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut 
     };
     let at = center_world(st, c);
     let mut run = |a: Act, st: &mut St, c: &mut Canvas, ws: &mut Workspace, out: &mut Out| act(a, st, c, ws, ctx, page, out, at);
-    if !compact {
-        let b = next(bs);
-        if tbtn(ui, pal, b, Id::new("cnv_zo"), l::MINUS, false, "Zoom out  (−)", true) {
-            if let Some(sr) = st.rect {
-                let mut v = st.anim.unwrap_or(c.view);
-                v.zoom_at(sr.min, sr.center(), 0.8);
-                animate_to(st, v);
-            }
-        }
-        let b = next(pct_w);
-        let resp = ui.interact(b, Id::new("cnv_pct"), Sense::click());
-        if resp.hovered() {
-            ui.painter().rect_filled(b, 9.0, pal.hover);
-        }
-        ui.painter().text(b.center(), Align2::CENTER_CENTER, format!("{}%", (c.view.zoom * 100.0).round() as i32), body(13.0), pal.text);
-        if resp.on_hover_text("Reset to 100%").clicked() {
-            run(Act::Reset, st, c, ws, out);
-        }
-        let b = next(bs);
-        if tbtn(ui, pal, b, Id::new("cnv_zi"), l::PLUS, false, "Zoom in  (+)", true) {
-            if let Some(sr) = st.rect {
-                let mut v = st.anim.unwrap_or(c.view);
-                v.zoom_at(sr.min, sr.center(), 1.25);
-                animate_to(st, v);
-            }
-        }
+    let b = next(bs);
+    if tbtn(ui, pal, b, Id::new("cnv_frames"), l::LAYOUT_LIST, st.frames_open, "Frames  (navigator)", true) {
+        st.frames_open = !st.frames_open;
+        st.menu = None;
     }
     let b = next(bs);
     if tbtn(ui, pal, b, Id::new("cnv_fit"), l::MAXIMIZE, false, "Fit to content  (Shift+1)", true) {
@@ -1897,6 +2026,97 @@ fn top_right(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut 
     if tbtn(ui, pal, b, Id::new("cnv_more"), l::ELLIPSIS, matches!(st.menu, Some(MenuState { kind: MenuKind::Canvas, .. })), "Canvas options", true) {
         st.menu = Some(MenuState { kind: MenuKind::Canvas, pos: pos2(b.right(), b.bottom() + 6.0), world: at });
         st.fresh = true;
+    }
+}
+
+/// Frames navigator + zoom bar: the two pieces of chrome that make a large board easy to travel.
+fn frames_panel(ui: &mut Ui, c: &mut Canvas, st: &mut St, pal: &Palette, rect: Rect, compact: bool) {
+    if !st.frames_open {
+        return;
+    }
+    let frames: Vec<(u64, String)> = c.nodes.iter().filter(|n| n.kind == Kind::Group).map(|n| (n.id, if n.text.trim().is_empty() { "Frame".to_owned() } else { n.text.clone() })).collect();
+    let rows = frames.len().clamp(1, 9);
+    let m = if compact { 8.0 } else { 14.0 };
+    let bs = if touch::touchy() { 40.0 } else { 34.0 };
+    let w = 236.0_f32.min(rect.width() - 2.0 * m);
+    let h = 44.0 + rows as f32 * 36.0 + 8.0;
+    let r = Rect::from_min_size(pos2(rect.right() - m - w, rect.top() + m + bs + 12.0), vec2(w, h));
+    pill(ui, pal, r, 14.0);
+    ui.painter().text(r.left_top() + vec2(14.0, 22.0), Align2::LEFT_CENTER, "Frames", bold(13.0), pal.text);
+    let play = Rect::from_center_size(pos2(r.right() - 22.0, r.top() + 22.0), vec2(30.0, 30.0));
+    if tbtn(ui, pal, play, Id::new("cnv_fr_play"), l::MONITOR_PLAY, false, "Present frames as slides", !frames.is_empty()) {
+        st.present = Some(0);
+        st.edit = None;
+        st.frames_open = false;
+        present_goto(st, c, 0);
+    }
+    if frames.is_empty() {
+        ui.painter().text(r.left_top() + vec2(14.0, 66.0), Align2::LEFT_CENTER, "No frames yet — press F and drag", body(12.5), pal.muted);
+    }
+    let mut goto: Option<u64> = None;
+    for (i, (id, name)) in frames.iter().take(9).enumerate() {
+        let row = Rect::from_min_size(pos2(r.left() + 6.0, r.top() + 44.0 + i as f32 * 36.0), vec2(w - 12.0, 34.0));
+        let resp = ui.interact(row, Id::new(("cnv_fr", *id)), Sense::click());
+        if resp.hovered() {
+            ui.painter().rect_filled(row, 8.0, pal.hover);
+        }
+        ui.painter().text(row.left_center() + vec2(10.0, 0.0), Align2::LEFT_CENTER, format!("{}", i + 1), body(12.0), pal.muted);
+        crate::widgets::text_fit(ui.painter(), row.left_center() + vec2(32.0, 0.0), Align2::LEFT_CENTER, name, body(13.5), pal.text, row.width() - 44.0);
+        if resp.clicked() {
+            goto = Some(*id);
+        }
+    }
+    if let Some(id) = goto {
+        let set: BTreeSet<u64> = [id].into_iter().collect();
+        select_only(st, [id]);
+        fit_ids(st, c, Some(&set));
+    }
+}
+
+fn zoom_bar(ui: &mut Ui, c: &mut Canvas, st: &mut St, pal: &Palette, rect: Rect, compact: bool) {
+    let bs = if touch::touchy() { 40.0 } else { 34.0 };
+    let pct_w = 54.0;
+    let w = bs * 3.0 + pct_w + 10.0 - bs;
+    let m = if compact { 10.0 } else { 18.0 };
+    let dock_h = (if touch::touchy() { 44.0 } else { 38.0 }) + 8.0;
+    let y = if compact { rect.bottom() - m - dock_h - 10.0 - (bs + 4.0) } else { rect.bottom() - m - (bs + 4.0) };
+    let r = Rect::from_min_size(pos2(rect.left() + m, y), vec2(w, bs + 4.0));
+    pill(ui, pal, r, 12.0);
+    let mut x = r.left() + 5.0;
+    let yy = r.top() + 2.0;
+    let mut next = |wd: f32| {
+        let b = Rect::from_min_size(pos2(x, yy), vec2(wd, bs));
+        x += wd;
+        b
+    };
+    let b = next(bs);
+    if tbtn(ui, pal, b, Id::new("cnv_zo"), l::MINUS, false, "Zoom out  (−)", true) {
+        if let Some(sr) = st.rect {
+            let mut v = st.anim.unwrap_or(c.view);
+            v.zoom_at(sr.min, sr.center(), 0.8);
+            animate_to(st, v);
+        }
+    }
+    let b = next(pct_w);
+    let resp = ui.interact(b, Id::new("cnv_pct"), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(b, 9.0, pal.hover);
+    }
+    ui.painter().text(b.center(), Align2::CENTER_CENTER, format!("{}%", (c.view.zoom * 100.0).round() as i32), body(13.0), pal.text);
+    if resp.on_hover_text("Reset to 100%").clicked() {
+        if let Some(sr) = st.rect {
+            let mut v = c.view;
+            v.zoom_at(sr.min, sr.center(), 1.0 / c.view.zoom);
+            animate_to(st, v);
+        }
+    }
+    let b = next(bs);
+    if tbtn(ui, pal, b, Id::new("cnv_zi"), l::PLUS, false, "Zoom in  (+)", true) {
+        if let Some(sr) = st.rect {
+            let mut v = st.anim.unwrap_or(c.view);
+            v.zoom_at(sr.min, sr.center(), 1.25);
+            animate_to(st, v);
+        }
     }
 }
 
@@ -1911,33 +2131,140 @@ const KINDS: [(Kind, &str, &str, &str); 7] = [
 ];
 
 #[allow(clippy::too_many_arguments)]
+/// Little outline of a shape geometry (dock palette and selection toolbar).
+fn geo_icon(p: &egui::Painter, center: Pos2, geo: u8, size: f32, col: Color32, fill: bool) {
+    let r = Rect::from_center_size(center, vec2(size, size * 0.8));
+    let mut pts = cv::geo_points(geo, r);
+    if fill {
+        let mut m = egui::epaint::Mesh::default();
+        m.colored_vertex(r.center(), with_alpha(col, 0.25));
+        for q in &pts {
+            m.colored_vertex(*q, with_alpha(col, 0.25));
+        }
+        let k = pts.len() as u32;
+        for i in 0..k {
+            m.add_triangle(0, 1 + i, 1 + (i + 1) % k);
+        }
+        p.add(egui::Shape::mesh(m));
+    }
+    if let Some(f0) = pts.first().copied() {
+        pts.push(f0);
+    }
+    p.add(egui::Shape::line(pts, Stroke::new(1.7_f32, col)));
+}
+
+/// Icon of a shape look (0 tinted, 1 outline, 2 solid, 3 hand-drawn).
+fn style_icon(p: &egui::Painter, center: Pos2, style: u8, col: Color32) {
+    let r = Rect::from_center_size(center, vec2(18.0, 13.0));
+    match style {
+        0 => {
+            p.rect_filled(r, 3.0, with_alpha(col, 0.28));
+            p.rect_stroke(r, 3.0, Stroke::new(1.5_f32, col), StrokeKind::Inside);
+        }
+        1 => {
+            p.rect_stroke(r, 3.0, Stroke::new(1.7_f32, col), StrokeKind::Inside);
+        }
+        2 => {
+            p.rect_filled(r, 3.0, col);
+        }
+        _ => {
+            let pts = vec![r.left_top() + vec2(0.0, 1.0), r.center_top() + vec2(0.0, -1.0), r.right_top() + vec2(0.5, 0.5), r.right_center() + vec2(1.0, 0.0), r.right_bottom() + vec2(-0.5, 1.0), r.center_bottom() + vec2(0.0, -0.5), r.left_bottom() + vec2(0.5, -1.0), r.left_center() + vec2(-1.0, 0.0), r.left_top() + vec2(0.0, 1.0)];
+            p.add(egui::Shape::line(pts, Stroke::new(1.5_f32, col)));
+        }
+    }
+}
+
+fn dash_icon(p: &egui::Painter, center: Pos2, dash: u8, col: Color32) {
+    let st_ = Stroke::new(2.0_f32, col);
+    match dash {
+        0 => {
+            p.line_segment([center + vec2(-9.0, 0.0), center + vec2(9.0, 0.0)], st_);
+        }
+        1 => {
+            for k in 0..3 {
+                let x0 = center.x - 9.0 + k as f32 * 7.0;
+                p.line_segment([pos2(x0, center.y), pos2(x0 + 4.0, center.y)], st_);
+            }
+        }
+        _ => {
+            for k in 0..4 {
+                p.circle_filled(pos2(center.x - 8.0 + k as f32 * 5.5, center.y), 1.4, col);
+            }
+        }
+    }
+}
+
+/// A row of colour dots; returns the colour that was picked.
+fn color_row(ui: &mut Ui, pal: &Palette, x0: f32, cy: f32, cw: f32, current: u8, tag: &'static str) -> Option<u8> {
+    let mut picked = None;
+    let mut x = x0;
+    for col in PEN_COLORS {
+        let cc = pos2(x + cw / 2.0, cy);
+        let hit = Rect::from_center_size(cc, vec2(cw, 34.0));
+        let resp = ui.interact(hit, Id::new((tag, col)), Sense::click());
+        let color = draw::accent(pal, col).unwrap_or(pal.text);
+        ui.painter().circle_filled(cc, 8.5, color);
+        if current == col {
+            ui.painter().circle_stroke(cc, 12.0, Stroke::new(1.8_f32, color));
+        }
+        if resp.clicked() {
+            picked = Some(col);
+        }
+        x += cw;
+    }
+    picked
+}
+
 fn dock(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canvas, st: &mut St, out: &mut Out, pal: &Palette, rect: Rect, compact: bool) {
     let _ = (ws, page, out, ctx);
     let bs = if touch::touchy() { 44.0 } else { 38.0 };
-    let tools = [(Tool::Select, l::MOUSE_POINTER_2, "Select  (V)"), (Tool::Hand, l::MOVE, "Hand — drag to pan  (H)"), (Tool::Pen, l::PEN_LINE, "Pen  (P)")];
+    let pen_glyph = match st.pen_mode {
+        1 => l::HIGHLIGHTER,
+        2 => l::ERASER,
+        _ => l::PEN_LINE,
+    };
+    let tools = [
+        (Tool::Select, l::MOUSE_POINTER_2, "Select  (V)"),
+        (Tool::Hand, l::MOVE, "Hand — drag to pan  (H)"),
+        (Tool::Pen, pen_glyph, "Pen · highlighter · eraser  (P, Shift+P, E)"),
+        (Tool::Shape, l::SQUARE, "Shapes  (S)"),
+        (Tool::Frame, l::SCAN_LINE, "Frame  (F) — a slide and a section"),
+    ];
     let n_add = if compact { 1 } else { KINDS.len() };
     let items = tools.len() + n_add;
     let sep = 12.0;
     let w = items as f32 * bs + sep + 12.0;
     let m = if compact { 10.0 } else { 18.0 };
     let r = Rect::from_min_size(pos2(rect.center().x - w / 2.0, rect.bottom() - m - bs - 8.0), vec2(w, bs + 8.0));
-    // pen options above the dock
+    // option panel above the dock
     if st.tool == Tool::Pen {
         let cw = 26.0;
-        let pw = (PEN_COLORS.len() + 3) as f32 * cw + 28.0;
-        let pr = Rect::from_min_size(pos2(rect.center().x - pw / 2.0, r.top() - 50.0), vec2(pw, 40.0));
+        let rows = if st.pen_mode == 2 { 1.0 } else { 2.0 };
+        let pw = (PEN_COLORS.len() as f32 * cw + 24.0).max(250.0);
+        let ph = rows * 38.0 + 8.0;
+        let pr = Rect::from_min_size(pos2(rect.center().x - pw / 2.0, r.top() - ph - 10.0), vec2(pw, ph));
         pill(ui, pal, pr, 12.0);
-        let mut x = pr.left() + 10.0;
-        for col in PEN_COLORS {
-            let cc = pos2(x + cw / 2.0, pr.center().y);
-            let hit = Rect::from_center_size(cc, vec2(cw, 34.0));
-            let resp = ui.interact(hit, Id::new(("cnv_pc", col)), Sense::click());
-            let color = draw::accent(pal, col).unwrap_or(pal.text);
-            ui.painter().circle_filled(cc, 8.5, color);
-            if st.pen_color == col {
-                ui.painter().circle_stroke(cc, 12.0, Stroke::new(1.8_f32, color));
+        let cy = pr.top() + 4.0 + 17.0;
+        let mut x = pr.left() + 8.0;
+        for (mode, g, tip) in [(0u8, l::PEN_LINE, "Pen"), (1, l::HIGHLIGHTER, "Highlighter"), (2, l::ERASER, "Eraser — drag over strokes")] {
+            let b = Rect::from_center_size(pos2(x + 17.0, cy), vec2(34.0, 34.0));
+            if tbtn(ui, pal, b, Id::new(("cnv_pm", mode)), g, st.pen_mode == mode, tip, true) {
+                st.pen_mode = mode;
             }
-            if resp.clicked() {
+            x += 36.0;
+        }
+        if st.pen_mode != 2 {
+            let mut sx = pr.right() - 8.0 - 3.0 * cw;
+            for sz in 0..3u8 {
+                let cc = pos2(sx + cw / 2.0, cy);
+                let resp = ui.interact(Rect::from_center_size(cc, vec2(cw, 34.0)), Id::new(("cnv_ps", sz)), Sense::click());
+                ui.painter().circle_filled(cc, 2.5 + sz as f32 * 2.0, if st.pen_size == sz { pal.accent } else { pal.muted });
+                if resp.clicked() {
+                    st.pen_size = sz;
+                }
+                sx += cw;
+            }
+            if let Some(col) = color_row(ui, pal, pr.left() + 12.0, pr.top() + 4.0 + 38.0 + 17.0, cw, st.pen_color, "cnv_pc") {
                 st.pen_color = col;
                 // recolour the stroke that is selected
                 if let Some(id) = st.sel.iter().next().copied().filter(|_| st.sel.len() == 1) {
@@ -1950,18 +2277,64 @@ fn dock(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canva
                     }
                 }
             }
-            x += cw;
+        }
+    }
+    if st.tool == Tool::Shape {
+        let cw = 26.0;
+        let pw = (cv::GEO_NAMES.len() as f32 * 31.0 + 20.0).max(PEN_COLORS.len() as f32 * cw + 24.0);
+        let ph = 3.0 * 38.0 + 8.0;
+        let pr = Rect::from_min_size(pos2(rect.center().x - pw / 2.0, r.top() - ph - 10.0), vec2(pw, ph));
+        pill(ui, pal, pr, 12.0);
+        let col = draw::accent(pal, st.shape_color).unwrap_or(pal.text);
+        let mut x = pr.left() + 10.0;
+        let cy = pr.top() + 4.0 + 17.0;
+        for g in 0..cv::GEO_NAMES.len() as u8 {
+            let b = Rect::from_center_size(pos2(x + 15.0, cy), vec2(31.0, 34.0));
+            let resp = ui.interact(b, Id::new(("cnv_geo", g)), Sense::click());
+            if st.geo == g {
+                ui.painter().rect_filled(b, 8.0, pal.accent_soft);
+            } else if resp.hovered() {
+                ui.painter().rect_filled(b, 8.0, pal.hover);
+            }
+            geo_icon(ui.painter(), b.center(), g, 19.0, if st.geo == g { pal.accent } else { pal.text }, false);
+            if resp.on_hover_text(cv::GEO_NAMES[g as usize]).clicked() {
+                st.geo = g;
+            }
+            x += 31.0;
+        }
+        let cy = pr.top() + 4.0 + 38.0 + 17.0;
+        let mut x = pr.left() + 10.0;
+        for sty in 0..4u8 {
+            let b = Rect::from_center_size(pos2(x + 17.0, cy), vec2(34.0, 34.0));
+            let resp = ui.interact(b, Id::new(("cnv_sty", sty)), Sense::click());
+            if st.shape_style == sty {
+                ui.painter().rect_filled(b, 8.0, pal.accent_soft);
+            } else if resp.hovered() {
+                ui.painter().rect_filled(b, 8.0, pal.hover);
+            }
+            style_icon(ui.painter(), b.center(), sty, if st.shape_style == sty { pal.accent } else { col });
+            if resp.on_hover_text(cv::SHAPE_STYLES[sty as usize]).clicked() {
+                st.shape_style = sty;
+            }
+            x += 36.0;
         }
         x += 8.0;
-        for s in 0..3u8 {
-            let cc = pos2(x + cw / 2.0, pr.center().y);
-            let hit = Rect::from_center_size(cc, vec2(cw, 34.0));
-            let resp = ui.interact(hit, Id::new(("cnv_ps", s)), Sense::click());
-            ui.painter().circle_filled(cc, 2.5 + s as f32 * 2.0, if st.pen_size == s { pal.accent } else { pal.muted });
-            if resp.clicked() {
-                st.pen_size = s;
+        for d in 0..3u8 {
+            let b = Rect::from_center_size(pos2(x + 17.0, cy), vec2(34.0, 34.0));
+            let resp = ui.interact(b, Id::new(("cnv_dsh", d)), Sense::click());
+            if st.shape_dash == d {
+                ui.painter().rect_filled(b, 8.0, pal.accent_soft);
+            } else if resp.hovered() {
+                ui.painter().rect_filled(b, 8.0, pal.hover);
             }
-            x += cw;
+            dash_icon(ui.painter(), b.center(), d, if st.shape_dash == d { pal.accent } else { pal.text });
+            if resp.on_hover_text(["Solid outline", "Dashed outline", "Dotted outline"][d as usize]).clicked() {
+                st.shape_dash = d;
+            }
+            x += 36.0;
+        }
+        if let Some(cc) = color_row(ui, pal, pr.left() + 12.0, pr.top() + 4.0 + 76.0 + 17.0, cw, st.shape_color, "cnv_shc") {
+            st.shape_color = cc;
         }
     }
     pill(ui, pal, r, 16.0);
@@ -2106,6 +2479,9 @@ fn selection_toolbar(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, 
         Act(Act, &'static str, &'static str, bool),
         Size,
         Dash(bool),
+        Geo,
+        Style,
+        Dash3,
         Sep,
         More,
     }
@@ -2125,6 +2501,12 @@ fn selection_toolbar(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, 
         if let (true, Some(n)) = (single, first.as_ref()) {
             match n.kind {
                 Kind::Text | Kind::Ink => btns.push(B::Size),
+                Kind::Shape => {
+                    btns.push(B::Geo);
+                    btns.push(B::Style);
+                    btns.push(B::Dash3);
+                    btns.push(B::Size);
+                }
                 Kind::Page => btns.push(B::Act(Act::OpenPage, l::ARROW_UP_RIGHT, "Open page", false)),
                 Kind::Link => btns.push(B::Act(Act::OpenLink, l::EXTERNAL_LINK, "Open link", false)),
                 _ => {}
@@ -2155,6 +2537,7 @@ fn selection_toolbar(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, 
     x = r.left() + 5.0;
     let y = r.top() + 4.0;
     let mut color_btn: Option<Rect> = None;
+    let mut geo_btn: Option<Rect> = None;
     for (i, b) in btns.iter().enumerate() {
         match b {
             B::Sep => {
@@ -2204,6 +2587,50 @@ fn selection_toolbar(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, 
                 }
                 x += bs;
             }
+            B::Geo | B::Style | B::Dash3 => {
+                let br = Rect::from_min_size(pos2(x, y), vec2(bs, bs));
+                let n0 = first.clone().unwrap_or_default();
+                let resp = ui.interact(br, Id::new(("cnv_tb", i)), Sense::click());
+                let on = matches!(b, B::Geo) && st.geo_open;
+                if on {
+                    ui.painter().rect_filled(br, 9.0, pal.accent_soft);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(br, 9.0, pal.hover);
+                }
+                let ink = if on { pal.accent } else { pal.text };
+                match b {
+                    B::Geo => geo_icon(ui.painter(), br.center(), n0.geo, 19.0, ink, false),
+                    B::Style => style_icon(ui.painter(), br.center(), n0.style, ink),
+                    _ => dash_icon(ui.painter(), br.center(), n0.dash, ink),
+                }
+                let tip = match b {
+                    B::Geo => "Shape",
+                    B::Style => "Look: tinted · outline · solid · hand-drawn",
+                    _ => "Outline: solid · dashed · dotted",
+                };
+                if resp.on_hover_text(tip).clicked() {
+                    match b {
+                        B::Geo => st.geo_open = !st.geo_open,
+                        _ => {
+                            c.checkpoint();
+                            let sel = st.sel.clone();
+                            let is_style = matches!(b, B::Style);
+                            for n in c.nodes.iter_mut().filter(|n| sel.contains(&n.id) && n.kind == Kind::Shape) {
+                                if is_style {
+                                    n.style = (n.style + 1) % 4;
+                                } else {
+                                    n.dash = (n.dash + 1) % 3;
+                                }
+                            }
+                            c.rev += 1;
+                        }
+                    }
+                }
+                if matches!(b, B::Geo) {
+                    geo_btn = Some(br);
+                }
+                x += bs;
+            }
             B::Size => {
                 let br = Rect::from_min_size(pos2(x, y), vec2(bs, bs));
                 if tbtn(ui, pal, br, Id::new(("cnv_tb", i)), l::TYPE, false, "Size", true) {
@@ -2224,6 +2651,32 @@ fn selection_toolbar(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, 
                     st.fresh = true;
                 }
                 x += bs;
+            }
+        }
+    }
+    // shape picker row
+    if st.geo_open {
+        if let Some(gb) = geo_btn {
+            let gw = 33.0;
+            let pr = Rect::from_min_size(pos2(gb.left() - 40.0, r.bottom() + 8.0), vec2(gw * cv::GEO_NAMES.len() as f32 + 12.0, 40.0));
+            let pr = pr.translate(vec2((rect.right() - 8.0 - pr.right()).min(0.0) + (rect.left() + 8.0 - pr.left()).max(0.0), 0.0));
+            pill(ui, pal, pr, 12.0);
+            for g in 0..cv::GEO_NAMES.len() as u8 {
+                let b = Rect::from_min_size(pos2(pr.left() + 6.0 + gw * g as f32, pr.top() + 3.0), vec2(gw, 34.0));
+                let resp = ui.interact(b, Id::new(("cnv_gpick", g)), Sense::click());
+                if resp.hovered() {
+                    ui.painter().rect_filled(b, 8.0, pal.hover);
+                }
+                geo_icon(ui.painter(), b.center(), g, 19.0, pal.text, false);
+                if resp.on_hover_text(cv::GEO_NAMES[g as usize]).clicked() {
+                    c.checkpoint();
+                    let sel = st.sel.clone();
+                    for n in c.nodes.iter_mut().filter(|n| sel.contains(&n.id) && n.kind == Kind::Shape) {
+                        n.geo = g;
+                    }
+                    c.rev += 1;
+                    st.geo_open = false;
+                }
             }
         }
     }
@@ -2398,7 +2851,8 @@ fn menus(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canv
             items.push((CtxItem::new(l::FILE_TEXT, "Page…"), Act::AddPage));
             items.push((CtxItem::new(l::IMAGE, "Image…"), Act::AddImage));
             items.push((CtxItem::new(l::LINK, "Link…"), Act::AddLink));
-            items.push((CtxItem::new(l::FOCUS, "Group"), Act::AddGroup));
+            items.push((CtxItem::new(l::SQUARE, "Shape"), Act::AddShape));
+            items.push((CtxItem::new(l::FOCUS, "Frame"), Act::AddGroup));
             items.push((CtxItem::new(l::LAYOUT_TEMPLATE, "Templates…").sep(), Act::Templates));
         }
         MenuKind::Templates => {
@@ -2409,6 +2863,9 @@ fn menus(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canv
                     Tpl::Swot => l::GRID_2X2,
                     Tpl::Flow => l::GIT_BRANCH,
                     Tpl::Week => l::CALENDAR_DAYS,
+                    Tpl::Diagram => l::SQUARE,
+                    Tpl::Retro => l::LAYOUT_LIST,
+                    Tpl::Org => l::NETWORK,
                 }, t.name()), Act::Tpl(t)));
             }
         }
@@ -2418,6 +2875,8 @@ fn menus(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canv
             items.push((CtxItem::new(l::SEARCH, "Find on canvas").hint("Ctrl+F"), Act::Find));
             items.push((CtxItem::new(l::MONITOR_PLAY, "Present groups as slides"), Act::Present));
             items.push((CtxItem::new(l::LAYOUT_TEMPLATE, "Templates…").sep(), Act::Templates));
+            items.push((CtxItem::new(l::DOWNLOAD, "Export board as SVG").sep(), Act::ExportSvg));
+            items.push((CtxItem::new(l::COPY, "Copy board as SVG"), Act::CopySvg));
             items.push((CtxItem::new(l::LAYOUT_GRID, "Tidy up cards"), Act::Tidy));
             items.push((CtxItem::new(l::GRID_3X3, match c.grid {
                 Grid::Dots => "Grid: dots",
@@ -2438,7 +2897,8 @@ fn menus(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canv
             items.push((CtxItem::new(l::FILE_TEXT, "Add page…"), Act::AddPage));
             items.push((CtxItem::new(l::IMAGE, "Add image…"), Act::AddImage));
             items.push((CtxItem::new(l::LINK, "Add link…"), Act::AddLink));
-            items.push((CtxItem::new(l::FOCUS, "New group"), Act::AddGroup));
+            items.push((CtxItem::new(l::SQUARE, "New shape"), Act::AddShape));
+            items.push((CtxItem::new(l::FOCUS, "New frame"), Act::AddGroup));
             items.push((CtxItem::new(l::LAYOUT_TEMPLATE, "Templates…").sep(), Act::Templates));
             items.push((CtxItem::new(l::CLIPBOARD_PASTE, "Paste").hint("Ctrl+V"), Act::Paste));
             items.push((CtxItem::new(l::MAXIMIZE, "Fit to content").sep().hint("Shift+1"), Act::Fit));

@@ -15,6 +15,8 @@ mod bigui;
 mod memgov;
 mod canvas;
 mod canvasdraw;
+mod canvasexport;
+mod whiteboard;
 mod canvasfmt;
 mod canvasui;
 mod flow;

@@ -57,6 +57,8 @@ pub struct EditorState {
     pub edit_button: Option<u64>,
     /// Set by the `/widget` command: open the widget gallery for this (new) widget block.
     pub want_widget: Option<u64>,
+    /// Set when a whiteboard block is created: the block that needs a new board (a canvas page under this page).
+    pub want_board: Option<u64>,
     pub focus: Option<(u64, usize)>,
     /// The block the user is editing / last touched (touch devices keep its handle + toolbar visible; survives focus loss).
     pub active: Option<u64>,
@@ -201,6 +203,7 @@ fn slash_all() -> Vec<SlashItem> {
     v.push(SlashItem { act: Slash::Block(BlockKind::Divider), label: "Divider", hint: "Visually divide blocks.", glyph: l::MINUS, kw: "divider line hr separator", sec: "BASIC BLOCKS" });
     let med = "MEDIA";
     for (k, label, hint, glyph, kw) in [
+        (BlockKind::Whiteboard, "Whiteboard", "An infinite board inside the page — shapes, sticky notes, ink, frames, connectors.", l::NETWORK, "whiteboard canvas edgeless draw sketch diagram miro board affine shapes frame mindmap"),
         (BlockKind::Image, "Image", "Upload a picture or paste an image link.", l::IMAGE, "image picture photo upload png jpg gif"),
         (BlockKind::Embed, "Video", "Embed a YouTube, Vimeo or Loom video.", l::VIDEO, "video youtube vimeo loom movie clip"),
         (BlockKind::Embed, "Audio", "Embed Spotify or any audio player.", l::MUSIC, "audio spotify music podcast sound"),
@@ -763,6 +766,17 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
         crate::inlinew::request_pick(ws, bid);
         ui.ctx().request_repaint();
     }
+    if let Some(bid) = ed.want_board.take() {
+        let board = ws.add_canvas(Some(id));
+        if let Some(b) = ws.pages.iter_mut().find(|p| p.id == id).and_then(|p| p.blocks.iter_mut().find(|b| b.id == bid)) {
+            b.link = Some(board);
+        }
+        changed = true;
+        crate::whiteboard::open_peek(ui.ctx(), board, id);
+    }
+    if let Some(op) = crate::whiteboard::peek(ui.ctx(), ws, id, pal) {
+        ed.nav = Some(op);
+    }
     {
         // menu / gallery / settings panel of the dashboard widgets placed inside this page
         let o = crate::inlinew::overlays(ui.ctx(), ws, pal);
@@ -1221,6 +1235,15 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
                 ui.set_width(w - ind_px);
                 if kind == BlockKind::DbView {
                     cx.changed |= draw_dbview(ui, cx.ws, &mut page.blocks[cur], cx.ed, pal, w - ind_px);
+                } else if kind == BlockKind::Whiteboard {
+                    let o = crate::whiteboard::block(ui, cx.ws, cx.ed.cur_page, &mut page.blocks[cur], pal, w - ind_px);
+                    cx.changed |= o.changed;
+                    if o.create {
+                        cx.ed.want_board = Some(bid);
+                    }
+                    if let Some(op) = o.open {
+                        cx.ed.nav = Some(op);
+                    }
                 } else if kind == BlockKind::Widget {
                     let o = crate::inlinew::draw(ui, cx.ws, pal, &mut page.blocks[cur], w - ind_px);
                     cx.changed |= o.changed;
@@ -1840,6 +1863,10 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
                     bl[i].text = crate::mdtable::encode(&t.rows);
                     bl[i].url = t.align;
                     bl[i].checked = true;
+                }
+                if kind == BlockKind::Whiteboard {
+                    bl[i].link = None;
+                    ed.want_board = Some(bl[i].id);
                 }
                 if kind == BlockKind::Button {
                     bl[i].text = "New button".into();
@@ -2490,7 +2517,7 @@ fn draw_block(
             ui.add_space(4.0);
         }
         // laid out by `draw_range` / `draw_columns` / `draw_dbview`, never by this function
-        BlockKind::Columns | BlockKind::Column | BlockKind::DbView | BlockKind::Widget => {}
+        BlockKind::Columns | BlockKind::Column | BlockKind::DbView | BlockKind::Widget | BlockKind::Whiteboard => {}
         BlockKind::PageLink => {
             let info = b.link.and_then(|l| links.get(&l));
             let (rect, resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::click());
