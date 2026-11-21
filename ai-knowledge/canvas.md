@@ -4,7 +4,10 @@ A `canvas` page holds **nodes** at world coordinates (x → right, y → down, 1
 
 ## Node kinds
 `note` (card, markdown inside), `text` (frameless label), `todo` (check-list card with progress), `page` (live link card to a page: set `page`),
-`link` (bookmark: `url`), `image` (`url`), `group` (labelled frame — also a slide in presentation mode).
+`link` (bookmark: `url`), `image` (`url`), `group` (labelled frame — also a slide in presentation mode),
+`embed` (YouTube / Vimeo / any website: `url`; poster card, live frame on demand), `pdf` / `file` (`url`, `text` = file name),
+`database` (live table window onto a database: set `page`), `widget` (editable widget: `widget` = counter | timer | pomodoro | progress | poll | clock | calendar | sheet,
+optional `config`, e.g. `{"t":"Sprint goal","v":3,"goal":10}`, poll `{"t":"Lunch?","o":["Pizza","Sushi"],"v":[0,0]}`, sheet `{"c":[["Item","Qty"],["Nails","4"]]}`).
 Colours: `1` red, `2` orange, `3` yellow, `4` green, `5` cyan, `6` purple (omit for none).
 
 ## Tools

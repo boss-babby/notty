@@ -286,7 +286,7 @@ impl LumenApp {
 
     /// Stores a picked / dropped file and wires it into its target (block, cover or icon).
     fn set_media(&mut self, ctx: &Context, target: PickTarget, name: &str, bytes: Vec<u8>) {
-        let as_image = !matches!(target, PickTarget::BlockFile { .. });
+        let as_image = !matches!(target, PickTarget::BlockFile { .. } | PickTarget::CanvasFile { .. });
         let size_hint = bytes.len();
         match self.media.add(ctx, name, bytes, as_image) {
             Err(e) => self.toast(e, None),
@@ -295,7 +295,7 @@ impl LumenApp {
                 self.ed.media_sizes.insert(id, size);
                 let page = match target {
                     PickTarget::ImportFile { .. } => return,
-                    PickTarget::BlockImage { page, .. } | PickTarget::BlockFile { page, .. } | PickTarget::Cover { page } | PickTarget::Icon { page } | PickTarget::CanvasImage { page, .. } => page,
+                    PickTarget::BlockImage { page, .. } | PickTarget::BlockFile { page, .. } | PickTarget::Cover { page } | PickTarget::Icon { page } | PickTarget::CanvasImage { page, .. } | PickTarget::CanvasFile { page, .. } => page,
                 };
                 if let Some(p) = self.ws.page_mut(page) {
                     match target {
@@ -325,6 +325,26 @@ impl LumenApp {
                             p.icon = format!("img:media:{id}");
                             self.ed.icon_picker = None;
                         }
+                        PickTarget::CanvasFile { node, .. } => {
+                            if let Some(c) = p.canvas.as_mut() {
+                                if let Some(n) = c.node_mut(node) {
+                                    let pdf = crate::pdf::looks_like_pdf(name, "");
+                                    n.kind = if pdf { crate::canvas::Kind::Pdf } else { crate::canvas::Kind::File };
+                                    n.url = format!("media:{id}");
+                                    n.text = name.to_owned();
+                                    n.num = if pdf { 0 } else { (size / 1024).max(1) as u32 };
+                                    if pdf {
+                                        n.w = 260.0;
+                                        n.h = 360.0;
+                                    } else {
+                                        n.w = 272.0;
+                                        n.h = 76.0;
+                                    }
+                                }
+                                c.rev += 1;
+                            }
+                            crate::canvasui::close_popup();
+                        }
                         PickTarget::CanvasImage { node, .. } => {
                             if let Some(c) = p.canvas.as_mut() {
                                 if let Some(n) = c.node_mut(node) {
@@ -351,8 +371,8 @@ impl LumenApp {
                 if let Some(node) = crate::canvasui::new_image_node(&mut self.ws, cur) {
                     self.set_media(ctx, PickTarget::CanvasImage { page: cur, node }, name, bytes);
                 }
-            } else {
-                self.toast("Drop images onto a canvas to add them", None);
+            } else if let Some(node) = crate::canvasui::new_file_node(&mut self.ws, cur) {
+                self.set_media(ctx, PickTarget::CanvasFile { page: cur, node }, name, bytes);
             }
             return;
         }
@@ -406,7 +426,7 @@ impl LumenApp {
     }
 
     /// Web: draws live iframes over embed blocks; Windows: native WebView2 child windows (hidden while a modal / palette is open).
-    fn sync_embeds(&mut self, frame: &eframe::Frame) {
+    fn sync_embeds(&mut self, ctx: &Context, frame: &eframe::Frame) {
         let overlay = self.locked
             || self.ed.pdf_req.is_some()
             || self.history.is_some()
@@ -424,8 +444,10 @@ impl LumenApp {
             platform::sync_iframes(&[]);
             platform::sync_native_previews(frame, &[]);
         } else {
-            platform::sync_iframes(&self.ed.embed_rects);
-            platform::sync_native_previews(frame, &self.ed.embed_rects);
+            let mut rects = self.ed.embed_rects.clone();
+            rects.extend(crate::canvasx::live_rects(ctx));
+            platform::sync_iframes(&rects);
+            platform::sync_native_previews(frame, &rects);
         }
     }
 
@@ -2220,7 +2242,7 @@ impl eframe::App for LumenApp {
         #[cfg(target_os = "android")]
         self.android_back(ctx);
         self.frame(ctx);
-        self.sync_embeds(frame);
+        self.sync_embeds(ctx, frame);
         crate::touch::paint_hold(ctx);
         {
             let target = if self.locked || self.ws.dark { 1.0 } else { 0.0 };
@@ -2732,6 +2754,19 @@ impl LumenApp {
                 if let Some(t) = out.toast {
                     self.toast(t, None);
                 }
+                if let Some(ask) = out.pdf_ask {
+                    self.ed.pdf_ask = Some(ask);
+                }
+                if let Some((media_id, name)) = out.file_ask {
+                    match self.media.bytes(media_id) {
+                        Some(b) => {
+                            let msg = platform::save_download(&name, &b, "application/octet-stream");
+                            self.toast(msg, None);
+                        }
+                        None => self.toast("The attached file could not be read", None),
+                    }
+                }
+                crate::canvasx::service(ui.ctx(), &self.media);
                 return;
             }
             if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Flow) {

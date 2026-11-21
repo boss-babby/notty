@@ -31,7 +31,7 @@ pub fn tools() -> Vec<Tool> {
         }),
         &["kind"],
     );
-    let node = obj(json!({"id": s("Local id used by edges"), "kind": s("note|text|todo|page|link|image|group"), "text": s("Markdown / label"), "x": n("x"), "y": n("y"), "w": n("width"), "h": n("height"), "color": s("1-6"), "url": s("link/image url"), "page": page_ref("page card target")}), &["kind"]);
+    let node = obj(json!({"id": s("Local id used by edges"), "kind": s("note|text|todo|page|link|image|group|embed|pdf|file|database|widget"), "widget": s("for kind widget: counter|timer|pomodoro|progress|poll|clock|calendar|sheet"), "config": json!({"type": "object", "description": "widget settings, e.g. {\"t\":\"Title\",\"v\":3,\"goal\":10}"}), "text": s("Markdown / label"), "x": n("x"), "y": n("y"), "w": n("width"), "h": n("height"), "color": s("1-6"), "url": s("link/image url"), "page": page_ref("page card target")}), &["kind"]);
     let edge = obj(json!({"from": s("local node id"), "to": s("local node id"), "label": s("Edge label"), "dashed": b("Dashed line")}), &["from", "to"]);
     let fnode = obj(json!({"id": s("Local id used by wires"), "kind": s("Node type from list_flow_nodes"), "label": s("Custom title"), "params": json!({"type": "object", "description": "parameter key → string value"})}), &["id", "kind"]);
     let wire = obj(json!({"from": s("local node id"), "to": s("local node id"), "from_port": s("output port name or index"), "to_port": s("input port name or index")}), &["from", "to"]);
@@ -272,13 +272,29 @@ fn canvas_json(ws: &Workspace, a: &Json) -> Result<(String, usize), String> {
             "link" | "bookmark" => ("link", "Link"),
             "image" => ("file", "Image"),
             "group" | "frame" => ("group", "Group"),
-            other => return Err(format!("node {}: unknown kind “{other}” (note, text, todo, page, link, image, group).", i + 1)),
+            "embed" | "video" | "website" => ("link", "Embed"),
+            "pdf" => ("file", "Pdf"),
+            "file" => ("file", "File"),
+            "database" | "dbview" | "db_view" => ("text", "DbView"),
+            "widget" => ("text", "Widget"),
+            other => return Err(format!("node {}: unknown kind “{other}” (note, text, todo, page, link, image, group, embed, pdf, file, database, widget).", i + 1)),
         };
         let id = str_of(nd, "id").map(|s| s.to_owned()).unwrap_or_else(|| format!("n{i}"));
         let x = nd.get("x").and_then(|v| v.as_f64()).unwrap_or(((i % 3) * 300) as f64);
         let y = nd.get("y").and_then(|v| v.as_f64()).unwrap_or(((i / 3) * 190) as f64);
-        let w = nd.get("w").or_else(|| nd.get("width")).and_then(|v| v.as_f64()).unwrap_or(if lumen == "Text" { 220.0 } else { 260.0 });
-        let h = nd.get("h").or_else(|| nd.get("height")).and_then(|v| v.as_f64()).unwrap_or(if lumen == "Text" { 48.0 } else { 140.0 });
+        let wkey = str_of(nd, "widget").unwrap_or("counter").to_lowercase();
+        let (mut wdata, wsize) = crate::canvasx::widget_defaults(&wkey);
+        let (dw, dh) = match lumen {
+            "Text" => (220.0, 48.0),
+            "Embed" => (400.0, 250.0),
+            "Pdf" => (260.0, 360.0),
+            "File" => (272.0, 76.0),
+            "DbView" => (460.0, 280.0),
+            "Widget" => (wsize.x as f64, wsize.y as f64),
+            _ => (260.0, 140.0),
+        };
+        let w = nd.get("w").or_else(|| nd.get("width")).and_then(|v| v.as_f64()).unwrap_or(dw);
+        let h = nd.get("h").or_else(|| nd.get("height")).and_then(|v| v.as_f64()).unwrap_or(dh);
         minx = minx.min(x);
         miny = miny.min(y);
         maxx = maxx.max(x + w);
@@ -297,7 +313,16 @@ fn canvas_json(ws: &Workspace, a: &Json) -> Result<(String, usize), String> {
         if let Some(c) = nd.get("color").map(|c| c.to_string().trim_matches('"').to_owned()).filter(|c| matches!(c.as_str(), "1" | "2" | "3" | "4" | "5" | "6")) {
             j["color"] = json!(c);
         }
-        if lumen == "Page" {
+        if lumen == "Widget" {
+            // optional "config": {"t": "Title", "v": 3, "goal": 10, "o": ["A","B"] …} overrides the widget defaults
+            if let (Some(cfg), Some(o)) = (nd.get("config").and_then(|c| c.as_object()), wdata.as_object_mut()) {
+                for (k, v) in cfg {
+                    o.insert(k.clone(), v.clone());
+                }
+            }
+            j["data"] = json!(wdata.to_string());
+        }
+        if lumen == "Page" || lumen == "DbView" {
             if let Some(p) = nd.get("page") {
                 j["page"] = json!(resolve_page_str(ws, p)?);
             }

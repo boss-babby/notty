@@ -155,6 +155,8 @@ pub enum PickTarget {
     Icon { page: u64 },
     /// An image card of a canvas.
     CanvasImage { page: u64, node: u64 },
+    /// A PDF / file card of a canvas.
+    CanvasFile { page: u64, node: u64 },
 }
 
 pub struct Picked {

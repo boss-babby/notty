@@ -284,3 +284,7 @@ bash build-web.sh               # -> ../public/webapp   (WebAssembly)
 bash build-windows.sh           # -> ../public/downloads/Lumen-windows-x64.exe (+zip)
 bash build-android.sh           # -> ../public/downloads/Lumen-android-arm64.apk
 ```
+
+
+## 13.6 (Android + Canvas release)
+Rich canvas nodes (embeds, PDF covers, files, database windows, 8 editable widgets) — see [CANVAS.md](CANVAS.md). Build everything headlessly with `./tools/pipeline.sh` or `./build-all.sh` (Windows `.exe`, signed Android APK, WebAssembly into `../public`). The Next.js site in the parent folder serves `/app` (WebAssembly), `/downloads/*` and the `/api/*` helpers the app talks to (`preview`, `flow-proxy`, `ai-proxy`, `hooks`, `mcp`, `bridge`).

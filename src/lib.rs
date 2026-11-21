@@ -19,6 +19,7 @@ mod canvasexport;
 mod whiteboard;
 mod canvasfmt;
 mod canvasui;
+mod canvasx;
 mod flow;
 mod flowui;
 mod flowbg;

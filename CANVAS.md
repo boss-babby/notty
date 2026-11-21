@@ -43,6 +43,26 @@ Lumen-only kinds travel in an extra `lumen` field and survive the round trip.
 * `src/canvasui.rs` — gestures, shortcuts, floating chrome, menus, popovers.
 * Extending: add a variant to `canvas::Kind`, paint it in `canvasdraw::draw_node` — it is then selectable, movable, connectable and exportable.
 
+## 13.6 — a whiteboard that holds everything
+
+New node kinds (dock buttons, `+` menu, right-click menu; pasting a YouTube / Vimeo link now creates an embed card):
+
+| Kind | What it does |
+|---|---|
+| **Embed** | YouTube, Vimeo, Loom, Spotify, maps, Figma or any website. Shows a poster picture; **▶** loads the live frame (web: `<iframe>`, Windows: WebView2). At most 3 frames are live at once, the rest cost nothing. Android opens the link in the browser. Sites that forbid framing go through the site's `/api/preview` proxy. |
+| **PDF** | Upload or link a PDF. The card shows a page as a picture: the first page (cover) or the **last page you turned to** (‹ › in the card footer — remembered). The page is rasterised **once** (`pdf::render_page_image`: parse → render → drop everything, 900 px, ≤ 1 per frame), cached in a 6 / 14 entry LRU that is released 3 s after you leave the board. Tap the card to open the full reader. |
+| **File** | Any attachment: icon by type, name, size; tap = save / download. |
+| **Database** | Live window onto a database (name + first 4 properties, as many rows as fit, “+ N more”). Tap = open the database. |
+| **Widget** | Editable widgets — **tap ⚙ (or double-click / Enter) to edit** the selected widget in a form; everything else works directly on the board. |
+
+Widgets: **Counter** (step, goal bar) · **Timer / stopwatch** · **Pomodoro** (focus / break minutes, skip) · **Progress bar** (drag / tap the bar, ± 5 %) · **Quick poll**
+(editable options, tap to vote) · **Clock** (UTC offset, 12 / 24 h) · **Calendar / habit tracker** (tap days to mark) · **Mini sheet** (editable grid, column sums).
+The widget popover also switches a widget to another type. Timers keep running while the app is closed (they store absolute start times).
+
+Code map: `src/canvasx.rs` (draw, click actions, editor forms, caches, 6 unit tests) · hot spots travel through `DrawOut::acts` → `canvasx::act` → `Fx` (page / url / pdf / file / edit).
+Model: `Node::data` (widget JSON) and `Node::num` (PDF page / file size in KB). The Obsidian JSON export maps embeds to `link` and PDFs / files to `file`; Lumen-only fields travel in `lumen`, `data`, `num`.
+The AI agent can create all of them (`canvas_add`, kinds `embed`, `pdf`, `file`, `database`, `widget`).
+
 ## Bug fix: drop-downs inside pop-ups
 **Symptom** — in a pop-up (e.g. the automation *Button* editor) a drop-down worked once; afterwards the dialog looked dimmed and every click only closed the list.
 

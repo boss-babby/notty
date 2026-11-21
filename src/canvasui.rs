@@ -52,6 +52,14 @@ enum Pop {
     Image(u64),
     Link(u64),
     Page(u64),
+    /// Video / website address of an embed card.
+    Embed(u64),
+    /// Upload or link of a PDF / file card.
+    Doc(u64),
+    /// Database picker of a database window.
+    Db(u64),
+    /// Settings form of a widget.
+    Widget(u64),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -66,6 +74,7 @@ enum MenuKind {
     Context(Target),
     Add,
     Templates,
+    Widgets,
     Canvas,
 }
 
@@ -129,6 +138,8 @@ struct St {
     hover: Option<u64>,
     checks: Vec<(Rect, u64, usize)>,
     opens: Vec<(Rect, u64)>,
+    acts: Vec<(Rect, u64, u16, i32)>,
+    pop_dirty: bool,
     spawn_n: u32,
     paste_n: u32,
     want_paste: bool,
@@ -147,6 +158,10 @@ pub struct Out {
     /// Page to open (page cards).
     pub open: Option<u64>,
     pub toast: Option<String>,
+    /// PDF card clicked: (media id or 0, link, title) → the app opens the reader.
+    pub pdf_ask: Option<(u64, String, String)>,
+    /// File card clicked: (media id, name) → the app saves / downloads it.
+    pub file_ask: Option<(u64, String)>,
 }
 
 const PEN_COLORS: [u8; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
@@ -215,6 +230,19 @@ pub fn new_image_node(ws: &mut Workspace, page: u64) -> Option<u64> {
     });
     c.checkpoint();
     let id = c.add_node(Kind::Image, at);
+    ws.touch(page);
+    Some(id)
+}
+
+/// A new empty file card in the middle of the visible board (dropped files). Returns the node id.
+pub fn new_file_node(ws: &mut Workspace, page: u64) -> Option<u64> {
+    let c = ws.page_mut(page)?.canvas.as_mut()?;
+    let at = ST.with(|s| {
+        let s = s.borrow();
+        s.rect.map(|r| c.view.to_world(r.min, r.center())).unwrap_or_else(|| pos2(c.view.x + 300.0, c.view.y + 200.0))
+    });
+    c.checkpoint();
+    let id = c.add_node(Kind::File, at);
     ws.touch(page);
     Some(id)
 }
@@ -318,9 +346,52 @@ fn add_at(st: &mut St, c: &mut Canvas, kind: Kind, at: Pos2) -> u64 {
             st.pop_fresh = true;
             st.page_query.clear();
         }
-        Kind::Ink => {}
+        Kind::Embed => {
+            st.pop = Some(Pop::Embed(id));
+            st.pop_fresh = true;
+        }
+        Kind::Pdf | Kind::File => {
+            st.pop = Some(Pop::Doc(id));
+            st.pop_fresh = true;
+        }
+        Kind::DbView => {
+            st.pop = Some(Pop::Db(id));
+            st.pop_fresh = true;
+            st.page_query.clear();
+        }
+        Kind::Widget | Kind::Ink => {}
     }
     id
+}
+
+/// A new widget of catalogue entry `key`, centred on `at`.
+fn add_widget(st: &mut St, c: &mut Canvas, key: &str, at: Pos2) -> u64 {
+    c.checkpoint();
+    let id = c.add_node(Kind::Widget, at);
+    if let Some(n) = c.node_mut(id) {
+        crate::canvasx::make_widget(n, key, true);
+        n.x = at.x - n.w / 2.0;
+        n.y = at.y - n.h / 2.0;
+    }
+    select_only(st, [id]);
+    st.tool = Tool::Select;
+    id
+}
+
+fn apply_fx(ctx: &Context, st: &mut St, out: &mut Out, fx: crate::canvasx::Fx, id: u64) {
+    use crate::canvasx::Fx;
+    match fx {
+        Fx::None => {}
+        Fx::Page(p) => out.open = Some(p),
+        Fx::Url(u) => platform::open_url(ctx, &u),
+        Fx::Pdf { media, url, title } => out.pdf_ask = Some((media, url, title)),
+        Fx::File { media, name } => out.file_ask = Some((media, name)),
+        Fx::Edit(w) => {
+            st.pop = Some(Pop::Widget(w));
+            st.pop_fresh = true;
+            select_only(st, [id]);
+        }
+    }
 }
 
 /// Next free spot near the middle of the screen (cards added from the dock cascade instead of stacking).
@@ -369,6 +440,12 @@ enum Act {
     AddImage,
     AddLink,
     AddGroup,
+    AddEmbed,
+    AddPdf,
+    AddFile,
+    AddDb,
+    Widgets,
+    AddWidget(u8),
     Templates,
     Tpl(Tpl),
     Paste,
@@ -438,6 +515,28 @@ fn act(a: Act, st: &mut St, c: &mut Canvas, ws: &mut Workspace, ctx: &Context, p
         Act::AddGroup => {
             add_at(st, c, Kind::Group, at);
         }
+        Act::AddEmbed => {
+            add_at(st, c, Kind::Embed, at);
+        }
+        Act::AddPdf => {
+            add_at(st, c, Kind::Pdf, at);
+        }
+        Act::AddFile => {
+            add_at(st, c, Kind::File, at);
+        }
+        Act::AddDb => {
+            add_at(st, c, Kind::DbView, at);
+        }
+        Act::Widgets => {
+            let pos = st.rect.map_or(Pos2::ZERO, |r| r.center() - vec2(120.0, 140.0));
+            st.menu = Some(MenuState { kind: MenuKind::Widgets, pos, world: at });
+            st.fresh = true;
+        }
+        Act::AddWidget(i) => {
+            if let Some(w) = crate::canvasx::WIDGETS.get(i as usize) {
+                add_widget(st, c, w.0, at);
+            }
+        }
         Act::AddShape => {
             add_at(st, c, Kind::Shape, at);
         }
@@ -487,6 +586,23 @@ fn act(a: Act, st: &mut St, c: &mut Canvas, ws: &mut Workspace, ctx: &Context, p
                             st.pop_fresh = true;
                             st.page_query.clear();
                         }
+                        Kind::Embed => {
+                            st.pop = Some(Pop::Embed(id));
+                            st.pop_fresh = true;
+                        }
+                        Kind::Pdf | Kind::File => {
+                            st.pop = Some(Pop::Doc(id));
+                            st.pop_fresh = true;
+                        }
+                        Kind::DbView => {
+                            st.pop = Some(Pop::Db(id));
+                            st.pop_fresh = true;
+                            st.page_query.clear();
+                        }
+                        Kind::Widget => {
+                            st.pop = Some(Pop::Widget(id));
+                            st.pop_fresh = true;
+                        }
                         Kind::Ink => {}
                         _ => {}
                     }
@@ -499,7 +615,7 @@ fn act(a: Act, st: &mut St, c: &mut Canvas, ws: &mut Workspace, ctx: &Context, p
             }
         }
         Act::OpenLink => {
-            if let Some(n) = sel.iter().filter_map(|i| c.node(*i)).find(|n| n.kind == Kind::Link && !n.url.is_empty()) {
+            if let Some(n) = sel.iter().filter_map(|i| c.node(*i)).find(|n| matches!(n.kind, Kind::Link | Kind::Embed) && !n.url.is_empty()) {
                 platform::open_url(ctx, &crate::media::normalize_url(&n.url));
             }
         }
@@ -847,6 +963,7 @@ fn run(ui: &mut Ui, ws: &mut Workspace, page: u64, pal: &Palette, c: &mut Canvas
     }
     st.checks = dout.checks;
     st.opens = dout.opens;
+    st.acts = dout.acts;
     if touchy {
         for n in &c.nodes {
             let r = c.view.rect_to_screen(origin, if n.kind == Kind::Group { Rect::from_min_size(n.rect().min, vec2(n.w, 34.0)) } else { n.rect() });
@@ -1099,7 +1216,9 @@ fn paste_text(ctx: &Context, c: &mut Canvas, st: &mut St, text: &str, at: Pos2, 
         }
         select_only(st, [id]);
     } else if crate::media::looks_like_url(t) && !t.contains(char::is_whitespace) {
-        let id = c.add_node(Kind::Link, at + off);
+        let url = crate::media::normalize_url(t);
+        let video = crate::media::embed_info(&url).kind == crate::media::EmbedKind::Video;
+        let id = c.add_node(if video { Kind::Embed } else { Kind::Link }, at + off);
         if let Some(n) = c.node_mut(id) {
             n.url = crate::media::normalize_url(t);
         }
@@ -1489,6 +1608,13 @@ fn finish_pointer(ctx: &Context, ui: &Ui, ws: &mut Workspace, page: u64, resp: &
     if resp.double_clicked() {
         if let Some(p) = resp.interact_pointer_pos().or(cur) {
             let w = to_w(p);
+            // a fast second tap on a button of a widget (+1 +1 …) is a second press, not "edit"
+            if let Some((rc, id, code, arg)) = st.acts.iter().rev().find(|(r, ..)| r.contains(p)).copied().filter(|(_, id, ..)| c.hit_node(w, 0.0, 34.0).map_or(true, |h| h == *id)) {
+                let frac = ((p.x - rc.left()) / rc.width().max(1.0)).clamp(0.0, 1.0);
+                let fx = crate::canvasx::act(c, id, code, arg, frac);
+                apply_fx(ctx, st, out, fx, id);
+                return;
+            }
             if let Some(id) = c.hit_node(w, hit_slack(st, c), 34.0) {
                 select_only(st, [id]);
                 let n = c.node(id).cloned();
@@ -1514,6 +1640,32 @@ fn finish_pointer(ctx: &Context, ui: &Ui, ws: &mut Workspace, page: u64, resp: &
                             st.pop = Some(Pop::Image(id));
                             st.pop_fresh = true;
                         }
+                        Kind::Embed => {
+                            st.pop = Some(Pop::Embed(id));
+                            st.pop_fresh = true;
+                        }
+                        Kind::Pdf | Kind::File => {
+                            if n.url.is_empty() {
+                                st.pop = Some(Pop::Doc(id));
+                                st.pop_fresh = true;
+                            } else {
+                                let fx = crate::canvasx::act(c, id, crate::canvasx::A_OPEN, 0, 0.0);
+                                apply_fx(ctx, st, out, fx, id);
+                            }
+                        }
+                        Kind::DbView => {
+                            if let Some(pg) = n.page {
+                                out.open = Some(pg);
+                            } else {
+                                st.pop = Some(Pop::Db(id));
+                                st.pop_fresh = true;
+                                st.page_query.clear();
+                            }
+                        }
+                        Kind::Widget => {
+                            st.pop = Some(Pop::Widget(id));
+                            st.pop_fresh = true;
+                        }
                         Kind::Ink => {}
                         _ => begin_edit(st, c, Edit::Node(id)),
                     }
@@ -1533,6 +1685,13 @@ fn finish_pointer(ctx: &Context, ui: &Ui, ws: &mut Workspace, page: u64, resp: &
     if resp.clicked() && matches!(st.drag, Drag::None) {
         let Some(p) = resp.interact_pointer_pos().or(cur) else { return };
         let w = to_w(p);
+        // buttons of rich nodes (play, page turn, counter +/-, timer …)
+        if let Some((rc, id, code, arg)) = st.acts.iter().rev().find(|(r, ..)| r.contains(p)).copied().filter(|(_, id, ..)| c.hit_node(w, 0.0, 34.0).map_or(true, |h| h == *id)) {
+            let frac = ((p.x - rc.left()) / rc.width().max(1.0)).clamp(0.0, 1.0);
+            let fx = crate::canvasx::act(c, id, code, arg, frac);
+            apply_fx(ctx, st, out, fx, id);
+            return;
+        }
         // check boxes first
         if let Some((_, id, line)) = st.checks.iter().rev().find(|(r, _, _)| r.contains(p)).copied() {
             if c.node(id).map_or(false, |n| !n.locked) {
@@ -1571,6 +1730,9 @@ fn finish_pointer(ctx: &Context, ui: &Ui, ws: &mut Workspace, page: u64, resp: &
                         Kind::Image if n.url.is_empty() => Some(Pop::Image(id)),
                         Kind::Link if n.url.is_empty() => Some(Pop::Link(id)),
                         Kind::Page if n.page.is_none() => Some(Pop::Page(id)),
+                        Kind::Embed if n.url.is_empty() => Some(Pop::Embed(id)),
+                        Kind::Pdf | Kind::File if n.url.is_empty() => Some(Pop::Doc(id)),
+                        Kind::DbView if n.page.is_none() => Some(Pop::Db(id)),
                         _ => None,
                     };
                     if let Some(pp) = empty_pop {
@@ -2120,7 +2282,7 @@ fn zoom_bar(ui: &mut Ui, c: &mut Canvas, st: &mut St, pal: &Palette, rect: Rect,
     }
 }
 
-const KINDS: [(Kind, &str, &str, &str); 7] = [
+const KINDS: [(Kind, &str, &str, &str); 11] = [
     (Kind::Note, l::STICKY_NOTE, "Card  (N)", "Card"),
     (Kind::Text, l::TYPE, "Text  (T)", "Text"),
     (Kind::Todo, l::LIST_TODO, "To-do list  (L)", "To-do list"),
@@ -2128,6 +2290,10 @@ const KINDS: [(Kind, &str, &str, &str); 7] = [
     (Kind::Image, l::IMAGE, "Image", "Image"),
     (Kind::Link, l::LINK, "Link", "Link"),
     (Kind::Group, l::FOCUS, "Group  (G)", "Group"),
+    (Kind::Embed, l::GLOBE, "Embed video / website", "Embed"),
+    (Kind::Pdf, l::FILE_TEXT, "PDF with cover page", "PDF"),
+    (Kind::File, l::PAPERCLIP, "File", "File"),
+    (Kind::DbView, l::DATABASE, "Database view", "Database"),
 ];
 
 #[allow(clippy::too_many_arguments)]
@@ -2230,7 +2396,7 @@ fn dock(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canva
         (Tool::Shape, l::SQUARE, "Shapes  (S)"),
         (Tool::Frame, l::SCAN_LINE, "Frame  (F) — a slide and a section"),
     ];
-    let n_add = if compact { 1 } else { KINDS.len() };
+    let n_add = if compact { 1 } else { KINDS.len() + 1 };
     let items = tools.len() + n_add;
     let sep = 12.0;
     let w = items as f32 * bs + sep + 12.0;
@@ -2363,6 +2529,11 @@ fn dock(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canva
                 add_at(st, c, kind, at);
             }
             x += bs;
+        }
+        let b = Rect::from_min_size(pos2(x, y), vec2(bs, bs));
+        if tbtn(ui, pal, b, Id::new("cnv_widgets"), l::LAYOUT_DASHBOARD, matches!(st.menu, Some(MenuState { kind: MenuKind::Widgets, .. })), "Widgets — counter, timer, poll, calendar …", true) {
+            st.menu = Some(MenuState { kind: MenuKind::Widgets, pos: pos2(b.left() - 60.0, b.top() - 6.0), world: center_world(st, c) });
+            st.fresh = true;
         }
     }
 }
@@ -2508,11 +2679,15 @@ fn selection_toolbar(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, 
                     btns.push(B::Size);
                 }
                 Kind::Page => btns.push(B::Act(Act::OpenPage, l::ARROW_UP_RIGHT, "Open page", false)),
-                Kind::Link => btns.push(B::Act(Act::OpenLink, l::EXTERNAL_LINK, "Open link", false)),
+                Kind::Link | Kind::Embed => btns.push(B::Act(Act::OpenLink, l::EXTERNAL_LINK, "Open link", false)),
+                Kind::DbView => btns.push(B::Act(Act::OpenPage, l::ARROW_UP_RIGHT, "Open database", false)),
                 _ => {}
             }
-            if matches!(n.kind, Kind::Image | Kind::Link | Kind::Page) {
+            if matches!(n.kind, Kind::Image | Kind::Link | Kind::Page | Kind::Embed | Kind::Pdf | Kind::File | Kind::DbView) {
                 btns.push(B::Act(Act::ReplaceSrc, l::PENCIL, "Change", false));
+            }
+            if n.kind == Kind::Widget {
+                btns.push(B::Act(Act::ReplaceSrc, l::SETTINGS, "Edit widget", false));
             }
             if n.kind != Kind::Ink {
                 btns.push(B::Act(Act::AddChild, l::CIRCLE_PLUS, "Add connected card  (Tab)", false));
@@ -2727,7 +2902,7 @@ fn selection_toolbar(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, 
 fn popovers(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canvas, st: &mut St, pal: &Palette, rect: Rect) {
     let Some(pop) = st.pop else { return };
     let id = match pop {
-        Pop::Image(i) | Pop::Link(i) | Pop::Page(i) => i,
+        Pop::Image(i) | Pop::Link(i) | Pop::Page(i) | Pop::Embed(i) | Pop::Doc(i) | Pop::Db(i) | Pop::Widget(i) => i,
     };
     let Some(n) = c.node(id).cloned() else {
         st.pop = None;
@@ -2735,10 +2910,14 @@ fn popovers(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut C
     };
     let sr = c.view.rect_to_screen(rect.min, n.rect());
     let width = 340.0_f32.min(rect.width() - 20.0);
-    let pos = pos2((sr.center().x - width / 2.0).clamp(rect.left() + 10.0, (rect.right() - width - 10.0).max(rect.left() + 10.0)), (sr.bottom() + 12.0).clamp(rect.top() + 60.0, (rect.bottom() - 260.0).max(rect.top() + 60.0)));
+    let pos = pos2((sr.center().x - width / 2.0).clamp(rect.left() + 10.0, (rect.right() - width - 10.0).max(rect.left() + 10.0)), (sr.bottom() + 12.0).clamp(rect.top() + 60.0, (rect.bottom() - if matches!(pop, Pop::Widget(_)) { 380.0 } else { 260.0 }).max(rect.top() + 60.0)));
     let mut fresh = st.pop_fresh;
     let fresh_now = st.pop_fresh;
+    if fresh_now {
+        st.pop_dirty = false;
+    }
     let mut result: Option<String> = None;
+    let mut edited: Option<cv::Node> = None;
     let mut chosen_page: Option<Option<u64>> = None;
     let pid = Id::new(("cnv_pop", id));
     let open = match pop {
@@ -2754,7 +2933,28 @@ fn popovers(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut C
                 result = uploader::popover_body(ui, pal, pid.with("body"), &spec, if matches!(pop, Pop::Image(_)) { target } else { None }, width - 12.0);
             })
         }
-        Pop::Page(_) => widgets::popup_area(ctx, pid, pos, pal, &mut fresh, width, |ui| {
+        Pop::Embed(_) => {
+            let spec = Spec { icon: l::GLOBE, title: "Embed a video or website", subtitle: "YouTube, Vimeo, Loom, Spotify, maps, Figma — or any web address.", upload: None, link_hint: "Paste a link…", link_button: "Embed", providers: &[] };
+            widgets::popup_area(ctx, pid, pos, pal, &mut fresh, width, |ui| {
+                result = uploader::popover_body(ui, pal, pid.with("body"), &spec, None, width - 12.0);
+            })
+        }
+        Pop::Doc(_) => {
+            const CHIPS: &[&str] = &["PDF", "DOCX", "XLSX", "ZIP"];
+            let spec = Spec { icon: l::PAPERCLIP, title: "Add a PDF or file", subtitle: "A PDF shows its page as a picture (first page, or the one you were on).", upload: Some((false, CHIPS)), link_hint: "Paste a file or PDF link…", link_button: "Add", providers: &[] };
+            let target = Some(PickTarget::CanvasFile { page, node: id });
+            widgets::popup_area(ctx, pid, pos, pal, &mut fresh, width, |ui| {
+                result = uploader::popover_body(ui, pal, pid.with("body"), &spec, target, width - 12.0);
+            })
+        }
+        Pop::Widget(_) => widgets::popup_area(ctx, pid, pos, pal, &mut fresh, width, |ui| {
+            let mut nn = n.clone();
+            if crate::canvasx::edit_widget(ui, pal, &mut nn) {
+                edited = Some(nn);
+            }
+        }),
+        Pop::Page(_) | Pop::Db(_) => widgets::popup_area(ctx, pid, pos, pal, &mut fresh, width, |ui| {
+            let db_only = matches!(pop, Pop::Db(_));
             ui.spacing_mut().item_spacing.y = 2.0;
             let te = ui.add(TextEdit::singleline(&mut st.page_query).hint_text("Search pages…").desired_width(f32::INFINITY).margin(Margin::symmetric(8, 7)));
             if fresh_now {
@@ -2763,17 +2963,19 @@ fn popovers(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut C
             ui.add_space(4.0);
             let q = st.page_query.to_lowercase();
             // new sub-page
-            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
-            if resp.hovered() {
-                ui.painter().rect_filled(r, 7.0, pal.hover);
-            }
-            icons::glyph(ui.painter(), pos2(r.left() + 18.0, r.center().y), 16.0, l::FILE_PLUS, pal.accent);
-            ui.painter().text(pos2(r.left() + 38.0, r.center().y), Align2::LEFT_CENTER, "New page", bold(14.0), pal.accent);
-            if resp.clicked() {
-                chosen_page = Some(None);
+            if !db_only {
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+                if resp.hovered() {
+                    ui.painter().rect_filled(r, 7.0, pal.hover);
+                }
+                icons::glyph(ui.painter(), pos2(r.left() + 18.0, r.center().y), 16.0, l::FILE_PLUS, pal.accent);
+                ui.painter().text(pos2(r.left() + 38.0, r.center().y), Align2::LEFT_CENTER, "New page", bold(14.0), pal.accent);
+                if resp.clicked() {
+                    chosen_page = Some(None);
+                }
             }
             let mut shown = 0;
-            for p in ws.pages.iter().filter(|p| !p.trashed && !p.row && p.id != page) {
+            for p in ws.pages.iter().filter(|p| !p.trashed && !p.row && p.id != page && (!db_only || p.kind == PageKind::Database)) {
                 let title = if p.title.is_empty() { "Untitled".to_owned() } else { p.title.clone() };
                 if !q.is_empty() && !title.to_lowercase().contains(&q) {
                     continue;
@@ -2800,12 +3002,44 @@ fn popovers(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut C
         }),
     };
     st.pop_fresh = false;
+    if let Some(nn) = edited {
+        if !st.pop_dirty {
+            c.checkpoint();
+            st.pop_dirty = true;
+        }
+        if let Some(slot) = c.node_mut(id) {
+            *slot = nn;
+        }
+        c.rev += 1;
+    }
     if let Some(url) = result {
         c.checkpoint();
         if let Some(nn) = c.node_mut(id) {
             nn.url = url;
-            if nn.kind == Kind::Image {
-                nn.h = 0.0;
+            match nn.kind {
+                Kind::Image => nn.h = 0.0,
+                Kind::Embed => {
+                    nn.url = crate::media::normalize_url(&nn.url);
+                    let info = crate::media::embed_info(&nn.url);
+                    if info.kind == crate::media::EmbedKind::Video {
+                        nn.h = ((nn.w - 10.0) * 9.0 / 16.0 + 42.0).round();
+                    }
+                }
+                Kind::Pdf | Kind::File => {
+                    nn.url = crate::media::normalize_url(&nn.url);
+                    let name = nn.url.split(['?', '#']).next().unwrap_or("").rsplit('/').next().unwrap_or("").to_owned();
+                    nn.text = name;
+                    nn.kind = if crate::pdf::looks_like_pdf(&nn.text, &nn.url) { Kind::Pdf } else { Kind::File };
+                    nn.num = 0;
+                    if nn.kind == Kind::Pdf {
+                        nn.w = 260.0;
+                        nn.h = 360.0;
+                    } else {
+                        nn.w = 272.0;
+                        nn.h = 76.0;
+                    }
+                }
+                _ => {}
             }
         }
         c.rev += 1;
@@ -2851,6 +3085,11 @@ fn menus(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canv
             items.push((CtxItem::new(l::FILE_TEXT, "Page…"), Act::AddPage));
             items.push((CtxItem::new(l::IMAGE, "Image…"), Act::AddImage));
             items.push((CtxItem::new(l::LINK, "Link…"), Act::AddLink));
+            items.push((CtxItem::new(l::GLOBE, "Video / website embed…"), Act::AddEmbed));
+            items.push((CtxItem::new(l::FILE_TEXT, "PDF…"), Act::AddPdf));
+            items.push((CtxItem::new(l::PAPERCLIP, "File…"), Act::AddFile));
+            items.push((CtxItem::new(l::DATABASE, "Database view…"), Act::AddDb));
+            items.push((CtxItem::new(l::LAYOUT_DASHBOARD, "Widgets…"), Act::Widgets));
             items.push((CtxItem::new(l::SQUARE, "Shape"), Act::AddShape));
             items.push((CtxItem::new(l::FOCUS, "Frame"), Act::AddGroup));
             items.push((CtxItem::new(l::LAYOUT_TEMPLATE, "Templates…").sep(), Act::Templates));
@@ -2867,6 +3106,11 @@ fn menus(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canv
                     Tpl::Retro => l::LAYOUT_LIST,
                     Tpl::Org => l::NETWORK,
                 }, t.name()), Act::Tpl(t)));
+            }
+        }
+        MenuKind::Widgets => {
+            for (i, w) in crate::canvasx::WIDGETS.iter().enumerate() {
+                items.push((CtxItem::new(w.1, w.2), Act::AddWidget(i as u8)));
             }
         }
         MenuKind::Canvas => {
@@ -2897,6 +3141,11 @@ fn menus(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canv
             items.push((CtxItem::new(l::FILE_TEXT, "Add page…"), Act::AddPage));
             items.push((CtxItem::new(l::IMAGE, "Add image…"), Act::AddImage));
             items.push((CtxItem::new(l::LINK, "Add link…"), Act::AddLink));
+            items.push((CtxItem::new(l::GLOBE, "Embed video / website…"), Act::AddEmbed));
+            items.push((CtxItem::new(l::FILE_TEXT, "Add PDF…"), Act::AddPdf));
+            items.push((CtxItem::new(l::PAPERCLIP, "Attach file…"), Act::AddFile));
+            items.push((CtxItem::new(l::DATABASE, "Add database view…"), Act::AddDb));
+            items.push((CtxItem::new(l::LAYOUT_DASHBOARD, "Add widget…"), Act::Widgets));
             items.push((CtxItem::new(l::SQUARE, "New shape"), Act::AddShape));
             items.push((CtxItem::new(l::FOCUS, "New frame"), Act::AddGroup));
             items.push((CtxItem::new(l::LAYOUT_TEMPLATE, "Templates…").sep(), Act::Templates));
@@ -2915,7 +3164,8 @@ fn menus(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canv
             let kind = first.as_ref().map(|n| n.kind);
             match kind {
                 Some(Kind::Page) => items.push((CtxItem::new(l::ARROW_UP_RIGHT, "Open page"), Act::OpenPage)),
-                Some(Kind::Link) => items.push((CtxItem::new(l::EXTERNAL_LINK, "Open link"), Act::OpenLink)),
+                Some(Kind::Link) | Some(Kind::Embed) => items.push((CtxItem::new(l::EXTERNAL_LINK, "Open link"), Act::OpenLink)),
+                Some(Kind::DbView) => items.push((CtxItem::new(l::ARROW_UP_RIGHT, "Open database"), Act::OpenPage)),
                 _ => {}
             }
             if sel_n == 1 && kind != Some(Kind::Ink) {
@@ -2946,6 +3196,7 @@ fn menus(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canv
     let key = match m.kind {
         MenuKind::Add => 1,
         MenuKind::Templates => 2,
+        MenuKind::Widgets => 7,
         MenuKind::Canvas => 3,
         MenuKind::Context(Target::Empty) => 4,
         MenuKind::Context(Target::Node(_)) => 5,
@@ -2962,7 +3213,7 @@ fn menus(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canv
         st.menu = None;
         let a = items[i].1;
         let at = match m.kind {
-            MenuKind::Context(Target::Empty) | MenuKind::Templates | MenuKind::Add => m.world,
+            MenuKind::Context(Target::Empty) | MenuKind::Templates | MenuKind::Widgets | MenuKind::Add => m.world,
             _ => center_world(st, c),
         };
         act(a, st, c, ws, ctx, page, out, at);

@@ -80,6 +80,8 @@ pub struct DrawOut {
     pub checks: Vec<(Rect, u64, usize)>,
     /// Small "open" arrows (page / link cards): screen rect, node.
     pub opens: Vec<(Rect, u64)>,
+    /// Hot spots of rich nodes (embeds, PDFs, widgets …): screen rect, node, action code, argument (see `canvasx`).
+    pub acts: Vec<(Rect, u64, u16, i32)>,
     pub drawn: usize,
 }
 
@@ -306,7 +308,7 @@ fn text_bars(f: &Frame, r: Rect, n: usize, color: Color32) {
 
 // ───────────────────────────── nodes ─────────────────────────────
 
-fn fake_shadow(f: &Frame, r: Rect, rad: f32, strong: bool) {
+pub(crate) fn fake_shadow(f: &Frame, r: Rect, rad: f32, strong: bool) {
     let z = f.z();
     if z < 0.25 {
         return;
@@ -346,7 +348,7 @@ fn page_excerpt(ws: &Workspace, id: u64) -> (String, String, String, bool) {
     (p.icon.clone(), title, sub, true)
 }
 
-fn dashed_rect(f: &Frame, r: Rect, rad: f32, color: Color32) {
+pub(crate) fn dashed_rect(f: &Frame, r: Rect, rad: f32, color: Color32) {
     let mut pts = vec![];
     let n = 6;
     for (c, a0) in [(pos2(r.right() - rad, r.top() + rad), -90.0_f32), (pos2(r.right() - rad, r.bottom() - rad), 0.0), (pos2(r.left() + rad, r.bottom() - rad), 90.0), (pos2(r.left() + rad, r.top() + rad), 180.0)] {
@@ -407,6 +409,7 @@ pub fn draw_node(f: &Frame, ws: &Workspace, n: &Node, st: &NodeSt, out: &mut Dra
             }
         }
         Kind::Shape => draw_shape(f, n, st, r, lod),
+        Kind::Embed | Kind::Pdf | Kind::File | Kind::DbView | Kind::Widget => crate::canvasx::draw(f, ws, n, st, r, rad, lod, tiny, out),
         Kind::Text => {
             if st.selected || st.hovered {
                 f.p.rect_stroke(r, 6.0, Stroke::new(1.0_f32, with_alpha(pal.muted, 0.5)), StrokeKind::Inside);

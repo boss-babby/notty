@@ -2167,3 +2167,23 @@ mod tests {
         });
     }
 }
+
+/// One-shot page picture for canvas cards: opens the document, rasterises page `page` (clamped) at `width_px` pixels wide, and drops the
+/// parser, hayro's caches and everything else again before returning. Returns the picture and the page count. `None` for encrypted
+/// or damaged files. Nothing stays resident — the caller keeps only the small picture.
+pub fn render_page_image(data: Arc<[u8]>, page: usize, width_px: u32) -> Option<(ColorImage, usize)> {
+    let e = Engine::new(data, "").ok()?;
+    let n = e.dims.len();
+    let i = page.min(n.saturating_sub(1));
+    let (pw, ph) = e.dims[i];
+    let w = width_px.clamp(64, 1400);
+    let mut scale = w as f32 / pw;
+    let mut h = (ph * scale).round().max(1.0);
+    if h > 2000.0 {
+        scale *= 2000.0 / h;
+        h = 2000.0;
+    }
+    let w = (pw * scale).round().max(1.0) as u32;
+    let img = e.render(i, scale, 0, 0, w, h as u32, false)?;
+    Some((img, n))
+}

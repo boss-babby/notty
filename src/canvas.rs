@@ -41,6 +41,16 @@ pub enum Kind {
     Ink,
     /// Vector shape (rectangle, ellipse, diamond, triangle, hexagon, star …) with centred text, fill / outline / hand-drawn styles.
     Shape,
+    /// YouTube / Vimeo / any website: poster card, live frame on demand (web + Windows), opens in the browser elsewhere.
+    Embed,
+    /// PDF whose chosen page (cover = first page, or the last page you were on) is rasterised **once** into a small picture.
+    Pdf,
+    /// Any attached file (or file link): name, type, size.
+    File,
+    /// Live window onto a database page (first rows of its active view).
+    DbView,
+    /// Editable widget (counter, timer, pomodoro, progress, poll, clock, calendar, sheet). State lives in [`Node::data`].
+    Widget,
 }
 
 impl Kind {
@@ -55,6 +65,11 @@ impl Kind {
             Kind::Group => vec2(480.0, 320.0),
             Kind::Ink => vec2(10.0, 10.0),
             Kind::Shape => vec2(176.0, 112.0),
+            Kind::Embed => vec2(400.0, 250.0),
+            Kind::Pdf => vec2(260.0, 360.0),
+            Kind::File => vec2(272.0, 76.0),
+            Kind::DbView => vec2(460.0, 280.0),
+            Kind::Widget => vec2(236.0, 150.0),
         }
     }
     pub fn min_size(self) -> Vec2 {
@@ -64,6 +79,8 @@ impl Kind {
             Kind::Image => vec2(60.0, 40.0),
             Kind::Ink => vec2(4.0, 4.0),
             Kind::Shape => vec2(28.0, 28.0),
+            Kind::Embed | Kind::DbView | Kind::Pdf => vec2(160.0, 110.0),
+            Kind::Widget => vec2(140.0, 90.0),
             _ => vec2(120.0, 56.0),
         }
     }
@@ -148,6 +165,16 @@ pub struct Node {
     /// Highlighter stroke (wide, translucent) instead of a pen stroke.
     #[serde(default, skip_serializing_if = "is_false")]
     pub hl: bool,
+    /// State of a [`Kind::Widget`] (JSON text) / options of other kinds.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub data: String,
+    /// [`Kind::Pdf`]: page shown (0-based, the last one you turned to). Embeds: playback options.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub num: u32,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 fn is_zero(v: &u8) -> bool {
@@ -992,7 +1019,7 @@ impl Canvas {
         if q.is_empty() {
             return vec![];
         }
-        self.nodes.iter().filter(|n| n.text.to_lowercase().contains(&q) || n.url.to_lowercase().contains(&q)).map(|n| n.id).collect()
+        self.nodes.iter().filter(|n| n.text.to_lowercase().contains(&q) || n.url.to_lowercase().contains(&q) || (n.kind == Kind::Widget && crate::canvasx::search_text(n).to_lowercase().contains(&q))).map(|n| n.id).collect()
     }
 
     /// All text of the canvas (workspace search / indexing).
@@ -1068,6 +1095,8 @@ impl Canvas {
                 Kind::Group => json!({"id": n.id.to_string(), "type": "group", "label": n.text}),
                 Kind::Link => json!({"id": n.id.to_string(), "type": "link", "url": n.url}),
                 Kind::Image => json!({"id": n.id.to_string(), "type": "file", "file": n.url}),
+                Kind::Embed => json!({"id": n.id.to_string(), "type": "link", "url": n.url}),
+                Kind::Pdf | Kind::File => json!({"id": n.id.to_string(), "type": "file", "file": n.url, "text": n.text}),
                 _ => json!({"id": n.id.to_string(), "type": "text", "text": n.text}),
             };
             let o = v.as_object_mut().unwrap();
@@ -1081,6 +1110,12 @@ impl Canvas {
             o.insert("lumen".into(), json!(format!("{:?}", n.kind)));
             if let Some(p) = n.page {
                 o.insert("page".into(), json!(p));
+            }
+            if !n.data.is_empty() {
+                o.insert("data".into(), json!(n.data));
+            }
+            if n.num != 0 {
+                o.insert("num".into(), json!(n.num));
             }
             if n.kind == Kind::Shape {
                 o.insert("geo".into(), json!(n.geo));
@@ -1168,6 +1203,11 @@ impl Canvas {
                 Some("Link") => Kind::Link,
                 Some("Group") => Kind::Group,
                 Some("Shape") => Kind::Shape,
+                Some("Embed") => Kind::Embed,
+                Some("Pdf") => Kind::Pdf,
+                Some("File") => Kind::File,
+                Some("DbView") => Kind::DbView,
+                Some("Widget") => Kind::Widget,
                 Some("Note") => Kind::Note,
                 _ => match ty {
                     "group" => Kind::Group,
@@ -1197,13 +1237,16 @@ impl Canvas {
             };
             node.text = match ty {
                 "group" => n["label"].as_str().unwrap_or("Group").to_owned(),
+                "file" if matches!(kind, Kind::Pdf | Kind::File) => n["text"].as_str().unwrap_or("").to_owned(),
                 "file" if kind != Kind::Image => n["file"].as_str().unwrap_or("").to_owned(),
                 _ => n["text"].as_str().unwrap_or("").to_owned(),
             };
             node.url = n["url"].as_str().or_else(|| n["file"].as_str()).unwrap_or("").to_owned();
-            if kind == Kind::Page {
+            if matches!(kind, Kind::Page | Kind::DbView) {
                 node.page = n["page"].as_u64();
             }
+            node.data = n["data"].as_str().unwrap_or("").to_owned();
+            node.num = n["num"].as_u64().unwrap_or(0).min(100_000) as u32;
             if kind == Kind::Shape {
                 node.geo = n["geo"].as_u64().unwrap_or(0).min(GEO_NAMES.len() as u64 - 1) as u8;
                 node.style = n["style"].as_u64().unwrap_or(0).min(3) as u8;
