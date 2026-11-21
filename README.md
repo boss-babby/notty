@@ -1,3 +1,11 @@
+# Lumen 14.0 — local collaboration (same Wi-Fi), borderless PDF cards
+
+See [RELEASE-14.0.md](RELEASE-14.0.md) and [COLLAB.md](COLLAB.md) (architecture, protocol, security status, next-pass task list).
+Deliverables are built by `./build-all.sh` into `../public`: `webapp/` (WebAssembly, served at `/app`), `downloads/Lumen-android-arm64.apk`,
+`downloads/Lumen-windows-x64.exe|.zip`, `SHA256SUMS.txt`.
+
+---
+
 # Lumen 12.0 — Markdown tables, two-way relations, data safety, Android-optimised
 
 * **Markdown everywhere** — GFM tables are parsed by *every* entry point (paste, import, AI tools, MCP, `append_markdown`) through one pre-pass

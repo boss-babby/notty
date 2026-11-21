@@ -253,7 +253,10 @@ impl Notes {
     }
 
     fn next_id(&self) -> u64 {
-        self.list.iter().map(|a| a.id).max().unwrap_or(0) + 1
+        // while a collaboration session runs every device allocates from its own id space (no clashes between simultaneous marks)
+        let base = crate::collab::id_base();
+        let top = base + (1u64 << 40);
+        self.list.iter().map(|a| a.id).filter(|id| (base..top).contains(id)).max().unwrap_or(base) + 1
     }
 
     pub fn remove(&mut self, id: u64) {

@@ -14,6 +14,7 @@ mod bigtable;
 mod bigui;
 mod memgov;
 mod canvas;
+mod collab;
 mod canvasdraw;
 mod canvasexport;
 mod whiteboard;

@@ -196,6 +196,22 @@ impl MediaStore {
         Ok(id)
     }
 
+    /// Stores a file received from a collaborator under the id it has on every device (ids are content hashes).
+    pub fn insert_raw(&mut self, ctx: &egui::Context, id: u64, name: &str, mime: &str, bytes: Vec<u8>) {
+        if self.items.contains_key(&id) {
+            return;
+        }
+        let size = bytes.len();
+        let data: Arc<[u8]> = bytes.into();
+        if is_image_mime(mime) {
+            ctx.include_bytes(uri_for(id), egui::load::Bytes::from(data.clone()));
+            ctx.forget_image(&uri_for(id));
+        }
+        self.items.insert(id, MediaItem { name: name.to_owned(), mime: mime.to_owned(), size, data: Some(data) });
+        self.pending.push(id);
+        self.index_dirty = true;
+    }
+
     /// Drops items nobody references any more (run once at start-up).
     pub fn gc(&mut self, used: &HashSet<u64>) {
         let dead: Vec<u64> = self.items.keys().copied().filter(|k| !used.contains(k)).collect();

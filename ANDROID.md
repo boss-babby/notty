@@ -65,3 +65,10 @@ Build profile: `opt-level 3`, thin LTO, stripped, no MSAA / depth / stencil buff
   (`SCHEDULE_EXACT_ALARM` on Android 12), `RECEIVE_BOOT_COMPLETED`.
 * **PDF reader on touch screens**: pinch zoom follows the finger centre (zoom + pan), Select-text mode, hold-and-drag / hold-on-word selection with drag
   handles, thumbnails drawer and an overflow menu on phones.
+
+
+## Local collaboration on Android (14.0)
+The same Rust session code runs on the phone (see [COLLAB.md](COLLAB.md)). Permissions added to `android/AndroidManifest.xml`:
+`ACCESS_NETWORK_STATE`, `ACCESS_WIFI_STATE`, `CHANGE_WIFI_MULTICAST_STATE`, `NEARBY_WIFI_DEVICES (neverForLocation)`. Discovery is UDP
+broadcast on port 47616, sessions use TCP 47615. Open points for the next pass: a `WifiManager.MulticastLock` + `NsdManager` discovery,
+camera QR scanning in `LumenActivity` (→ `collab::Collab::join_text`), `lumen://join` deep link.

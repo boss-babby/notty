@@ -268,6 +268,11 @@ pub fn service(ctx: &Context, media: &MediaStore) {
     if remote {
         ctx.forget_image(&media::normalize_url(&src));
     }
+    // a document that a collaborator is still sending: keep waiting instead of giving up on it
+    if bytes.is_none() && !remote {
+        C.with(|c| c.borrow_mut().want.retain(|k| !(k.0 == src && k.1 == page)));
+        return;
+    }
     let rendered = bytes.and_then(|b| crate::pdf::render_page_image(b, page, 900));
     let pass = ctx.cumulative_pass_nr();
     C.with(|c| {
@@ -398,7 +403,7 @@ pub fn draw(f: &Frame, ws: &Workspace, n: &Node, st: &NodeSt, r: Rect, rad: f32,
     }
     match n.kind {
         Kind::Embed => draw_embed(f, n, r, out, acc_col),
-        Kind::Pdf => draw_pdf(f, n, r, out, acc_col),
+        Kind::Pdf => draw_pdf(f, ws, n, r, rad, out, acc_col),
         Kind::File => draw_file(f, n, st, r, out, acc_col),
         Kind::DbView => draw_db(f, ws, n, st, r, out, acc_col),
         _ => draw_widget(f, n, st, r, out, acc_col),
@@ -467,30 +472,47 @@ fn draw_embed(f: &Frame, n: &Node, r: Rect, out: &mut DrawOut, acc: Color32) {
     out.acts.push((bodyr, n.id, if can_live { A_LIVE } else { A_OPEN }, 0));
 }
 
-fn draw_pdf(f: &Frame, n: &Node, r: Rect, out: &mut DrawOut, acc: Color32) {
+/// Height (screen points at zoom 1) of the slim caption bar under a PDF card; the card's height is page height + this.
+pub const PDF_CAP: f32 = 28.0;
+
+/// Borderless PDF card: the page fills the card edge to edge (the card keeps the page's aspect ratio), the annotations made in the
+/// reader are drawn on top of it, and a slim caption bar carries the file name, the page counter and first / previous / next.
+fn draw_pdf(f: &Frame, ws: &Workspace, n: &Node, r: Rect, rad: f32, out: &mut DrawOut, acc: Color32) {
     let pal = f.pal;
     let z = f.z();
-    let head = header(f, r, 28.0 * z);
-    icons::glyph(f.p, pos2(head.left() + 16.0 * z, head.center().y), 14.0 * z, l::FILE_TEXT, Color32::from_rgb(214, 69, 65));
-    btn(f, out, n.id, pos2(head.right() - 15.0 * z, head.center().y), 22.0 * z, l::EXTERNAL_LINK, A_OPEN, 0, pal.muted, false);
-    let name = if n.text.trim().is_empty() { "Document.pdf" } else { n.text.trim() };
-    text_fit(f.p, pos2(head.left() + 30.0 * z, head.center().y), Align2::LEFT_CENTER, name, bold(12.5 * z), pal.text, head.width() - 64.0 * z);
-    let foot_h = 30.0 * z;
-    let foot = Rect::from_min_max(pos2(r.left(), r.bottom() - foot_h), r.max);
-    let area = Rect::from_min_max(pos2(r.left() + 8.0 * z, head.bottom() + 8.0 * z), pos2(r.right() - 8.0 * z, foot.top() - 4.0 * z));
+    let cap_h = PDF_CAP * z;
+    let cap = Rect::from_min_max(pos2(r.left(), r.bottom() - cap_h), r.max);
+    let area = Rect::from_min_max(r.min, pos2(r.right(), cap.top()));
     let page = n.num as usize;
     let cs = cover(f.ui.ctx(), &n.url, page);
     let mut pages = known_pages(&n.url);
+    let r8 = rad.round().clamp(0.0, 40.0) as u8;
     match cs {
         CoverState::Ready(tex, size, p) => {
             pages = Some(p);
             let pr = fit(area, size);
-            f.p.rect_filled(pr.expand(1.0), 2.0, Color32::from_black_alpha(if crate::canvasdraw::is_dark(pal) { 90 } else { 40 }));
-            f.p.image(tex, pr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            let top = (pr.top() - r.top()).abs() < 0.6;
+            let cr = egui::CornerRadius { nw: if top && (pr.left() - r.left()).abs() < 0.6 { r8 } else { 0 }, ne: if top && (pr.right() - r.right()).abs() < 0.6 { r8 } else { 0 }, sw: 0, se: 0 };
+            let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+            f.p.add(egui::epaint::RectShape::filled(pr, cr, Color32::WHITE).with_texture(tex, uv));
+            if size.x > 0.0 {
+                // aspect lock: the card is exactly as tall as the page it shows (+ caption), so nothing is letter-boxed
+                out.grow.push((n.id, n.w * size.y / size.x + PDF_CAP));
+            }
+            // annotations made in the reader (highlights, underlines, notes, drawings) stay visible on the card
+            let key = media::media_id(&n.url).unwrap_or_else(|| crate::pdf::key_of(&n.url));
+            if let Some(list) = ws.pdf_annots.get(&key) {
+                let on: Vec<crate::model::PdfAnnot> = list.iter().filter(|a| a.page as usize == page).cloned().collect();
+                if !on.is_empty() {
+                    let notes = crate::pdfnotes::Notes::new(on);
+                    let clipped = f.p.with_clip_rect(pr.intersect(f.p.clip_rect()));
+                    notes.paint_page(&clipped, pr, page, crate::canvasdraw::is_dark(pal), acc, true);
+                }
+            }
         }
         CoverState::Pending => {
             f.ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
-            f.p.rect_filled(fit(area, vec2(0.72, 1.0)), 2.0, with_alpha(pal.hover, 0.8));
+            f.p.rect_filled(area.shrink(1.0), egui::CornerRadius { nw: r8, ne: r8, sw: 0, se: 0 }, with_alpha(pal.hover, 0.8));
             f.p.text(area.center(), Align2::CENTER_CENTER, "Rendering page…", body(12.0 * z), pal.muted);
         }
         CoverState::Failed => {
@@ -499,15 +521,29 @@ fn draw_pdf(f: &Frame, n: &Node, r: Rect, out: &mut DrawOut, acc: Color32) {
         }
     }
     out.acts.push((area, n.id, A_OPEN, 0));
-    // pager
-    let cy = foot.center().y;
+    // caption bar
+    f.p.line_segment([pos2(cap.left() + 1.0, cap.top()), pos2(cap.right() - 1.0, cap.top())], Stroke::new(1.0_f32, with_alpha(pal.border, 0.7)));
+    let cy = cap.center().y;
     let total = pages.unwrap_or(0);
     let can_prev = page > 0;
     let can_next = total == 0 || page + 1 < total;
-    btn(f, out, n.id, pos2(foot.left() + 22.0 * z, cy), 22.0 * z, l::CHEVRON_LEFT, A_PAGE, -1, if can_prev { acc } else { with_alpha(pal.muted, 0.4) }, false);
-    btn(f, out, n.id, pos2(foot.right() - 22.0 * z, cy), 22.0 * z, l::CHEVRON_RIGHT, A_PAGE, 1, if can_next { acc } else { with_alpha(pal.muted, 0.4) }, false);
-    let label = if total > 0 { format!("Page {} of {}", page + 1, total) } else { format!("Page {}", page + 1) };
-    f.p.text(foot.center(), Align2::CENTER_CENTER, label, body(12.0 * z), pal.muted);
+    let off = with_alpha(pal.muted, 0.4);
+    let label = if total > 0 { format!("{} / {}", page + 1, total) } else { format!("{}", page + 1) };
+    let g = f.p.layout_no_wrap(label, body(11.5 * z), pal.muted);
+    let d = 22.0 * z;
+    let x_next = r.right() - 13.0 * z;
+    let right_txt = x_next - 12.0 * z;
+    f.p.galley(pos2(right_txt - g.size().x, cy - g.size().y / 2.0), g.clone(), pal.muted);
+    let x_prev = right_txt - g.size().x - 13.0 * z;
+    let x_first = x_prev - 20.0 * z;
+    btn(f, out, n.id, pos2(x_next, cy), d, l::CHEVRON_RIGHT, A_PAGE, 1, if can_next { acc } else { off }, false);
+    btn(f, out, n.id, pos2(x_prev, cy), d, l::CHEVRON_LEFT, A_PAGE, -1, if can_prev { acc } else { off }, false);
+    let first_tint = if can_prev { acc } else { off };
+    btn(f, out, n.id, pos2(x_first, cy), d, l::CHEVRON_LEFT, A_PAGE, i32::MIN, first_tint, false);
+    icons::glyph(f.p, pos2(x_first - 4.0 * z, cy), d * 0.52, l::CHEVRON_LEFT, first_tint);
+    let name = if n.text.trim().is_empty() { "Document.pdf" } else { n.text.trim() };
+    icons::glyph(f.p, pos2(cap.left() + 13.0 * z, cy), 13.0 * z, l::FILE_TEXT, Color32::from_rgb(214, 69, 65));
+    text_fit(f.p, pos2(cap.left() + 26.0 * z, cy), Align2::LEFT_CENTER, name, bold(11.5 * z), pal.text, (x_first - 14.0 * z - (cap.left() + 26.0 * z)).max(0.0));
 }
 
 fn draw_file(f: &Frame, n: &Node, st: &NodeSt, r: Rect, out: &mut DrawOut, acc: Color32) {
@@ -882,7 +918,7 @@ pub fn act(c: &mut Canvas, id: u64, code: u16, arg: i32, frac: f32) -> Fx {
         A_PAGE => {
             let known = known_pages(&n.url).unwrap_or(usize::MAX);
             if let Some(nn) = c.node_mut(id) {
-                let p = nn.num as i64 + arg as i64;
+                let p = if arg == i32::MIN { 0 } else { nn.num as i64 + arg as i64 };
                 nn.num = p.clamp(0, known.saturating_sub(1).min(100_000) as i64) as u32;
             }
             c.rev += 1;

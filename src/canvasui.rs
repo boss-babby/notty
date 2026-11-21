@@ -980,6 +980,12 @@ fn run(ui: &mut Ui, ws: &mut Workspace, page: u64, pal: &Palette, c: &mut Canvas
         let f = Frame { p: &painter, ui: &*ui, pal, view: c.view, origin, clip: rect };
         draw_overlays_world(&f, c, st, &ctx);
     }
+    // collaborators: my pointer goes out, theirs is drawn (hidden when the user switches cursors off)
+    if let Some(hp) = hover_pos.filter(|p| rect.contains(*p)) {
+        let w = c.view.to_world(origin, hp);
+        crate::collab::canvas_cursor(page, [w.x, w.y]);
+    }
+    crate::collab::paint_canvas_cursors(&painter, pal, page, &|w: Pos2| c.view.to_screen(origin, w));
     // auto-grow
     for (id, h) in dout.grow {
         if let Some(n) = c.node_mut(id) {
@@ -987,6 +993,12 @@ fn run(ui: &mut Ui, ws: &mut Workspace, page: u64, pal: &Palette, c: &mut Canvas
             match n.kind {
                 Kind::Image => {
                     if n.h <= 0.5 {
+                        n.h = h;
+                    }
+                }
+                // PDF cards keep the page's aspect ratio (borderless page + caption bar)
+                Kind::Pdf => {
+                    if (h - n.h).abs() > 0.5 && !matches!(st.drag, Drag::Resize { .. }) {
                         n.h = h;
                     }
                 }

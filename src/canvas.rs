@@ -632,8 +632,12 @@ impl Canvas {
     }
 
     pub fn new_id(&mut self) -> u64 {
-        let max = self.nodes.iter().map(|n| n.id).chain(self.edges.iter().map(|e| e.id)).max().unwrap_or(0);
-        self.next_id = self.next_id.max(max) + 1;
+        // ids of other collaborators live in their own 2^40-wide spaces (see collab::id_base) and must not push ours into theirs
+        let base = crate::collab::id_base();
+        let top = base + (1u64 << 40);
+        let max = self.nodes.iter().map(|n| n.id).chain(self.edges.iter().map(|e| e.id)).filter(|id| (base..top).contains(id)).max().unwrap_or(base);
+        let cur = if (base..top).contains(&self.next_id) { self.next_id } else { base };
+        self.next_id = cur.max(max) + 1;
         self.next_id
     }
 

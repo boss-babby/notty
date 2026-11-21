@@ -185,6 +185,8 @@ pub struct LumenApp {
     last_accent: usize,
     last_touch: bool,
     media: MediaStore,
+    /// Local collaboration session (see `collab/` and COLLAB.md).
+    collab: crate::collab::Collab,
     history: Option<crate::history::HistState>,
     last_calc: f64,
     calc_dirty: bool,
@@ -296,6 +298,7 @@ impl LumenApp {
             history: None,
             last_calc: 0.0,
             calc_dirty: true,
+            collab: crate::collab::Collab::new(&cc.egui_ctx),
             prev_sidebar_page: None,
             auto_rt: crate::automation::Runtime::new(),
             bg: crate::flowbg::Bg::default(),
@@ -1056,6 +1059,8 @@ impl LumenApp {
             self.row_menu = Some(m);
             self.fresh = true;
         }
+        ui.add_space(6.0);
+        crate::collab::ui::chip(ui, pal, &mut self.collab);
         let (updated, fav) = self.ws.page(cur).map(|p| (p.updated, p.favorite)).unwrap_or((0.0, false));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(10.0);
@@ -1397,6 +1402,71 @@ impl LumenApp {
         ctx.request_repaint();
     }
 
+    /// Local collaboration: runs the session once per frame (network events, remote edits, local change scan, media on demand).
+    fn run_collab(&mut self, ctx: &Context) {
+        if !self.collab.active() && !self.collab.ui.discovering {
+            return;
+        }
+        if ctx.input(|i| !i.events.is_empty()) {
+            self.collab.poke();
+        }
+        if let Some(name) = self.collab.take_new_workspace() {
+            self.new_shared_workspace(ctx, &name);
+        }
+        let cur = self.ws.current;
+        let (page, cursor) = crate::collab::view_state();
+        self.collab.set_view(cur.filter(|_| !self.locked), self.ed.active, cursor.filter(|_| page == cur));
+        let ws_id = self.wsreg.active;
+        let media = &self.media;
+        let changed = self.collab.poll(&mut self.ws, ws_id, cur, &|id| media.get(id).is_some());
+        for (id, name, mime, bytes) in self.collab.take_media() {
+            self.media.insert_raw(ctx, id, &name, &mime, bytes);
+        }
+        for (conn, id, off) in self.collab.take_media_requests() {
+            if self.collab.serving.as_ref().map_or(true, |s| s.0 != id) {
+                self.collab.serving = self.media.bytes(id).map(|b| (id, b));
+            }
+            let (name, mime) = self.media.get(id).map(|i| (i.name.clone(), i.mime.clone())).unwrap_or_default();
+            let bytes = self.collab.serving.as_ref().map(|s| s.1.clone());
+            self.collab.serve_media(conn, id, off, &name, &mime, bytes.as_deref());
+        }
+        if changed {
+            self.calc_dirty = true;
+            ctx.request_repaint();
+        }
+        crate::collab::publish(&self.collab);
+    }
+
+    /// The people menu, the Share / Nearby dialog and the toast of the session.
+    fn collab_overlays(&mut self, ctx: &Context, pal: &Palette) {
+        let cur = self.ws.current;
+        let ws_id = self.wsreg.active;
+        let out = crate::collab::ui::overlays(ctx, pal, &mut self.collab, &mut self.ws, ws_id, cur);
+        if let Some(pg) = out.open {
+            self.ws.current = Some(pg);
+        }
+        // a link opened in the browser (…/app?join=ROOM&t=TOKEN) or pasted through the command line
+        if let Some(link) = crate::collab::take_launch_link() {
+            self.collab.ui.join_text = link.clone();
+            let base = self.collab.ui.relay_url.clone();
+            self.collab.join_text(&link, &base);
+            crate::collab::ui::open_dialog(&mut self.collab, 1);
+        }
+    }
+
+    /// A joined session lands in its own workspace (the host's pages keep their ids, so every edit maps 1:1).
+    fn new_shared_workspace(&mut self, ctx: &Context, name: &str) {
+        let mut ws = Workspace::blank(name, self.ws.dark, self.ws.accent);
+        ws.pages.clear();
+        ws.current = None;
+        let Ok(text) = serde_json::to_string(&ws) else { return };
+        let id = self.wsreg.add(name);
+        self.wsother.insert(id, text);
+        self.wsdirty.insert(id);
+        self.switch_workspace(ctx, id);
+        self.collab.bind(self.wsreg.active);
+    }
+
     fn switch_workspace(&mut self, ctx: &Context, target: u64) {
         if target == self.wsreg.active {
             return;
@@ -1653,7 +1723,7 @@ impl LumenApp {
         let sw = ui.ctx().screen_rect().width();
         let sp = ui.spacing().item_spacing.x;
         let btn = 38.0;
-        let title_w = (sw - 8.0 - btn * 6.0 - sp * 8.0 - 28.0).clamp(60.0, 520.0);
+        let title_w = (sw - 8.0 - btn * 7.0 - sp * 9.0 - 28.0).clamp(60.0, 520.0);
         if let Some(p) = self.ws.page(cur) {
             let title = if p.title.is_empty() { "Untitled".to_owned() } else { p.title.clone() };
             let icon = p.icon.clone();
@@ -1674,6 +1744,7 @@ impl LumenApp {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(4.0);
             let r = icon_button(ui, pal, Icon::Dots, 18.0, "Page options");
+            crate::collab::ui::chip(ui, pal, &mut self.collab);
             if r.clicked() {
                 self.page_menu = Some(r.rect.left_bottom() + vec2(-230.0, 6.0));
                 self.fresh = true;
@@ -2546,6 +2617,7 @@ impl LumenApp {
             }
         }
         self.run_ai(ctx);
+        self.run_collab(ctx);
         // theme (animated)
         let target = if self.locked || self.ws.dark { 1.0 } else { 0.0 };
         let t = ctx.animate_value_with_time(Id::new("theme_t"), target, 0.35);
@@ -2658,6 +2730,7 @@ impl LumenApp {
         if self.ed.pdf_req.is_some() {
             crate::pdf::reader_ui(ctx, &mut self.ed.pdf_req, &mut self.ws.pdf_annots, &pal);
             self.toasts_ui(ctx, &pal);
+            self.collab_overlays(ctx, &pal);
             return;
         }
 
@@ -3030,6 +3103,7 @@ impl LumenApp {
         self.history_ui(ctx, &pal);
         crate::pdf::reader_ui(ctx, &mut self.ed.pdf_req, &mut self.ws.pdf_annots, &pal);
         self.toasts_ui(ctx, &pal);
+            self.collab_overlays(ctx, &pal);
     }
 
     fn history_ui(&mut self, ctx: &Context, pal: &Palette) {
