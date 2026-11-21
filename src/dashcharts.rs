@@ -171,30 +171,64 @@ fn mesh_quad(m: &mut Mesh, a: Pos2, b: Pos2, c_: Pos2, d: Pos2, col: Color32) {
 }
 
 /// Filled ring sector between radii `r0` and `r1` (r0 = 0 gives a pie slice).
+///
+/// The arc is sampled so finely (see `crisp::arc_steps`: ≤ 0.06 px between chord and true arc, measured in physical pixels of the
+/// final on-screen size) that it is a true circle for the eye, and the curved edges carry a one-pixel feathered fringe (like egui's own
+/// anti-aliased shapes), so they are smooth instead of stair-stepped.
 pub fn sector(p: &Painter, center: Pos2, r0: f32, r1: f32, a0: f32, a1: f32, col: Color32) {
-    let steps = (((a1 - a0).abs() * r1) / 6.0).ceil().clamp(2.0, 120.0) as usize;
-    let mut m = Mesh::default();
+    if r1 <= 0.0 || (a1 - a0).abs() < 1e-6 || col.a() == 0 {
+        return;
+    }
+    let steps = crate::crisp::arc_steps(r1, a1 - a0);
+    let f = crate::crisp::feather().min(r1 * 0.5);
     let pt = |r: f32, a: f32| center + vec2(a.cos(), a.sin()) * r;
-    if r0 <= 0.5 {
+    let ang = |i: usize| a0 + (a1 - a0) * i as f32 / steps as f32;
+    let clear = Color32::TRANSPARENT;
+    let mut m = Mesh::default();
+    let pie = r0 <= 0.5;
+    // solid body: from the hole (or the centre) to one fringe-width inside the outer edge, plus an inner fringe at the hole
+    let outer_solid = (r1 - f).max(0.0);
+    if pie {
         m.colored_vertex(center, col);
         for i in 0..=steps {
-            let a = a0 + (a1 - a0) * i as f32 / steps as f32;
-            m.colored_vertex(pt(r1, a), col);
+            m.colored_vertex(pt(outer_solid, ang(i)), col);
         }
         for i in 0..steps as u32 {
             m.add_triangle(0, i + 1, i + 2);
         }
     } else {
+        let inner_solid = (r0 + f).min(outer_solid);
         for i in 0..=steps {
-            let a = a0 + (a1 - a0) * i as f32 / steps as f32;
-            m.colored_vertex(pt(r0, a), col);
-            m.colored_vertex(pt(r1, a), col);
+            m.colored_vertex(pt(inner_solid, ang(i)), col);
+            m.colored_vertex(pt(outer_solid, ang(i)), col);
         }
         for i in 0..steps as u32 {
             let k = i * 2;
             m.add_triangle(k, k + 1, k + 2);
             m.add_triangle(k + 1, k + 3, k + 2);
         }
+        // inner fringe: solid at `inner_solid`, transparent at `r0`
+        let base = m.vertices.len() as u32;
+        for i in 0..=steps {
+            m.colored_vertex(pt(inner_solid, ang(i)), col);
+            m.colored_vertex(pt(r0, ang(i)), clear);
+        }
+        for i in 0..steps as u32 {
+            let k = base + i * 2;
+            m.add_triangle(k, k + 1, k + 2);
+            m.add_triangle(k + 1, k + 3, k + 2);
+        }
+    }
+    // outer fringe: solid at `outer_solid`, transparent one pixel further out (the exact radius `r1` is the half-coverage line)
+    let base = m.vertices.len() as u32;
+    for i in 0..=steps {
+        m.colored_vertex(pt(outer_solid, ang(i)), col);
+        m.colored_vertex(pt(r1 + f, ang(i)), clear);
+    }
+    for i in 0..steps as u32 {
+        let k = base + i * 2;
+        m.add_triangle(k, k + 1, k + 2);
+        m.add_triangle(k + 1, k + 3, k + 2);
     }
     p.add(Shape::mesh(m));
 }

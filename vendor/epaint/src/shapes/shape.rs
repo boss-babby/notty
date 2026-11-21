@@ -2,6 +2,40 @@
 
 use std::sync::Arc;
 
+thread_local! {
+    static CRISP_FONTS: std::cell::RefCell<Option<Fonts>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Lumen: registers the `Fonts` that [`Shape::transform`] uses to re-lay text out at the zoomed size (crisp glyphs instead of
+/// a stretched bitmap). Set by egui every frame and by the whiteboard before it zooms a widget card.
+pub fn set_crisp_fonts(fonts: Option<Fonts>) {
+    CRISP_FONTS.with(|c| *c.borrow_mut() = fonts);
+}
+
+fn crisp_text(ts: &mut TextShape, tf: TSTransform) -> bool {
+    let Some(fonts) = CRISP_FONTS.with(|c| c.borrow().clone()) else { return false };
+    let z = tf.scaling;
+    let mut job = (*ts.galley.job).clone();
+    for sec in &mut job.sections {
+        sec.leading_space *= z;
+        sec.format.font_id.size *= z;
+        sec.format.extra_letter_spacing *= z;
+        if let Some(lh) = sec.format.line_height.as_mut() {
+            *lh *= z;
+        }
+        sec.format.underline.width *= z;
+        sec.format.strikethrough.width *= z;
+    }
+    if job.wrap.max_width.is_finite() {
+        job.wrap.max_width *= z;
+    }
+    job.first_row_min_height *= z;
+    ts.galley = fonts.layout_job(job);
+    ts.pos = tf * ts.pos;
+    ts.underline.width *= z;
+    true
+}
+
 use emath::{pos2, Align2, Pos2, Rangef, Rect, TSTransform, Vec2};
 
 use crate::{
@@ -456,6 +490,11 @@ impl Shape {
                 rect_shape.blur_width *= transform.scaling;
             }
             Self::Text(text_shape) => {
+                // Lumen: when a layer is zoomed, re-lay the text out at the final size instead of scaling the
+                // already-rasterised glyph quads (which made zoomed widgets look like a blurry image).
+                if (transform.scaling - 1.0).abs() > 0.01 && transform.scaling > 0.0 && crisp_text(text_shape, transform) {
+                    return;
+                }
                 text_shape.pos = transform * text_shape.pos;
 
                 // Scale text:

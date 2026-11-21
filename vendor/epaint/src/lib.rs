@@ -57,7 +57,7 @@ pub use self::{
     shadow::Shadow,
     shapes::{
         CircleShape, CubicBezierShape, EllipseShape, PaintCallback, PaintCallbackInfo, PathShape,
-        QuadraticBezierShape, RectShape, Shape, TextShape,
+        QuadraticBezierShape, RectShape, Shape, TextShape, set_crisp_fonts,
     },
     stats::PaintStats,
     stroke::{PathStroke, Stroke, StrokeKind},

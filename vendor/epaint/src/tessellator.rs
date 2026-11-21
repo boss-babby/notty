@@ -1532,7 +1532,21 @@ impl Tessellator {
 
         let path_stroke = PathStroke::from(stroke).outside();
         self.scratchpad_path.clear();
-        self.scratchpad_path.add_circle(center, radius);
+        // Lumen: big circles (large screens, 3x phones, zoomed cards) get as many corners as their size in physical pixels needs,
+        // not at most 128 — otherwise the straight edges of the polygon become visible.
+        let radius_px = radius * self.pixels_per_point;
+        if radius_px > 40.0 {
+            let step = 2.0 * (1.0 - (0.06 / radius_px).min(0.5)).acos();
+            let n = ((std::f32::consts::TAU / step).ceil() as usize).clamp(128, 2048);
+            self.scratchpad_path.0.reserve(n + 1);
+            for i in 0..=n {
+                let a = i as f32 / n as f32 * std::f32::consts::TAU;
+                let normal = vec2(a.cos(), a.sin());
+                self.scratchpad_path.0.push(PathPoint { pos: center + radius * normal, normal });
+            }
+        } else {
+            self.scratchpad_path.add_circle(center, radius);
+        }
         self.scratchpad_path
             .fill_and_stroke(self.feathering, fill, &path_stroke, out);
     }

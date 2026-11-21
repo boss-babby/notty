@@ -148,7 +148,9 @@ pub fn draw_all(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, c: &mut Canvas, 
             Area::new(area_id).order(Order::Middle).fixed_pos(Pos2::ZERO).movable(false).constrain(false).interactable(true).show(&ctx, |ui| {
                 ui.set_clip_rect(clip_local);
                 ui.allocate_exact_size(size, Sense::hover());
+                crate::crisp::set_zoom(z);
                 inlinew::paint_card(ui, ws, pal, &wd, id | (1 << 62), local, true, true, nav);
+                crate::crisp::set_zoom(1.0);
             });
             let tf = TSTransform::new(r.min.to_vec2(), z);
             inlinew::drill_to_screen(|p| tf * p);
@@ -157,6 +159,10 @@ pub fn draw_all(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, c: &mut Canvas, 
             let local = Rect::from_min_size(pos2(FAR, FAR), size);
             let clip_local = Rect::from_min_max(pos2(FAR, FAR) + (vis.min - r.min) / z, pos2(FAR, FAR) + (vis.max - r.min) / z);
             let start = ctx.graphics_mut(|g| g.entry(layer).next_idx());
+            // The card is painted at 100 % and zoomed afterwards: tell the arc / circle code the final size so that circles stay
+            // true circles, and let the text be re-laid out at the final size so it stays crisp instead of a stretched bitmap.
+            crate::crisp::set_zoom(z);
+            egui::epaint::set_crisp_fonts(Some(ctx.fonts(|f| f.clone())));
             {
                 let mut child = ui.new_child(UiBuilder::new().max_rect(local).layout(egui::Layout::top_down(egui::Align::Min)));
                 child.set_clip_rect(clip_local);
@@ -164,6 +170,7 @@ pub fn draw_all(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, c: &mut Canvas, 
                 inlinew::paint_card(&mut child, ws, pal, &wd, id | (1 << 62), local, true, selected, nav);
             }
             let end = ctx.graphics_mut(|g| g.entry(layer).next_idx());
+            crate::crisp::set_zoom(1.0);
             let tf = TSTransform::new(r.min.to_vec2() - far * z, z);
             ctx.graphics_mut(|g| g.entry(layer).transform_range(start, end, tf));
         }

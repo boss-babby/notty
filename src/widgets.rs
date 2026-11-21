@@ -267,7 +267,7 @@ pub fn gradient_rect(ui: &Ui, rect: Rect, a: Color32, b: Color32) {
 pub fn radial_glow(p: &egui::Painter, center: Pos2, radius: f32, color: Color32) {
     let mut mesh = egui::Mesh::default();
     mesh.colored_vertex(center, color);
-    let n = 48;
+    let n = crate::crisp::arc_steps(radius, std::f32::consts::TAU).max(48) as u32;
     for i in 0..=n {
         let a = i as f32 / n as f32 * std::f32::consts::TAU;
         mesh.colored_vertex(pos2(center.x + a.cos() * radius, center.y + a.sin() * radius), Color32::TRANSPARENT);

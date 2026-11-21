@@ -2383,6 +2383,8 @@ impl eframe::App for LumenApp {
     }
 
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+        crate::crisp::set_ppp(ctx.pixels_per_point());
+        crate::crisp::set_zoom(1.0);
         self.ed.embed_rects.clear();
         self.load_script_fonts(ctx);
         #[cfg(target_os = "android")]

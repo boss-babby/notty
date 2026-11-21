@@ -20,6 +20,7 @@ mod whiteboard;
 mod canvasfmt;
 mod canvasui;
 mod canvasdash;
+mod crisp;
 mod workspaces;
 mod canvasx;
 mod flow;

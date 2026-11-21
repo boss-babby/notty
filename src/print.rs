@@ -31,11 +31,28 @@ fn safe_url(u: &str) -> bool {
     l.starts_with("http://") || l.starts_with("https://") || l.starts_with("mailto:") || l.starts_with("data:image/")
 }
 
+/// `(start, end, tex, display)` of every `$…$` / `$$…$$` of `plain`, as BYTE ranges.
+fn math_spans(plain: &str) -> Vec<(usize, usize, String, bool)> {
+    if !plain.contains('$') {
+        return vec![];
+    }
+    let offs: Vec<usize> = plain.char_indices().map(|(i, _)| i).chain(std::iter::once(plain.len())).collect();
+    crate::math::inline_spans(plain).into_iter().map(|(s, e, tex, d)| (offs[s], offs[e.min(offs.len() - 1)], tex, d)).collect()
+}
+
+fn math_html(tex: &str, display: bool) -> String {
+    if display {
+        format!("<span class=\"eqi\">{}</span>", crate::math::to_mathml(tex, true))
+    } else {
+        crate::math::to_mathml(tex, false)
+    }
+}
+
 fn inline(markup: &str) -> String {
     let r = Rich::parse(markup);
+    let spans = math_spans(&r.plain);
     let mut out = String::new();
     for (range, f) in r.runs() {
-        let mut t = esc(&r.plain[range.clone()]).replace('\n', "<br>");
         let mut open = String::new();
         let mut close = String::new();
         for (flag, tag) in [(BOLD, "b"), (ITALIC, "i"), (STRIKE, "s"), (CODE, "code"), (UNDERLINE, "u"), (HIGHLIGHT, "mark")] {
@@ -50,8 +67,22 @@ fn inline(markup: &str) -> String {
                 close.insert_str(0, "</a>");
             }
         }
-        t = format!("{open}{t}{close}");
-        out.push_str(&t);
+        // Formulas inside the run: `$x^2$` becomes real MathML (typeset by the browser / print engine), never in code spans.
+        let mut pos = range.start;
+        while pos < range.end {
+            let hit = if f.flags & CODE != 0 { None } else { spans.iter().find(|s| s.0 <= pos && pos < s.1) };
+            if let Some(sp) = hit {
+                if pos == sp.0 {
+                    out.push_str(&format!("{open}{}{close}", math_html(&sp.2, sp.3)));
+                }
+                pos = sp.1.min(range.end).max(pos + 1);
+                continue;
+            }
+            let next = if f.flags & CODE != 0 { range.end } else { spans.iter().filter(|s| s.0 > pos && s.0 < range.end).map(|s| s.0).min().unwrap_or(range.end) };
+            let t = esc(&r.plain[pos..next]).replace('\n', "<br>");
+            out.push_str(&format!("{open}{t}{close}"));
+            pos = next;
+        }
     }
     out
 }
@@ -224,6 +255,21 @@ fn gantt_svg(ws: &Workspace, id: u64, db: &Database, view: &View, rows: &[u64]) 
     Some(s)
 }
 
+static MATH_FONT: &[u8] = include_bytes!("../assets/xits-math-print.woff2");
+
+const MATH_CSS: &str = r#"
+math { font-family: "Lumen Math", "STIX Two Math", "Cambria Math", "Latin Modern Math", math; font-size: 1.1em; line-height: 1.2; color: inherit; }
+math[display="block"] { display: block math; margin: .15em 0; text-align: center; }
+.eq { margin: .75em 0; padding: .2em 0; text-align: center; overflow-x: auto; overflow-y: hidden; break-inside: avoid; }
+.eqi { display: block; text-align: center; margin: .35em 0; overflow-x: auto; }
+mtable.mx mtd { padding: .18em .55em; }
+mtable.cases mtd, mtable.al mtd { padding: .18em .35em; }
+mtable.al mtd:nth-child(even) { padding-left: 0; }
+mtable { math-style: normal; }
+annotation { display: none; }
+@media print { .eq, .eqi { overflow: visible; } math { font-size: 1.08em; } }
+"#;
+
 const CSS: &str = r#"
 @page { size: A4; margin: 16mm 15mm; }
 * { box-sizing: border-box; }
@@ -278,7 +324,7 @@ pub fn page_html(ws: &Workspace, media: &MediaStore, id: u64, auto_print: bool) 
     let Some(page) = ws.page(id) else { return String::new() };
     let title = if page.title.is_empty() { "Untitled".to_owned() } else { page.title.clone() };
     let mut o = String::new();
-    o.push_str(&format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>{CSS}</style></head><body>", esc(&title)));
+    o.push_str(&format!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>{CSS}</style><!--MATHFONT--></head><body>", esc(&title)));
     o.push_str("<div class=\"bar\"><button onclick=\"window.print()\">Print / Save as PDF</button><span>Tip: choose “Save as PDF” as the destination. Images and databases are included.</span></div><div class=\"page\">");
     // cover
     if let Some(src) = image_src(media, &page.cover_img).filter(|_| !page.cover_img.is_empty()) {
@@ -347,7 +393,13 @@ pub fn page_html(ws: &Workspace, media: &MediaStore, id: u64, auto_print: bool) 
             BlockKind::Quote => o.push_str(&format!("<blockquote style=\"{pad}{st}\">{tx}</blockquote>")),
             BlockKind::Callout => o.push_str(&format!("<div class=\"callout\" style=\"{pad}{st}\"><span>💡</span><span>{tx}</span></div>")),
             BlockKind::Code => o.push_str(&format!("<pre style=\"{pad}\">{}</pre>", esc(&b.text))),
-            BlockKind::Equation => o.push_str(&format!("<p style=\"{pad};text-align:center;font-size:1.15em;font-style:italic\">{}</p>", esc(&crate::math::to_unicode(&b.text)))),
+            BlockKind::Equation => {
+                if b.text.trim().is_empty() {
+                    o.push_str(&format!("<div class=\"eq\" style=\"{pad}\">&nbsp;</div>"));
+                } else {
+                    o.push_str(&format!("<div class=\"eq\" style=\"{pad}\">{}</div>", crate::math::to_mathml(&b.text, true)));
+                }
+            }
             BlockKind::Divider => o.push_str("<hr>"),
             BlockKind::Toc => {
                 o.push_str("<div class=\"toc\" style=\"margin:.6em 0\">");
@@ -387,7 +439,8 @@ pub fn page_html(ws: &Workspace, media: &MediaStore, id: u64, auto_print: bool) 
                 open.push((b.indent, false));
             }
             BlockKind::Widget => {
-                o.push_str(&format!("<p style=\"{pad};color:#888\"><em>[Dashboard widget]</em></p>"));
+                let name = ws.dash.widget(b.media as u64).and_then(crate::dashwidgets::def_for).map_or_else(|| "Dashboard widget".to_owned(), |d| d.name.to_string());
+                o.push_str(&format!("<div class=\"card\" style=\"{pad}\"><b>{}</b><small>Interactive dashboard widget — open the page in Lumen to see it live.</small></div>", esc(&name)));
             }
             BlockKind::Whiteboard => match b.link.and_then(|l| ws.page(l)).and_then(|p| p.canvas.as_ref()) {
                 Some(c) => {
@@ -405,7 +458,7 @@ pub fn page_html(ws: &Workspace, media: &MediaStore, id: u64, auto_print: bool) 
                     for (ci, c) in r.iter().enumerate() {
                         let tag = if ri == 0 && b.checked { "th" } else { "td" };
                         let a = match al.get(ci) { Some('c') => "center", Some('r') => "right", _ => "left" };
-                        o.push_str(&format!("<{tag} style=\"border:1px solid #ccc;padding:5px 9px;text-align:{a};{}\">{}</{tag}>", if tag == "th" { "background:#f3f3f2" } else { "" }, esc(&crate::rich::strip(c))));
+                        o.push_str(&format!("<{tag} style=\"border:1px solid #ccc;padding:5px 9px;text-align:{a};{}\">{}</{tag}>", if tag == "th" { "background:#f3f3f2" } else { "" }, inline(c)));
                     }
                     o.push_str("</tr>");
                 }
@@ -443,6 +496,12 @@ pub fn page_html(ws: &Workspace, media: &MediaStore, id: u64, auto_print: bool) 
         o.push_str("<script>window.addEventListener('load',function(){setTimeout(function(){window.print()},500)})</script>");
     }
     o.push_str("</body></html>");
+    if o.contains("<math") {
+        // standalone file: ship the math font (XITS Math, OFL; MATH table included) so every device — also Android, which has no math font —
+        // typesets fractions, roots, big operators and stretchy brackets identically
+        let font = format!("<style>@font-face{{font-family:\"Lumen Math\";src:url(data:font/woff2;base64,{}) format(\"woff2\");}}{MATH_CSS}</style>", b64_encode(MATH_FONT));
+        o = o.replacen("<!--MATHFONT-->", &font, 1);
+    }
     o
 }
 
@@ -473,5 +532,26 @@ mod tests {
         assert!(page_html(&ws, &media, cur, false).contains("&lt;b&gt;x&lt;/b&gt;"));
         // database page prints too
         assert!(page_html(&ws, &media, road, false).contains("<th>Status</th>"));
+    }
+
+    #[test]
+    fn equations_are_exported_as_mathml_not_flat_text() {
+        let mut ws = Workspace::seed();
+        let media = MediaStore::default();
+        let cur = ws.current.unwrap();
+        let mut eq = ws.blk(BlockKind::Equation, r"\frac{-b\pm\sqrt{b^2-4ac}}{2a}", 0);
+        eq.indent = 0;
+        let para = ws.blk(BlockKind::Text, r"Euler: $e^{i\pi}+1=0$ and costs $5 and $10, `$x$` stays code", 0);
+        let p = ws.page_mut(cur).unwrap();
+        p.blocks.push(eq);
+        p.blocks.push(para);
+        let h = page_html(&ws, &media, cur, false);
+        assert!(h.contains("<mfrac>") && h.contains("<msqrt>") && h.contains("display=\"block\""), "block equation is MathML");
+        assert!(h.contains("<msup>") && h.contains("display=\"inline\""), "inline formula is MathML");
+        assert!(h.contains("font/woff2;base64"), "math font is embedded");
+        assert!(h.contains("costs $5 and $10"), "prices stay text");
+        let plain = Workspace::seed();
+        let cur2 = plain.current.unwrap();
+        assert!(!page_html(&plain, &media, cur2, false).contains("font/woff2"), "no math, no font");
     }
 }

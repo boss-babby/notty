@@ -14,6 +14,6 @@ pub use self::{
     paint_callback::{PaintCallback, PaintCallbackInfo},
     path_shape::PathShape,
     rect_shape::RectShape,
-    shape::Shape,
+    shape::{set_crisp_fonts, Shape},
     text_shape::TextShape,
 };

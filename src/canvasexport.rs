@@ -72,7 +72,7 @@ pub fn to_svg(c: &Canvas, dark: bool, title_of: &dyn Fn(u64) -> String) -> Strin
                 text_block(o, &wrap(&n.text, r.width(), px), r.min.x + 4.0, r.min.y + 2.0, px, &acc, "start", "700");
             }
             Kind::Shape => {
-                let pts: Vec<String> = cv::geo_points(n.geo, r).iter().map(|p| format!("{:.1},{:.1}", p.x, p.y)).collect();
+                let pts: Vec<String> = cv::geo_points_px(n.geo, r, 6.0).iter().map(|p| format!("{:.1},{:.1}", p.x, p.y)).collect();
                 let (fill, fo, sw) = match n.style {
                     1 | 3 => ("none".to_owned(), 1.0, 2.0),
                     2 => (acc.clone(), 1.0, 2.0),
@@ -83,7 +83,12 @@ pub fn to_svg(c: &Canvas, dark: bool, title_of: &dyn Fn(u64) -> String) -> Strin
                     2 => " stroke-dasharray=\"2 6\" stroke-linecap=\"round\"",
                     _ => "",
                 };
-                let _ = write!(o, "<polygon points=\"{}\" fill=\"{fill}\" fill-opacity=\"{fo}\" stroke=\"{acc}\" stroke-width=\"{sw}\" stroke-linejoin=\"round\"{dash}/>", pts.join(" "));
+                if n.geo == 2 {
+                    // a real ellipse element: exact at any zoom / print size
+                    let _ = write!(o, "<ellipse cx=\"{:.2}\" cy=\"{:.2}\" rx=\"{:.2}\" ry=\"{:.2}\" fill=\"{fill}\" fill-opacity=\"{fo}\" stroke=\"{acc}\" stroke-width=\"{sw}\"{dash}/>", r.center().x, r.center().y, r.width() / 2.0, r.height() / 2.0);
+                } else {
+                    let _ = write!(o, "<polygon points=\"{}\" fill=\"{fill}\" fill-opacity=\"{fo}\" stroke=\"{acc}\" stroke-width=\"{sw}\" stroke-linejoin=\"round\"{dash}/>", pts.join(" "));
+                }
                 let px = [16.0, 22.0, 30.0][n.size.min(2) as usize];
                 let tcol = if n.style == 2 { "#ffffff".to_owned() } else { fg.to_owned() };
                 let lines = wrap(&n.text, r.width() * 0.8, px);

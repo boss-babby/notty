@@ -1549,6 +1549,288 @@ fn uni(n: &Node, out: &mut String) {
     }
 }
 
+// ───────────────────────────── MathML (HTML / PDF export) ─────────────────────────────
+//
+// The print export used to flatten every formula to one line of italic Unicode (`to_unicode`), so fractions, roots, matrices, sums and
+// limits lost their structure. `to_mathml` walks the very same AST that the on-screen typesetter uses and emits MathML Core, which
+// Chromium (Chrome, Edge, Android WebView — the engines behind "Print / Save as PDF"), Firefox and Safari lay out natively, in the
+// HTML file as well as in the PDF that is printed from it.
+
+fn mx(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            '"' => o.push_str("&quot;"),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+fn mathml_accent(kind: &str) -> (&'static str, bool) {
+    // (glyph, over?)
+    match kind {
+        "hat" | "widehat" => ("^", true),
+        "check" => ("ˇ", true),
+        "bar" | "overline" => ("‾", true),
+        "vec" | "overrightarrow" => ("→", true),
+        "tilde" | "widetilde" => ("~", true),
+        "dot" => ("˙", true),
+        "ddot" => ("¨", true),
+        "acute" => ("´", true),
+        "grave" => ("`", true),
+        "breve" => ("˘", true),
+        "mathring" => ("˚", true),
+        "overbrace" => ("⏞", true),
+        "underline" => ("_", false),
+        "underbrace" => ("⏟", false),
+        _ => ("", true),
+    }
+}
+
+fn ml_fence(out: &mut String, d: &str) {
+    if d == "." || d.is_empty() {
+        return;
+    }
+    let d = match d {
+        "<" => "⟨",
+        ">" => "⟩",
+        "\\{" => "{",
+        "\\}" => "}",
+        "\\|" => "‖",
+        x => x,
+    };
+    out.push_str(&format!("<mo fence=\"true\" stretchy=\"true\" symmetric=\"true\">{}</mo>", mx(d)));
+}
+
+fn ml(n: &Node, out: &mut String) {
+    match n {
+        Node::Row(v) => {
+            if v.len() == 1 {
+                ml(&v[0], out);
+            } else {
+                out.push_str("<mrow>");
+                for x in v {
+                    ml(x, out);
+                }
+                out.push_str("</mrow>");
+            }
+        }
+        Node::Sym { s, class, face } => {
+            let t = mx(s);
+            let numeric = !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',');
+            let alpha = s.chars().next().map_or(false, |c| c.is_alphabetic()) && !s.contains(char::is_whitespace);
+            if s.trim().is_empty() {
+                out.push_str("<mspace width=\"0.28em\"/>");
+            } else if s.contains(char::is_whitespace) {
+                out.push_str(&format!("<mtext>{}</mtext>", t.replace(' ', "&#160;")));
+            } else if numeric && *class == Class::Ord {
+                out.push_str(&format!("<mn>{t}</mn>"));
+            } else if alpha && *class == Class::Ord {
+                let single = s.chars().count() == 1;
+                // letters that were already mapped to the Mathematical Italic / Bold alphabets keep their look; upright letters stay upright
+                let upright = s.chars().all(|c| (c as u32) < 0x1D400 || c as u32 > 0x1D7FF) && (face.roman || !face.italic || !single);
+                let var = if face.mono { " mathvariant=\"monospace\"" } else if upright && single && !face.bold { " mathvariant=\"normal\"" } else if upright && single { " mathvariant=\"bold\"" } else { "" };
+                out.push_str(&format!("<mi{var}>{t}</mi>"));
+            } else if *class == Class::Ord && matches!(s.as_str(), "∞" | "∂" | "∇" | "ℏ" | "ℓ" | "∅" | "′" | "″" | "…" | "⋯" | "⋮" | "⋱" | "°") {
+                out.push_str(&format!("<mi mathvariant=\"normal\">{t}</mi>"));
+            } else {
+                let extra = match class {
+                    Class::Open | Class::Close => " stretchy=\"false\"",
+                    Class::Punct => " separator=\"true\"",
+                    _ => "",
+                };
+                out.push_str(&format!("<mo{extra}>{t}</mo>"));
+            }
+        }
+        Node::BigOp { s, limits } => {
+            if let Some(name) = s.strip_prefix('\u{1}') {
+                out.push_str(&format!("<mo movablelimits=\"true\" lspace=\"0\" rspace=\"0.17em\">{}</mo>", mx(name)));
+            } else {
+                out.push_str(&format!("<mo largeop=\"true\" stretchy=\"false\" symmetric=\"true\" movablelimits=\"{limits}\">{}</mo>", mx(s)));
+            }
+        }
+        Node::Frac(a, b, tight) => {
+            out.push_str(if *tight { "<mfrac linethickness=\"0\">" } else { "<mfrac>" });
+            ml(a, out);
+            ml(b, out);
+            out.push_str("</mfrac>");
+        }
+        Node::Sqrt(idx, b) => {
+            if let Some(i) = idx {
+                out.push_str("<mroot>");
+                ml_row(b, out);
+                ml(i, out);
+                out.push_str("</mroot>");
+            } else {
+                out.push_str("<msqrt>");
+                ml_row(b, out);
+                out.push_str("</msqrt>");
+            }
+        }
+        Node::Script(base, sub, sup) => {
+            let limits = matches!(&**base, Node::BigOp { limits: true, .. });
+            let (open, close) = match (sub.is_some(), sup.is_some(), limits) {
+                (true, true, true) => ("<munderover>", "</munderover>"),
+                (true, true, false) => ("<msubsup>", "</msubsup>"),
+                (true, false, true) => ("<munder>", "</munder>"),
+                (true, false, false) => ("<msub>", "</msub>"),
+                (false, true, true) => ("<mover>", "</mover>"),
+                (false, true, false) => ("<msup>", "</msup>"),
+                (false, false, _) => ("", ""),
+            };
+            out.push_str(open);
+            ml(base, out);
+            if let Some(s) = sub {
+                ml(s, out);
+            }
+            if let Some(s) = sup {
+                ml(s, out);
+            }
+            out.push_str(close);
+        }
+        Node::Delim(l, b, r) => {
+            out.push_str("<mrow>");
+            ml_fence_open(out, l);
+            ml_inner(b, out);
+            ml_fence(out, r);
+            out.push_str("</mrow>");
+        }
+        Node::Matrix { rows, left, right, align } => {
+            out.push_str("<mrow>");
+            ml_fence_open(out, left);
+            let cls = match align {
+                1 => "cases",
+                2 => "al",
+                _ => "mx",
+            };
+            out.push_str(&format!("<mtable class=\"{cls}\" displaystyle=\"{}\">", *align != 0));
+            for r in rows {
+                out.push_str("<mtr>");
+                for (j, c) in r.iter().enumerate() {
+                    let side = match align {
+                        1 => "left",
+                        2 => {
+                            if j % 2 == 0 {
+                                "right"
+                            } else {
+                                "left"
+                            }
+                        }
+                        _ => "center",
+                    };
+                    out.push_str(&format!("<mtd style=\"text-align:{side}\">"));
+                    ml_inner(c, out);
+                    out.push_str("</mtd>");
+                }
+                out.push_str("</mtr>");
+            }
+            out.push_str("</mtable>");
+            ml_fence(out, right);
+            out.push_str("</mrow>");
+        }
+        Node::Accent(kind, b) => {
+            let (g, over) = mathml_accent(kind);
+            if g.is_empty() {
+                ml(b, out);
+                return;
+            }
+            let wide = matches!(kind.as_str(), "widehat" | "widetilde" | "overline" | "underline" | "overrightarrow" | "overbrace" | "underbrace");
+            let (tag, attr) = if over { ("mover", "accent") } else { ("munder", "accentunder") };
+            out.push_str(&format!("<{tag} {attr}=\"true\">"));
+            ml(b, out);
+            out.push_str(&format!("<mo stretchy=\"{wide}\">{}</mo></{tag}>", mx(g)));
+        }
+        Node::Space(em) => {
+            if *em > 0.0 {
+                out.push_str(&format!("<mspace width=\"{:.2}em\"/>", em.min(8.0)));
+            }
+        }
+        Node::Over(b, t) => {
+            out.push_str("<mover>");
+            ml(b, out);
+            ml(t, out);
+            out.push_str("</mover>");
+        }
+        Node::Under(b, t) => {
+            out.push_str("<munder>");
+            ml(b, out);
+            ml(t, out);
+            out.push_str("</munder>");
+        }
+    }
+}
+
+fn ml_fence_open(out: &mut String, d: &str) {
+    ml_fence(out, d);
+}
+
+/// Children of an mrow-like container without an extra wrapper when the node is already a row.
+fn ml_inner(n: &Node, out: &mut String) {
+    match n {
+        Node::Row(v) => {
+            for x in v {
+                ml(x, out);
+            }
+        }
+        x => ml(x, out),
+    }
+}
+
+/// An argument that must be exactly one element (e.g. the radicand): rows get a wrapper.
+fn ml_row(n: &Node, out: &mut String) {
+    match n {
+        Node::Row(v) if v.len() == 1 => ml(&v[0], out),
+        Node::Row(v) => {
+            out.push_str("<mrow>");
+            for x in v {
+                ml(x, out);
+            }
+            out.push_str("</mrow>");
+        }
+        x => ml(x, out),
+    }
+}
+
+/// MathML Core markup for a TeX formula (`display` = a block equation; otherwise inline math). Never panics; unknown commands come
+/// out as literal text exactly like in the on-screen renderer. The TeX source travels along in an `<annotation>`.
+pub fn to_mathml(tex: &str, display: bool) -> String {
+    let ast = parse(tex);
+    let mut body = String::new();
+    ml_row(&ast, &mut body);
+    format!(
+        "<math xmlns=\"http://www.w3.org/1998/Math/MathML\" display=\"{}\"><semantics>{}<annotation encoding=\"application/x-tex\">{}</annotation></semantics></math>",
+        if display { "block" } else { "inline" },
+        body,
+        mx(tex)
+    )
+}
+
+#[cfg(test)]
+mod mathml_tests {
+    use super::*;
+
+    #[test]
+    fn mathml_keeps_the_structure() {
+        let m = to_mathml(r"\frac{a+b}{\sqrt{c}}", true);
+        assert!(m.contains("<mfrac>") && m.contains("<msqrt>") && m.contains("display=\"block\""));
+        let m = to_mathml(r"\sum_{i=1}^{n} x_i^2", false);
+        assert!(m.contains("<munderover>") && m.contains("<msubsup>") && m.contains("display=\"inline\""));
+        let m = to_mathml(r"\int_0^1 f(x)\,dx", true);
+        assert!(m.contains("<msubsup>") && m.contains("largeop"));
+        let m = to_mathml(r"\begin{pmatrix} a & b \\ c & d \end{pmatrix}", true);
+        assert!(m.contains("<mtable") && m.matches("<mtr>").count() == 2 && m.matches("<mtd").count() == 4);
+        let m = to_mathml(r"\begin{cases} x & x>0 \\ 0 & \text{else} \end{cases}", true);
+        assert!(m.contains("cases") && m.contains("&gt;"));
+        // hostile / broken input never panics and never leaks raw markup
+        let m = to_mathml(r"\frac{<script>}{", true);
+        assert!(!m.contains("<script>"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

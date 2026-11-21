@@ -195,14 +195,23 @@ pub const SHAPE_STYLES: [&str; 4] = ["Tinted", "Outline", "Solid", "Hand-drawn"]
 /// Outline of a shape geometry inside `r` as a closed polygon (curves are sampled). Every outline is star-shaped around the centre of `r`,
 /// so a triangle fan from the centre is a correct fill.
 pub fn geo_points(geo: u8, r: Rect) -> Vec<Pos2> {
+    geo_points_px(geo, r, crate::crisp::px_scale())
+}
+
+/// Like [`geo_points`] with an explicit `px_per_unit` (physical pixels per unit of `r`): curves are sampled finely enough that the
+/// polygon is a true circle / ellipse / rounded corner at that size (see `crisp`). SVG export uses real `<ellipse>` / `<rect rx>` instead.
+pub fn geo_points_px(geo: u8, r: Rect, px_per_unit: f32) -> Vec<Pos2> {
     let (cx, cy) = (r.center().x, r.center().y);
     let (hw, hh) = (r.width() / 2.0, r.height() / 2.0);
     let at = |u: f32, v: f32| pos2(r.min.x + u * r.width(), r.min.y + v * r.height());
     match geo {
-        2 => (0..56).map(|i| {
-            let a = i as f32 / 56.0 * std::f32::consts::TAU;
-            pos2(cx + hw * a.cos(), cy + hh * a.sin())
-        }).collect(),
+        2 => {
+            let n = crate::crisp::arc_steps_at(hw.max(hh), std::f32::consts::TAU, px_per_unit).max(56);
+            (0..n).map(|i| {
+                let a = i as f32 / n as f32 * std::f32::consts::TAU;
+                pos2(cx + hw * a.cos(), cy + hh * a.sin())
+            }).collect()
+        }
         3 => vec![at(0.5, 0.0), at(1.0, 0.5), at(0.5, 1.0), at(0.0, 0.5)],
         4 => vec![at(0.5, 0.0), at(1.0, 1.0), at(0.0, 1.0)],
         5 => vec![at(0.25, 0.0), at(0.75, 0.0), at(1.0, 0.5), at(0.75, 1.0), at(0.25, 1.0), at(0.0, 0.5)],
@@ -225,9 +234,10 @@ pub fn geo_points(geo: u8, r: Rect) -> Vec<Pos2> {
             let rad = rad.min(hw).min(hh);
             let mut v = Vec::new();
             let corners = [(r.max.x - rad, r.min.y + rad, -90.0_f32), (r.max.x - rad, r.max.y - rad, 0.0), (r.min.x + rad, r.max.y - rad, 90.0), (r.min.x + rad, r.min.y + rad, 180.0)];
+            let seg = crate::crisp::arc_steps_at(rad, std::f32::consts::FRAC_PI_2, px_per_unit).max(7);
             for (ccx, ccy, a0) in corners {
-                for k in 0..=7 {
-                    let a = (a0 + k as f32 / 7.0 * 90.0).to_radians();
+                for k in 0..=seg {
+                    let a = (a0 + k as f32 / seg as f32 * 90.0).to_radians();
                     v.push(pos2(ccx + rad * a.cos(), ccy + rad * a.sin()));
                 }
             }

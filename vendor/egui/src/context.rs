@@ -2291,6 +2291,9 @@ impl Context {
 impl ContextImpl {
     fn end_pass(&mut self) -> FullOutput {
         let ended_viewport_id = self.viewport_id();
+        // Lumen: layer transforms (zoomed whiteboard cards) re-lay text out at the final size
+        let crisp_ppp = self.pixels_per_point();
+        epaint::set_crisp_fonts(self.fonts.get(&crisp_ppp.into()).cloned());
         let viewport = self.viewports.entry(ended_viewport_id).or_default();
         let pixels_per_point = viewport.input.pixels_per_point;
 
