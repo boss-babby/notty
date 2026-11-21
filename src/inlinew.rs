@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use egui::{pos2, vec2, Align2, CursorIcon, Id, Margin, Pos2, Rect, RichText, Sense, Stroke, Ui};
 
 use crate::dashboard::{self as dash, Nav, GAP, HEADER_H, UNIT};
-use crate::dashcfg::{self as cfg, MAX_ROWS};
+use crate::dashcfg::{self as cfg, Widget, MAX_ROWS};
 use crate::dashedit::{self, Gallery};
 use crate::dashwidgets::{self as dw, Cx, Drill};
 use crate::lucide as l;
@@ -36,6 +36,8 @@ struct St {
     assign: Option<(u64, u64)>,
     /// A widget that the user deleted from its menu: its block is removed on the next draw.
     delete: Option<u64>,
+    /// (canvas node id, widget id): the gallery picked a widget for a whiteboard node.
+    canvas_assign: Option<(u64, u64)>,
 }
 
 thread_local! {
@@ -48,6 +50,35 @@ pub struct Out {
     /// The user deleted the widget: remove the block.
     pub remove: bool,
     pub nav: Nav,
+}
+
+/// Marks a gallery target as a whiteboard node (block ids and node ids live in different number spaces).
+const CANVAS_TAG: u64 = 1 << 62;
+
+/// Opens the widget gallery; the widget that is chosen is handed to whiteboard node `node` (see [`take_canvas_assign`]).
+pub fn request_pick_canvas(ws: &mut Workspace, node: u64) {
+    request_pick(ws, node | CANVAS_TAG);
+}
+
+/// The (node, widget) pair chosen in the gallery for a whiteboard node, once.
+pub fn take_canvas_assign() -> Option<(u64, u64)> {
+    ST.with(|s| s.borrow_mut().canvas_assign.take())
+}
+
+/// Opens the settings panel of widget `id`.
+pub fn inspect(id: u64) {
+    ST.with(|s| s.borrow_mut().inspect = Some(id));
+}
+
+/// Maps the position of a drill-down popup that was just opened from layer-local to screen coordinates.
+pub fn drill_to_screen(f: impl Fn(Pos2) -> Pos2) {
+    ST.with(|s| {
+        if let Some(d) = s.borrow_mut().drill.as_mut() {
+            if d.fresh {
+                d.at = f(d.at);
+            }
+        }
+    });
 }
 
 /// Opens the widget gallery; the chosen widget is assigned to block `block`.
@@ -133,9 +164,18 @@ pub fn draw(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, b: &mut Block, w: f3
     if !ui.clip_rect().expand(300.0).intersects(r) {
         return out;
     }
+    let selected = ST.with(|s| s.borrow().inspect == Some(wd.id) || s.borrow().menu.map_or(false, |m| m.0 == wd.id));
+    paint_card(ui, ws, pal, &wd, b.id, r, false, selected, &mut out.nav);
+    out
+}
+
+/// Paints one dashboard widget as a card inside `r` (header + content). `canvas`: the card sits on a whiteboard — no header buttons
+/// (settings / options live in the board's selection toolbar). Shared by the page blocks and the whiteboard's widget nodes.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_card(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, wd: &Widget, block: u64, r: Rect, canvas: bool, selected: bool, nav: &mut Nav) {
+    let wd = wd.clone();
     let def = dw::def_for(&wd);
     let title = dash::auto_title(ws, def.as_ref(), &wd);
-    let selected = ST.with(|s| s.borrow().inspect == Some(wd.id) || s.borrow().menu.map_or(false, |m| m.0 == wd.id));
     dash::card_frame(ui, pal, r, false, selected, ui.rect_contains_pointer(r));
 
     // header: icon · title · settings · menu (both always visible — no hover / right-click needed on a phone)
@@ -150,8 +190,9 @@ pub fn draw(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, b: &mut Block, w: f3
     let bw = if crate::touch::touchy() { 38.0 } else { 30.0 };
     let more = Rect::from_min_size(pos2(hr.right() - bw + 6.0, hr.center().y - 15.0), vec2(bw, 30.0));
     let gear = Rect::from_min_size(pos2(more.left() - bw, more.top()), vec2(bw, 30.0));
-    text_fit(ui.painter(), pos2(tx, hr.center().y), Align2::LEFT_CENTER, &title, bold(14.0), pal.text, (gear.left() - tx - 6.0).max(30.0));
-    for (rect, glyph, id, tip) in [(gear, l::SETTINGS, "iw_gear", "Widget settings"), (more, l::ELLIPSIS, "iw_more", "Widget options")] {
+    text_fit(ui.painter(), pos2(tx, hr.center().y), Align2::LEFT_CENTER, &title, bold(14.0), pal.text, (if canvas { hr.right() } else { gear.left() } - tx - 6.0).max(30.0));
+    let btns: &[(Rect, &str, &str, &str)] = if canvas { &[] } else { &[(gear, l::SETTINGS, "iw_gear", "Widget settings"), (more, l::ELLIPSIS, "iw_more", "Widget options")] };
+    for &(rect, glyph, id, tip) in btns {
         let resp = ui.interact(rect, Id::new((id, wd.id)), Sense::click());
         if resp.hovered() || resp.is_pointer_button_down_on() {
             ui.painter().rect_filled(rect.shrink(2.0), 8.0, pal.hover);
@@ -163,7 +204,7 @@ pub fn draw(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, b: &mut Block, w: f3
                 if id == "iw_gear" {
                     s.inspect = if s.inspect == Some(wd.id) { None } else { Some(wd.id) };
                 } else {
-                    s.menu = Some((wd.id, b.id, rect.left_bottom() + vec2(-200.0, 4.0)));
+                    s.menu = Some((wd.id, block, rect.left_bottom() + vec2(-200.0, 4.0)));
                     s.fresh = true;
                 }
             });
@@ -182,7 +223,7 @@ pub fn draw(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, b: &mut Block, w: f3
             let configure;
             {
                 let drill = &mut s.drill;
-                let mut cx = Cx { ws, pal, nav: &mut out.nav, drill, global, wid: wd.id, configure: false };
+                let mut cx = Cx { ws, pal, nav: &mut *nav, drill, global, wid: wd.id, configure: false };
                 match &def {
                     Some(d) => (d.draw)(&mut cx, &mut copy, &mut child),
                     None => {
@@ -201,7 +242,6 @@ pub fn draw(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, b: &mut Block, w: f3
             }
         }
     }
-    out
 }
 
 enum Act {
@@ -293,7 +333,11 @@ pub fn overlays(ctx: &egui::Context, ws: &mut Workspace, pal: &Palette) -> Nav {
                 dashedit::GalleryResult::Open => st.gallery = Some((g, bid)),
                 dashedit::GalleryResult::Close => {}
                 dashedit::GalleryResult::Added(id) => {
-                    st.assign = Some((bid, id));
+                    if bid & CANVAS_TAG != 0 {
+                        st.canvas_assign = Some((bid & !CANVAS_TAG, id));
+                    } else {
+                        st.assign = Some((bid, id));
+                    }
                     st.inspect = Some(id);
                     nav.toast = Some("Widget added — adjust it in the settings panel".into());
                 }

@@ -175,10 +175,10 @@ pub fn draw_edge(f: &Frame, c: &Canvas, e: &Edge, selected: bool, hovered: bool)
     if e.arrow == Arrow::Both {
         arrow_head(f.p, spts[0], d_start, hs, hc);
     }
-    if !e.label.is_empty() && z > 0.3 {
+    if !e.label.is_empty() && z > 0.05 {
         let mid = f.pt(cv::path_mid(&pts));
-        let g = f.p.layout_no_wrap(e.label.clone(), body((12.5 * z).clamp(9.0, 22.0)), f.pal.text);
-        let r = Rect::from_center_size(mid, g.size() + vec2(14.0, 8.0));
+        let g = f.p.layout_no_wrap(e.label.clone(), body(12.5 * z), f.pal.text);
+        let r = Rect::from_center_size(mid, g.size() + vec2(14.0, 8.0) * z);
         f.p.rect_filled(r, r.height() / 2.0, f.pal.card);
         f.p.rect_stroke(r, r.height() / 2.0, Stroke::new(1.0_f32, if selected { f.pal.accent } else { f.pal.border }), StrokeKind::Inside);
         f.p.galley(r.center() - g.size() / 2.0, g, f.pal.text);
@@ -371,12 +371,13 @@ pub fn draw_node(f: &Frame, ws: &Workspace, n: &Node, st: &NodeSt, out: &mut Dra
     out.drawn += 1;
     let z = f.z();
     let pal = f.pal;
-    let rad = (10.0 * z).clamp(2.0, 14.0);
+    let rad = (10.0 * z).clamp(0.6, 14.0);
     let (fill, border, acc) = card_colors(pal, n.color);
     let acc_col = acc.unwrap_or(pal.accent);
-    let tiny = r.width() < 54.0 || z < 0.2;
+    // vector style: everything scales with the board down to the point where glyphs are sub-pixel (≈ 1.6 px); only then are bars drawn
+    let tiny = r.width() < 9.0 || z < 0.06;
     let px = 14.5 * z;
-    let lod = px < 6.5;
+    let lod = px < 1.6;
 
     match n.kind {
         Kind::Group => {
@@ -386,13 +387,13 @@ pub fn draw_node(f: &Frame, ws: &Workspace, n: &Node, st: &NodeSt, out: &mut Dra
             f.p.rect_stroke(r, rad + 2.0, Stroke::new(1.2_f32, bc), StrokeKind::Inside);
             let label = if n.text.is_empty() { "Group" } else { n.text.as_str() };
             if !st.editing {
-                let fs = (13.5 * z).max(if z < 0.4 { 11.0 } else { 0.0 });
-                let pill_h = (26.0 * z).max(fs * 1.7);
+                let fs = 13.5 * z;
+                let pill_h = 26.0 * z;
                 let g = f.p.layout_no_wrap(label.to_owned(), bold(fs), acc.unwrap_or(pal.text));
-                let pw = (g.size().x + 22.0 * z.max(0.6)).min(r.width() - 12.0 * z);
-                let pill = Rect::from_min_size(r.min + vec2(10.0 * z, 9.0 * z), vec2(pw.max(24.0), pill_h));
+                let pw = (g.size().x + 22.0 * z).min(r.width() - 12.0 * z);
+                let pill = Rect::from_min_size(r.min + vec2(10.0 * z, 9.0 * z), vec2(pw.max(24.0 * z), pill_h));
                 f.p.rect_filled(pill, pill_h / 2.0, acc.map(|a| with_alpha(a, if is_dark(pal) { 0.28 } else { 0.16 })).unwrap_or_else(|| with_alpha(pal.muted, 0.2)));
-                text_fit(f.p, pill.left_center() + vec2(11.0 * z.max(0.6), 0.0), Align2::LEFT_CENTER, label, bold(fs), acc.unwrap_or(pal.text), (pill.width() - 18.0).max(8.0));
+                text_fit(f.p, pill.left_center() + vec2(11.0 * z, 0.0), Align2::LEFT_CENTER, label, bold(fs), acc.unwrap_or(pal.text), (pill.width() - 18.0 * z).max(8.0 * z));
             }
         }
         Kind::Ink => {
@@ -409,6 +410,21 @@ pub fn draw_node(f: &Frame, ws: &Workspace, n: &Node, st: &NodeSt, out: &mut Dra
             }
         }
         Kind::Shape => draw_shape(f, n, st, r, lod),
+        Kind::Dash => {
+            // the widget itself is painted by `canvasdash::draw_all` (it needs the mutable workspace); here: empty slot / far-zoom stand-in
+            if !crate::canvasdash::has_widget(ws, n.num) {
+                fake_shadow(f, r, rad, st.selected);
+                f.p.rect_filled(r, rad, with_alpha(pal.card, 0.6));
+                dashed_rect(f, r, rad, pal.muted);
+                if !lod {
+                    icons::glyph(f.p, r.center() + vec2(0.0, -10.0 * z), 20.0 * z, l::LAYOUT_DASHBOARD, pal.muted);
+                    f.p.text(r.center() + vec2(0.0, 14.0 * z), Align2::CENTER_CENTER, "Choose a dashboard widget", body(13.0 * z), pal.muted);
+                }
+            } else if tiny {
+                f.p.rect_filled(r, rad, fill);
+                f.p.rect_stroke(r, rad, Stroke::new(1.0_f32, border), StrokeKind::Inside);
+            }
+        }
         Kind::Embed | Kind::Pdf | Kind::File | Kind::DbView | Kind::Widget => crate::canvasx::draw(f, ws, n, st, r, rad, lod, tiny, out),
         Kind::Text => {
             if st.selected || st.hovered {
@@ -522,7 +538,7 @@ pub fn draw_node(f: &Frame, ws: &Workspace, n: &Node, st: &NodeSt, out: &mut Dra
                     let host = crate::media::host_of(&n.url);
                     let title = if n.text.trim().is_empty() { host.clone() } else { n.text.trim().to_owned() };
                     let tx = tile.right() + 12.0 * z;
-                    let tw = (r.right() - tx - pad - 18.0 * z).max(20.0);
+                    let tw = (r.right() - tx - pad - 18.0 * z).max(20.0 * z);
                     text_fit(f.p, pos2(tx, r.center().y - 9.0 * z), Align2::LEFT_CENTER, &title, bold(14.5 * z), pal.text, tw);
                     text_fit(f.p, pos2(tx, r.center().y + 10.0 * z), Align2::LEFT_CENTER, n.url.trim_start_matches("https://").trim_start_matches("http://"), body(12.0 * z), pal.muted, tw);
                     let b = Rect::from_center_size(pos2(r.right() - pad, r.top() + pad + 2.0 * z), vec2(24.0 * z.max(0.8), 24.0 * z.max(0.8)));

@@ -359,6 +359,7 @@ fn add_at(st: &mut St, c: &mut Canvas, kind: Kind, at: Pos2) -> u64 {
             st.pop_fresh = true;
             st.page_query.clear();
         }
+        Kind::Dash => crate::canvasdash::request(crate::canvasdash::Cmd::Pick, id),
         Kind::Widget | Kind::Ink => {}
     }
     id
@@ -446,6 +447,10 @@ enum Act {
     AddDb,
     Widgets,
     AddWidget(u8),
+    AddDash,
+    DashLive,
+    DashSettings,
+    DashPick,
     Templates,
     Tpl(Tpl),
     Paste,
@@ -599,6 +604,7 @@ fn act(a: Act, st: &mut St, c: &mut Canvas, ws: &mut Workspace, ctx: &Context, p
                             st.pop_fresh = true;
                             st.page_query.clear();
                         }
+                        Kind::Dash => crate::canvasdash::request(crate::canvasdash::Cmd::Open, id),
                         Kind::Widget => {
                             st.pop = Some(Pop::Widget(id));
                             st.pop_fresh = true;
@@ -621,6 +627,19 @@ fn act(a: Act, st: &mut St, c: &mut Canvas, ws: &mut Workspace, ctx: &Context, p
         }
         Act::ReplaceSrc => {
             act(Act::Edit, st, c, ws, ctx, page, out, at);
+        }
+        Act::AddDash => {
+            add_at(st, c, Kind::Dash, at);
+        }
+        Act::DashLive | Act::DashSettings | Act::DashPick => {
+            let cmd = match a {
+                Act::DashLive => crate::canvasdash::Cmd::Open,
+                Act::DashSettings => crate::canvasdash::Cmd::Configure,
+                _ => crate::canvasdash::Cmd::Pick,
+            };
+            for id in sel.iter().filter(|i| c.node(**i).map_or(false, |n| n.kind == Kind::Dash)) {
+                crate::canvasdash::request(cmd, *id);
+            }
         }
         Act::Duplicate => {
             if !sel.is_empty() {
@@ -919,7 +938,7 @@ fn run(ui: &mut Ui, ws: &mut Workspace, page: u64, pal: &Palette, c: &mut Canvas
             st.hover = c.hit_node(wpos(hp), hit_slack(st, c), 34.0);
         }
     }
-    if !multi && !st.present.is_some() {
+    if !multi && !st.present.is_some() && !ctx.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos())).is_some_and(crate::canvasdash::live_blocks) {
         pointer(&ctx, ui, ws, page, &resp, c, st, out, origin, over_canvas, touchy, pal);
     }
 
@@ -941,6 +960,24 @@ fn run(ui: &mut Ui, ws: &mut Workspace, page: u64, pal: &Palette, c: &mut Canvas
         for n in c.nodes.iter().filter(|n| n.kind != Kind::Group) {
             draw::draw_node(&f, ws, n, &nst(n.id), &mut dout);
         }
+    }
+    // dashboard widgets: laid out in design units, scaled with the board (vector style), between the cards and the selection handles
+    {
+        let sel_ids: Vec<u64> = st.sel.iter().copied().collect();
+        let mut dnav = crate::dashboard::Nav::default();
+        crate::canvasdash::draw_all(ui, ws, pal, c, &sel_ids, origin, rect, &mut dnav);
+        let over = crate::inlinew::overlays(&ctx, ws, pal);
+        for nv in [dnav, over] {
+            if let Some(o) = nv.out.open {
+                out.open = Some(o);
+            }
+            if let Some(t) = nv.toast {
+                crate::dashcfg::set_toast(&t);
+            }
+        }
+    }
+    {
+        let f = Frame { p: &painter, ui: &*ui, pal, view: c.view, origin, clip: rect };
         draw_overlays_world(&f, c, st, &ctx);
     }
     // auto-grow
@@ -1662,6 +1699,7 @@ fn finish_pointer(ctx: &Context, ui: &Ui, ws: &mut Workspace, page: u64, resp: &
                                 st.page_query.clear();
                             }
                         }
+                        Kind::Dash => crate::canvasdash::request(crate::canvasdash::Cmd::Open, id),
                         Kind::Widget => {
                             st.pop = Some(Pop::Widget(id));
                             st.pop_fresh = true;
@@ -2689,6 +2727,12 @@ fn selection_toolbar(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, 
             if n.kind == Kind::Widget {
                 btns.push(B::Act(Act::ReplaceSrc, l::SETTINGS, "Edit widget", false));
             }
+            if n.kind == Kind::Dash {
+                let live = crate::canvasdash::live() == n.id;
+                btns.push(B::Act(Act::DashLive, l::PLAY, if live { "Done interacting  (Esc)" } else { "Interact with the widget  (double-click)" }, live));
+                btns.push(B::Act(Act::DashSettings, l::SETTINGS, "Widget settings", false));
+                btns.push(B::Act(Act::DashPick, l::REPLACE, "Choose another widget", false));
+            }
             if n.kind != Kind::Ink {
                 btns.push(B::Act(Act::AddChild, l::CIRCLE_PLUS, "Add connected card  (Tab)", false));
             }
@@ -3109,6 +3153,7 @@ fn menus(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canv
             }
         }
         MenuKind::Widgets => {
+            items.push((CtxItem::new(l::LAYOUT_DASHBOARD, "Dashboard widget…").hint("charts · numbers · tasks"), Act::AddDash));
             for (i, w) in crate::canvasx::WIDGETS.iter().enumerate() {
                 items.push((CtxItem::new(w.1, w.2), Act::AddWidget(i as u8)));
             }
@@ -3196,7 +3241,7 @@ fn menus(ui: &mut Ui, ctx: &Context, ws: &mut Workspace, page: u64, c: &mut Canv
     let key = match m.kind {
         MenuKind::Add => 1,
         MenuKind::Templates => 2,
-        MenuKind::Widgets => 7,
+        MenuKind::Widgets => 9,
         MenuKind::Canvas => 3,
         MenuKind::Context(Target::Empty) => 4,
         MenuKind::Context(Target::Node(_)) => 5,

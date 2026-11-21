@@ -157,6 +157,11 @@ pub struct LumenApp {
     row_menu: Option<(u64, Pos2)>,
     side_menu: Option<Pos2>,
     ws_menu: Option<Pos2>,
+    /// Workspace switcher: registry, the serialised inactive workspaces, which of them changed since the last save, delete confirmation.
+    wsreg: crate::workspaces::Registry,
+    wsother: std::collections::BTreeMap<u64, String>,
+    wsdirty: std::collections::HashSet<u64>,
+    ws_confirm_delete: bool,
     /// Raw text of a stored workspace that could not be parsed (kept under its own storage key on the next save).
     rescued: Option<String>,
     trash_open: bool,
@@ -238,6 +243,18 @@ impl LumenApp {
             media.register(&cc.egui_ctx);
         }
         let ai = crate::ai::AiHost { st: cc.storage.and_then(|s| eframe::get_value::<crate::ai::AiState>(s, crate::ai::STORAGE_KEY)).unwrap_or_default(), rt: Default::default() };
+        let mut wsreg = cc.storage.and_then(|s| eframe::get_value::<crate::workspaces::Registry>(s, crate::workspaces::REG_KEY)).unwrap_or_default();
+        wsreg.ensure(&ws.name);
+        let mut wsother = std::collections::BTreeMap::new();
+        if let Some(s) = cc.storage {
+            for m in wsreg.list.iter().filter(|m| m.id != wsreg.active) {
+                if let Some(t) = s.get_string(&crate::workspaces::key(m.id)).filter(|t| !t.trim().is_empty()) {
+                    wsother.insert(m.id, t);
+                }
+            }
+        }
+        let active_id = wsreg.active;
+        wsreg.list.retain(|m| m.id == active_id || wsother.contains_key(&m.id));
         let mut ed = EditorState::default();
         ed.media_sizes = media.items.iter().map(|(k, v)| (*k, v.size)).collect();
         Self {
@@ -251,6 +268,10 @@ impl LumenApp {
             row_menu: None,
             side_menu: None,
             ws_menu: None,
+            wsreg,
+            wsother,
+            wsdirty: Default::default(),
+            ws_confirm_delete: false,
             trash_open: false,
             security: None,
             fresh: false,
@@ -1349,6 +1370,83 @@ impl LumenApp {
         }
     }
 
+    /// Replaces the open workspace by `next` and resets everything that points into the old one.
+    fn install_workspace(&mut self, ctx: &Context, mut next: Workspace) {
+        for pg in &next.pages {
+            theme::ensure_scripts(ctx, &pg.title);
+            for b in pg.blocks.iter().filter(|b| b.kind.has_text()) {
+                theme::ensure_scripts(ctx, &b.text);
+            }
+        }
+        if next.current.map_or(true, |c| next.page(c).is_none()) {
+            next.current = next.pages.iter().find(|p| !p.trashed && !p.row).map(|p| p.id);
+        }
+        self.ws = next;
+        self.auto_rt.resync(&self.ws);
+        let sizes = std::mem::take(&mut self.ed.media_sizes);
+        self.ed = EditorState::default();
+        self.ed.media_sizes = sizes;
+        crate::canvasdash::set_live(0);
+        self.palette = None;
+        self.row_menu = None;
+        self.side_menu = None;
+        self.ws_menu = None;
+        self.trash_open = false;
+        self.shown_page = None;
+        self.calc_dirty = true;
+        ctx.request_repaint();
+    }
+
+    fn switch_workspace(&mut self, ctx: &Context, target: u64) {
+        if target == self.wsreg.active {
+            return;
+        }
+        let Some(text) = self.wsother.get(&target).cloned() else { return };
+        let Ok(mut next) = serde_json::from_str::<Workspace>(&text) else {
+            self.toast("That workspace could not be read", None);
+            return;
+        };
+        crate::bigtable::flush_all();
+        let Ok(current) = serde_json::to_string(&self.ws) else {
+            self.toast("The current workspace could not be saved — not switching", None);
+            return;
+        };
+        next.migrate();
+        self.wsreg.sync_active_name(&self.ws.name);
+        let old = self.wsreg.active;
+        self.wsother.insert(old, current);
+        self.wsdirty.insert(old);
+        self.wsother.remove(&target);
+        self.wsreg.active = target;
+        let name = next.name.clone();
+        self.install_workspace(ctx, next);
+        self.toast(&format!("Switched to {name}"), None);
+    }
+
+    fn new_workspace(&mut self, ctx: &Context) {
+        let name = self.wsreg.fresh_name();
+        let ws = Workspace::blank(&name, self.ws.dark, self.ws.accent);
+        let Ok(text) = serde_json::to_string(&ws) else { return };
+        let id = self.wsreg.add(&name);
+        self.wsother.insert(id, text);
+        self.wsdirty.insert(id);
+        self.switch_workspace(ctx, id);
+    }
+
+    /// Deletes the open workspace (the next one in the list is opened). The last workspace cannot be deleted.
+    fn delete_workspace(&mut self, ctx: &Context) {
+        let cur = self.wsreg.active;
+        let Some(target) = self.wsreg.list.iter().find(|m| m.id != cur).map(|m| m.id) else { return };
+        let gone = self.ws.name.clone();
+        self.switch_workspace(ctx, target);
+        if self.wsreg.active == target {
+            self.wsother.remove(&cur);
+            self.wsdirty.remove(&cur);
+            self.wsreg.remove(cur);
+            self.toast(&format!("Workspace “{gone}” deleted"), None);
+        }
+    }
+
     fn ws_menu_ui(&mut self, ctx: &Context, pal: &Palette) {
         let Some(pos) = self.ws_menu else { return };
         let mut act: Option<u8> = None;
@@ -1356,6 +1454,12 @@ impl LumenApp {
         let dark = self.ws.dark;
         let accent = self.ws.accent;
         let mut acc_pick: Option<usize> = None;
+        self.wsreg.sync_active_name(&self.ws.name);
+        let wlist: Vec<(u64, String)> = self.wsreg.list.iter().map(|m| (m.id, m.name.clone())).collect();
+        let w_active = self.wsreg.active;
+        let confirm = self.ws_confirm_delete;
+        let mut w_act: Option<(u8, u64)> = None;
+        let mut w_confirm = confirm;
         let name = &mut self.ws.name;
         let open = popup_area(ctx, Id::new("ws_menu"), pos, pal, &mut self.fresh, 286.0, |ui| {
             section_label(ui, pal, "WORKSPACE");
@@ -1363,6 +1467,30 @@ impl LumenApp {
                 ui.add_space(6.0);
                 ui.add(TextEdit::singleline(name).font(bold(15.0)).frame(false).desired_width(220.0).margin(Margin::symmetric(0, 4)));
             });
+            ui.add_space(3.0);
+            ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
+            ui.add_space(4.0);
+            section_label(ui, pal, "WORKSPACES");
+            for (id, nm) in &wlist {
+                let on = *id == w_active;
+                let shown = if nm.trim().is_empty() { "Untitled" } else { nm.as_str() };
+                if menu_item(ui, pal, if on { l::CHECK } else { l::BRIEFCASE }, shown, None, on, false).clicked() && !on {
+                    w_act = Some((0, *id));
+                }
+            }
+            if menu_item(ui, pal, l::CIRCLE_PLUS, "New workspace", None, false, false).clicked() {
+                w_act = Some((1, 0));
+            }
+            if wlist.len() > 1 {
+                let label = if confirm { "Click again to delete this workspace" } else { "Delete this workspace…" };
+                if menu_item(ui, pal, l::TRASH_2, label, None, confirm, true).clicked() {
+                    if confirm {
+                        w_act = Some((2, 0));
+                    } else {
+                        w_confirm = true;
+                    }
+                }
+            }
             ui.add_space(3.0);
             ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
             ui.add_space(4.0);
@@ -1412,8 +1540,15 @@ impl LumenApp {
         if let Some(i) = acc_pick {
             self.ws.accent = i;
         }
-        if !open || act.is_some() {
+        self.ws_confirm_delete = w_confirm && open && w_act.is_none();
+        if !open || act.is_some() || w_act.is_some() {
             self.ws_menu = None;
+        }
+        match w_act {
+            Some((0, id)) => self.switch_workspace(ctx, id),
+            Some((1, _)) => self.new_workspace(ctx),
+            Some((2, _)) => self.delete_workspace(ctx),
+            _ => {}
         }
         match act {
             Some(0) => self.ws.dark = !self.ws.dark,
@@ -2212,6 +2347,17 @@ impl eframe::App for LumenApp {
             storage.set_string(VERSION_KEY, env!("CARGO_PKG_VERSION").to_owned());
         }
         eframe::set_value(storage, STORAGE_KEY, &SavedRef { ws: &self.ws, cred: &self.cred, skipped: self.skipped_setup });
+        // other workspaces (only the ones that changed hands since the last save are rewritten)
+        self.wsreg.sync_active_name(&self.ws.name);
+        for id in std::mem::take(&mut self.wsdirty) {
+            if let Some(text) = self.wsother.get(&id) {
+                storage.set_string(&crate::workspaces::key(id), text.clone());
+            }
+        }
+        for id in std::mem::take(&mut self.wsreg.removed) {
+            storage.set_string(&crate::workspaces::key(id), String::new());
+        }
+        eframe::set_value(storage, crate::workspaces::REG_KEY, &self.wsreg);
         self.media.save(storage);
         eframe::set_value(storage, crate::ai::STORAGE_KEY, &self.ai.st.for_save());
     }

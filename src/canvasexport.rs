@@ -98,7 +98,7 @@ pub fn to_svg(c: &Canvas, dark: bool, title_of: &dyn Fn(u64) -> String) -> Strin
                     let _ = write!(o, "<text x=\"{:.1}\" y=\"{:.1}\" font-size=\"13\" fill=\"{fg}\" text-anchor=\"middle\">image</text>", r.center().x, r.center().y);
                 }
             }
-            Kind::Note | Kind::Todo | Kind::Page | Kind::Link | Kind::Embed | Kind::Pdf | Kind::File | Kind::DbView | Kind::Widget => {
+            Kind::Note | Kind::Todo | Kind::Page | Kind::Link | Kind::Embed | Kind::Pdf | Kind::File | Kind::DbView | Kind::Widget | Kind::Dash => {
                 let _ = write!(o, "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" rx=\"10\" fill=\"{card}\" stroke=\"{}\"/>", r.min.x, r.min.y, r.width(), r.height(), if n.color > 0 { acc.clone() } else { line.to_owned() });
                 if n.color > 0 {
                     let _ = write!(o, "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"3\" height=\"{:.1}\" fill=\"{acc}\"/>", r.min.x, r.min.y + 10.0, (r.height() - 20.0).max(1.0));
@@ -108,6 +108,7 @@ pub fn to_svg(c: &Canvas, dark: bool, title_of: &dyn Fn(u64) -> String) -> Strin
                     Kind::DbView => format!("{} (database)", n.page.map(title_of).unwrap_or_default()),
                     Kind::Pdf | Kind::File => format!("{} ({})", if n.text.is_empty() { &n.url } else { &n.text }, if n.kind == Kind::Pdf { "PDF" } else { "file" }),
                     Kind::Widget => crate::canvasx::search_text(n),
+                    Kind::Dash => "Dashboard widget".to_owned(),
                     Kind::Link | Kind::Embed => {
                         if n.text.is_empty() {
                             n.url.clone()

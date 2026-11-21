@@ -194,7 +194,7 @@ pub fn section_label(ui: &mut Ui, pal: &Palette, text: &str) {
 /// Paints single-line text that is truncated with an ellipsis instead of overflowing its box. Returns the painted width.
 pub fn text_fit(p: &egui::Painter, pos: Pos2, anchor: Align2, text: &str, font: egui::FontId, color: Color32, max_w: f32) -> f32 {
     let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
-    job.wrap = egui::text::TextWrapping::truncate_at_width(max_w.max(10.0));
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_w.max(1.0));
     let g = p.layout_job(job);
     let rect = anchor.anchor_size(pos, g.size());
     let w = g.size().x;

@@ -375,12 +375,16 @@ pub fn draw(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: 
         }
     }
     let touchy = crate::touch::touchy();
+    // page zoom: text (through body()/bold()), cell padding, column widths and row heights all follow the content size
+    let s = crate::theme::content_z();
+    let (pad_x, pad_y) = (PAD_X * s, PAD_Y * s);
     let gutter = if touchy { 22.0 } else { 14.0 };
     let grip_h = if touchy { 22.0 } else { 14.0 };
     let hw = if touchy { 13.0 } else { 5.0 };
     let avail = (w - gutter).max(200.0);
 
-    let colw = layout_widths(&t.w, avail);
+    let colw_d = layout_widths(&t.w, avail / s);
+    let colw: Vec<f32> = colw_d.iter().map(|c| c * s).collect();
     let mut xs = vec![0.0f32; nc + 1];
     for ci in 0..nc {
         xs[ci + 1] = xs[ci] + colw[ci];
@@ -397,7 +401,7 @@ pub fn draw(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: 
             let head = ri == 0 && b.checked;
             let font = if head { &f_head } else { &f_body };
             let mut job = rich_job(cell, font, pal.text, pal, true);
-            job.wrap.max_width = colw[ci] - PAD_X * 2.0;
+            job.wrap.max_width = colw[ci] - pad_x * 2.0;
             if cell.is_empty() {
                 job = rich_job(" ", font, pal.text, pal, true);
             }
@@ -406,7 +410,7 @@ pub fn draw(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: 
             gr.push(g);
         }
         galleys.push(gr);
-        heights[ri] = (heights[ri].max(20.0) + PAD_Y * 2.0).max(t.h[ri]);
+        heights[ri] = (heights[ri].max(20.0 * s) + pad_y * 2.0).max(t.h[ri] * s);
     }
     let mut ys = vec![0.0f32; nr + 1];
     for ri in 0..nr {
@@ -462,7 +466,7 @@ pub fn draw(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: 
                     let back = ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab));
                     let esc = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
                     let font = if head { f_head.clone() } else { f_body.clone() };
-                    let inner = cell.shrink2(vec2(PAD_X, PAD_Y));
+                    let inner = cell.shrink2(vec2(pad_x, pad_y));
                     let r = ui.put(inner, TextEdit::multiline(&mut t.rows[ri][ci]).id(eid).frame(false).desired_rows(1).desired_width(inner.width()).font(font).text_color(pal.text).margin(egui::Margin::ZERO));
                     if st.fresh {
                         ui.memory_mut(|m| m.request_focus(eid));
@@ -505,10 +509,10 @@ pub fn draw(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: 
                     let gw = g.size().x;
                     let x = match t.al[ci] {
                         'c' => cell.center().x - gw / 2.0,
-                        'r' => cell.right() - PAD_X - gw,
-                        _ => cell.left() + PAD_X,
+                        'r' => cell.right() - pad_x - gw,
+                        _ => cell.left() + pad_x,
                     };
-                    p.with_clip_rect(cell).galley(pos2(x, cell.top() + PAD_Y), g, pal.text);
+                    p.with_clip_rect(cell).galley(pos2(x, cell.top() + pad_y), g, pal.text);
                     if resp.on_hover_cursor(CursorIcon::Text).clicked() {
                         next = Some((ri, ci));
                         st.fresh = true;
@@ -540,10 +544,10 @@ pub fn draw(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: 
                 p.line_segment([pos2(x, rect.center().y - 12.0), pos2(x, rect.center().y + 12.0)], Stroke::new(3.0_f32, with_alpha(pal.muted, 0.6)));
             }
             if r.drag_started() && widths_now.iter().any(|w| *w <= 0.0) {
-                widths_now = colw.clone(); // freeze the automatic widths so only this border moves
+                widths_now = colw_d.clone(); // freeze the automatic widths so only this border moves
             }
             if r.dragged() {
-                widths_now[ci] = (widths_now[ci] + r.drag_delta().x).clamp(MIN_COL, MAX_COL);
+                widths_now[ci] = (widths_now[ci] + r.drag_delta().x / s).clamp(MIN_COL, MAX_COL);
                 dragging_w = true;
             }
             if r.double_clicked() {
@@ -568,10 +572,10 @@ pub fn draw(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: 
                 p.line_segment([pos2(rect.left(), y), pos2(rect.right(), y)], Stroke::new(2.5_f32, pal.accent));
             }
             if r.drag_started() {
-                heights_now[ri] = heights[ri];
+                heights_now[ri] = heights[ri] / s;
             }
             if r.dragged() {
-                heights_now[ri] = (heights_now[ri].max(heights[ri]) + r.drag_delta().y).max(MIN_ROW);
+                heights_now[ri] = (heights_now[ri].max(heights[ri] / s) + r.drag_delta().y / s).max(MIN_ROW);
                 dragging_h = true;
             }
             if r.double_clicked() {
@@ -600,7 +604,7 @@ pub fn draw(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: 
         }
         if cr.dragged() {
             let factor = ((total_w + cr.drag_delta().x) / total_w.max(1.0)).clamp(0.5, 2.0);
-            t.w = colw.iter().map(|w| (w * factor).clamp(MIN_COL, MAX_COL)).collect();
+            t.w = colw_d.iter().map(|w| (w * factor).clamp(MIN_COL, MAX_COL)).collect();
             changed = true;
             ctx.request_repaint();
         }
@@ -799,14 +803,14 @@ pub fn draw(ui: &mut Ui, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: 
                 let font = if ri == 0 && b.checked { &f_head } else { &f_body };
                 let mut job = rich_job(&row[c], font, pal.text, pal, true);
                 job.wrap.max_width = f32::INFINITY;
-                wmax = wmax.max(ui.fonts(|f| f.layout_job(job)).size().x + PAD_X * 2.0 + 4.0);
+                wmax = wmax.max((ui.fonts(|f| f.layout_job(job)).size().x + pad_x * 2.0) / s + 4.0);
             }
-            let mut cur: Vec<f32> = t.w.iter().zip(&colw).map(|(a, b)| if *a > 0.0 { *a } else { *b }).collect();
+            let mut cur: Vec<f32> = t.w.iter().zip(&colw_d).map(|(a, b)| if *a > 0.0 { *a } else { *b }).collect();
             cur[c] = wmax.clamp(MIN_COL, 600.0).round();
             t.w = cur;
         } else {
             let structural = !matches!(op, Op::Align(..) | Op::ToggleHeader | Op::ResetRowH(_) | Op::EqualCols | Op::FitWidth);
-            apply_op(&mut t, &mut b.checked, &mut st.sorted, op, avail);
+            apply_op(&mut t, &mut b.checked, &mut st.sorted, op, avail / s);
             if structural {
                 next = None;
             }

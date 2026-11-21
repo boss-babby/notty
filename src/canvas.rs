@@ -51,6 +51,8 @@ pub enum Kind {
     DbView,
     /// Editable widget (counter, timer, pomodoro, progress, poll, clock, calendar, sheet). State lives in [`Node::data`].
     Widget,
+    /// Any widget of the dashboard catalogue (chart, number, tasks …); `num` is the id of the widget in the workspace's widget store.
+    Dash,
 }
 
 impl Kind {
@@ -70,6 +72,7 @@ impl Kind {
             Kind::File => vec2(272.0, 76.0),
             Kind::DbView => vec2(460.0, 280.0),
             Kind::Widget => vec2(236.0, 150.0),
+            Kind::Dash => vec2(420.0, 260.0),
         }
     }
     pub fn min_size(self) -> Vec2 {
@@ -81,6 +84,7 @@ impl Kind {
             Kind::Shape => vec2(28.0, 28.0),
             Kind::Embed | Kind::DbView | Kind::Pdf => vec2(160.0, 110.0),
             Kind::Widget => vec2(140.0, 90.0),
+            Kind::Dash => vec2(180.0, 120.0),
             _ => vec2(120.0, 56.0),
         }
     }
@@ -1208,6 +1212,7 @@ impl Canvas {
                 Some("File") => Kind::File,
                 Some("DbView") => Kind::DbView,
                 Some("Widget") => Kind::Widget,
+                Some("Dash") => Kind::Dash,
                 Some("Note") => Kind::Note,
                 _ => match ty {
                     "group" => Kind::Group,

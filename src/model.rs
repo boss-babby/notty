@@ -1861,6 +1861,24 @@ impl Workspace {
 
     // ───────── first-run content ─────────
 
+    /// An empty workspace for the workspace switcher: one welcome page, no sample data. Look (dark mode, accent) is inherited.
+    pub fn blank(name: &str, dark: bool, accent: usize) -> Self {
+        let mut ws = Workspace { name: name.into(), pages: vec![], next_id: 0, bigs: BTreeMap::new(), current: None, dark, sidebar_open: true, accent, icons_v2: false, pdf_annots: BTreeMap::new(), dash: Default::default(), auto: Default::default() };
+        let start = ws.add_page(None, PageKind::Doc);
+        let bl = vec![
+            ws.blk(BlockKind::Text, "This is a fresh workspace — pages, databases, canvases and dashboards you create here stay separate from your other workspaces.", 0),
+            ws.blk(BlockKind::Bullet, "Press Ctrl+K (or the search row) to create something or jump anywhere", 0),
+            ws.blk(BlockKind::Bullet, "Switch workspaces any time from the name at the top of the sidebar", 0),
+        ];
+        if let Some(p) = ws.page_mut(start) {
+            p.title = "Getting started".into();
+            p.icon = "👋".into();
+            p.blocks = bl;
+        }
+        ws.current = Some(start);
+        ws
+    }
+
     pub fn seed() -> Self {
         let mut ws = Workspace { name: "My Workspace".into(), pages: vec![], next_id: 0, bigs: BTreeMap::new(), current: None, dark: false, sidebar_open: true, accent: 0, icons_v2: false, pdf_annots: BTreeMap::new(), dash: Default::default(), auto: Default::default() };
         use BlockKind::*;

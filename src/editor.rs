@@ -2226,6 +2226,7 @@ fn draw_block(
             changed |= crate::autoui::button_block(ui, b, ed, pal, w);
         }
         BlockKind::Table => {
+            let _zoom = crate::theme::ContentScale::new(ed.scale);
             changed |= crate::tableblock::draw(ui, b, ed, pal, w);
         }
         BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File => {

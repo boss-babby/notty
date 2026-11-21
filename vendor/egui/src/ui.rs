@@ -518,6 +518,12 @@ impl Ui {
     /// });
     /// # });
     /// ```
+    /// Lumen: denies all interaction (like [`Self::disable`]) but keeps the normal, un-faded look. Used for live widgets on the
+    /// whiteboard that only react to the pointer once they have been activated.
+    pub fn freeze(&mut self) {
+        self.enabled = false;
+    }
+
     pub fn disable(&mut self) {
         self.enabled = false;
         if self.is_visible() {
