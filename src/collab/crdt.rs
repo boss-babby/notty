@@ -118,6 +118,28 @@ pub struct Applied {
     pub n: usize,
 }
 
+/// Largest accepted value of one entity (a block, a page header, a canvas card …).
+const MAX_VALUE: usize = 4 << 20;
+/// Entities one replica will hold (a hostile editor cannot grow the host without bound).
+const MAX_ENTITIES: usize = 3_000_000;
+
+/// Would giving `pid` the parent `parent` make the page tree loop?
+fn would_cycle(ws: &Workspace, pid: u64, parent: Option<u64>) -> bool {
+    let mut cur = parent;
+    let mut steps = 0usize;
+    while let Some(c) = cur {
+        if c == pid {
+            return true;
+        }
+        steps += 1;
+        if steps > ws.pages.len() + 1 {
+            return true;
+        }
+        cur = ws.page(c).and_then(|p| p.parent);
+    }
+    false
+}
+
 fn hash_of(val: &Option<String>, pos: f64) -> u64 {
     let mut h = match val {
         Some(s) => crate::media::fnv(s.as_bytes()),
@@ -297,6 +319,11 @@ impl Replica {
                 out
             }
         }
+    }
+
+    /// Is this page part of what the session shares (a workspace share shares everything)?
+    fn in_scope_page(&self, ws: &Workspace, pid: u64) -> bool {
+        self.scope.kind == ScopeKind::Workspace || self.in_scope.contains(&pid) || (ws.page(pid).is_none() && self.cells.contains_key(&Key::Page(pid)))
     }
 
     fn page_allowed(&self, pid: u64, parent: Option<u64>) -> bool {
@@ -505,6 +532,10 @@ impl Replica {
 
     /// Merges one remote operation. Returns `true` when it changed this replica (the caller then forwards it to the other peers).
     pub fn apply(&mut self, ws: &mut Workspace, op: &Op, now: u64, applied: &mut Applied) -> bool {
+        // a value this large is an attack (or a bug), not a block: never let one entity swallow the memory of the host
+        if op.e.val.as_ref().map_or(false, |v| v.len() > MAX_VALUE) || !op.e.pos.is_finite() || self.cells.len() > MAX_ENTITIES {
+            return false;
+        }
         self.clock.observe(op.e.hlc, now);
         let new_hash = hash_of(&op.e.val, op.e.pos);
         if let Some(c) = self.cells.get(&op.key) {
@@ -514,6 +545,11 @@ impl Replica {
         }
         let ok = match (&op.key, &op.e.val) {
             (Key::Page(pid), None) => {
+                // deleting a page is an operation on that page: it must be inside the shared scope (an editor of ONE shared page
+                // could otherwise delete any page of the host by guessing its small sequential id)
+                if !self.in_scope_page(ws, *pid) {
+                    return false;
+                }
                 ws.pages.retain(|p| p.id != *pid);
                 self.in_scope.remove(pid);
                 applied.reorder_pages = true;
@@ -583,6 +619,7 @@ impl Replica {
                 }
                 _ => false,
             },
+            (Key::Annot(doc, _), _) if self.scope.kind != ScopeKind::Workspace && !self.docs.contains(doc) => false,
             (Key::Annot(doc, aid), val) => {
                 let list = ws.pdf_annots.entry(*doc).or_default();
                 match val {
@@ -632,6 +669,15 @@ impl Replica {
     fn apply_page(&mut self, ws: &mut Workspace, pid: u64, json: &str, applied: &mut Applied) -> bool {
         let Ok(mut np) = serde_json::from_str::<Page>(json) else { return false };
         if !self.page_allowed(pid, np.parent) {
+            return false;
+        }
+        // page take-over: a page that already exists on this device but is not part of the shared scope cannot be pulled into it by
+        // claiming a shared parent (that would let a guest read / overwrite any page of the host)
+        if self.scope.kind != ScopeKind::Workspace && !self.in_scope.contains(&pid) && ws.page(pid).is_some() {
+            return false;
+        }
+        // a page can never be its own ancestor: a cycle would hang the sidebar / breadcrumb of every device
+        if np.parent == Some(pid) || would_cycle(ws, pid, np.parent) {
             return false;
         }
         np.id = pid;
@@ -833,5 +879,51 @@ mod tests {
             assert_eq!(p.blocks[0].text, "from A");
             assert_eq!(p.blocks[1].text, "from B");
         }
+    }
+
+    fn page_op(ws: &mut Workspace, pid: u64, parent: Option<u64>, hlc: u64) -> Op {
+        let mut p = ws.page(pid).cloned().unwrap_or_else(|| ws.pages[0].clone());
+        p.id = pid;
+        p.parent = parent;
+        p.blocks.clear();
+        Op { key: Key::Page(pid), e: Entry { hlc: Hlc { t: hlc, r: 9 }, pos: 1.0, val: serde_json::to_string(&p).ok() } }
+    }
+
+    #[test]
+    fn a_guest_cannot_take_over_delete_or_loop_pages_outside_its_scope() {
+        let mut a = Workspace::seed();
+        let ids: Vec<u64> = a.pages.iter().map(|p| p.id).collect();
+        assert!(ids.len() >= 3);
+        let tops: Vec<u64> = a.pages.iter().filter(|p| p.parent.is_none()).map(|p| p.id).collect();
+        assert!(tops.len() >= 2, "seed has two top-level pages");
+        let (root, other) = (tops[0], tops[1]);
+        let mut ra = Replica::new(1, Scope { kind: ScopeKind::Tree, root });
+        ra.adopt(&mut a, 1000);
+        let mut ap = Applied::default();
+        // 1. delete a page outside the shared tree
+        let del = Op { key: Key::Page(other), e: Entry { hlc: Hlc { t: 5_000_000_000_000, r: 9 }, pos: 1.0, val: None } };
+        assert!(!ra.apply(&mut a, &del, 6000, &mut ap), "delete outside scope must be refused");
+        assert!(a.page(other).is_some());
+        // 2. pull an existing outside page into the tree by claiming the shared root as its parent
+        let hijack = page_op(&mut a, other, Some(root), 5_000_000_000_000);
+        assert!(!ra.apply(&mut a, &hijack, 6000, &mut ap), "take-over of an existing page must be refused");
+        // 3. a page that is its own parent
+        let selfp = page_op(&mut a, root, Some(root), 5_000_000_000_001);
+        assert!(!ra.apply(&mut a, &selfp, 6000, &mut ap), "self parent must be refused");
+        // 4. oversize value
+        let mut big = page_op(&mut a, root, None, 5_000_000_000_002);
+        big.e.val = Some("x".repeat(MAX_VALUE + 1));
+        assert!(!ra.apply(&mut a, &big, 6000, &mut ap), "oversize value must be refused");
+    }
+
+    #[test]
+    fn parent_cycles_are_detected() {
+        let mut a = Workspace::seed();
+        let (x, y) = (a.pages[0].id, a.pages[1].id);
+        a.page_mut(y).unwrap().parent = Some(x);
+        assert!(would_cycle(&a, x, Some(y)));
+        assert!(would_cycle(&a, x, Some(x)));
+        assert!(!would_cycle(&a, y, Some(x)));
+        assert!(!would_cycle(&a, x, None));
     }
 }

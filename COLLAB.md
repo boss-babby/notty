@@ -185,3 +185,67 @@ protects them on the wire); a malicious *approved Editor* can of course edit or 
 | 8 | Tombstone GC | open |
 | 9 | WebRTC for browser hosting | open |
 | 10 | Comments / @mentions | open |
+
+## 9. Pass 3 — scope audit, reconnect, relay on the site (this delivery)
+
+Method: second review of everything an *approved* guest (Editor) or a stranger can still do after pass 2, plus a look at failure modes
+(network drops, screen off, slow peers). Every fix below has a test (`cargo test --lib collab`, 12 tests).
+
+### 9.1 Findings and fixes
+| # | Finding | Severity | Fix |
+|---|---|---|---|
+| 15 | **Page take-over.** In a *Tree* share a guest could send a `Page` op for an *existing, unshared* page id and name a shared page as parent: `page_allowed` accepted it, the page was overwritten and pulled into the shared scope (its blocks then synced out). Ids are small and sequential. | High | `apply_page` refuses a page that exists locally but is not in scope. Test `a_guest_cannot_take_over_delete_or_loop_pages_outside_its_scope`. |
+| 16 | **Delete outside scope.** `Key::Page` tombstones were applied without any scope check: an editor of ONE page could delete any page of the host. | High | Deletes need the page to be in scope (`in_scope_page`). |
+| 17 | **PDF annotation scope.** `Key::Annot` ops were applied for any document id. | Medium | Only for documents referenced by shared pages (`docs`), workspace shares unchanged. |
+| 18 | **Page-tree cycles.** `A.parent = B`, `B.parent = A` from a hostile editor (or a bad merge) loops every sidebar / breadcrumb walk → UI hang on all devices. | High (DoS) | `would_cycle` walk before applying a page; self-parent refused. |
+| 19 | **Unbounded entity values / count.** One 20 MB block, millions of tiny ones. | Medium (DoS) | ≤ 4 MiB per entity value, ≤ 3 M entities per replica, non-finite positions refused. Digest cap 3 M → 1 M entries per connection. |
+| 20 | **Kick was not a ban.** A removed guest still held the share token and rejoined as Editor at once. | High | Removed devices are banned by their Noise static key for the session (`banned`). |
+| 21 | **Role laundering.** A guest demoted to *View* reconnected with the token and was auto-approved as Editor again. | High | Demoted keys are remembered (`demoted`) and re-admitted as viewers. |
+| 22 | **Slow-loris on the WebSocket handshake.** The 5 s socket timeout restarts with every byte, so a stranger could hold one of the 48 connection slots forever. | Medium (DoS) | Hard 8 s handshake deadline (`HandshakeGuard`) on accept and on dial. |
+| 23 | **Unbounded inbox.** A peer sending at wire speed while the UI thread is not running (screen off, Android background) queued events without limit. | Medium (memory) | Socket threads stop reading while > 4 096 events wait (TCP back-pressure). |
+| 24 | **Silent half-open sessions.** On the relay (and on a dead Wi-Fi) an authenticated peer that vanished was never noticed. | Medium (reliability) | Heartbeat watchdog: no frame for 45 s ⇒ connection closed ⇒ reconnect logic (below). |
+| 25 | Android build ships the *development* release keystore inside the repository (`android/lumen-release.jks`, password in `Cargo.toml` / `build-android.sh`). | Info | Kept so that updates install over earlier APKs. For your own distribution generate a key (`LUMEN_KEYSTORE`, `LUMEN_KEYSTORE_PASS` are honoured by `build-android.sh`) and keep it out of git. |
+
+### 9.2 Reliability: automatic reconnect with digest resync (roadmap item 5, joiner side)
+A joined device that loses its connection (Wi-Fi blip, host asleep, relay hiccup, 45 s of silence) no longer ends the session:
+* the **replica, the workspace and the session description are kept**; only the transports are torn down;
+* the dial is repeated with back-off 0.8 / 2 / 4 / 7 / 10 / 15 / 20 / 30 s (8 attempts), the UI shows the normal "connecting" state and a toast;
+* on `Welcome` for the **same session id** the joiner sends its *real* digest instead of an empty one, so anti-entropy transfers whatever
+  changed on either side while it was away (offline edits are merged by the normal LWW rules; deletions stay deleted);
+* a different session id at the same address (host restarted) is treated as a fresh join, a `Denied` / `Bye` / kick ends the session at once;
+* a viewer stays read-only while reconnecting.
+Test: `a_dropped_connection_is_re_dialled_and_catches_up` (real sockets, edits on both sides while disconnected).
+
+### 9.3 The relay lives in this repository's website
+`src/app/api/collab/route.ts` + `src/lib/relay.ts` implement the protocol `relay.rs` speaks: `POST {room, from, k, msgs:[{to, m}]}` (`to` 0 = everybody else) and
+long-poll `GET ?room&me&k&since` → `{next, items:[{from, m}]}`. Controls: room code is the capability (uppercase, 4–32 chars), each
+(room, device id) is bound to a per-session key on first use (403 otherwise), ≤ 400 rooms / 12 per address / 24 members, log ≤ 3 000 frames and 24 MiB,
+frame ≤ 512 KiB, body ≤ 6 MiB, token-bucket per address, hello frames older than 60 s are never replayed, 30 min idle expiry, memory only.
+Frames are opaque sealed Noise records — losing one (log trimmed) breaks the AEAD nonce sequence, the connection is dropped and the reconnect above repairs it.
+
+### 9.4 Task list status (after pass 3)
+| # | Task | State |
+|---|---|---|
+| 1 | Text CRDT (`yrs`) inside blocks | open — still the biggest gap; entity LWW remains (on a same-block conflict the newer whole-block value wins) |
+| 2 | Encrypted transport, viewers read-only, bans | **done** (trusted-device *persistence* across restarts still open: Noise keys are per process) |
+| 3 | Android deep link, MulticastLock | **done**; camera QR scan, NSD open |
+| 4 | PDF realtime readers | open |
+| 5 | Mesh / host hand-over | **joiner reconnect done**; host hand-over open |
+| 6 | Big tables sync | open |
+| 7 | Compression | **done** |
+| 8 | Tombstone GC | open — needs "all peers acknowledged" bookkeeping; tombstones are 48 B each |
+| 9 | WebRTC for browser hosting | open |
+| 10 | Comments / @mentions | open |
+
+### 9.5 Ideas not done (ranked)
+1. `yrs` Y.Text per text block (largest user-visible win: two people typing in the same paragraph).
+2. Persist the device key + "trusted devices" (approve once, auto-join later) — pair with Android Keystore.
+3. Camera QR scan on Android (Java activity → `join_text`), NSD discovery.
+4. Binary framing (postcard) for the relay.
+5. Tombstone GC with acknowledgements; snapshot checkpoints.
+
+### 9.6 Verified against the website relay
+`LUMEN_RELAY_TEST=http://127.0.0.1:3000 cargo test --lib site_relay -- --ignored` runs the real Rust client (host + joiner, `ehttp`) against the
+running site: Noise handshake over the room, initial sync, joiner → host edit (stable over repeated runs). Note: the relay shows a device only frames posted
+*after* it first appeared in the room (so a late joiner never receives somebody else's old handshake); a host therefore has to be polling before the link is
+shared — which is always the case in the app (the link only exists once the room does).

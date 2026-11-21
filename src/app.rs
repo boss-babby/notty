@@ -2461,7 +2461,7 @@ impl eframe::App for LumenApp {
         crate::crisp::set_zoom(1.0);
         self.ed.embed_rects.clear();
         // a person who joined as "View": no typing, pasting, cutting or deleting in this client (the host drops such edits anyway)
-        if self.collab.mode == crate::collab::Mode::Joined && self.collab.role == crate::collab::Role::Viewer {
+        if (self.collab.mode == crate::collab::Mode::Joined || self.collab.reconnecting()) && self.collab.role == crate::collab::Role::Viewer {
             ctx.input_mut(|i| {
                 i.events.retain(|e| match e {
                     egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut | egui::Event::Ime(_) => false,

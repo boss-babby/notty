@@ -54,6 +54,35 @@ impl Drop for Slot {
     }
 }
 
+/// Slow-loris protection: the WebSocket handshake gets a hard deadline. (The socket read timeout alone is reset by every byte, so a
+/// stranger dribbling one byte every few seconds could hold a connection slot forever.)
+struct HandshakeGuard(Arc<AtomicBool>);
+
+impl HandshakeGuard {
+    fn arm(stream: &TcpStream, secs: u64) -> HandshakeGuard {
+        let done = Arc::new(AtomicBool::new(false));
+        if let Ok(s) = stream.try_clone() {
+            let d = done.clone();
+            let _ = std::thread::Builder::new().name("lumen-collab-guard".into()).spawn(move || {
+                for _ in 0..secs * 5 {
+                    std::thread::sleep(Duration::from_millis(200));
+                    if d.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            });
+        }
+        HandshakeGuard(done)
+    }
+}
+
+impl Drop for HandshakeGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 struct WsSink {
     tx: Sender<Option<Msg>>,
 }
@@ -111,6 +140,12 @@ fn pump(mut ws: WebSocket<TcpStream>, conn: ConnId, inbox: Inbox, rx: Receiver<O
             slow = want_slow;
             let _ = ws.get_ref().set_read_timeout(Some(Duration::from_millis(if slow { 90 } else { 15 })));
         }
+        // back-pressure: while the UI thread has a big backlog (screen off, huge sync) stop reading, so the kernel's TCP window fills
+        // instead of this process's memory
+        if inbox.pending() > 4096 {
+            std::thread::sleep(Duration::from_millis(10));
+            last_rx = Instant::now();
+        } else {
         match ws.read() {
             Ok(Message::Text(t)) => {
                 last_rx = Instant::now();
@@ -129,6 +164,7 @@ fn pump(mut ws: WebSocket<TcpStream>, conn: ConnId, inbox: Inbox, rx: Receiver<O
                 why = "Connection lost";
                 break;
             }
+        }
         }
         loop {
             match rx.try_recv() {
@@ -190,7 +226,9 @@ impl Net {
                                 let _slot = slot;
                                 let _ = stream.set_nonblocking(false);
                                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                                let guard = HandshakeGuard::arm(&stream, 8);
                                 let Ok(ws) = tungstenite::accept_with_config(stream, Some(ws_config())) else { return };
+                                drop(guard);
                                 let (tx, rx) = channel();
                                 let conn = inbox.conn_id();
                                 inbox.push(Event::Open { conn, sink: Box::new(WsSink { tx }), addr: peer.ip().to_string(), incoming: true });
@@ -216,7 +254,9 @@ impl Net {
             let Some(sa) = addr.to_socket_addrs().ok().and_then(|mut a| a.next()) else { return fail("That address is not valid") };
             let Ok(stream) = TcpStream::connect_timeout(&sa, Duration::from_secs(4)) else { return fail("Could not reach that device — are you on the same Wi-Fi?") };
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let guard = HandshakeGuard::arm(&stream, 8);
             let Ok((ws, _)) = tungstenite::client::client_with_config(format!("ws://{addr}/"), stream, Some(ws_config())) else { return fail("That device did not answer as a Lumen host") };
+            drop(guard);
             let (tx, rx) = channel();
             inbox.push(Event::Open { conn, sink: Box::new(WsSink { tx }), addr: sa.ip().to_string(), incoming: false });
             pump(ws, conn, inbox, rx, stop);

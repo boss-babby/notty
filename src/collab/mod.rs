@@ -203,6 +203,10 @@ impl Inbox {
         }
         self.ctx.request_repaint();
     }
+    /// Events waiting for the UI thread (transports stop reading their socket while this is large: TCP back-pressure instead of memory).
+    pub fn pending(&self) -> usize {
+        self.q.lock().map_or(0, |q| q.len())
+    }
     pub fn conn_id(&self) -> ConnId {
         self.next.fetch_add(1, Ordering::Relaxed)
     }
@@ -246,6 +250,24 @@ pub struct JoinRequest {
     pub peer: PeerInfo,
     pub addr: String,
 }
+
+/// How this device joined (kept so a dropped connection can be re-dialled).
+#[derive(Clone)]
+enum Target {
+    Addr { addr: String, token: String },
+    Relay { base: String, room: String, token: String },
+}
+
+/// A joined session whose connection broke: the replica and the workspace stay, the dial is retried with a back-off and the next
+/// digest exchange transfers whatever changed on either side in the meantime.
+struct Resume {
+    attempt: u32,
+    next_at: f64,
+    session: String,
+}
+
+/// Back-off between reconnect attempts (milliseconds); after the last one the session ends.
+const RESUME_DELAYS: [f64; 8] = [800.0, 2000.0, 4000.0, 7000.0, 10_000.0, 15_000.0, 20_000.0, 30_000.0];
 
 #[derive(Default)]
 pub struct Ui {
@@ -295,6 +317,12 @@ pub struct Collab {
     relay_init: Option<Arc<Mutex<secure::Crypt>>>,
     /// Wrong-token attempts per address: (count, last time).
     fails: HashMap<String, (u32, f64)>,
+    target: Option<Target>,
+    resume: Option<Resume>,
+    /// Devices (by Noise static key) the host removed: they cannot walk back in with the share token.
+    banned: HashSet<Vec<u8>>,
+    /// Devices (by Noise static key) that were demoted to viewers: reconnecting with the token does not make them editors again.
+    demoted: HashSet<Vec<u8>>,
     /// The attachment currently being streamed to a peer (so a big PDF is read from disk once, not once per chunk).
     pub serving: Option<(u64, Arc<[u8]>)>,
     presence: HashMap<u32, (Presence, f64)>,
@@ -422,6 +450,10 @@ impl Collab {
             keys: secure::gen_keys().map(Arc::new),
             relay_init: None,
             fails: HashMap::new(),
+            target: None,
+            resume: None,
+            banned: HashSet::new(),
+            demoted: HashSet::new(),
             serving: None,
             presence: HashMap::new(),
             local: Presence { peer: id, ..Default::default() },
@@ -581,32 +613,87 @@ impl Collab {
 
     pub fn join_addr(&mut self, addr: &str, token: &str) {
         self.stop(false);
-        self.mode = Mode::Joining;
-        self.joining_since = mono_ms();
-        self.token = token.to_owned();
-        self.last_error = None;
         let addr = if addr.contains(':') { addr.to_owned() } else { format!("{addr}:{PORT}") };
-        #[cfg(not(target_arch = "wasm32"))]
-        self.net.connect(&addr, &self.inbox);
-        #[cfg(target_arch = "wasm32")]
-        webnet::connect(&addr, &self.inbox);
+        self.target = Some(Target::Addr { addr, token: token.to_owned() });
+        self.dial();
     }
 
     pub fn join_relay(&mut self, base: &str, room: &str, token: &str) {
         self.stop(false);
+        self.target = Some(Target::Relay { base: base.to_owned(), room: room.to_owned(), token: token.to_owned() });
+        self.dial();
+    }
+
+    /// Opens the connection described by `self.target` (first join and every reconnect).
+    fn dial(&mut self) {
+        let Some(t) = self.target.clone() else { return };
         self.mode = Mode::Joining;
         self.joining_since = mono_ms();
-        self.token = token.to_owned();
         self.last_error = None;
-        self.relay = Some(relay::Relay::start(base, room, self.me.id, &self.inbox));
-        // tell the room we are here (first handshake message): whoever hosts answers, the encrypted channel is set up from there
-        if let (Some(r), Some(keys)) = (&self.relay, self.keys.clone()) {
-            let mut cr = secure::Crypt::new();
-            if let Some(d) = cr.start_initiator(&keys) {
-                self.relay_init = Some(Arc::new(Mutex::new(cr)));
-                r.hello(&Msg::Hs { d });
+        match t {
+            Target::Addr { addr, token } => {
+                self.token = token;
+                #[cfg(not(target_arch = "wasm32"))]
+                self.net.connect(&addr, &self.inbox);
+                #[cfg(target_arch = "wasm32")]
+                webnet::connect(&addr, &self.inbox);
+            }
+            Target::Relay { base, room, token } => {
+                self.token = token;
+                self.relay = Some(relay::Relay::start(&base, &room, self.me.id, &self.inbox));
+                // tell the room we are here (first handshake message): whoever hosts answers, the encrypted channel is set up from there
+                if let (Some(r), Some(keys)) = (&self.relay, self.keys.clone()) {
+                    let mut cr = secure::Crypt::new();
+                    if let Some(d) = cr.start_initiator(&keys) {
+                        self.relay_init = Some(Arc::new(Mutex::new(cr)));
+                        r.hello(&Msg::Hs { d });
+                    }
+                }
             }
         }
+    }
+
+    /// True while a joined session is re-dialling its host after the connection broke.
+    pub fn reconnecting(&self) -> bool {
+        self.resume.is_some()
+    }
+
+    /// A joined device lost its connection for a transport reason: keep the replica / workspace and schedule another dial.
+    /// Returns `false` when the session should end instead (host left on purpose, removed, too many failures).
+    fn try_resume(&mut self, why: &str, was_joined: bool) -> bool {
+        let transient = ["Connection lost", "timed out", "closed the connection", "Could not reach", "did not answer"].iter().any(|k| why.contains(k));
+        if !(was_joined || self.resume.is_some()) || !transient || self.target.is_none() || self.rep.is_none() || !self.ready {
+            return false;
+        }
+        let session = match (&self.resume, &self.session) {
+            (Some(r), _) => r.session.clone(),
+            (None, Some(s)) => s.id.clone(),
+            _ => return false,
+        };
+        let attempt = self.resume.as_ref().map_or(0, |r| r.attempt);
+        if attempt as usize >= RESUME_DELAYS.len() {
+            return false;
+        }
+        // tear down the dead transports, but not the replica, the workspace binding or the session description
+        for c in self.conns.values() {
+            c.sink.close();
+        }
+        self.conns.clear();
+        self.relay_init = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.net.stop();
+        if let Some(r) = self.relay.take() {
+            r.stop();
+        }
+        self.inq.clear();
+        self.ops_in.clear();
+        self.mode = Mode::Joining;
+        self.joining_since = mono_ms();
+        self.resume = Some(Resume { attempt: attempt + 1, next_at: mono_ms() + RESUME_DELAYS[attempt as usize], session });
+        if attempt == 0 {
+            self.toast("Connection lost — reconnecting…");
+        }
+        true
     }
 
     fn hello(&self, hash: &[u8]) -> Msg {
@@ -630,6 +717,9 @@ impl Collab {
             *g = None;
         }
         self.mode = Mode::Off;
+        self.resume = None;
+        self.banned.clear();
+        self.demoted.clear();
         self.rep = None;
         self.session = None;
         self.roster.clear();
@@ -682,10 +772,21 @@ impl Collab {
 
     pub fn set_role(&mut self, id: u32, role: Role) {
         let mut changed = false;
+        let mut keys: Vec<Vec<u8>> = vec![];
         for c in self.conns.values_mut() {
             if c.peer.as_ref().map_or(false, |p| p.id == id) {
                 c.role = role;
                 changed = true;
+                if let Ok(x) = c.crypt.lock() {
+                    keys.push(x.remote.clone());
+                }
+            }
+        }
+        for k in keys.into_iter().filter(|k| !k.is_empty()) {
+            if role == Role::Viewer {
+                self.demoted.insert(k);
+            } else {
+                self.demoted.remove(&k);
             }
         }
         if changed {
@@ -702,6 +803,11 @@ impl Collab {
         let conn = self.conns.iter().find(|(_, c)| c.peer.as_ref().map_or(false, |p| p.id == id)).map(|(k, _)| *k);
         if let Some(k) = conn {
             if let Some(c) = self.conns.remove(&k) {
+                if let Ok(x) = c.crypt.lock() {
+                    if !x.remote.is_empty() {
+                        self.banned.insert(x.remote.clone());
+                    }
+                }
                 c.sink.send(&Msg::Denied { reason: "You were removed from the session".into() });
                 c.sink.close();
             }
@@ -828,6 +934,12 @@ impl Collab {
         let now = mono_ms();
         if let Some(r) = &self.relay {
             r.tick();
+        }
+        if self.resume.as_ref().map_or(false, |r| now >= r.next_at) && self.conns.is_empty() {
+            if let Some(r) = self.resume.as_mut() {
+                r.next_at = f64::MAX; // until this attempt fails (Closed / reap) or succeeds (Welcome)
+            }
+            self.dial();
         }
         self.handle_events();
         if now - self.last_reap > 2000.0 {
@@ -1112,8 +1224,14 @@ impl Collab {
                 } else if age > 300_000.0 {
                     dead.push((*id, "Request expired"));
                 }
-            } else if age > 300_000.0 {
+            } else if age > if self.resume.is_some() { 25_000.0 } else { 300_000.0 } {
                 dead.push((*id, "The host did not answer"));
+            }
+        }
+        // an authenticated connection that went completely silent (heartbeats are sent every 3 s): unplugged / out of range / host asleep
+        for (id, c) in &self.conns {
+            if c.active && now - c.last_rx > 45_000.0 {
+                dead.push((*id, "The connection timed out"));
             }
         }
         for (id, why) in dead {
@@ -1127,7 +1245,14 @@ impl Collab {
         }
         self.fails.retain(|_, (_, t)| now - *t < 600_000.0);
         // joining a room that nobody answers (typo in the code, host gone)
-        if self.mode == Mode::Joining && self.conns.is_empty() && now - self.joining_since > 30_000.0 {
+        if self.resume.as_ref().map_or(false, |r| r.next_at == f64::MAX) && self.conns.is_empty() && now - self.joining_since > 25_000.0 {
+            // a reconnect dial that nobody answered (relay: no Closed event ever comes)
+            if !self.try_resume("Could not reach", false) {
+                self.stop(false);
+                self.last_error = Some("Could not reconnect — the shared copy stays on this device".into());
+                self.toast("Could not reconnect — the shared copy stays on this device");
+            }
+        } else if self.mode == Mode::Joining && self.resume.is_none() && self.conns.is_empty() && now - self.joining_since > 30_000.0 {
             self.stop(false);
             let msg = "Nobody answered — check the room code and that the host is still sharing";
             self.last_error = Some(msg.into());
@@ -1152,6 +1277,9 @@ impl Collab {
             Mode::Joining | Mode::Joined => {
                 if self.conns.is_empty() {
                     let was_joined = self.mode == Mode::Joined;
+                    if self.try_resume(why, was_joined) {
+                        return;
+                    }
                     let msg = if was_joined { "The host ended the session — the shared copy stays on this device".to_owned() } else if why.is_empty() { "Could not reach that device".to_owned() } else { why.to_owned() };
                     self.stop(false);
                     self.last_error = Some(msg.clone());
@@ -1187,6 +1315,13 @@ impl Collab {
                     }
                     None => return,
                 };
+                if !remote.is_empty() && self.banned.contains(&remote) {
+                    if let Some(c) = self.conns.get(&conn) {
+                        c.sink.send(&Msg::Denied { reason: "You were removed from this session".into() });
+                    }
+                    self.drop_conn(conn, "removed");
+                    return;
+                }
                 let now = mono_ms();
                 let locked = self.fails.get(&peer_key(&addr)).map_or(false, |(n, t)| *n >= 5 && now - *t < 300_000.0);
                 let want = secure::proof("c", &self.token, &hash);
@@ -1232,7 +1367,8 @@ impl Collab {
                     c.peer = Some(peer.clone());
                 }
                 if authed {
-                    self.accept(conn, Role::Editor);
+                    let role = if !remote.is_empty() && self.demoted.contains(&remote) { Role::Viewer } else { Role::Editor };
+                    self.accept(conn, role);
                 } else if self.requests.len() >= MAX_REQUESTS {
                     if let Some(c) = self.conns.get(&conn) {
                         c.sink.send(&Msg::Denied { reason: "The host has too many pending requests".into() });
@@ -1263,11 +1399,19 @@ impl Collab {
                         return;
                     }
                 }
+                // a reconnect to the SAME session keeps the replica and the workspace: the digest exchange brings both sides up to date
+                let resuming = self.resume.take().map_or(false, |r| r.session == session.id) && self.rep.is_some() && self.ready;
                 self.mode = Mode::Joined;
                 self.role = role;
-                let mut rep = Replica::new(self.me.id, Scope::ALL);
-                rep.set_roots(session.roots.iter().copied());
-                self.rep = Some(rep);
+                if resuming {
+                    if let Some(rep) = self.rep.as_mut() {
+                        rep.set_roots(session.roots.iter().copied());
+                    }
+                } else {
+                    let mut rep = Replica::new(self.me.id, Scope::ALL);
+                    rep.set_roots(session.roots.iter().copied());
+                    self.rep = Some(rep);
+                }
                 ID_BASE.store((self.me.id as u64) << 40, Ordering::Relaxed);
                 self.roster = vec![(peer.clone(), Role::Editor), (self.me.clone(), role)];
                 self.fails.clear();
@@ -1275,7 +1419,17 @@ impl Collab {
                     c.peer = Some(peer);
                     c.active = true;
                     c.role = Role::Editor;
-                    c.backlog.push_back(Msg::Digest { items: vec![], last: true });
+                    if !resuming {
+                        c.backlog.push_back(Msg::Digest { items: vec![], last: true });
+                    }
+                }
+                if resuming {
+                    self.send_digest(conn);
+                    self.session = Some(session);
+                    self.ui.dialog = false;
+                    self.next_scan = 0.0;
+                    self.toast("Reconnected");
+                    return;
                 }
                 self.want_ws = Some(format!("Shared · {}", session.name));
                 self.session = Some(session);
@@ -1309,7 +1463,7 @@ impl Collab {
         match msg {
             Msg::Digest { items, last } => {
                 if let Some(c) = self.conns.get_mut(&conn) {
-                    if c.digest.len() + items.len() > 3_000_000 {
+                    if c.digest.len() + items.len() > 1_000_000 {
                         self.drop_conn(conn, "Digest too large");
                         return;
                     }
@@ -1545,6 +1699,93 @@ mod tests {
         jw.page_mut(pid).unwrap().blocks.push(extra);
         join.poke();
         assert!(until(&mut host, &mut hw, &mut join, &mut jw, 6, |a, _| a.page(pid).map_or(false, |p| p.blocks[1].text == "edited on the phone" && p.blocks.iter().any(|b| b.text == "added on the phone"))), "joiner edit did not arrive");
+        host.stop(true);
+        join.stop(true);
+    }
+
+    fn pair() -> (Collab, Workspace, Collab, Workspace, u16) {
+        let ctx = egui::Context::default();
+        let mut host = Collab::new(&ctx);
+        let join = Collab::new(&ctx);
+        let mut hw = Workspace::seed();
+        let mut jw = Workspace::blank("joiner", false, 0);
+        jw.pages.clear();
+        jw.current = None;
+        host.start_host(&mut hw, 1, Scope::ALL, None);
+        let port = host.net.port;
+        (host, hw, join, jw, port)
+    }
+
+    #[test]
+    fn a_dropped_connection_is_re_dialled_and_catches_up() {
+        let (mut host, mut hw, mut join, mut jw, port) = pair();
+        join.join_addr(&format!("127.0.0.1:{port}"), &host.token.clone());
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 10, |a, b| !b.pages.is_empty() && a.pages.len() == b.pages.len()), "initial sync");
+        let pid = hw.pages.iter().find(|p| p.blocks.len() > 1).map(|p| p.id).unwrap();
+        hw.current = Some(pid);
+        jw.current = Some(pid);
+        // the network drops under the joiner
+        let conn = *join.conns.keys().next().expect("joined");
+        join.drop_conn(conn, "Connection lost");
+        assert!(join.reconnecting(), "a joined session must try to come back");
+        assert_eq!(join.mode, Mode::Joining);
+        // meanwhile the host edits, and so does the (offline) joiner
+        hw.page_mut(pid).unwrap().blocks[0].text = "typed while you were away".into();
+        jw.page_mut(pid).unwrap().blocks[1].text = "typed offline".into();
+        host.poke();
+        join.poke();
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 15, |a, b| b.page(pid).map_or(false, |p| p.blocks[0].text == "typed while you were away") && a.page(pid).map_or(false, |p| p.blocks[1].text == "typed offline")), "both sides must converge after the reconnect");
+        assert_eq!(join.mode, Mode::Joined);
+        assert!(!join.reconnecting());
+        assert!(join.want_ws.is_none(), "a reconnect must not create another shared workspace");
+        host.stop(true);
+        join.stop(true);
+    }
+
+    #[test]
+    fn a_removed_device_cannot_come_back_with_the_token() {
+        let (mut host, mut hw, mut join, mut jw, port) = pair();
+        let token = host.token.clone();
+        join.join_addr(&format!("127.0.0.1:{port}"), &token);
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 10, |_, b| !b.pages.is_empty()), "initial sync");
+        let id = join.me.id;
+        host.kick(id);
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(3) {
+            step(&mut host, &mut hw, &mut join, &mut jw);
+        }
+        assert_eq!(join.mode, Mode::Off, "the kicked device must leave");
+        join.join_addr(&format!("127.0.0.1:{port}"), &token);
+        let t1 = Instant::now();
+        while t1.elapsed() < Duration::from_secs(4) {
+            step(&mut host, &mut hw, &mut join, &mut jw);
+        }
+        assert_ne!(join.mode, Mode::Joined, "a removed device must stay out");
+        assert_eq!(host.roster.len(), 1);
+        host.stop(true);
+        join.stop(true);
+    }
+
+    /// Needs the website running: `LUMEN_RELAY_TEST=http://127.0.0.1:3000 cargo test --lib relay -- --ignored`.
+    #[test]
+    #[ignore]
+    fn two_devices_sync_through_the_site_relay() {
+        let base = std::env::var("LUMEN_RELAY_TEST").unwrap_or_else(|_| "http://127.0.0.1:3000".into());
+        let (mut host, mut hw, mut join, mut jw, _port) = pair();
+        host.enable_relay(base.clone());
+        let room = host.relay_room.clone().expect("relay room");
+        // a real host has been polling for a long time before anybody holds the link; the relay shows a device only frames posted
+        // after it first appeared (a late joiner must not see other people's old handshakes)
+        std::thread::sleep(Duration::from_millis(800));
+        join.join_relay(&base, &room, &host.token.clone());
+        let blocks = |w: &Workspace| w.pages.iter().map(|p| p.blocks.len()).sum::<usize>();
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 30, |a, b| !b.pages.is_empty() && a.pages.len() == b.pages.len() && blocks(a) == blocks(b)), "initial sync through the relay did not finish");
+        let pid = hw.pages.iter().find(|p| p.blocks.len() > 1).map(|p| p.id).unwrap();
+        hw.current = Some(pid);
+        jw.current = Some(pid);
+        jw.page_mut(pid).unwrap().blocks[0].text = "typed on the other side of the relay".into();
+        join.poke();
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 30, |a, _| a.page(pid).map_or(false, |p| p.blocks[0].text == "typed on the other side of the relay")), "edit through the relay did not arrive");
         host.stop(true);
         join.stop(true);
     }
