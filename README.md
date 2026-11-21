@@ -1,3 +1,18 @@
+# Lumen 14.1 — encrypted collaboration, Android deep links, security review
+
+* **Collaboration is now end-to-end encrypted** (Noise XX, ChaCha20-Poly1305, forward secrecy) on the LAN socket, the browser WebSocket and the
+  relay; the share token is *proven*, never sent; flood / DoS limits everywhere; relay rooms are key-bound. Full audit, findings and fixes:
+  [COLLAB.md §8](COLLAB.md). Remaining work and the task list status: COLLAB.md §8.3.
+* **Android**: `lumen://join?…` intent filter (pre-fills the join dialog), Wi-Fi `MulticastLock` while in the foreground (discovery on
+  power-saving Wi-Fi chips), backup + cleartext disabled, signed + zip-aligned arm64 release APK (`./build-android.sh`).
+* **Deliverables** (all built from this source by `./build-all.sh`, published into `../public`): `webapp/` (WebAssembly, served at `/app`),
+  `downloads/Lumen-android-arm64.apk`, `downloads/Lumen-windows-x64.exe|.zip`, `SHA256SUMS.txt`.
+* Binary assets that are not in git (`assets/emoji-noto.pack`, `assets/XITSMath-Regular.otf`, `assets/xits-math-print.woff2`) are produced by
+  `tools/fetch-assets.sh` (see the comments in `tools/build-emoji-pack.py`).
+* Tests: `cargo test --lib collab` (CRDT, Noise handshake / tamper / replay / bomb, and a two-device sync over a real encrypted socket).
+
+---
+
 # Lumen 14.0 — local collaboration (same Wi-Fi), borderless PDF cards
 
 See [RELEASE-14.0.md](RELEASE-14.0.md) and [COLLAB.md](COLLAB.md) (architecture, protocol, security status, next-pass task list).

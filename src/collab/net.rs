@@ -9,9 +9,50 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAdd
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
+use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
 
 const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 76, 77);
+/// Frames are ≤ ~66 KB (Noise limit + base64); anything bigger is an attack, not a message.
+const MAX_FRAME: usize = 256 * 1024;
+const MAX_LIVE: usize = 48;
+const MAX_PER_IP: usize = 6;
+
+fn ws_config() -> WebSocketConfig {
+    WebSocketConfig::default().max_message_size(Some(MAX_FRAME)).max_frame_size(Some(MAX_FRAME)).write_buffer_size(64 * 1024).max_write_buffer_size(4 * 1024 * 1024)
+}
+
+/// Counts a live connection per address; released when the connection thread ends.
+struct Slot {
+    ip: IpAddr,
+    live: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+impl Slot {
+    fn take(live: &Arc<Mutex<HashMap<IpAddr, usize>>>, ip: IpAddr) -> Option<Slot> {
+        let mut m = live.lock().ok()?;
+        let total: usize = m.values().sum();
+        let n = m.entry(ip).or_insert(0);
+        if total >= MAX_LIVE || (*n >= MAX_PER_IP && !ip.is_loopback()) {
+            return None;
+        }
+        *n += 1;
+        Some(Slot { ip, live: live.clone() })
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.live.lock() {
+            if let Some(n) = m.get_mut(&self.ip) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    m.remove(&self.ip);
+                }
+            }
+        }
+    }
+}
 
 struct WsSink {
     tx: Sender<Option<Msg>>,
@@ -56,15 +97,24 @@ fn pump(mut ws: WebSocket<TcpStream>, conn: ConnId, inbox: Inbox, rx: Receiver<O
     let _ = ws.get_ref().set_nodelay(true);
     let mut last_rx = Instant::now();
     let mut last_ping = Instant::now();
+    let mut last_busy = Instant::now();
+    let mut slow = false;
     let why: &str;
     'outer: loop {
         if stop.load(Ordering::Relaxed) {
             why = "stopped";
             break;
         }
+        // battery: poll every 15 ms while data moves, every 90 ms after two idle seconds (outgoing frames wait at most that long)
+        let want_slow = last_busy.elapsed() > Duration::from_secs(2);
+        if want_slow != slow {
+            slow = want_slow;
+            let _ = ws.get_ref().set_read_timeout(Some(Duration::from_millis(if slow { 90 } else { 15 })));
+        }
         match ws.read() {
             Ok(Message::Text(t)) => {
                 last_rx = Instant::now();
+                last_busy = last_rx;
                 if let Ok(m) = serde_json::from_str::<Msg>(t.as_str()) {
                     inbox.push(Event::Msg { conn, msg: m });
                 }
@@ -83,6 +133,7 @@ fn pump(mut ws: WebSocket<TcpStream>, conn: ConnId, inbox: Inbox, rx: Receiver<O
         loop {
             match rx.try_recv() {
                 Ok(Some(m)) => {
+                    last_busy = Instant::now();
                     let Ok(s) = serde_json::to_string(&m) else { continue };
                     if ws.send(Message::text(s)).is_err() {
                         why = "Connection lost";
@@ -124,6 +175,7 @@ impl Net {
         self.stop = Some(stop.clone());
         self.port = port;
         let inbox = inbox.clone();
+        let live: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::new(Mutex::new(HashMap::new()));
         std::thread::Builder::new()
             .name("lumen-collab-accept".into())
             .spawn(move || {
@@ -132,10 +184,13 @@ impl Net {
                         Ok((stream, peer)) => {
                             let inbox = inbox.clone();
                             let stop = stop.clone();
+                            // flood protection: a limited number of simultaneous sockets overall and per address
+                            let Some(slot) = Slot::take(&live, peer.ip()) else { continue };
                             let _ = std::thread::Builder::new().name("lumen-collab-conn".into()).spawn(move || {
+                                let _slot = slot;
                                 let _ = stream.set_nonblocking(false);
                                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                                let Ok(ws) = tungstenite::accept(stream) else { return };
+                                let Ok(ws) = tungstenite::accept_with_config(stream, Some(ws_config())) else { return };
                                 let (tx, rx) = channel();
                                 let conn = inbox.conn_id();
                                 inbox.push(Event::Open { conn, sink: Box::new(WsSink { tx }), addr: peer.ip().to_string(), incoming: true });
@@ -161,7 +216,7 @@ impl Net {
             let Some(sa) = addr.to_socket_addrs().ok().and_then(|mut a| a.next()) else { return fail("That address is not valid") };
             let Ok(stream) = TcpStream::connect_timeout(&sa, Duration::from_secs(4)) else { return fail("Could not reach that device — are you on the same Wi-Fi?") };
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-            let Ok((ws, _)) = tungstenite::client(format!("ws://{addr}/"), stream) else { return fail("That device did not answer as a Lumen host") };
+            let Ok((ws, _)) = tungstenite::client::client_with_config(format!("ws://{addr}/"), stream, Some(ws_config())) else { return fail("That device did not answer as a Lumen host") };
             let (tx, rx) = channel();
             inbox.push(Event::Open { conn, sink: Box::new(WsSink { tx }), addr: sa.ip().to_string(), incoming: false });
             pump(ws, conn, inbox, rx, stop);

@@ -15,6 +15,7 @@ import android.database.Cursor;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.net.Uri;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.VibrationEffect;
@@ -87,6 +88,7 @@ public class LumenActivity extends NativeActivity {
     private static native void nativeText(String text);
     private static native void nativeKey(int androidKeyCode, boolean down);
     private static native void nativeBack();
+    private static native void nativeLink(String link);
     private static native void nativePicked(int req, String name, String mime, byte[] data);
     private static native void nativePickCancelled(int req);
 
@@ -115,6 +117,7 @@ public class LumenActivity extends NativeActivity {
 
         configureWindow();
         super.onCreate(savedInstanceState);
+        deliverLink(getIntent());
 
         imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
         ime = new ImeView(this);
@@ -221,15 +224,62 @@ public class LumenActivity extends NativeActivity {
         getWindow().getDecorView().requestApplyInsets();
     }
 
+    // ───────────── local collaboration: join links and Wi-Fi multicast ─────────────
+
+    private WifiManager.MulticastLock multicast;
+
+    /** lumen://join?h=IP:PORT&t=CODE (scanned QR code, message, browser) → Rust opens the join dialog. */
+    private void deliverLink(Intent intent) {
+        try {
+            if (intent == null || !Intent.ACTION_VIEW.equals(intent.getAction())) return;
+            Uri u = intent.getData();
+            if (u == null || !"lumen".equals(u.getScheme()) || !"join".equals(u.getHost())) return;
+            String raw = u.toString();
+            if (raw.length() > 512) return; // nothing legitimate is longer
+            nativeLink(raw);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        deliverLink(intent);
+    }
+
+    /** Android filters multicast / broadcast UDP while the Wi-Fi chip is in power-save unless an app holds a MulticastLock. */
+    private void acquireMulticast() {
+        try {
+            if (multicast == null) {
+                WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                if (wm == null) return;
+                multicast = wm.createMulticastLock("lumen-collab");
+                multicast.setReferenceCounted(false);
+            }
+            if (!multicast.isHeld()) multicast.acquire();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void releaseMulticast() {
+        try {
+            if (multicast != null && multicast.isHeld()) multicast.release();
+        } catch (Throwable ignored) {
+        }
+    }
+
     @Override
     protected void onResume() {
         super.onResume();
+        acquireMulticast();
         reportMetrics();
         getWindow().getDecorView().requestApplyInsets();
     }
 
     @Override
     protected void onPause() {
+        releaseMulticast();
         hideImeNow();
         super.onPause();
     }

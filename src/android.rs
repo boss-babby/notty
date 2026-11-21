@@ -158,6 +158,18 @@ pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeKey(_env: JNIEnv, 
     wake();
 }
 
+/// `lumen://join?…` delivered by the activity (intent filter): handed to the collaboration dialog on the next frame.
+#[no_mangle]
+pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeLink(mut env: JNIEnv, _c: JClass, link: JString) {
+    if let Ok(s) = env.get_string(&link) {
+        let s: String = s.into();
+        if s.len() <= 512 && s.starts_with("lumen://join") {
+            crate::collab::push_launch_link(s);
+            wake();
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeBack(_env: JNIEnv, _c: JClass) {
     BACK.store(true, Ordering::SeqCst);

@@ -237,13 +237,13 @@ fn menu(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &crate::model::Workspa
             });
             ui.add_space(8.0);
             // join requests
-            let reqs: Vec<(ConnId, PeerInfo, String)> = c.requests.iter().map(|r| (r.conn, r.peer.clone(), r.addr.clone())).collect();
-            for (conn, p, addr) in reqs {
+            let reqs: Vec<(ConnId, PeerInfo, String, String)> = c.requests.iter().map(|r| (r.conn, r.peer.clone(), r.addr.clone(), r.code.clone())).collect();
+            for (conn, p, addr, code) in reqs {
                 let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::hover());
                 ui.painter().rect_filled(r, 10.0, with_alpha(pal.accent_soft, 0.9));
                 avatar(ui.painter(), pos2(r.left() + 24.0, r.center().y), 12.0, &p, pal.accent_soft);
                 ui.painter().text(pos2(r.left() + 44.0, r.center().y - 8.0), Align2::LEFT_CENTER, &p.name, bold(13.0), pal.text);
-                ui.painter().text(pos2(r.left() + 44.0, r.center().y + 8.0), Align2::LEFT_CENTER, format!("wants to join · {}", platform_label(&p.platform)), body(11.5), pal.muted);
+                ui.painter().text(pos2(r.left() + 44.0, r.center().y + 8.0), Align2::LEFT_CENTER, format!("wants to join · {} · code {}", platform_label(&p.platform), code), body(11.5), pal.muted);
                 let mut x = r.right() - 6.0;
                 for (g, tip, act) in [(l::X, "Decline", 0), (l::EYE, "Allow to view only", 1), (l::CHECK, "Allow to edit", 2)] {
                     let b = Rect::from_center_size(pos2(x - 14.0, r.center().y), vec2(28.0, 28.0));
@@ -526,13 +526,13 @@ fn share_tab(ui: &mut Ui, pal: &Palette, c: &mut Collab, ws: &mut crate::model::
         }
     });
     // join requests inline
-    let reqs: Vec<(ConnId, PeerInfo)> = c.requests.iter().map(|r| (r.conn, r.peer.clone())).collect();
-    for (conn, p) in reqs {
+    let reqs: Vec<(ConnId, PeerInfo, String)> = c.requests.iter().map(|r| (r.conn, r.peer.clone(), r.code.clone())).collect();
+    for (conn, p, code) in reqs {
         card(ui, pal, |ui| {
             ui.horizontal(|ui| {
                 let (r, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
                 avatar(ui.painter(), r.center(), 13.0, &p, pal.popup);
-                ui.label(egui::RichText::new(format!("{} wants to join", p.name)).font(bold(13.0)).color(pal.text));
+                ui.label(egui::RichText::new(format!("{} wants to join · code {}", p.name, code)).font(bold(13.0)).color(pal.text));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if button(ui, pal, "Edit", 1, 52.0).clicked() {
                         c.approve(conn, Role::Editor);

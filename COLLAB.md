@@ -1,4 +1,7 @@
-# Local collaboration — design, status and next steps (Lumen 14.0)
+# Local collaboration — design, status and next steps (Lumen 14.1)
+
+> **14.1 update:** the security review and hardening pass is documented in §8 (protocol 2: end-to-end encrypted, authenticated, rate-limited);
+> §4 and §7 below describe the 14.0 state and are annotated with what 14.1 closed.
 
 Sharing a workspace, one page, or a page **with everything nested** between devices on the same Wi-Fi, with live cursors, roles, PDF
 annotations and on-demand attachments. No account, no cloud. Code: `src/collab/` (≈2 000 lines), UI hooks in `src/app.rs`,
@@ -133,3 +136,52 @@ Hosts broadcast a `Beacon` (device, what is shared, people) every 2 s to `255.25
 * One machine: start the app twice is not possible (UDP port reuse) — use the automated test: `cargo test --lib collab`.
 * Phone ↔ desktop: install the APK, same Wi-Fi, same steps. Type the 6-letter code if discovery is blocked by the router (AP isolation).
 * Web: open `/app?join=ROOM&t=TOKEN` (host: *Settings ⚙ → relay server = your site*, switch on *Also create a link*).
+
+
+## 8. Pass 2 (14.1) — security & performance review, and what changed
+
+Method: read every path that handles bytes from the network (`net.rs`, `webnet.rs`, `relay.rs`, `mod.rs::on_msg/handle_ready`, the site's
+relay) with the question "what can a stranger on the Wi-Fi / who knows only the room code make this device do?".
+
+### 8.1 Findings (14.0) and fixes (14.1)
+| # | Finding (14.0) | Severity | Fix in 14.1 |
+|---|---|---|---|
+| 1 | All traffic in clear text (LAN socket, relay) — sniffable, forgeable | High | **Noise XX** (`secure.rs`): X25519 / ChaCha20-Poly1305 / SHA-256, forward secrecy, every frame AEAD-sealed, nonce counter ⇒ replay / reorder / tamper fails. Applies to LAN, browser WebSocket and relay alike. Protocol 2; protocol-1 peers are refused. |
+| 2 | Token sent in `Hello` (a sniffer / relay operator learns it) and compared with `==` | High | The token **never travels**: both sides send `SHA-256(label ‖ token ‖ handshake-hash)` (bound to the channel ⇒ not replayable by a man in the middle), compared in constant time. The same proof authenticates the *host* to the joiner (`Welcome.auth`), so knowing only the room code cannot impersonate a host. |
+| 3 | Tokens / room codes from a time-seeded xorshift (predictable), 6 characters | High | `getrandom` (OS CSPRNG; `crypto.getRandomValues` in the browser), unbiased 32-symbol alphabet, **10 characters (50 bit)**; session / room ids too. Noise static keys are per process. |
+| 4 | Token brute force unlimited | High | 5 wrong proofs per address ⇒ 5 min lock-out (auto-join disabled, approval still possible); a wrong proof disconnects. |
+| 5 | **Kick by id**: an unauthenticated socket could send `Hello{peer.id = victim}` and the host dropped the victim's real connection | High | A stale connection is replaced only by a peer that proves the token or presents the same channel key; otherwise "id already connected". Host's own id and id 0 are refused. |
+| 6 | Presence spoofing: the host trusted `Presence.peer` from the client | Medium | The host overwrites it with the connection's peer id; non-finite / absurd coordinates dropped; ≤ 64 presence entries. |
+| 7 | Unbounded resources per stranger: threads (one per connection), pending approval cards, digest, op queue, media requests | High (DoS) | ≤ 40 connections / 6 per address / 16 signed-in peers / 8 pending approvals; `Hello` due within 20 s, approvals expire after 5 min; digest ≤ 3 M entries; ≤ 1 000 ops per message and ≤ 300 000 queued; ≤ 64 media requests queued; token-bucket flood control (≈ 500 frames/s) drops the connection. |
+| 8 | WebSocket frames up to 64 MiB accepted | High (memory) | `max_message_size = max_frame_size = 256 KiB`; reassembled plaintext ≤ 24 MiB; inflate is limited (decompression bomb test). |
+| 9 | Unsolicited `MediaData` accepted and stored, unlimited size, no integrity check | High | Only for ids this device requested, ≤ 256 MiB, ≤ 8 transfers, chunk offsets checked, **content id (FNV of the bytes) verified** before the file is used; names / mime sanitised. |
+| 10 | Names from the network drawn unescaped (control chars, 10 kB names) | Low | `clean()`: printable, ≤ 40 chars; beacons sanitised, ≤ 64 discovered hosts. |
+| 11 | Relay: anyone could post/poll any room as any device id; no limits | High | Per-session random key bound to (room, device id) on first use (403 afterwards), room/member/byte/message caps, IP token bucket, 30 min idle TTL, nothing on disk, stale hellos not replayed. The relay only ever sees sealed frames. |
+| 12 | `lumen://` links joined immediately | Medium | A link from another app only pre-fills the dialog; the user taps Join. |
+| 13 | Android: `allowBackup=true`, cleartext allowed | Medium | Backup off, cleartext off (LAN sockets are native and unaffected). |
+| 14 | Join request cards could be raised by anyone | Low | Cards show a **4-digit channel code** derived from the handshake: if both screens show the same code, nobody sits in the middle. |
+
+Known limits (unchanged, documented honestly): a *viewer* client's UI is not locked (its edits stay local and the host drops them);
+the host is the single authority; FNV is not collision-resistant (attachment ids are content ids, not signatures — the AEAD already
+protects them on the wire); a malicious *approved Editor* can of course edit or delete content in scope (use View / history).
+
+### 8.2 Performance
+* **Compression**: payloads > 400 B are deflated before sealing (JSON ops typically 4–10× smaller; relay bandwidth ÷ 5).
+* **Battery**: socket threads poll every 15 ms while data moves and every 90 ms after 2 idle seconds (was a fixed 15 ms ⇒ 66 wake-ups/s per
+  connection); the collab repaint timer follows the adaptive scan interval (≤ 1 s) instead of a fixed 120 ms.
+* **No work for strangers**: failed handshakes cost one X25519 operation and a thread slot that is released at once.
+* Android holds a `MulticastLock` only while the app is in the foreground (discovery works with Wi-Fi power-save, battery is spared in the background).
+
+### 8.3 Task list (§7) — status
+| # | Task | State |
+|---|---|---|
+| 1 | Text CRDT (`yrs`) inside blocks | open — large editor adapter; entity LWW stays |
+| 2 | Encrypted transport (Noise) | **done** (XX + token proof; "trusted devices" persistence still open) |
+| 3 | Android deep link + MulticastLock | **done** (`lumen://join` intent filter, `nativeLink`, `MulticastLock`); camera QR scan & NSD still open |
+| 4 | PDF realtime readers | open |
+| 5 | Mesh / host hand-over | open |
+| 6 | Big tables sync | open |
+| 7 | Compression | **done** (deflate; binary framing still open) |
+| 8 | Tombstone GC | open |
+| 9 | WebRTC for browser hosting | open |
+| 10 | Comments / @mentions | open |

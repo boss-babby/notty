@@ -6,6 +6,7 @@
 //! browser WebSocket on the web, HTTP relay everywhere) only move [`Msg`] frames — the session code below never touches a socket.
 pub mod crdt;
 mod relay;
+mod secure;
 pub mod ui;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -19,7 +20,15 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub const PROTO: u32 = 1;
+/// Protocol 2: every frame is end-to-end encrypted (`secure.rs`); the share token is proven, never sent.
+pub const PROTO: u32 = 2;
+/// Hard limits (denial-of-service protection of a host): connections, signed-in people, waiting approval cards.
+const MAX_CONNS: usize = 40;
+const MAX_PEERS: usize = 16;
+const MAX_REQUESTS: usize = 8;
+const MAX_OPS_QUEUE: usize = 300_000;
+const MAX_MEDIA: u64 = 256 << 20;
+
 pub const PORT: u16 = 47615;
 pub const DISCOVERY_PORT: u16 = 47616;
 
@@ -53,29 +62,27 @@ pub fn now_ms() -> u64 {
     js_sys::Date::now() as u64
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+/// 64 random bits from the operating system (`getrandom`; `crypto.getRandomValues` in the browser).
 pub fn random_u64() -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u64(now_ms());
-    h.finish()
-}
-#[cfg(target_arch = "wasm32")]
-pub fn random_u64() -> u64 {
-    ((js_sys::Math::random() * 4503599627370496.0) as u64) ^ (now_ms() << 7)
+    let mut b = [0u8; 8];
+    if getrandom::getrandom(&mut b).is_ok() {
+        return u64::from_le_bytes(b);
+    }
+    // the OS generator is unavailable (should never happen): fall back to a time-seeded value rather than a fixed one
+    let n = now_ms() ^ (mono_ms().to_bits());
+    n.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (n >> 29)
 }
 
 pub fn random_code(n: usize) -> String {
+    // 32 symbols: 256 % 32 == 0, so a random byte maps to a symbol without modulo bias; every symbol is fresh OS randomness
     const A: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let mut r = random_u64() | 1;
-    (0..n)
-        .map(|_| {
-            r ^= r << 13;
-            r ^= r >> 7;
-            r ^= r << 17;
-            A[(r % A.len() as u64) as usize] as char
-        })
-        .collect()
+    let mut raw = vec![0u8; n];
+    if getrandom::getrandom(&mut raw).is_err() {
+        for b in raw.iter_mut() {
+            *b = random_u64() as u8;
+        }
+    }
+    raw.iter().map(|b| A[(*b & 31) as usize] as char).collect()
 }
 
 // ───────────── protocol ─────────────
@@ -119,9 +126,14 @@ pub struct Presence {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(tag = "t")]
 pub enum Msg {
-    Hello { peer: PeerInfo, token: String, proto: u32 },
+    /// `auth` = proof of the share token bound to the encrypted channel (empty = ask the host for approval).
+    Hello { peer: PeerInfo, #[serde(default)] auth: String, proto: u32 },
+    /// Noise handshake message (base64). Always sent in the clear — it is what sets the encryption up.
+    Hs { d: String },
+    /// One encrypted frame (base64); `more` = the message continues in the next frame.
+    Enc { d: String, more: bool },
     Pending,
-    Welcome { peer: PeerInfo, session: SessionInfo, role: Role },
+    Welcome { peer: PeerInfo, session: SessionInfo, role: Role, #[serde(default)] auth: String },
     Denied { reason: String },
     Roster { peers: Vec<(PeerInfo, Role)> },
     Digest { items: Vec<(Key, Hlc, u64)>, last: bool },
@@ -159,6 +171,10 @@ pub type ConnId = u64;
 
 pub trait Sink: Send {
     fn send(&self, m: &Msg);
+    /// Bypasses the cipher (handshake frames only).
+    fn raw(&self, m: &Msg) {
+        self.send(m)
+    }
     fn close(&self);
 }
 
@@ -214,10 +230,19 @@ struct Conn {
     active: bool,
     digest: HashMap<Key, (Hlc, u64)>,
     backlog: VecDeque<Msg>,
+    crypt: Arc<Mutex<secure::Crypt>>,
+    opened: f64,
+    last_rx: f64,
+    /// Token bucket against message floods.
+    bucket: f64,
+    /// Four digits derived from the encrypted channel (shown on both sides).
+    code: String,
 }
 
 pub struct JoinRequest {
     pub conn: ConnId,
+    /// Short code of the encrypted channel: read it out loud on both devices to rule out an active attacker.
+    pub code: String,
     pub peer: PeerInfo,
     pub addr: String,
 }
@@ -263,6 +288,13 @@ pub struct Collab {
     pub show_cursors: bool,
     pub last_error: Option<String>,
     pub stats: Stats,
+    last_reap: f64,
+    joining_since: f64,
+    keys: Option<Arc<secure::Keys>>,
+    /// A relay joiner's handshake that already sent its first message (adopted by the first virtual connection that answers).
+    relay_init: Option<Arc<Mutex<secure::Crypt>>>,
+    /// Wrong-token attempts per address: (count, last time).
+    fails: HashMap<String, (u32, f64)>,
     /// The attachment currently being streamed to a peer (so a big PDF is read from disk once, not once per chunk).
     pub serving: Option<(u64, Arc<[u8]>)>,
     presence: HashMap<u32, (Presence, f64)>,
@@ -349,6 +381,16 @@ pub fn device_name() -> String {
     "Web browser".into()
 }
 
+/// Printable, bounded text from the network (names that end up in menus and toasts).
+fn clean(s: &str, max: usize) -> String {
+    s.chars().filter(|c| !c.is_control()).take(max).collect::<String>().trim().to_owned()
+}
+
+/// The part of an address that identifies a machine (the port changes with every connection).
+fn peer_key(addr: &str) -> String {
+    addr.rsplit_once(':').map_or(addr, |(h, _)| h).to_owned()
+}
+
 fn chunked<T: Clone>(v: Vec<T>, n: usize) -> Vec<Vec<T>> {
     v.chunks(n.max(1)).map(|c| c.to_vec()).collect()
 }
@@ -375,6 +417,11 @@ impl Collab {
             show_cursors,
             last_error: None,
             stats: Stats::default(),
+            last_reap: 0.0,
+            joining_since: 0.0,
+            keys: secure::gen_keys().map(Arc::new),
+            relay_init: None,
+            fails: HashMap::new(),
             serving: None,
             presence: HashMap::new(),
             local: Presence { peer: id, ..Default::default() },
@@ -464,13 +511,13 @@ impl Collab {
         let mut rep = Replica::new(self.me.id, scope);
         rep.adopt(ws, now_ms());
         let roots = rep.roots();
-        self.session = Some(SessionInfo { id: random_code(8), name: title.clone(), scope, roots });
+        self.session = Some(SessionInfo { id: random_code(10), name: title.clone(), scope, roots });
         self.rep = Some(rep);
         self.mode = Mode::Hosting;
         self.role = Role::Editor;
         self.bound = ws_id;
         self.ready = true;
-        self.token = random_code(6);
+        self.token = random_code(10);
         self.roster = vec![(self.me.clone(), Role::Editor)];
         self.last_error = None;
         #[cfg(not(target_arch = "wasm32"))]
@@ -497,7 +544,7 @@ impl Collab {
         if self.mode != Mode::Hosting {
             return;
         }
-        let room = random_code(6);
+        let room = random_code(10);
         self.relay = Some(relay::Relay::start(&base, &room, self.me.id, &self.inbox));
         self.relay_room = Some(room);
     }
@@ -535,6 +582,7 @@ impl Collab {
     pub fn join_addr(&mut self, addr: &str, token: &str) {
         self.stop(false);
         self.mode = Mode::Joining;
+        self.joining_since = mono_ms();
         self.token = token.to_owned();
         self.last_error = None;
         let addr = if addr.contains(':') { addr.to_owned() } else { format!("{addr}:{PORT}") };
@@ -547,17 +595,22 @@ impl Collab {
     pub fn join_relay(&mut self, base: &str, room: &str, token: &str) {
         self.stop(false);
         self.mode = Mode::Joining;
+        self.joining_since = mono_ms();
         self.token = token.to_owned();
         self.last_error = None;
         self.relay = Some(relay::Relay::start(base, room, self.me.id, &self.inbox));
-        // tell the room we are here: whoever hosts answers
-        if let Some(r) = &self.relay {
-            r.hello(&self.hello());
+        // tell the room we are here (first handshake message): whoever hosts answers, the encrypted channel is set up from there
+        if let (Some(r), Some(keys)) = (&self.relay, self.keys.clone()) {
+            let mut cr = secure::Crypt::new();
+            if let Some(d) = cr.start_initiator(&keys) {
+                self.relay_init = Some(Arc::new(Mutex::new(cr)));
+                r.hello(&Msg::Hs { d });
+            }
         }
     }
 
-    fn hello(&self) -> Msg {
-        Msg::Hello { peer: self.me.clone(), token: self.token.clone(), proto: PROTO }
+    fn hello(&self, hash: &[u8]) -> Msg {
+        Msg::Hello { peer: self.me.clone(), auth: secure::proof("c", &self.token, hash), proto: PROTO }
     }
 
     pub fn stop(&mut self, notify: bool) {
@@ -567,6 +620,7 @@ impl Collab {
         }
         let _ = notify;
         self.conns.clear();
+        self.relay_init = None;
         #[cfg(not(target_arch = "wasm32"))]
         self.net.stop();
         if let Some(r) = self.relay.take() {
@@ -659,11 +713,20 @@ impl Collab {
 
     fn accept(&mut self, conn: ConnId, role: Role) {
         let Some(session) = self.session.clone() else { return };
+        if self.conns.values().filter(|c| c.active).count() >= MAX_PEERS {
+            if let Some(c) = self.conns.remove(&conn) {
+                c.sink.send(&Msg::Denied { reason: "This session is full".into() });
+                c.sink.close();
+            }
+            return;
+        }
+        let token = self.token.clone();
         let Some(c) = self.conns.get_mut(&conn) else { return };
         c.active = true;
         c.role = role;
         let Some(peer) = c.peer.clone() else { return };
-        c.sink.send(&Msg::Welcome { peer: self.me.clone(), session, role });
+        let hash = c.crypt.lock().map(|x| x.hash.clone()).unwrap_or_default();
+        c.sink.send(&Msg::Welcome { peer: self.me.clone(), session, role, auth: secure::proof("s", &token, &hash) });
         self.roster.retain(|(p, _)| p.id != peer.id);
         self.roster.push((peer.clone(), role));
         self.broadcast_roster();
@@ -767,6 +830,10 @@ impl Collab {
             r.tick();
         }
         self.handle_events();
+        if now - self.last_reap > 2000.0 {
+            self.last_reap = now;
+            self.reap(now);
+        }
         let mut changed = false;
         let usable = self.ready && self.rep.is_some() && self.bound == ws_id;
         if usable {
@@ -883,7 +950,7 @@ impl Collab {
         self.presence.retain(|_, (_, t)| now - *t < 12_000.0);
         self.found.retain(|f| now - f.seen < 7000.0);
         if self.mode != Mode::Off {
-            self.ctx.request_repaint_after(std::time::Duration::from_millis(if self.conns.values().any(|c| !c.backlog.is_empty()) || !self.ops_in.is_empty() { 8 } else { 120 }));
+            self.ctx.request_repaint_after(std::time::Duration::from_millis(if self.conns.values().any(|c| !c.backlog.is_empty()) || !self.ops_in.is_empty() { 8 } else { ((self.next_scan - now).clamp(120.0, 1000.0)) as u64 }));
         } else if self.ui.discovering {
             self.ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
@@ -906,8 +973,18 @@ impl Collab {
     fn handle_events(&mut self) {
         for ev in self.inbox.drain() {
             match ev {
-                Event::Found(b, ip) => {
-                    if b.id == self.me.id {
+                Event::Found(mut b, ip) => {
+                    if b.id == self.me.id || b.port == 0 {
+                        continue;
+                    }
+                    // beacons are unauthenticated UDP: bound and sanitise everything that is drawn
+                    b.device = clean(&b.device, 40);
+                    b.name = clean(&b.name, 40);
+                    b.platform = clean(&b.platform, 12);
+                    b.what = clean(&b.what, 20);
+                    b.title = clean(&b.title, 60);
+                    b.people = b.people.min(999);
+                    if self.found.len() >= 64 && !self.found.iter().any(|f| f.beacon.id == b.id) {
                         continue;
                     }
                     let seen = mono_ms();
@@ -921,18 +998,140 @@ impl Collab {
                     }
                 }
                 Event::Open { conn, sink, addr, incoming } => {
-                    if self.mode == Mode::Off {
+                    if self.mode == Mode::Off || self.conns.len() >= MAX_CONNS || self.keys.is_none() {
                         sink.close();
                         continue;
                     }
-                    if !incoming {
-                        sink.send(&self.hello());
-                    }
-                    self.conns.insert(conn, Conn { sink, addr, peer: None, role: Role::Editor, active: false, digest: HashMap::new(), backlog: VecDeque::new() });
+                    let now = mono_ms();
+                    let crypt = match (self.mode, self.relay_init.take()) {
+                        // relay joiner: the first handshake message already went out through the room
+                        (Mode::Joining, Some(c)) => c,
+                        (Mode::Joining, None) if !incoming => {
+                            let mut cr = secure::Crypt::new();
+                            if let Some(d) = cr.start_initiator(self.keys.as_ref().unwrap()) {
+                                sink.send(&Msg::Hs { d });
+                            }
+                            Arc::new(Mutex::new(cr))
+                        }
+                        _ => Arc::new(Mutex::new(secure::Crypt::new())),
+                    };
+                    let sink: Box<dyn Sink> = Box::new(secure::SecureSink { inner: sink, crypt: crypt.clone() });
+                    self.conns.insert(conn, Conn { sink, addr, peer: None, role: Role::Editor, active: false, digest: HashMap::new(), backlog: VecDeque::new(), crypt, opened: now, last_rx: now, bucket: 600.0, code: String::new() });
                 }
                 Event::Closed { conn, why } => self.on_closed(conn, &why),
-                Event::Msg { conn, msg } => self.on_msg(conn, msg),
+                Event::Msg { conn, msg } => self.on_frame(conn, msg),
             }
+        }
+    }
+
+    /// Closes a connection that misbehaved (or failed to authenticate) and runs the normal "closed" bookkeeping.
+    fn drop_conn(&mut self, conn: ConnId, why: &str) {
+        if let Some(c) = self.conns.get(&conn) {
+            c.sink.close();
+        }
+        self.on_closed(conn, why);
+    }
+
+    /// Every frame from the network enters here: flood control, handshake, decryption. Nothing in clear text reaches `on_msg`.
+    fn on_frame(&mut self, conn: ConnId, msg: Msg) {
+        let now = mono_ms();
+        let Some(c) = self.conns.get_mut(&conn) else { return };
+        // token bucket: ~500 frames / s sustained, bursts of 800 (a 24 MiB message is ~700 frames, so sync traffic fits)
+        c.bucket = (c.bucket + (now - c.last_rx) * 0.5).min(800.0);
+        c.last_rx = now;
+        if c.bucket < 1.0 {
+            self.drop_conn(conn, "Too many messages");
+            return;
+        }
+        c.bucket -= 1.0;
+        match msg {
+            Msg::Hs { d } => self.on_hs(conn, &d),
+            Msg::Enc { d, more } => {
+                let r = c.crypt.lock().map(|mut x| x.open(&d, more)).unwrap_or(Err(()));
+                match r {
+                    Ok(Some(json)) => match serde_json::from_str::<Msg>(&json) {
+                        Ok(Msg::Hs { .. }) | Ok(Msg::Enc { .. }) | Err(_) => self.drop_conn(conn, "Protocol error"),
+                        Ok(m) => self.on_msg(conn, m),
+                    },
+                    Ok(None) => {}
+                    Err(()) => self.drop_conn(conn, "Encryption error — the connection was closed"),
+                }
+            }
+            // anything in clear text (an old version, or someone probing the port) is refused
+            _ => self.drop_conn(conn, "This device runs an incompatible version"),
+        }
+    }
+
+    fn on_hs(&mut self, conn: ConnId, d: &str) {
+        let Some(keys) = self.keys.clone() else { return };
+        let joining = self.mode == Mode::Joining;
+        let Some(c) = self.conns.get_mut(&conn) else { return };
+        let (out, hash) = {
+            let Ok(mut cr) = c.crypt.lock() else { return };
+            // a joiner only ever initiates; an unsolicited first message from the other side is not a handshake we asked for
+            if joining && !cr.started() {
+                drop(cr);
+                self.drop_conn(conn, "Unexpected handshake");
+                return;
+            }
+            let out = cr.on_hs(&keys, d);
+            (out, cr.hash.clone())
+        };
+        if out.failed {
+            self.drop_conn(conn, "Secure connection failed");
+            return;
+        }
+        if let Some(r) = out.reply {
+            c.sink.raw(&Msg::Hs { d: r });
+        }
+        for f in &out.flushed {
+            c.sink.raw(f);
+        }
+        if out.done {
+            c.code = secure::short_code(&hash);
+            if joining {
+                let hello = self.hello(&hash);
+                if let Some(c) = self.conns.get(&conn) {
+                    c.sink.send(&hello);
+                }
+            }
+        }
+    }
+
+    /// Housekeeping: connections that never authenticate or never answer are closed, so half-open sockets cannot pile up.
+    fn reap(&mut self, now: f64) {
+        let mut dead: Vec<(ConnId, &'static str)> = vec![];
+        for (id, c) in &self.conns {
+            if c.active {
+                continue;
+            }
+            let age = now - c.opened;
+            if self.mode == Mode::Hosting {
+                if c.peer.is_none() && age > 20_000.0 {
+                    dead.push((*id, "No hello"));
+                } else if age > 300_000.0 {
+                    dead.push((*id, "Request expired"));
+                }
+            } else if age > 300_000.0 {
+                dead.push((*id, "The host did not answer"));
+            }
+        }
+        for (id, why) in dead {
+            if self.requests.iter().any(|r| r.conn == id) {
+                self.requests.retain(|r| r.conn != id);
+            }
+            if let Some(c) = self.conns.get(&id) {
+                c.sink.send(&Msg::Denied { reason: why.into() });
+            }
+            self.drop_conn(id, why);
+        }
+        self.fails.retain(|_, (_, t)| now - *t < 600_000.0);
+        // joining a room that nobody answers (typo in the code, host gone)
+        if self.mode == Mode::Joining && self.conns.is_empty() && now - self.joining_since > 30_000.0 {
+            self.stop(false);
+            let msg = "Nobody answered — check the room code and that the host is still sharing";
+            self.last_error = Some(msg.into());
+            self.toast(msg);
         }
     }
 
@@ -965,44 +1164,104 @@ impl Collab {
 
     fn on_msg(&mut self, conn: ConnId, msg: Msg) {
         match msg {
-            Msg::Hello { peer, token, proto } => {
+            Msg::Hello { peer, auth, proto } => {
                 if self.mode != Mode::Hosting {
                     return;
+                }
+                if self.conns.get(&conn).map_or(true, |c| c.peer.is_some() || c.active) {
+                    return; // one hello per connection
                 }
                 if proto != PROTO {
                     if let Some(c) = self.conns.get(&conn) {
                         c.sink.send(&Msg::Denied { reason: "This device runs an incompatible version".into() });
                     }
+                    self.drop_conn(conn, "incompatible");
                     return;
                 }
-                // a device that reconnects replaces its stale connection
-                let stale: Vec<ConnId> = self.conns.iter().filter(|(k, c)| **k != conn && c.peer.as_ref().map_or(false, |p| p.id == peer.id)).map(|(k, _)| *k).collect();
-                for s in stale {
-                    if let Some(c) = self.conns.remove(&s) {
-                        c.sink.close();
+                // the host chooses what everybody sees: bounded, printable, and never the host's own identity
+                let peer = PeerInfo { id: peer.id, name: clean(&peer.name, 40), device: clean(&peer.device, 40), platform: clean(&peer.platform, 12), color: (peer.id % 8) as u8 };
+                let (addr, hash, remote, code) = match self.conns.get(&conn) {
+                    Some(c) => {
+                        let cr = c.crypt.lock();
+                        (c.addr.clone(), cr.as_ref().map(|x| x.hash.clone()).unwrap_or_default(), cr.as_ref().map(|x| x.remote.clone()).unwrap_or_default(), c.code.clone())
                     }
-                    self.roster.retain(|(p, _)| p.id != peer.id);
+                    None => return,
+                };
+                let now = mono_ms();
+                let locked = self.fails.get(&peer_key(&addr)).map_or(false, |(n, t)| *n >= 5 && now - *t < 300_000.0);
+                let want = secure::proof("c", &self.token, &hash);
+                let authed = !locked && !auth.is_empty() && secure::ct_eq(&auth, &want);
+                if !auth.is_empty() && !authed {
+                    if !locked {
+                        let e = self.fails.entry(peer_key(&addr)).or_insert((0, now));
+                        e.0 += 1;
+                        e.1 = now;
+                    }
+                    if let Some(c) = self.conns.get(&conn) {
+                        c.sink.send(&Msg::Denied { reason: if locked { "Too many wrong codes — try again in a few minutes".into() } else { "That share code is not valid".into() } });
+                    }
+                    self.drop_conn(conn, "bad code");
+                    return;
                 }
-                let addr = self.conns.get(&conn).map(|c| c.addr.clone()).unwrap_or_default();
+                if peer.id == 0 || peer.id == self.me.id {
+                    if let Some(c) = self.conns.get(&conn) {
+                        c.sink.send(&Msg::Denied { reason: "Device id conflict — restart Lumen on that device".into() });
+                    }
+                    self.drop_conn(conn, "id conflict");
+                    return;
+                }
+                // a device that reconnects replaces its stale connection — but only when it proves who it is (token or same channel key);
+                // otherwise anybody could kick a person out of the session just by claiming their id
+                let existing: Vec<ConnId> = self.conns.iter().filter(|(k, c)| **k != conn && c.peer.as_ref().map_or(false, |p| p.id == peer.id)).map(|(k, _)| *k).collect();
+                for s in existing {
+                    let same_key = !remote.is_empty() && self.conns.get(&s).and_then(|c| c.crypt.lock().ok().map(|x| x.remote == remote)).unwrap_or(false);
+                    if authed || same_key {
+                        if let Some(c) = self.conns.remove(&s) {
+                            c.sink.close();
+                        }
+                        self.roster.retain(|(p, _)| p.id != peer.id);
+                    } else {
+                        if let Some(c) = self.conns.get(&conn) {
+                            c.sink.send(&Msg::Denied { reason: "A device with that id is already connected".into() });
+                        }
+                        self.drop_conn(conn, "id in use");
+                        return;
+                    }
+                }
                 if let Some(c) = self.conns.get_mut(&conn) {
                     c.peer = Some(peer.clone());
                 }
-                if !self.token.is_empty() && token == self.token {
+                if authed {
                     self.accept(conn, Role::Editor);
+                } else if self.requests.len() >= MAX_REQUESTS {
+                    if let Some(c) = self.conns.get(&conn) {
+                        c.sink.send(&Msg::Denied { reason: "The host has too many pending requests".into() });
+                    }
+                    self.drop_conn(conn, "busy");
                 } else {
                     if let Some(c) = self.conns.get(&conn) {
                         c.sink.send(&Msg::Pending);
                     }
-                    self.requests.push(JoinRequest { conn, peer, addr });
+                    self.requests.push(JoinRequest { conn, code, peer, addr });
                     self.ui.menu = true;
                 }
             }
             Msg::Pending => {
                 self.toast("Waiting for the host to accept…");
             }
-            Msg::Welcome { peer, session, role } => {
+            Msg::Welcome { peer, session, role, auth } => {
                 if self.mode != Mode::Joining {
                     return;
+                }
+                // the share token also authenticates the HOST: somebody who only knows the room code cannot pose as the host
+                if !self.token.is_empty() {
+                    let hash = self.conns.get(&conn).and_then(|c| c.crypt.lock().ok().map(|x| x.hash.clone())).unwrap_or_default();
+                    if !secure::ct_eq(&auth, &secure::proof("s", &self.token, &hash)) {
+                        self.last_error = Some("That device could not prove it holds the share code — connection refused".into());
+                        self.toast("That device could not prove it holds the share code");
+                        self.drop_conn(conn, "host not authentic");
+                        return;
+                    }
                 }
                 self.mode = Mode::Joined;
                 self.role = role;
@@ -1011,6 +1270,7 @@ impl Collab {
                 self.rep = Some(rep);
                 ID_BASE.store((self.me.id as u64) << 40, Ordering::Relaxed);
                 self.roster = vec![(peer.clone(), Role::Editor), (self.me.clone(), role)];
+                self.fails.clear();
                 if let Some(c) = self.conns.get_mut(&conn) {
                     c.peer = Some(peer);
                     c.active = true;
@@ -1049,6 +1309,10 @@ impl Collab {
         match msg {
             Msg::Digest { items, last } => {
                 if let Some(c) = self.conns.get_mut(&conn) {
+                    if c.digest.len() + items.len() > 3_000_000 {
+                        self.drop_conn(conn, "Digest too large");
+                        return;
+                    }
                     c.digest.extend(items.into_iter().map(|(k, h, x)| (k, (h, x))));
                 }
                 if last {
@@ -1065,11 +1329,30 @@ impl Collab {
             }
             Msg::Ops { ops } => {
                 let from_viewer = self.mode == Mode::Hosting && self.conns.get(&conn).map_or(true, |c| c.role == Role::Viewer);
+                if ops.len() > 1000 || self.ops_in.len() + ops.len() > MAX_OPS_QUEUE {
+                    self.drop_conn(conn, "Too many operations");
+                    return;
+                }
                 if !from_viewer {
                     self.ops_in.extend(ops.into_iter().map(|o| (conn, o)));
                 }
             }
-            Msg::Presence(p) => {
+            Msg::Presence(mut p) => {
+                // the host knows who is on the other end of the connection: a peer cannot move somebody else's cursor
+                if self.mode == Mode::Hosting {
+                    match self.conns.get(&conn).and_then(|c| c.peer.as_ref().map(|x| x.id)) {
+                        Some(id) => p.peer = id,
+                        None => return,
+                    }
+                } else if p.peer == self.me.id {
+                    return;
+                }
+                if p.cur.map_or(false, |c| !c[0].is_finite() || !c[1].is_finite() || c[0].abs() > 1e8 || c[1].abs() > 1e8) {
+                    p.cur = None;
+                }
+                if !self.presence.contains_key(&p.peer) && self.presence.len() >= 64 {
+                    return;
+                }
                 let id = p.peer;
                 if self.mode == Mode::Hosting {
                     let m = Msg::Presence(p.clone());
@@ -1081,18 +1364,31 @@ impl Collab {
                 }
                 self.presence.insert(id, (p, mono_ms()));
             }
-            Msg::MediaReq { id, off } => self.media_reqs.push((conn, id, off)),
+            Msg::MediaReq { id, off } => {
+                if self.media_reqs.len() < 64 {
+                    self.media_reqs.push((conn, id, off));
+                }
+            }
             Msg::MediaData { id, off, total, name, mime, data } => {
+                // only what this device asked for, bounded in size, and verified against its content id before it is used
+                if !self.requested.contains_key(&id) || total > MAX_MEDIA || data.len() > 700_000 || (self.partial.len() >= 8 && !self.partial.contains_key(&id)) {
+                    return;
+                }
                 let Some(bytes) = crate::media::b64_decode(&data) else { return };
+                let (name, mime) = (clean(&name, 200), clean(&mime, 100));
                 let e = self.partial.entry(id).or_insert_with(|| (Vec::new(), name, mime));
-                if e.0.len() as u64 != off {
+                if e.0.len() as u64 != off || off + bytes.len() as u64 > total {
                     return;
                 }
                 e.0.extend_from_slice(&bytes);
                 let got = e.0.len() as u64;
                 if got >= total {
                     if let Some((b, n, m)) = self.partial.remove(&id) {
-                        self.media_done.push((id, n, m, b));
+                        if crate::media::fnv(&b) == id {
+                            self.media_done.push((id, n, m, b));
+                        } else {
+                            self.requested.remove(&id);
+                        }
                     }
                 } else {
                     self.requested.insert(id, mono_ms());
@@ -1172,7 +1468,21 @@ pub fn take_launch_link() -> Option<String> {
             }
         }
     }
+    if let Ok(mut l) = LAUNCH.lock() {
+        if let Some(s) = l.take() {
+            return Some(s);
+        }
+    }
     VIEW.with(|v| v.borrow_mut().launch.take())
+}
+
+/// A join link that arrived on another thread (Android intent): picked up by [`take_launch_link`] on the UI thread.
+static LAUNCH: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn push_launch_link(s: String) {
+    if let Ok(mut l) = LAUNCH.lock() {
+        *l = Some(s);
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

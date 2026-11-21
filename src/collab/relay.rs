@@ -17,6 +17,8 @@ struct St {
     base: String,
     room: String,
     me: u32,
+    /// Random per-session secret: the relay binds it to our device id, so nobody else in the room can speak as this device.
+    key: String,
     stop: AtomicBool,
     since: AtomicU64,
     inflight: AtomicBool,
@@ -53,7 +55,12 @@ impl Sink for RelaySink {
             push_out(&self.st, self.to, s);
         }
     }
-    fn close(&self) {}
+    fn close(&self) {
+        // forget the virtual connection so a device that comes back gets a fresh one
+        if let Ok(mut p) = self.st.peers.lock() {
+            p.remove(&self.to);
+        }
+    }
 }
 
 fn push_out(st: &Arc<St>, to: u32, m: String) {
@@ -86,7 +93,7 @@ fn pump(st: Arc<St>) {
     if msgs.is_empty() || st.stop.load(Ordering::Relaxed) {
         return;
     }
-    let body = serde_json::json!({ "room": st.room, "from": st.me, "msgs": msgs }).to_string();
+    let body = serde_json::json!({ "room": st.room, "from": st.me, "k": st.key, "msgs": msgs }).to_string();
     let url = format!("{}/api/collab", st.base);
     let st2 = st.clone();
     ehttp::fetch(ehttp::Request::post(url, body.into_bytes()), move |_| pump(st2));
@@ -99,7 +106,7 @@ fn poll_once(st: &Arc<St>) {
     if let Ok(mut t) = st.last_try.lock() {
         *t = mono_ms();
     }
-    let url = format!("{}/api/collab?room={}&me={}&since={}", st.base, st.room, st.me, st.since.load(Ordering::Relaxed));
+    let url = format!("{}/api/collab?room={}&me={}&k={}&since={}", st.base, st.room, st.me, st.key, st.since.load(Ordering::Relaxed));
     let st2 = st.clone();
     ehttp::fetch(ehttp::Request::get(url), move |res| {
         st2.inflight.store(false, Ordering::Release);
@@ -139,6 +146,7 @@ impl Relay {
             base: base.trim_end_matches('/').to_owned(),
             room: room.to_owned(),
             me,
+            key: random_code(24),
             stop: AtomicBool::new(false),
             since: AtomicU64::new(0),
             inflight: AtomicBool::new(false),

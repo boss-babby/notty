@@ -1448,8 +1448,11 @@ impl LumenApp {
         // a link opened in the browser (…/app?join=ROOM&t=TOKEN) or pasted through the command line
         if let Some(link) = crate::collab::take_launch_link() {
             self.collab.ui.join_text = link.clone();
-            let base = self.collab.ui.relay_url.clone();
-            self.collab.join_text(&link, &base);
+            // a link from another app (Android intent) only pre-fills the dialog: joining is always the user's own tap
+            if !link.starts_with("lumen://") {
+                let base = self.collab.ui.relay_url.clone();
+                self.collab.join_text(&link, &base);
+            }
             crate::collab::ui::open_dialog(&mut self.collab, 1);
         }
     }
@@ -2457,6 +2460,18 @@ impl eframe::App for LumenApp {
         crate::crisp::set_ppp(ctx.pixels_per_point());
         crate::crisp::set_zoom(1.0);
         self.ed.embed_rects.clear();
+        // a person who joined as "View": no typing, pasting, cutting or deleting in this client (the host drops such edits anyway)
+        if self.collab.mode == crate::collab::Mode::Joined && self.collab.role == crate::collab::Role::Viewer {
+            ctx.input_mut(|i| {
+                i.events.retain(|e| match e {
+                    egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut | egui::Event::Ime(_) => false,
+                    egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                        !(matches!(key, Key::Backspace | Key::Delete | Key::Enter | Key::Tab) || (modifiers.command && matches!(key, Key::X | Key::V | Key::Z | Key::Y)))
+                    }
+                    _ => true,
+                })
+            });
+        }
         self.load_script_fonts(ctx);
         #[cfg(target_os = "android")]
         self.android_back(ctx);
