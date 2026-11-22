@@ -289,7 +289,7 @@ fn decode(b: &[u8]) -> Option<Msg> {
 }
 
 /// Sends probes at `peer` until one of its packets arrives (both sides do this at the same time: that is what opens the NAT mappings).
-fn punch(sock: &UdpSocket, peer: SocketAddr, cookie: u64, secs: u64, stop: &AtomicBool) -> bool {
+pub(super) fn punch(sock: &UdpSocket, peer: SocketAddr, cookie: u64, secs: u64, stop: &AtomicBool) -> bool {
     let _ = sock.set_read_timeout(Some(Duration::from_millis(40)));
     let end = Instant::now() + Duration::from_secs(secs);
     let mut last = Instant::now() - Duration::from_secs(1);
@@ -428,6 +428,15 @@ fn bound() -> Option<(UdpSocket, SocketAddr)> {
     Some((sock, mapped))
 }
 
+/// The UDP relay for peers behind symmetric NATs (`turn.rs`): `LUMEN_TURN` on this device, else the one the site announces (`turn`).
+fn turn_addr(v: &serde_json::Value) -> Option<SocketAddr> {
+    let name = std::env::var("LUMEN_TURN").ok().filter(|s| !s.trim().is_empty()).or_else(|| v.get("turn").and_then(|t| t.as_str()).map(str::to_owned))?;
+    if name.len() > 100 {
+        return None;
+    }
+    name.trim().to_socket_addrs().ok()?.find(|a| a.is_ipv4() && a.port() != 0 && !a.ip().is_unspecified() && !a.ip().is_multicast())
+}
+
 fn parse_addr(v: &serde_json::Value, key: &str) -> Option<SocketAddr> {
     v.get(key)?.as_str()?.parse::<SocketAddr>().ok().filter(|a| a.is_ipv4() && !a.ip().is_unspecified() && !a.ip().is_multicast())
 }
@@ -442,19 +451,29 @@ pub fn dial(base: String, room: String, inbox: Inbox, stop: Arc<AtomicBool>) -> 
     let url = format!("{}/api/collab/punch?room={}&c={}", base.trim_end_matches('/'), room, c);
     let end = Instant::now() + Duration::from_secs(6);
     let mut host = None;
+    let mut turn = None;
     while Instant::now() < end && !stop.load(Ordering::Relaxed) {
-        if let Some(a) = http(ehttp::Request::get(&url)).and_then(|v| parse_addr(&v, "a")) {
-            host = Some(a);
-            break;
+        if let Some(v) = http(ehttp::Request::get(&url)) {
+            if let Some(a) = parse_addr(&v, "a") {
+                host = Some(a);
+                turn = turn_addr(&v);
+                break;
+            }
         }
         std::thread::sleep(Duration::from_millis(350));
     }
     let Some(host) = host else { return false };
-    if !punch(&sock, host, cookie, 7, &stop) {
-        return false;
-    }
+    // direct first; when the NATs refuse (symmetric ones assign a new port per destination) both ends meet at the relay instead
+    let peer = if punch(&sock, host, cookie, 7, &stop) {
+        host
+    } else {
+        match turn {
+            Some(t) if punch(&sock, t, cookie, 9, &stop) => t,
+            _ => return false,
+        }
+    };
     let st = stop.clone();
-    let _ = std::thread::Builder::new().name("lumen-collab-punch".into()).spawn(move || run(sock, host, cookie, false, inbox, st));
+    let _ = std::thread::Builder::new().name("lumen-collab-punch".into()).spawn(move || run(sock, peer, cookie, false, inbox, st));
     true
 }
 
@@ -465,6 +484,7 @@ pub fn host(base: String, room: String, inbox: Inbox, stop: Arc<AtomicBool>) {
         let mut seen: HashSet<String> = HashSet::new();
         while !stop.load(Ordering::Relaxed) {
             if let Some(v) = http(ehttp::Request::get(&url)) {
+                let turn = turn_addr(&v);
                 for o in v.get("offers").and_then(|o| o.as_array()).cloned().unwrap_or_default() {
                     let (Some(c), Some(joiner)) = (o.get("c").and_then(|c| c.as_str()).map(str::to_owned), parse_addr(&o, "a")) else { continue };
                     let Ok(cookie) = u64::from_str_radix(&c, 16) else { continue };
@@ -477,6 +497,11 @@ pub fn host(base: String, room: String, inbox: Inbox, stop: Arc<AtomicBool>) {
                         post(&base, serde_json::json!({ "room": room, "role": "h", "c": c, "a": mine.to_string() }));
                         if punch(&sock, joiner, cookie, 8, &stop) {
                             run(sock, joiner, cookie, true, inbox, stop);
+                        } else if let Some(t) = turn {
+                            // the joiner gave up on the direct path at about the same time and now waits at the relay
+                            if punch(&sock, t, cookie, 9, &stop) {
+                                run(sock, t, cookie, true, inbox, stop);
+                            }
                         }
                     });
                 }

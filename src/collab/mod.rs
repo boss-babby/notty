@@ -18,8 +18,12 @@ mod net;
 mod upnp;
 #[cfg(not(target_arch = "wasm32"))]
 mod punch;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod turn;
 #[cfg(target_arch = "wasm32")]
 mod webnet;
+#[cfg(target_arch = "wasm32")]
+mod rtc;
 
 use crdt::{Applied, Hlc, Key, Op, Replica, Scope, ScopeKind};
 use serde::{Deserialize, Serialize};
@@ -30,7 +34,7 @@ use std::sync::{Arc, Mutex};
 /// Protocol 2: every frame is end-to-end encrypted (`secure.rs`); the share token is proven, never sent.
 /// Protocol 3: `Key::Comment` entities and `Entry::base` (merge bases).
 /// Protocol 4: `Role::Suggester`, `Presence::{typing, len}`. Older peers are refused with a clear message.
-pub const PROTO: u32 = 5;
+pub const PROTO: u32 = 6;
 /// Tombstones are forgotten after this long. A reconnect gives up after ~90 s, so no device can come back with an older view.
 const TOMBSTONE_GRACE_MS: u64 = 10 * 60 * 1000;
 
@@ -222,6 +226,13 @@ pub enum Msg {
     MediaReq { id: u64, off: u64 },
     MediaData { id: u64, off: u64, total: u64, name: String, mime: String, data: String },
     MediaMiss { id: u64 },
+    /// Host → the chosen successor (protocol 6): take over hosting. `leave` = the old host goes away instead of staying as a participant.
+    Baton { #[serde(default)] leave: bool },
+    /// Successor → old host: I listen now. Addresses to dial, an optional relay room `(site, room)` and the **new** share token (the old one
+    /// is retired, so a device that was removed earlier cannot walk back in with it).
+    BatonAck { addrs: Vec<String>, #[serde(default)] relay: Option<(String, String)>, #[serde(default)] token: String },
+    /// Old host → everybody else: the session continues there (same fields as `BatonAck`).
+    Moved { addrs: Vec<String>, #[serde(default)] relay: Option<(String, String)>, #[serde(default)] token: String },
     Bye,
 }
 
@@ -374,6 +385,13 @@ struct Resume {
     session: String,
 }
 
+/// A host hand-over in flight: the connection of the successor, when it started and whether the old host leaves afterwards.
+struct BatonWait {
+    conn: ConnId,
+    at: f64,
+    leave: bool,
+}
+
 /// Back-off between reconnect attempts (milliseconds); after the last one the session ends.
 const RESUME_DELAYS: [f64; 8] = [800.0, 2000.0, 4000.0, 7000.0, 10_000.0, 15_000.0, 20_000.0, 30_000.0];
 
@@ -463,6 +481,10 @@ pub struct Collab {
     fails: HashMap<String, (u32, f64)>,
     target: Option<Target>,
     resume: Option<Resume>,
+    /// A hand-over this host started and is waiting for the successor to confirm.
+    baton: Option<BatonWait>,
+    /// Roles of the people of the session a hand-over left us with: a device that comes back with the new token keeps its role.
+    inherited: HashMap<u32, Role>,
     /// Devices (by Noise static key) the host removed: they cannot walk back in with the share token.
     banned: HashSet<Vec<u8>>,
     /// Devices (by Noise static key) that were demoted to viewers: reconnecting with the token does not make them editors again.
@@ -701,6 +723,13 @@ fn fetch_public_ip(site: &str) -> Option<String> {
 }
 
 /// Printable, bounded text from the network (names that end up in menus and toasts).
+/// What a hand-over message may tell a device to dial: a few plain `host:port` strings and / or an http(s) site with a room code.
+fn valid_target(addrs: &[String], relay: &Option<(String, String)>, token: &str) -> bool {
+    let plain = |a: &String| !a.is_empty() && a.len() <= 64 && a.chars().all(|c| c.is_ascii_alphanumeric() || ".:-[]_".contains(c));
+    let room = relay.as_ref().map_or(true, |(b, r)| (b.starts_with("https://") || b.starts_with("http://")) && b.len() <= 200 && !b.contains(char::is_whitespace) && (4..=32).contains(&r.len()) && r.chars().all(|c| c.is_ascii_alphanumeric()));
+    addrs.len() <= 12 && addrs.iter().all(plain) && room && (addrs.len() + relay.iter().count()) > 0 && (4..=64).contains(&token.len()) && token.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 fn clean(s: &str, max: usize) -> String {
     s.chars().filter(|c| !c.is_control()).take(max).collect::<String>().trim().to_owned()
 }
@@ -754,6 +783,8 @@ impl Collab {
             fails: HashMap::new(),
             target: None,
             resume: None,
+            baton: None,
+            inherited: HashMap::new(),
             banned: HashSet::new(),
             demoted: HashSet::new(),
             serving: None,
@@ -876,9 +907,23 @@ impl Collab {
         self.token = random_code(10);
         self.roster = vec![(self.me.clone(), Role::Editor)];
         self.last_error = None;
-        #[cfg(not(target_arch = "wasm32"))]
+        self.open_listener(scope, title, false);
+        if let Some(base) = with_relay {
+            self.enable_relay(base);
+        }
+        self.next_scan = 0.0;
+        if self.internet {
+            let site = self.ui.relay_url.clone();
+            self.set_internet(true, &site);
+        }
+    }
+
+    /// Opens the TCP listener, the LAN beacon and (Android) the NSD registration of a hosting session. `keep`: leave the connections this
+    /// device already has open (a joiner that takes over hosting still talks to the old host while it answers).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_listener(&mut self, scope: Scope, title: String, keep: bool) {
         {
-            match self.net.listen(&self.inbox) {
+            match self.net.listen_with(&self.inbox, keep) {
                 Ok(port) => {
                     self.addr_hint = Self::local_ips().into_iter().map(|ip| format!("{ip}:{port}")).collect();
                     let b = Beacon { v: PROTO, id: self.me.id, device: self.me.device.clone(), name: self.me.name.clone(), platform: self.me.platform.clone(), port, what: Self::scope_label(scope).into(), title, people: 1 };
@@ -898,15 +943,10 @@ impl Collab {
                 Err(e) => self.last_error = Some(format!("Could not open a port: {e}")),
             }
         }
-        if let Some(base) = with_relay {
-            self.enable_relay(base);
-        }
-        self.next_scan = 0.0;
-        if self.internet {
-            let site = self.ui.relay_url.clone();
-            self.set_internet(true, &site);
-        }
     }
+
+    #[cfg(target_arch = "wasm32")]
+    fn open_listener(&mut self, _scope: Scope, _title: String, _keep: bool) {}
 
     /// Addresses of this device that peers on the same network can dial (every interface on Android, the default routes elsewhere).
     #[cfg(not(target_arch = "wasm32"))]
@@ -948,12 +988,19 @@ impl Collab {
             punch::host(base, room.clone(), self.inbox.clone(), stop.clone());
             self.punch_stop = Some(stop);
         }
+        // a browser host answers WebRTC offers instead (browser ⇄ browser data channel; the relay stays the fall-back)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            rtc::host(&base, &room, &self.inbox, stop.clone());
+            self.punch_stop = Some(stop);
+        }
         self.relay_room = Some(room);
     }
 
     pub fn relay_link(&self, base: &str) -> Option<String> {
         let room = self.relay_room.as_ref()?;
-        Some(format!("{}/app?join={}&t={}{}", base.trim_end_matches('/'), room, self.token, if self.punch_stop.is_some() { "&p=1" } else { "" }))
+        Some(format!("{}/app?join={}&t={}{}", base.trim_end_matches('/'), room, self.token, if self.punch_stop.is_none() { "" } else if cfg!(target_arch = "wasm32") { "&r=1" } else { "&p=1" }))
     }
 
     pub fn lan_link(&self) -> Option<String> {
@@ -1147,7 +1194,7 @@ impl Collab {
         };
         if let Some(room) = q("join") {
             let token = q("t").unwrap_or_default();
-            self.want_punch = q("p").as_deref() == Some("1");
+            self.want_punch = q(if cfg!(target_arch = "wasm32") { "r" } else { "p" }).as_deref() == Some("1");
             let base = if t.starts_with("http") { t.split("/app").next().unwrap_or(relay_base).to_owned() } else { relay_base.to_owned() };
             self.join_relay(&base, &room, &token);
         } else if let Some(h) = q("h") {
@@ -1221,6 +1268,14 @@ impl Collab {
                         self.punch_join = Some(PunchJoin { rx, stop, base, room });
                         return;
                     }
+                }
+                #[cfg(target_arch = "wasm32")]
+                if self.want_punch && self.punch_join.is_none() {
+                    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    rtc::dial(&base, &room, &self.inbox, stop.clone(), tx, self.ctx.clone());
+                    self.punch_join = Some(PunchJoin { rx, stop, base, room });
+                    return;
                 }
                 self.start_relay(&base, &room);
             }
@@ -1344,6 +1399,8 @@ impl Collab {
         self.resume = None;
         self.banned.clear();
         self.demoted.clear();
+        self.baton = None;
+        self.inherited.clear();
         self.rep = None;
         self.session = None;
         self.roster.clear();
@@ -1490,6 +1547,167 @@ impl Collab {
             self.presence.remove(&id);
             self.broadcast_roster();
         }
+    }
+
+    // ───────────── host hand-over (protocol 6) ─────────────
+
+    /// People who could take over hosting: connected editors, by id.
+    pub fn successors(&self) -> Vec<PeerInfo> {
+        let mut v: Vec<PeerInfo> = self.conns.values().filter(|c| c.active && c.role == Role::Editor).filter_map(|c| c.peer.clone()).collect();
+        v.sort_by_key(|p| p.id);
+        v
+    }
+
+    /// True while a hand-over waits for the successor's answer.
+    pub fn handing_over(&self) -> bool {
+        self.baton.is_some()
+    }
+
+    /// Host: asks `to` (default: the editor with the lowest id) to host the session from now on. The successor starts listening, answers
+    /// with its addresses and a fresh share token, and everybody — this device included, unless `leave` — re-connects to it with the usual
+    /// resume (replica and workspace stay, the digest exchange repairs whatever differs). Nothing changes if the successor does not answer.
+    pub fn hand_over(&mut self, to: Option<u32>, leave: bool) -> bool {
+        if self.mode != Mode::Hosting || self.baton.is_some() {
+            return false;
+        }
+        let pick = self.conns.iter().filter(|(_, c)| c.active && c.role == Role::Editor).filter_map(|(k, c)| c.peer.as_ref().map(|p| (p.id, *k, p.name.clone()))).filter(|(id, _, _)| to.map_or(true, |t| *id == t)).min_by_key(|(id, _, _)| *id);
+        let Some((_, conn, name)) = pick else {
+            self.toast("Nobody can take over right now");
+            return false;
+        };
+        if let Some(c) = self.conns.get(&conn) {
+            c.sink.send(&Msg::Baton { leave });
+        }
+        self.baton = Some(BatonWait { conn, at: mono_ms(), leave });
+        self.toast(format!("Handing the session over to {}…", ui::first_name(&name)));
+        true
+    }
+
+    /// Successor: the host asks us to take over. Listen first, then tell the host where to send everybody.
+    fn on_baton(&mut self, conn: ConnId) {
+        if self.mode != Mode::Joined || !self.ready || self.rep.is_none() || !self.conns.get(&conn).map_or(false, |c| c.active) {
+            return;
+        }
+        let Some(session) = self.session.clone() else { return };
+        let base = self.ui.relay_url.trim().trim_end_matches('/').to_owned();
+        // a browser cannot listen: it can only host through the site's relay
+        let can_host = cfg!(not(target_arch = "wasm32")) || !base.is_empty();
+        if !can_host {
+            if let Some(c) = self.conns.get(&conn) {
+                c.sink.send(&Msg::BatonAck { addrs: vec![], relay: None, token: String::new() });
+            }
+            return;
+        }
+        self.inherited = self.roster.iter().map(|(p, r)| (p.id, *r)).collect();
+        self.mode = Mode::Hosting;
+        self.role = Role::Editor;
+        self.token = random_code(10);
+        self.track = true;
+        self.changes.clear();
+        self.resume = None;
+        self.target = None;
+        self.reused = false;
+        self.open_listener(session.scope, session.name.clone(), true);
+        if !base.is_empty() {
+            self.enable_relay(base.clone());
+        }
+        let mut addrs = self.addr_hint.clone();
+        addrs.extend(self.wan_address());
+        let relay = self.relay_room.clone().map(|r| (base, r));
+        if let Some(c) = self.conns.get(&conn) {
+            c.sink.send(&Msg::BatonAck { addrs, relay, token: self.token.clone() });
+        }
+        self.update_beacon();
+        self.next_scan = 0.0;
+        self.toast("You are now hosting this session");
+    }
+
+    /// Old host: the successor listens. Tell everybody else, then follow it (or leave).
+    fn on_baton_ack(&mut self, conn: ConnId, addrs: Vec<String>, relay: Option<(String, String)>, token: String) {
+        let Some(b) = self.baton.take_if(|b| b.conn == conn) else { return };
+        if self.mode != Mode::Hosting {
+            return;
+        }
+        if !valid_target(&addrs, &relay, &token) {
+            self.toast("That device cannot host the session");
+            return;
+        }
+        let moved = Msg::Moved { addrs: addrs.clone(), relay: relay.clone(), token: token.clone() };
+        for (cid, c) in &self.conns {
+            if *cid != conn && c.active {
+                c.sink.send(&moved);
+            }
+        }
+        if b.leave {
+            self.stop(true);
+            self.toast("You handed the session over");
+        } else if !self.follow(addrs, relay, token) {
+            self.toast("Could not follow the new host");
+        }
+    }
+
+    /// Participant: the host moved the session to another device.
+    fn on_moved(&mut self, conn: ConnId, addrs: Vec<String>, relay: Option<(String, String)>, token: String) {
+        if self.mode != Mode::Joined || !self.conns.get(&conn).map_or(false, |c| c.active) || !valid_target(&addrs, &relay, &token) {
+            return;
+        }
+        if !self.follow(addrs, relay, token) {
+            self.toast("The session moved, but the new host cannot be reached");
+        }
+    }
+
+    /// Drops every transport and re-dials the new host as a *resumed* join (replica, workspace and session description stay).
+    fn follow(&mut self, addrs: Vec<String>, relay: Option<(String, String)>, token: String) -> bool {
+        let was_relay = matches!(self.target, Some(Target::Relay { .. }));
+        let target = match (addrs.is_empty(), relay) {
+            (false, Some(_)) if !was_relay => Target::Addr { addr: addrs.join(","), token },
+            (_, Some((base, room))) if was_relay || addrs.is_empty() => Target::Relay { base, room, token },
+            (false, _) => Target::Addr { addr: addrs.join(","), token },
+            _ => return false,
+        };
+        let Some(session) = self.session.as_ref().map(|s| s.id.clone()) else { return false };
+        if self.rep.is_none() || !self.ready {
+            return false;
+        }
+        if let Some(s) = self.punch_stop.take() {
+            s.store(true, Ordering::Relaxed);
+        }
+        if let Some(pj) = self.punch_join.take() {
+            pj.stop.store(true, Ordering::Relaxed);
+        }
+        for c in self.conns.values() {
+            c.sink.close();
+        }
+        self.conns.clear();
+        self.relay_init = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.net.stop();
+        if let Some(r) = self.relay.take() {
+            r.stop();
+        }
+        if let Ok(mut g) = self.beacon.lock() {
+            *g = None;
+        }
+        #[cfg(target_os = "android")]
+        crate::android::nsd_unregister();
+        self.requests.clear();
+        self.suggestions.clear();
+        self.held_in.clear();
+        self.reassert.clear();
+        self.banned.clear();
+        self.demoted.clear();
+        self.inq.clear();
+        self.ops_in.clear();
+        self.relay_room = None;
+        self.addr_hint.clear();
+        self.baton = None;
+        self.target = Some(target);
+        self.mode = Mode::Joining;
+        self.role = Role::Editor;
+        self.joining_since = mono_ms();
+        self.resume = Some(Resume { attempt: 0, next_at: mono_ms() + 600.0, session });
+        self.toast("The host changed — reconnecting…");
+        true
     }
 
     fn accept(&mut self, conn: ConnId, role: Role) {
@@ -1682,6 +1900,10 @@ impl Collab {
         }
         if matches!(self.mode, Mode::Hosting | Mode::Joined) && now - self.stamps_at > 120_000.0 {
             self.save_stamps();
+        }
+        if self.baton.as_ref().map_or(false, |b| now - b.at > 8000.0) {
+            self.baton = None;
+            self.toast("The hand-over was not confirmed — you are still the host");
         }
         if self.resume.as_ref().map_or(false, |r| now >= r.next_at) && self.conns.is_empty() {
             if let Some(r) = self.resume.as_mut() {
@@ -2235,9 +2457,11 @@ impl Collab {
                 if let Some(c) = self.conns.get_mut(&conn) {
                     c.peer = Some(peer.clone());
                 }
-                if known || (authed && self.auto_admit) {
+                // after a host hand-over the people of the old session come back with the new token and keep the role they had
+                let inherited = if authed { self.inherited.get(&peer.id).copied() } else { None };
+                if known || (authed && (self.auto_admit || inherited.is_some())) {
                     let viewer = !remote.is_empty() && (self.demoted.contains(&remote) || self.trusted.get(&hex(&remote)).map_or(false, |t| t.1));
-                    let role = if viewer { Role::Viewer } else { Role::Editor };
+                    let role = inherited.unwrap_or(if viewer { Role::Viewer } else { Role::Editor });
                     self.accept(conn, role);
                 } else if self.requests.len() >= MAX_REQUESTS {
                     if let Some(c) = self.conns.get(&conn) {
@@ -2320,6 +2544,9 @@ impl Collab {
                     self.roster = peers;
                 }
             }
+            Msg::Baton { .. } => self.on_baton(conn),
+            Msg::BatonAck { addrs, relay, token } => self.on_baton_ack(conn, addrs, relay, token),
+            Msg::Moved { addrs, relay, token } => self.on_moved(conn, addrs, relay, token),
             Msg::Bye => self.on_closed(conn, "The other device left"),
             other => {
                 if self.conns.get(&conn).map_or(false, |c| c.active) {
@@ -2463,6 +2690,17 @@ struct ViewState {
     caret_len: u32,
     typing_at: f64,
     draft: Option<(LiveDraft, f64)>,
+    /// Remote carets followed through other people's edits: (peer, block) → [`Track`].
+    tracks: HashMap<(u32, u64), Track>,
+}
+
+/// A remote caret as last drawn: the text it was drawn against and where it was mapped to, so that an edit by anybody (the remote
+/// person, me, a third device) moves the caret with the text instead of leaving it at the old offset.
+struct Track {
+    raw: (u32, u32),
+    len: u32,
+    text: String,
+    ab: (u32, u32),
 }
 
 thread_local! {
@@ -2474,6 +2712,9 @@ pub fn publish(c: &Collab) {
     VIEW.with(|v| {
         let mut v = v.borrow_mut();
         v.show = c.active() && c.show_cursors;
+        if !v.show {
+            v.tracks.clear();
+        }
         v.remotes = if v.show { c.roster.iter().filter(|(p, _)| p.id != c.me.id).filter_map(|(p, _)| c.presence.get(&p.id).map(|x| (p.clone(), x.0.clone()))).collect() } else { vec![] };
     });
 }
@@ -2527,13 +2768,13 @@ fn draft_state() -> Option<LiveDraft> {
 }
 
 /// Other people's text carets inside `block`: (name, colour index, selection start, caret).
-pub fn remote_carets(block: u64) -> Vec<(String, u8, u32, u32, u32, bool)> {
+pub fn remote_carets(block: u64) -> Vec<(String, u8, u32, u32, u32, bool, u32)> {
     VIEW.with(|v| {
         let v = v.borrow();
         if !v.show {
             return vec![];
         }
-        v.remotes.iter().filter(|(_, p)| p.block == Some(block)).filter_map(|(i, p)| p.caret.map(|(a, b)| (i.name.clone(), i.color, a, b, p.len, p.typing))).collect()
+        v.remotes.iter().filter(|(_, p)| p.block == Some(block)).filter_map(|(i, p)| p.caret.map(|(a, b)| (i.name.clone(), i.color, a, b, p.len, p.typing, i.id))).collect()
     })
 }
 
@@ -2548,21 +2789,60 @@ pub fn remote_drafts(doc: u64, page: u32) -> Vec<(u8, LiveDraft)> {
     })
 }
 
+/// Maps a character index of `old` to the matching index of `new` through the one contiguous edit that turns `old` into `new`
+/// (common prefix / common suffix). A point before the edit stays, a point after it moves by the length difference, a point inside the
+/// replaced range keeps its distance from the start of the edit, clamped to the new text.
+pub fn map_index(old: &[char], new: &[char], idx: usize) -> usize {
+    let max = old.len().min(new.len());
+    let pre = old.iter().zip(new).take_while(|(x, y)| x == y).count();
+    let suf = old[pre..].iter().rev().zip(new[pre..].iter().rev()).take(max - pre).take_while(|(x, y)| x == y).count();
+    let idx = idx.min(old.len());
+    if idx <= pre {
+        idx
+    } else if idx >= old.len() - suf {
+        new.len() - (old.len() - idx)
+    } else {
+        pre + (idx - pre).min(new.len() - suf - pre)
+    }
+}
+
+/// Follows one remote caret through the edits made to the block since it was drawn the last time. `(a, b)` is what the person sent
+/// (selection start, caret) and `len` the length of their text then; `text` / `n` are our text now.
+fn track_caret(peer: u32, block: u64, raw: (u32, u32), len: u32, text: &str, n: u32) -> (u32, u32) {
+    VIEW.with(|v| {
+        let mut v = v.borrow_mut();
+        if v.tracks.len() > 256 {
+            v.tracks.clear();
+        }
+        let t = v.tracks.entry((peer, block)).or_insert(Track { raw: (u32::MAX, u32::MAX), len: 0, text: String::new(), ab: (0, 0) });
+        if t.raw != raw || t.len != len {
+            // a fresh report: the caret was taken against a text of `len` characters; ours has `n` (an edit is still on its way): the
+            // missing / extra characters lie before the caret when somebody types or deletes at it, so shift instead of jumping
+            let adj = if len != 0 && len != n { (n as i64 - len as i64).clamp(-64, 64) } else { 0 };
+            let shift = |x: u32| (x as i64 + adj).clamp(0, n as i64) as u32;
+            *t = Track { raw, len, text: text.to_owned(), ab: (shift(raw.0), shift(raw.1)) };
+        } else if t.text != text {
+            let (old, new): (Vec<char>, Vec<char>) = (t.text.chars().collect(), text.chars().collect());
+            t.ab = (map_index(&old, &new, t.ab.0 as usize) as u32, map_index(&old, &new, t.ab.1 as usize) as u32);
+            t.text.clear();
+            t.text.push_str(text);
+        }
+        (t.ab.0.min(n), t.ab.1.min(n))
+    })
+}
+
 /// Paints other people's carets (a thin coloured bar, selection tint and a name flag) over the text of `block`.
 pub fn paint_carets(ui: &egui::Ui, block: u64, galley: &egui::Galley, pos: egui::Pos2) {
     let list = remote_carets(block);
     if list.is_empty() {
         return;
     }
-    let n = galley.text().chars().count() as u32;
+    let text = galley.text();
+    let n = text.chars().count() as u32;
     let p = ui.painter();
-    for (name, color, a, b, len, typing) in list {
+    for (name, color, a, b, len, typing, peer) in list {
         let col = ui::COLORS[(color % 8) as usize];
-        // the caret was taken against a text of `len` characters; ours has `n` (an edit is still on its way): the missing / extra
-        // characters lie before the caret when somebody types or deletes at it, so shift by the difference instead of jumping
-        let adj = if len != 0 && len != n { (n as i64 - len as i64).clamp(-64, 64) } else { 0 };
-        let shift = |x: u32| (x as i64 + adj).clamp(0, n as i64) as u32;
-        let (a, b) = (shift(a), shift(b));
+        let (a, b) = track_caret(peer, block, (a, b), len, text, n);
         let at = |i: u32| galley.pos_from_ccursor(egui::text::CCursor::new(i as usize));
         let head = at(b);
         if a != b {
@@ -2667,6 +2947,106 @@ mod tests {
             }
         }
         false
+    }
+
+    /// One frame of three devices: the host works on workspace 1, the two others on their "Shared" workspace 2.
+    fn round3(h: &mut Collab, hw: &mut Workspace, a: &mut Collab, aw: &mut Workspace, b: &mut Collab, bw: &mut Workspace) {
+        let hc = hw.current;
+        h.poll(hw, 1, hc, &|_| true);
+        for (c, w) in [(a, aw), (b, bw)] {
+            if c.take_new_workspace().is_some() {
+                c.bind(2);
+            }
+            let cur = w.current;
+            c.poll(w, 2, cur, &|_| true);
+        }
+        std::thread::sleep(Duration::from_millis(4));
+    }
+
+    #[test]
+    fn the_host_hands_the_session_over_and_everybody_follows() {
+        let (mut host, mut hw, mut a, mut aw, port) = pair();
+        let mut b = Collab::new(&egui::Context::default());
+        let mut bw = Workspace::blank("b", false, 0);
+        bw.pages.clear();
+        bw.current = None;
+        let token = host.token.clone();
+        a.join_addr(&format!("127.0.0.1:{port}"), &token);
+        b.join_addr(&format!("127.0.0.1:{port}"), &token);
+        let blocks = |w: &Workspace| w.pages.iter().map(|p| p.blocks.len()).sum::<usize>();
+        let t0 = std::time::Instant::now();
+        let mut synced = false;
+        while t0.elapsed().as_secs() < 12 && !synced {
+            round3(&mut host, &mut hw, &mut a, &mut aw, &mut b, &mut bw);
+            synced = !aw.pages.is_empty() && !bw.pages.is_empty() && blocks(&hw) == blocks(&aw) && blocks(&hw) == blocks(&bw) && host.roster.len() == 3;
+        }
+        assert!(synced, "three devices did not sync first");
+        let a_id = a.me.id;
+        assert!(host.hand_over(Some(a_id), false));
+        let pid = hw.pages.iter().find(|p| p.blocks.len() > 1).map(|p| p.id).unwrap();
+        let t0 = std::time::Instant::now();
+        let mut done = false;
+        while t0.elapsed().as_secs() < 20 && !done {
+            round3(&mut host, &mut hw, &mut a, &mut aw, &mut b, &mut bw);
+            done = a.mode == Mode::Hosting && host.mode == Mode::Joined && b.mode == Mode::Joined && a.roster.len() == 3 && a.token != token;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(done, "modes: host {:?} a {:?} b {:?}, roster at a {}", host.mode, a.mode, b.mode, a.roster.len());
+        // an edit made by the participant who did not move reaches the new host AND the old one through it
+        bw.page_mut(pid).unwrap().blocks[0].text = "typed after the hand-over".into();
+        b.poke();
+        let t0 = std::time::Instant::now();
+        let mut ok = false;
+        while t0.elapsed().as_secs() < 10 && !ok {
+            round3(&mut host, &mut hw, &mut a, &mut aw, &mut b, &mut bw);
+            ok = [&hw, &aw].iter().all(|w| w.page(pid).map_or(false, |p| p.blocks[0].text == "typed after the hand-over"));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(ok, "edit after the hand-over did not reach everybody");
+        for c in [&mut host, &mut a, &mut b] {
+            c.stop(true);
+        }
+    }
+
+    #[test]
+    fn hand_over_targets_are_validated() {
+        let ok = |a: &[&str], r: Option<(&str, &str)>, t: &str| valid_target(&a.iter().map(|x| x.to_string()).collect::<Vec<_>>(), &r.map(|(b, r)| (b.to_string(), r.to_string())), t);
+        assert!(ok(&["192.168.1.5:7878"], None, "abcd1234"));
+        assert!(ok(&[], Some(("https://site.example", "ROOM123456")), "abcd1234"));
+        assert!(!ok(&[], None, "abcd1234"), "nothing to dial");
+        assert!(!ok(&["a b"], None, "abcd1234"));
+        assert!(!ok(&["1.2.3.4:5"], None, "x"));
+        assert!(!ok(&[], Some(("ftp://x", "ROOM123456")), "abcd1234"));
+        assert!(!ok(&[], Some(("https://x", "RO OM")), "abcd1234"));
+    }
+
+    #[test]
+    fn carets_follow_edits_through_the_common_prefix_and_suffix() {
+        let c = |s: &str| s.chars().collect::<Vec<_>>();
+        // typing before the caret pushes it right, typing after leaves it
+        assert_eq!(map_index(&c("hello world"), &c("hello big world"), 8), 12);
+        assert_eq!(map_index(&c("hello world"), &c("hello world!!"), 8), 8);
+        // a deletion before the caret pulls it left; a caret inside the deleted range lands at the start of the edit
+        assert_eq!(map_index(&c("hello big world"), &c("hello world"), 12), 8);
+        assert_eq!(map_index(&c("hello big world"), &c("hello world"), 8), 6);
+        // identical text, empty text, index beyond the end
+        assert_eq!(map_index(&c("abc"), &c("abc"), 2), 2);
+        assert_eq!(map_index(&c(""), &c("abc"), 0), 0);
+        assert_eq!(map_index(&c("abc"), &c(""), 3), 0);
+        assert_eq!(map_index(&c("abc"), &c("abcd"), 99), 3);
+        // a caret exactly at the point of an insertion stays in front of it (the person's own next report moves it)
+        assert_eq!(map_index(&c("aaaa"), &c("aaaaa"), 4), 4);
+    }
+
+    #[test]
+    fn a_tracked_caret_moves_with_remote_text_and_resets_on_a_new_report() {
+        assert_eq!(track_caret(7, 1, (5, 5), 11, "hello world", 11), (5, 5));
+        // somebody typed at the start: same report, longer text ⇒ the caret moved with the text
+        assert_eq!(track_caret(7, 1, (5, 5), 11, "oh hello world", 14), (8, 8));
+        // a new report replaces the track
+        assert_eq!(track_caret(7, 1, (2, 3), 14, "oh hello world", 14), (2, 3));
+        // report taken against a longer text than ours (edit still on its way): shift by the difference
+        assert_eq!(track_caret(8, 1, (10, 10), 14, "oh hello wor", 12), (8, 8));
     }
 
     #[test]

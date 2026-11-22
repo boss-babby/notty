@@ -1,4 +1,4 @@
-# Local collaboration — design, status and next steps (Lumen 14.6)
+# Local collaboration — design, status and next steps (Lumen 14.7)
 
 > **14.1 update:** the security review and hardening pass is documented in §8 (protocol 2: end-to-end encrypted, authenticated, rate-limited);
 > §4 and §7 below describe the 14.0 state and are annotated with what 14.1 closed.
@@ -523,3 +523,94 @@ package-verified only (no phone here). FCM push for a *closed* app needs Google 
 | autosave fingerprint + RON text | **autosave worker (new)** |
 | decrypt, JSON parse, CRDT apply (≤ 4 ms / frame), change scan (≤ 2.5 ms / frame) | UI thread — it mutates the `Workspace` the UI draws, so it stays there and is time-boxed |
 Idle cost is unchanged: no thread spins; sealing and autosave threads block on channels, the host listener polls once per 1.5 s only while a relay room is offered.
+
+
+## 14. Pass 8 — host hand-over, UDP relay for symmetric NATs, browser WebRTC, caret mapping (14.7)
+
+Input: §13.8. Every item says what was done, how it was verified and what is left. `PROTO` is now **6** (three new messages; a 14.6 peer is
+refused with the usual "incompatible version" message). Verified on this build machine (Linux x86-64, no phones, no router, one headless
+host): `cargo test --lib` (new tests listed below), `cargo check` for the library on all four targets (native, `wasm32-unknown-unknown`,
+`aarch64-linux-android`, `x86_64-pc-windows-gnu`), the three release builds and the site's HTTP endpoints (see 14.7).
+
+### 14.1 Status of the §13.8 list
+
+| # | Item | State |
+|---|---|---|
+| 1 | Browser WebRTC data channel | **done, compile-verified + signalling verified over HTTP; not verified between two real browsers** (14.4) |
+| 2 | `yrs` / Y.Text per block | **not done, deliberately.** The agreed *cheaper intermediate step* **is done**: remote carets follow edits through the common-prefix/suffix diff (14.5) |
+| 3 | BLE advertising + GATT hand-off | **not done** — needs two phones and the `BLUETOOTH_*` permission flow; shipping untestable radio code in a production APK is a crash risk (14.8) |
+| 4a | Host hand-over | **done**, end-to-end test over real sockets with three devices (14.2) |
+| 4b | UDP TURN-like relay for symmetric NATs | **done**: `collab/turn.rs` + `lumen-turn` binary + client fall-back; tested over real UDP sockets (14.3) |
+| 4c | Big tables chunk-wise (`lumen-store` zone maps) | **not done** (14.8) — big tables are still not part of a shared session |
+| 4d | Mesh | **not done**; hand-over covers the "host leaves" case, the topology stays a star |
+| 4e | FCM push worker | **not done** — needs Google credentials and the Firebase SDK in the APK (14.8) |
+| 5 | `Arc<Page>` copy-on-write + per-page store | **not done** (14.8) |
+
+### 14.2 Host hand-over (protocol 6)
+* **Why**: the session used to end when the host left (the joiners kept their copy). Now the host can pass the baton.
+* **Flow**: host → successor `Baton{leave}` · the successor (an active *Editor*, default the lowest id) starts listening **without dropping its
+  link to the old host** (`Net::listen_with(keep)`), mints a **new share token**, and answers `BatonAck{addrs, relay, token}` · the old host
+  validates the answer (`valid_target`: ≤ 12 plain `host:port` strings, an http(s) site + room code, alphanumeric token) and sends
+  `Moved{…}` to everybody else · every other device — and the old host itself unless it chose *leave* — tears its transports down and re-dials the
+  new host with the **ordinary resume** (replica, workspace and session id stay; the digest exchange repairs whatever differs).
+* **Security**: the old token is retired, so a device that was removed earlier cannot walk back in with it; the roles of the old roster are
+  inherited (`inherited: id → Role`) and applied to devices that come back *with the new token* (Viewers stay Viewers, Suggesters stay Suggesters)
+  without a new approval card for each person. Banned-key and demotion lists do not travel (the successor does not know other people's channel
+  keys) — the token rotation is what keeps removed devices out. Held suggestions that had not been decided yet are discarded (stated in the toast text of the host).
+* **Timeouts**: no answer within 8 s → "you are still the host", nothing changed. A successor that cannot host (a browser without a relay URL)
+  answers with an empty address list.
+* **UI**: People drop-down → *Hand over hosting & leave* (shown to a host with at least one connected editor).
+* **Tests**: `the_host_hands_the_session_over_and_everybody_follows` (host + 2 joiners over loopback: modes swap, roster is complete, the token
+  changes, an edit typed afterwards reaches both the new and the old host) and `hand_over_targets_are_validated`.
+* **Not done**: automatic hand-over when the host's process dies (needs a failure detector and a deterministic election — the mesh item);
+  hand-over with several simultaneous successors; carrying pending suggestions.
+
+### 14.3 UDP relay for symmetric NATs (`collab/turn.rs`, `lumen-turn`)
+* Both ends send the packets of their reliable stream (`Rudp`) to the relay instead of to each other. The relay routes by the 64-bit cookie in
+  bytes 1..9 — the one the devices already agreed on through the site: the first two distinct source addresses become an *allocation*, a third is
+  refused; datagram shape is checked (17..1400 bytes, type ≤ 3, cookie ≠ 0), 256 KiB/s per allocation (512 KiB burst), ≤ 4 096 allocations, 60 s idle
+  expiry. The payload is the Noise channel, so the relay sees opaque bytes.
+* **Client**: after the direct punch fails (joiner 7 s, host 8 s) both sides punch *at the relay* (`punch()` with `peer = relay`, 9 s) and run the same
+  link (`run`) — no new session code. The relay address is `LUMEN_TURN` (environment of the device) or the `turn` field the rendezvous returns when the
+  site has `LUMEN_TURN_ADDR` set.
+* **Run it**: `lumen-turn --bind 0.0.0.0:3478` on any machine with a public UDP port (it is a normal `[[bin]]`, std-only). The Next.js site cannot
+  host UDP itself, so the relay is a separate small process.
+* **Tests**: routing (join / third address / cookie isolation), malformed datagrams + idle expiry, flood throttle, and **two sockets that only know the
+  relay** exchange a 23-byte and a 5 000-byte message through `Rudp` over real UDP.
+* **Not done**: skipping the 7 s direct attempt when the NAT is known to be symmetric (two STUN servers returning different ports) — an optimisation;
+  authentication of allocations beyond the cookie; IPv6.
+
+### 14.4 Browser WebRTC (`collab/rtc.rs`, site route `/api/collab/rtc`)
+* A host *in a browser* answers SDP offers; the join link carries `r=1`. The joiner first asks `?cap=1` (is a browser host polling?), then offers,
+  waits for the answer, and uses the open data channel as a normal `Sink` (binary messages `[more][Noise message]`, text for the rest). If anything
+  fails within ~12 s the **relay takes over** (same `PunchJoin` fall-back as native hole punching). Native hosts ignore `r=1`; native joiners ignore it too.
+* The ICE agent uses public STUN, no TURN. The RTCPeerConnection plumbing is ~80 lines of `inline_js` instead of a long `web-sys` feature list.
+* **Verified**: the wasm build compiles and links; the signalling endpoint is exercised over HTTP (offer → answer, capability flag, TTL, validation).
+  **Not verified**: a real connection between two browsers — there is no browser pair on this machine.
+
+### 14.5 Remote carets through the text diff
+`map_index(old, new, idx)` maps a caret through the single contiguous edit between two texts (common prefix / suffix); `track_caret` keeps, per
+(person, block), the text the caret was last drawn against and moves it with every later change of the block (remote, local, a third device), and
+re-bases on each new presence report (length shift as before for a report that is ahead of the text). Tests: `carets_follow_edits_through_the_common_prefix_and_suffix`,
+`a_tracked_caret_moves_with_remote_text_and_resets_on_a_new_report`. Still approximate for two simultaneous edits in different places of one block
+(only one contiguous edit is modelled) — exactness needs the CRDT adapter of §13.8 #2.
+
+### 14.6 The website (this repository's `src/`)
+`/api/collab` (relay: rooms, per-device keys, long poll, limits of §9.3, a device only sees frames posted after it first appeared),
+`/api/collab/punch` (addresses + optional `turn`), `/api/collab/rtc` (SDP signalling), `/api/collab/stats` (aggregate counters), the landing page with
+the Android / Windows downloads and the embedded WebAssembly app, and the rewrites `/app` and `/webapp` → `public/webapp/index.html` (so
+`/app?join=ROOM&t=TOKEN` links open the app with the join parameters). Everything is in memory; there is no database use.
+
+### 14.7 Verification log (this machine)
+See `RELEASE-14.7.md` for the exact commands, artefacts and sizes of this delivery.
+
+### 14.8 Not done — why, and what to do next (ranked)
+1. **Big tables in a session.** Rows of big tables live in `lumen-store`, outside the entity CRDT, so they are not shared at all (the page and its columns are).
+   The pieces exist: rows carry `updated` (last-writer-wins per row) and the store is chunked by id range (`CHUNK_ROWS` = 4 096). Plan: per-bucket digest
+   `(bucket, rows, FNV(id, updated))` cached by `bigtable::version`, `BigDigest / BigGet / BigChunk` messages (chunks via `encode_chunk`), row tombstones for deletes,
+   the same viewer / suggester gates as `Ops`, and joiners creating a volatile store for an unknown table. Needs a UI test rig for the creation path and a 1 M-row soak test.
+2. **BLE pairing (AirDrop feel).** Advertise a 16-byte session hash only; GATT hand-off of the join link sealed with an ECDH key (X25519 through Rust over JNI);
+   both phones show the same 6-digit code, the host taps *Accept*. Needs two phones.
+3. **`yrs` / Y.Text** per text block (real intention preservation, exact carets): an editor adapter that diffs egui's `TextEdit` string into CRDT operations.
+4. **FCM push** for a closed app: Firebase in the APK (needs `google-services.json`) + a sender route on the site with a service-account key.
+5. **Mesh / automatic election** when the host's process dies; skip-direct-punch on symmetric NAT detection; `Arc<Page>` copy-on-write snapshots and a per-page store.

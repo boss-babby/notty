@@ -87,6 +87,12 @@ mod dashtests;
 
 pub use app::LumenApp;
 
+/// `lumen-turn`: the UDP relay for collaboration through symmetric NATs (`collab/turn.rs`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn turn_cli(args: Vec<String>) -> i32 {
+    collab::turn::run(&args)
+}
+
 /// Entry point of the headless `lumen-mcp` binary (stdio MCP server over a workspace backup file).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn mcp_cli(args: Vec<String>) -> i32 {

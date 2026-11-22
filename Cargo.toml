@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "14.6.0"
+version = "14.7.0"
 edition = "2021"
 description = "Lumen — a Notion + Obsidian + Miro-lite alternative (infinite canvas) written entirely in Rust with egui (Windows, Android + WebAssembly): Markdown tables, two-way relations, automations, reminders, LumenScript, AI + MCP"
 license = "MIT"
@@ -17,6 +17,11 @@ path = "src/main.rs"
 [[bin]]
 name = "lumen-mcp"
 path = "src/bin/lumen_mcp.rs"
+
+# UDP relay for collaboration through symmetric NATs (run it on any host with a public UDP port): lumen-turn --bind 0.0.0.0:3478
+[[bin]]
+name = "lumen-turn"
+path = "src/bin/lumen_turn.rs"
 
 [dependencies]
 egui = "0.31"

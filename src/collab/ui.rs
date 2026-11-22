@@ -420,6 +420,17 @@ fn menu(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &crate::model::Workspa
                 });
             });
             ui.add_space(6.0);
+            if hosting && !c.successors().is_empty() {
+                // hand the session to somebody else: they host from now on, everybody (you too) reconnects to them
+                let first = c.successors().first().map(|p| p.id);
+                let waiting = c.handing_over();
+                let label = if waiting { "Handing over…" } else { "Hand over hosting & leave" };
+                if button(ui, pal, label, 2, ui.available_width()).on_hover_text("The session keeps running on another device — nothing is lost").clicked() && !waiting {
+                    c.hand_over(first, true);
+                    c.ui.menu = false;
+                }
+                ui.add_space(4.0);
+            }
             if button(ui, pal, if hosting { "Stop sharing" } else { "Leave session" }, 2, ui.available_width()).clicked() {
                 c.stop(true);
                 c.ui.menu = false;

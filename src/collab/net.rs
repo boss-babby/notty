@@ -221,8 +221,11 @@ fn pump(mut ws: WebSocket<TcpStream>, conn: ConnId, inbox: Inbox, rx: Receiver<O
 }
 
 impl Net {
-    pub fn listen(&mut self, inbox: &Inbox) -> Result<u16, String> {
-        self.stop();
+    /// `keep`: do not stop the connections opened so far (a joiner that becomes the host still needs its link to the old host).
+    pub fn listen_with(&mut self, inbox: &Inbox, keep: bool) -> Result<u16, String> {
+        if !keep {
+            self.stop();
+        }
         let l = TcpListener::bind(("0.0.0.0", PORT)).or_else(|_| TcpListener::bind(("0.0.0.0", 0))).map_err(|e| e.to_string())?;
         let port = l.local_addr().map_err(|e| e.to_string())?.port();
         l.set_nonblocking(true).map_err(|e| e.to_string())?;
