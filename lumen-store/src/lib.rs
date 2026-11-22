@@ -58,7 +58,18 @@ impl Row {
         self.props.binary_search_by_key(&prop, |p| p.0).ok().map(|i| &self.props[i].1)
     }
     fn heap_estimate(&self) -> usize {
-        64 + self.title.len() + self.props.iter().map(|(_, v)| 40 + match v { Value::Text(s) => s.len(), Value::Multi(m) => m.len() * 8, _ => 0 }).sum::<usize>()
+        64 + self.title.len()
+            + self
+                .props
+                .iter()
+                .map(|(_, v)| {
+                    40 + match v {
+                        Value::Text(s) => s.len(),
+                        Value::Multi(m) => m.len() * 8,
+                        _ => 0,
+                    }
+                })
+                .sum::<usize>()
     }
 }
 
@@ -459,7 +470,9 @@ pub fn decode_row(bytes: &[u8], id: u64) -> io::Result<Option<Row>> {
 /// Values of a numeric column without ids: values are densely packed behind the presence bitmap, so this is a straight pass over bytes.
 fn decode_num_values(bytes: &[u8], prop: u32, mut f: impl FnMut(f64)) -> io::Result<()> {
     let v = view(bytes)?;
-    let Some((_, _, b)) = v.cols.iter().find(|c| c.0 == prop && c.1 == 1) else { return Ok(()) };
+    let Some((_, _, b)) = v.cols.iter().find(|c| c.0 == prop && c.1 == 1) else {
+        return Ok(());
+    };
     for x in b[v.n.div_ceil(8)..].chunks_exact(8) {
         f(f64::from_le_bytes([x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]]));
     }
@@ -468,7 +481,9 @@ fn decode_num_values(bytes: &[u8], prop: u32, mut f: impl FnMut(f64)) -> io::Res
 
 fn decode_sel_values(bytes: &[u8], prop: u32, mut f: impl FnMut(u64)) -> io::Result<()> {
     let v = view(bytes)?;
-    let Some((_, _, b)) = v.cols.iter().find(|c| c.0 == prop && c.1 == 2) else { return Ok(()) };
+    let Some((_, _, b)) = v.cols.iter().find(|c| c.0 == prop && c.1 == 2) else {
+        return Ok(());
+    };
     let mut p = v.n.div_ceil(8);
     while p < b.len() {
         f(get_var(b, &mut p).ok_or_else(|| bad("sel"))?);
@@ -479,7 +494,9 @@ fn decode_sel_values(bytes: &[u8], prop: u32, mut f: impl FnMut(u64)) -> io::Res
 /// Decodes only the ids and one numeric column of a chunk (streaming scans never build rows).
 fn decode_num_col(bytes: &[u8], prop: u32, mut f: impl FnMut(u64, f64)) -> io::Result<()> {
     let v = view(bytes)?;
-    let Some((_, _, b)) = v.cols.iter().find(|c| c.0 == prop && c.1 == 1) else { return Ok(()) };
+    let Some((_, _, b)) = v.cols.iter().find(|c| c.0 == prop && c.1 == 1) else {
+        return Ok(());
+    };
     let ids = decode_ids(&v)?;
     let bm_len = v.n.div_ceil(8);
     let mut p = bm_len;
@@ -495,7 +512,9 @@ fn decode_num_col(bytes: &[u8], prop: u32, mut f: impl FnMut(u64, f64)) -> io::R
 
 fn decode_sel_col(bytes: &[u8], prop: u32, mut f: impl FnMut(u64, u64)) -> io::Result<()> {
     let v = view(bytes)?;
-    let Some((_, _, b)) = v.cols.iter().find(|c| c.0 == prop && c.1 == 2) else { return Ok(()) };
+    let Some((_, _, b)) = v.cols.iter().find(|c| c.0 == prop && c.1 == 2) else {
+        return Ok(());
+    };
     let ids = decode_ids(&v)?;
     let bm_len = v.n.div_ceil(8);
     let mut p = bm_len;
@@ -751,7 +770,9 @@ impl Store {
         let mut p = 0;
         while p + 4 <= wal.len() {
             let len = u32::from_le_bytes([wal[p], wal[p + 1], wal[p + 2], wal[p + 3]]) as usize;
-            let Some(rec) = wal.get(p + 4..p + 4 + len + 4) else { break }; // torn tail
+            let Some(rec) = wal.get(p + 4..p + 4 + len + 4) else {
+                break;
+            }; // torn tail
             let (body, ck) = rec.split_at(len);
             if fnv(body).to_le_bytes() != ck {
                 break;
@@ -925,7 +946,9 @@ impl Store {
         if let Some(o) = self.overlay.get(&id) {
             return Ok(o.clone());
         }
-        let Some(i) = self.locate(id) else { return Ok(None) };
+        let Some(i) = self.locate(id) else {
+            return Ok(None);
+        };
         let bytes = self.chunk_bytes(i)?;
         decode_row(&bytes, id)
     }
@@ -1012,6 +1035,21 @@ impl Store {
         Ok(self.chunks.iter().map(|c| c.n as u64).sum())
     }
 
+    /// Every row with `lo <= id < hi`, in id order (one bucket of the collaboration digest). Reads only the chunks that overlap the range.
+    pub fn rows_in(&mut self, lo: u64, hi: u64) -> io::Result<Vec<Row>> {
+        self.checkpoint()?;
+        let mut out = Vec::new();
+        let first = self.chunks.partition_point(|c| c.max_id < lo);
+        for i in first..self.chunks.len() {
+            if self.chunks[i].min_id >= hi {
+                break;
+            }
+            let rows = decode_chunk(&self.chunk_bytes(i)?)?;
+            out.extend(rows.into_iter().filter(|r| r.id >= lo && r.id < hi));
+        }
+        Ok(out)
+    }
+
     /// `count` rows starting at row number `start` (id order) — what a virtualised table asks for. Reads one or two chunks.
     pub fn window(&mut self, start: u64, count: usize) -> io::Result<Vec<Row>> {
         self.checkpoint()?;
@@ -1038,7 +1076,9 @@ impl Store {
         self.checkpoint()?;
         let mut agg = NumAgg::new();
         for i in 0..self.chunks.len() {
-            let Some(z) = self.chunks[i].zones.iter().find(|z| z.prop == prop).copied() else { continue };
+            let Some(z) = self.chunks[i].zones.iter().find(|z| z.prop == prop).copied() else {
+                continue;
+            };
             match range {
                 None => merge_zone(&mut agg, &z),
                 Some((lo, hi)) if z.max < lo || z.min > hi => self.stats.chunks_skipped += 1,
@@ -1186,7 +1226,9 @@ pub fn chunk_titles(bytes: &[u8]) -> io::Result<Vec<String>> {
 /// One entry per row of the chunk (`None` = empty cell), so several columns can be combined row by row.
 pub fn col_num(bytes: &[u8], prop: u32) -> io::Result<Vec<Option<f64>>> {
     let v = view_ex(bytes, false)?;
-    let Some(b) = col_bytes(&v, prop, 1) else { return Ok(vec![None; v.n]) };
+    let Some(b) = col_bytes(&v, prop, 1) else {
+        return Ok(vec![None; v.n]);
+    };
     let bm_len = v.n.div_ceil(8);
     let mut p = bm_len;
     let mut out = Vec::with_capacity(v.n);
@@ -1204,7 +1246,9 @@ pub fn col_num(bytes: &[u8], prop: u32) -> io::Result<Vec<Option<f64>>> {
 
 pub fn col_sel(bytes: &[u8], prop: u32) -> io::Result<Vec<Option<u64>>> {
     let v = view_ex(bytes, false)?;
-    let Some(b) = col_bytes(&v, prop, 2) else { return Ok(vec![None; v.n]) };
+    let Some(b) = col_bytes(&v, prop, 2) else {
+        return Ok(vec![None; v.n]);
+    };
     let bm_len = v.n.div_ceil(8);
     let mut p = bm_len;
     let mut out = Vec::with_capacity(v.n);
@@ -1216,7 +1260,9 @@ pub fn col_sel(bytes: &[u8], prop: u32) -> io::Result<Vec<Option<u64>>> {
 
 pub fn col_check(bytes: &[u8], prop: u32) -> io::Result<Vec<Option<bool>>> {
     let v = view_ex(bytes, false)?;
-    let Some(b) = col_bytes(&v, prop, 4) else { return Ok(vec![None; v.n]) };
+    let Some(b) = col_bytes(&v, prop, 4) else {
+        return Ok(vec![None; v.n]);
+    };
     let bm_len = v.n.div_ceil(8);
     let mut p = bm_len;
     let mut out = Vec::with_capacity(v.n);
@@ -1234,7 +1280,9 @@ pub fn col_check(bytes: &[u8], prop: u32) -> io::Result<Vec<Option<bool>>> {
 /// Dictionary + one code per row — text is compared / bucketed per *distinct* value, not per row.
 pub fn col_text(bytes: &[u8], prop: u32) -> io::Result<(Vec<String>, Vec<Option<u32>>)> {
     let v = view_ex(bytes, false)?;
-    let Some(b) = col_bytes(&v, prop, 0) else { return Ok((vec![], vec![None; v.n])) };
+    let Some(b) = col_bytes(&v, prop, 0) else {
+        return Ok((vec![], vec![None; v.n]));
+    };
     let bm_len = v.n.div_ceil(8);
     let mut p = bm_len;
     let c = get_var(b, &mut p).ok_or_else(|| bad("dict"))? as usize;
@@ -1341,10 +1389,7 @@ mod tests {
 
     #[test]
     fn sparse_and_unicode_rows() {
-        let rows = vec![
-            Row { id: 1, title: "😀 émoji".into(), updated: 1, props: vec![] },
-            Row { id: 5, title: String::new(), updated: 2, props: vec![(7, Value::Num(-1.5))] },
-        ];
+        let rows = vec![Row { id: 1, title: "😀 émoji".into(), updated: 1, props: vec![] }, Row { id: 5, title: String::new(), updated: 2, props: vec![(7, Value::Num(-1.5))] }];
         assert_eq!(decode_chunk(&encode_chunk(&rows).0).unwrap(), rows);
     }
 

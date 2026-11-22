@@ -146,33 +146,33 @@ fn pump(mut ws: WebSocket<TcpStream>, conn: ConnId, inbox: Inbox, rx: Receiver<O
             std::thread::sleep(Duration::from_millis(10));
             last_rx = Instant::now();
         } else {
-        match ws.read() {
-            Ok(Message::Text(t)) => {
-                last_rx = Instant::now();
-                last_busy = last_rx;
-                if let Some(m) = Msg::from_text(t.as_str()) {
-                    inbox.push(Event::Msg { conn, msg: m });
+            match ws.read() {
+                Ok(Message::Text(t)) => {
+                    last_rx = Instant::now();
+                    last_busy = last_rx;
+                    if let Some(m) = Msg::from_text(t.as_str()) {
+                        inbox.push(Event::Msg { conn, msg: m });
+                    }
+                }
+                // protocol 5: encrypted frames are binary — [more flag][Noise message]
+                Ok(Message::Binary(b)) => {
+                    last_rx = Instant::now();
+                    last_busy = last_rx;
+                    if let Some((flag, body)) = b.split_first() {
+                        inbox.push(Event::Msg { conn, msg: Msg::Bin { d: body.to_vec(), more: *flag != 0 } });
+                    }
+                }
+                Ok(Message::Close(_)) => {
+                    why = "The other device closed the connection";
+                    break;
+                }
+                Ok(_) => last_rx = Instant::now(),
+                Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(_) => {
+                    why = "Connection lost";
+                    break;
                 }
             }
-            // protocol 5: encrypted frames are binary — [more flag][Noise message]
-            Ok(Message::Binary(b)) => {
-                last_rx = Instant::now();
-                last_busy = last_rx;
-                if let Some((flag, body)) = b.split_first() {
-                    inbox.push(Event::Msg { conn, msg: Msg::Bin { d: body.to_vec(), more: *flag != 0 } });
-                }
-            }
-            Ok(Message::Close(_)) => {
-                why = "The other device closed the connection";
-                break;
-            }
-            Ok(_) => last_rx = Instant::now(),
-            Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-            Err(_) => {
-                why = "Connection lost";
-                break;
-            }
-        }
         }
         loop {
             match rx.try_recv() {
@@ -186,7 +186,9 @@ fn pump(mut ws: WebSocket<TcpStream>, conn: ConnId, inbox: Inbox, rx: Receiver<O
                             Message::binary(v)
                         }
                         m => {
-                            let Ok(s) = serde_json::to_string(&m) else { continue };
+                            let Ok(s) = serde_json::to_string(&m) else {
+                                continue;
+                            };
                             Message::text(s)
                         }
                     };
@@ -223,10 +225,15 @@ fn pump(mut ws: WebSocket<TcpStream>, conn: ConnId, inbox: Inbox, rx: Receiver<O
 impl Net {
     /// `keep`: do not stop the connections opened so far (a joiner that becomes the host still needs its link to the old host).
     pub fn listen_with(&mut self, inbox: &Inbox, keep: bool) -> Result<u16, String> {
+        self.listen_pref(inbox, keep, PORT)
+    }
+
+    /// Like [`listen_with`](Self::listen_with) but tries `pref` first (a fail-over host listens where it told the others it would).
+    pub fn listen_pref(&mut self, inbox: &Inbox, keep: bool, pref: u16) -> Result<u16, String> {
         if !keep {
             self.stop();
         }
-        let l = TcpListener::bind(("0.0.0.0", PORT)).or_else(|_| TcpListener::bind(("0.0.0.0", 0))).map_err(|e| e.to_string())?;
+        let l = TcpListener::bind(("0.0.0.0", pref)).or_else(|_| TcpListener::bind(("0.0.0.0", PORT))).or_else(|_| TcpListener::bind(("0.0.0.0", 0))).map_err(|e| e.to_string())?;
         let port = l.local_addr().map_err(|e| e.to_string())?.port();
         l.set_nonblocking(true).map_err(|e| e.to_string())?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -243,13 +250,17 @@ impl Net {
                             let inbox = inbox.clone();
                             let stop = stop.clone();
                             // flood protection: a limited number of simultaneous sockets overall and per address
-                            let Some(slot) = Slot::take(&live, peer.ip()) else { continue };
+                            let Some(slot) = Slot::take(&live, peer.ip()) else {
+                                continue;
+                            };
                             let _ = std::thread::Builder::new().name("lumen-collab-conn".into()).spawn(move || {
                                 let _slot = slot;
                                 let _ = stream.set_nonblocking(false);
                                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                                 let guard = HandshakeGuard::arm(&stream, 8);
-                                let Ok(ws) = tungstenite::accept_with_config(stream, Some(ws_config())) else { return };
+                                let Ok(ws) = tungstenite::accept_with_config(stream, Some(ws_config())) else {
+                                    return;
+                                };
                                 drop(guard);
                                 let (tx, rx) = channel();
                                 let conn = inbox.conn_id();
@@ -309,7 +320,11 @@ impl Net {
                 }
             }
             let Some((name, sa, stream)) = won else {
-                return fail(if n > 1 { "Could not reach that device on any of its addresses — same Wi-Fi? Is its Internet access switched on?" } else { "Could not reach that device — are you on the same Wi-Fi?" });
+                return fail(if n > 1 {
+                    "Could not reach that device on any of its addresses — same Wi-Fi? Is its Internet access switched on?"
+                } else {
+                    "Could not reach that device — are you on the same Wi-Fi?"
+                });
             };
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
             let guard = HandshakeGuard::arm(&stream, 8);
@@ -324,7 +339,9 @@ impl Net {
     pub fn announce(&mut self, beacon: Arc<Mutex<Option<Beacon>>>) {
         let stop = self.stop.get_or_insert_with(|| Arc::new(AtomicBool::new(false))).clone();
         let _ = std::thread::Builder::new().name("lumen-collab-beacon".into()).spawn(move || {
-            let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else { return };
+            let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
+                return;
+            };
             let _ = sock.set_broadcast(true);
             let _ = sock.set_multicast_ttl_v4(2);
             while !stop.load(Ordering::Relaxed) {
@@ -361,7 +378,9 @@ impl Net {
         self.disc_stop = Some(stop.clone());
         let inbox = inbox.clone();
         let _ = std::thread::Builder::new().name("lumen-collab-discover".into()).spawn(move || {
-            let Ok(sock) = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) else { return };
+            let Ok(sock) = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) else {
+                return;
+            };
             let _ = sock.join_multicast_v4(&GROUP, &Ipv4Addr::UNSPECIFIED);
             let _ = sock.set_read_timeout(Some(Duration::from_millis(300)));
             let mut buf = vec![0u8; 2048];

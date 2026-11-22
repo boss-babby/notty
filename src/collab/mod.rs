@@ -4,26 +4,28 @@
 //! Topology: a **host** shares a scope (whole workspace, one page, or a page with everything nested). Peers connect to the host
 //! (star); the host merges and fans out. The data model is the entity CRDT in [`crdt`]; the transports (WebSocket over TCP on native,
 //! browser WebSocket on the web, HTTP relay everywhere) only move [`Msg`] frames — the session code below never touches a socket.
+mod bigsync;
+pub mod changes;
+mod comments;
 pub mod crdt;
-mod textmerge;
+pub mod pair;
 mod relay;
 mod secure;
+mod textmerge;
 pub mod ui;
-mod comments;
-pub mod changes;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod net;
 #[cfg(not(target_arch = "wasm32"))]
-mod upnp;
-#[cfg(not(target_arch = "wasm32"))]
 mod punch;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod turn;
-#[cfg(target_arch = "wasm32")]
-mod webnet;
 #[cfg(target_arch = "wasm32")]
 mod rtc;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod turn;
+#[cfg(not(target_arch = "wasm32"))]
+mod upnp;
+#[cfg(target_arch = "wasm32")]
+mod webnet;
 
 use crdt::{Applied, Hlc, Key, Op, Replica, Scope, ScopeKind};
 use serde::{Deserialize, Serialize};
@@ -34,7 +36,7 @@ use std::sync::{Arc, Mutex};
 /// Protocol 2: every frame is end-to-end encrypted (`secure.rs`); the share token is proven, never sent.
 /// Protocol 3: `Key::Comment` entities and `Entry::base` (merge bases).
 /// Protocol 4: `Role::Suggester`, `Presence::{typing, len}`. Older peers are refused with a clear message.
-pub const PROTO: u32 = 6;
+pub const PROTO: u32 = 7;
 /// Tombstones are forgotten after this long. A reconnect gives up after ~90 s, so no device can come back with an older view.
 const TOMBSTONE_GRACE_MS: u64 = 10 * 60 * 1000;
 
@@ -207,32 +209,120 @@ fn is_zero32(x: &u32) -> bool {
 #[serde(tag = "t")]
 pub enum Msg {
     /// `auth` = proof of the share token bound to the encrypted channel (empty = ask the host for approval).
-    Hello { peer: PeerInfo, #[serde(default)] auth: String, proto: u32 },
+    Hello {
+        peer: PeerInfo,
+        #[serde(default)]
+        auth: String,
+        proto: u32,
+    },
     /// Noise handshake message (base64). Always sent in the clear — it is what sets the encryption up.
-    Hs { d: String },
+    Hs {
+        d: String,
+    },
     /// One encrypted frame (base64 text — only used on text transports: the relay and the browser); `more` = continues in the next frame.
-    Enc { d: String, more: bool },
+    Enc {
+        d: String,
+        more: bool,
+    },
     /// One encrypted frame as raw bytes (protocol 5: a binary WebSocket frame on TCP — no base64, no JSON envelope). Never serialised
     /// as JSON; text transports convert with [`Msg::to_text`] / [`Msg::from_text`].
     #[serde(skip)]
-    Bin { d: Vec<u8>, more: bool },
+    Bin {
+        d: Vec<u8>,
+        more: bool,
+    },
     Pending,
-    Welcome { peer: PeerInfo, session: SessionInfo, role: Role, #[serde(default)] auth: String },
-    Denied { reason: String },
-    Roster { peers: Vec<(PeerInfo, Role)> },
-    Digest { items: Vec<(Key, Hlc, u64)>, last: bool },
-    Ops { ops: Vec<Op> },
+    Welcome {
+        peer: PeerInfo,
+        session: SessionInfo,
+        role: Role,
+        #[serde(default)]
+        auth: String,
+    },
+    Denied {
+        reason: String,
+    },
+    Roster {
+        peers: Vec<(PeerInfo, Role)>,
+    },
+    Digest {
+        items: Vec<(Key, Hlc, u64)>,
+        last: bool,
+    },
+    Ops {
+        ops: Vec<Op>,
+    },
     Presence(Presence),
-    MediaReq { id: u64, off: u64 },
-    MediaData { id: u64, off: u64, total: u64, name: String, mime: String, data: String },
-    MediaMiss { id: u64 },
+    MediaReq {
+        id: u64,
+        off: u64,
+    },
+    MediaData {
+        id: u64,
+        off: u64,
+        total: u64,
+        name: String,
+        mime: String,
+        data: String,
+    },
+    MediaMiss {
+        id: u64,
+    },
     /// Host → the chosen successor (protocol 6): take over hosting. `leave` = the old host goes away instead of staying as a participant.
-    Baton { #[serde(default)] leave: bool },
+    Baton {
+        #[serde(default)]
+        leave: bool,
+    },
     /// Successor → old host: I listen now. Addresses to dial, an optional relay room `(site, room)` and the **new** share token (the old one
     /// is retired, so a device that was removed earlier cannot walk back in with it).
-    BatonAck { addrs: Vec<String>, #[serde(default)] relay: Option<(String, String)>, #[serde(default)] token: String },
+    BatonAck {
+        addrs: Vec<String>,
+        #[serde(default)]
+        relay: Option<(String, String)>,
+        #[serde(default)]
+        token: String,
+    },
     /// Old host → everybody else: the session continues there (same fields as `BatonAck`).
-    Moved { addrs: Vec<String>, #[serde(default)] relay: Option<(String, String)>, #[serde(default)] token: String },
+    Moved {
+        addrs: Vec<String>,
+        #[serde(default)]
+        relay: Option<(String, String)>,
+        #[serde(default)]
+        token: String,
+    },
+    /// Protocol 7 — big tables (`bigsync.rs`): per-bucket digest of the rows of one table, a request for the buckets that differ, and the rows
+    /// of a bucket (or a live edit, `b == u64::MAX`) as a `lumen-store` chunk (base64) plus tombstones `(row id, deleted at ms)`.
+    BigDigest {
+        table: u64,
+        items: Vec<(u64, u32, u64)>,
+        last: bool,
+    },
+    BigGet {
+        table: u64,
+        buckets: Vec<u64>,
+    },
+    BigChunk {
+        table: u64,
+        b: u64,
+        rows: String,
+        #[serde(default)]
+        dead: Vec<(u64, u64)>,
+    },
+    /// Protocol 7 — automatic fail-over. Host → each device: who takes over when the host disappears (`order`: editors by id), where they\n    /// can be reached, the shared `secret` (editors only) and this device's own `cap` (the token it proves to the successor), plus the\n    /// relay room the successor would host in.
+    Standby {
+        host: u32,
+        order: Vec<u32>,
+        addrs: Vec<(u32, Vec<String>)>,
+        #[serde(default)]
+        secret: String,
+        cap: String,
+        #[serde(default)]
+        relay: Option<(String, String)>,
+    },
+    /// Device → host: where I would listen if I had to take over.
+    StandbyAddr {
+        addrs: Vec<String>,
+    },
     Bye,
 }
 
@@ -352,6 +442,8 @@ struct Conn {
     bucket: f64,
     /// Four digits derived from the encrypted channel (shown on both sides).
     code: String,
+    /// The device proved itself with its fail-over `cap` (this device took over after the host vanished).
+    via_standby: bool,
 }
 
 pub struct JoinRequest {
@@ -393,6 +485,51 @@ struct BatonWait {
 }
 
 /// Back-off between reconnect attempts (milliseconds); after the last one the session ends.
+/// What the host told this device about the fail-over plan (`Msg::Standby`).
+#[derive(Clone, Debug)]
+struct Standby {
+    host: u32,
+    order: Vec<u32>,
+    addrs: Vec<(u32, Vec<String>)>,
+    secret: String,
+    cap: String,
+    relay: Option<(String, String)>,
+}
+
+/// An election in progress on a device that lost its host.
+struct Elect {
+    tried: Vec<u32>,
+    cand: u32,
+    since: f64,
+}
+
+/// How long a candidate gets to come up before the next one is tried.
+const ELECT_WINDOW_MS: f64 = 14_000.0;
+
+/// Token a device proves to a fail-over host: a one-way function of the session secret and the device id.
+fn standby_cap(secret: &str, id: u32) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"lumen-standby-cap-v1");
+    h.update(secret.as_bytes());
+    h.update(id.to_le_bytes());
+    hex(&h.finalize()[..10])
+}
+
+/// Relay room of the fail-over host (the same on every device that knows the secret; the site only sees an opaque code).
+fn standby_room(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"lumen-standby-room-v1");
+    h.update(secret.as_bytes());
+    hex(&h.finalize()[..8]).to_uppercase()
+}
+
+/// Port a device listens on when it becomes the host (derived from its id, so several devices on one machine do not clash).
+fn standby_port(id: u32) -> u16 {
+    47_700 + (id % 250) as u16
+}
+
 const RESUME_DELAYS: [f64; 8] = [800.0, 2000.0, 4000.0, 7000.0, 10_000.0, 15_000.0, 20_000.0, 30_000.0];
 
 #[derive(Default)]
@@ -475,6 +612,21 @@ pub struct Collab {
     /// Devices the host approved once (Noise static key as hex → (name, viewer)): they join again without a card. Persisted.
     trusted: HashMap<String, (String, bool)>,
     last_gc: f64,
+    /// Big tables in the session (digests, pending buckets, per-table index).
+    big: bigsync::BigState,
+    big_tracking: bool,
+    /// Joiner: the fail-over plan the host sent.
+    standby: Option<Standby>,
+    /// Host (original or promoted): the secret the fail-over caps derive from.
+    standby_key: Option<String>,
+    /// Set once this device took over after a failure: the host's secret, so joiners can prove their `cap`.
+    standby_secret: Option<String>,
+    /// Host: where each device said it would listen.
+    peer_addrs: HashMap<u32, Vec<String>>,
+    /// Joiner: the address list was sent for this host id.
+    standby_sent: u32,
+    electing: Option<Elect>,
+    listen_pref: u16,
     /// A relay joiner's handshake that already sent its first message (adopted by the first virtual connection that answers).
     relay_init: Option<Arc<Mutex<secure::Crypt>>>,
     /// Wrong-token attempts per address: (count, last time).
@@ -671,7 +823,11 @@ fn load_device_key(ctx: &egui::Context) -> Option<Arc<secure::Keys>> {
 
 fn with_port(a: &str) -> String {
     if a.starts_with('[') {
-        if a.contains("]:") { a.to_owned() } else { format!("{a}:{PORT}") }
+        if a.contains("]:") {
+            a.to_owned()
+        } else {
+            format!("{a}:{PORT}")
+        }
     } else if a.contains(':') {
         a.to_owned()
     } else {
@@ -726,7 +882,9 @@ fn fetch_public_ip(site: &str) -> Option<String> {
 /// What a hand-over message may tell a device to dial: a few plain `host:port` strings and / or an http(s) site with a room code.
 fn valid_target(addrs: &[String], relay: &Option<(String, String)>, token: &str) -> bool {
     let plain = |a: &String| !a.is_empty() && a.len() <= 64 && a.chars().all(|c| c.is_ascii_alphanumeric() || ".:-[]_".contains(c));
-    let room = relay.as_ref().map_or(true, |(b, r)| (b.starts_with("https://") || b.starts_with("http://")) && b.len() <= 200 && !b.contains(char::is_whitespace) && (4..=32).contains(&r.len()) && r.chars().all(|c| c.is_ascii_alphanumeric()));
+    let room = relay.as_ref().map_or(true, |(b, r)| {
+        (b.starts_with("https://") || b.starts_with("http://")) && b.len() <= 200 && !b.contains(char::is_whitespace) && (4..=32).contains(&r.len()) && r.chars().all(|c| c.is_ascii_alphanumeric())
+    });
     addrs.len() <= 12 && addrs.iter().all(plain) && room && (addrs.len() + relay.iter().count()) > 0 && (4..=64).contains(&token.len()) && token.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
@@ -770,6 +928,15 @@ impl Collab {
             keys: load_device_key(ctx),
             trusted: ctx.data_mut(|d| d.get_persisted::<Vec<(String, String, bool)>>(egui::Id::new("collab_trusted"))).unwrap_or_default().into_iter().map(|(k, n, v)| (k, (n, v))).collect(),
             last_gc: 0.0,
+            big: Default::default(),
+            big_tracking: false,
+            standby: None,
+            standby_key: None,
+            standby_secret: None,
+            peer_addrs: HashMap::new(),
+            standby_sent: 0,
+            electing: None,
+            listen_pref: PORT,
             relay_init: None,
             suggestions: vec![],
             held_in: VecDeque::new(),
@@ -923,10 +1090,20 @@ impl Collab {
     #[cfg(not(target_arch = "wasm32"))]
     fn open_listener(&mut self, scope: Scope, title: String, keep: bool) {
         {
-            match self.net.listen_with(&self.inbox, keep) {
+            match self.net.listen_pref(&self.inbox, keep, self.listen_pref) {
                 Ok(port) => {
                     self.addr_hint = Self::local_ips().into_iter().map(|ip| format!("{ip}:{port}")).collect();
-                    let b = Beacon { v: PROTO, id: self.me.id, device: self.me.device.clone(), name: self.me.name.clone(), platform: self.me.platform.clone(), port, what: Self::scope_label(scope).into(), title, people: 1 };
+                    let b = Beacon {
+                        v: PROTO,
+                        id: self.me.id,
+                        device: self.me.device.clone(),
+                        name: self.me.name.clone(),
+                        platform: self.me.platform.clone(),
+                        port,
+                        what: Self::scope_label(scope).into(),
+                        title,
+                        people: 1,
+                    };
                     if let Ok(mut g) = self.beacon.lock() {
                         *g = Some(b);
                     }
@@ -980,6 +1157,11 @@ impl Collab {
             return;
         }
         let room = random_code(10);
+        self.enable_relay_room(base, room);
+    }
+
+    /// Hosts in a given relay room (a fresh code normally; the one derived from the session secret after a fail-over).
+    fn enable_relay_room(&mut self, base: String, room: String) {
         self.relay = Some(relay::Relay::start(&base, &room, self.me.id, &self.inbox));
         // peers that can punch through their NATs get a direct UDP path (the room only carries two addresses); everyone else uses the relay
         #[cfg(not(target_arch = "wasm32"))]
@@ -1000,7 +1182,19 @@ impl Collab {
 
     pub fn relay_link(&self, base: &str) -> Option<String> {
         let room = self.relay_room.as_ref()?;
-        Some(format!("{}/app?join={}&t={}{}", base.trim_end_matches('/'), room, self.token, if self.punch_stop.is_none() { "" } else if cfg!(target_arch = "wasm32") { "&r=1" } else { "&p=1" }))
+        Some(format!(
+            "{}/app?join={}&t={}{}",
+            base.trim_end_matches('/'),
+            room,
+            self.token,
+            if self.punch_stop.is_none() {
+                ""
+            } else if cfg!(target_arch = "wasm32") {
+                "&r=1"
+            } else {
+                "&p=1"
+            }
+        ))
     }
 
     pub fn lan_link(&self) -> Option<String> {
@@ -1163,7 +1357,9 @@ impl Collab {
 
     /// Wi-Fi join that precedes a dial (link with `ws` / `wp`): waits for Android, then dials.
     fn poll_wifi(&mut self, now: f64) {
-        let Some(p) = self.pending_wifi.as_mut() else { return };
+        let Some(p) = self.pending_wifi.as_mut() else {
+            return;
+        };
         if now < p.next_check {
             return;
         }
@@ -1312,7 +1508,14 @@ impl Collab {
             (None, Some(s)) => s.id.clone(),
             _ => return false,
         };
-        let attempt = self.resume.as_ref().map_or(0, |r| r.attempt);
+        let mut attempt = self.resume.as_ref().map_or(0, |r| r.attempt);
+        // the host seems gone for good: the editors of the fail-over plan elect the next host (this device may be it)
+        if self.standby.is_some() && (attempt >= 2 || self.electing.is_some()) && self.elect() {
+            if self.mode == Mode::Hosting {
+                return true;
+            }
+            attempt = attempt.min(RESUME_DELAYS.len() as u32 - 5);
+        }
         if attempt as usize >= RESUME_DELAYS.len() {
             return false;
         }
@@ -1344,7 +1547,9 @@ impl Collab {
 
     /// Writes the per-entity clocks next to the workspace (egui persisted data, keyed by the share id).
     fn save_stamps(&mut self) {
-        let (Some(rep), Some(s)) = (self.rep.as_ref(), self.session.as_ref()) else { return };
+        let (Some(rep), Some(s)) = (self.rep.as_ref(), self.session.as_ref()) else {
+            return;
+        };
         if s.share.is_empty() {
             return;
         }
@@ -1354,7 +1559,9 @@ impl Collab {
     }
 
     fn load_stamps(&mut self) {
-        let Some(share) = self.session.as_ref().map(|s| s.share.clone()).filter(|s| !s.is_empty()) else { return };
+        let Some(share) = self.session.as_ref().map(|s| s.share.clone()).filter(|s| !s.is_empty()) else {
+            return;
+        };
         let text: Option<String> = self.ctx.data_mut(|d| d.get_persisted(egui::Id::new(("collab_stamps", share))));
         if let (Some(t), Some(rep)) = (text, self.rep.as_mut()) {
             rep.import_stamps(&t);
@@ -1362,6 +1569,17 @@ impl Collab {
     }
 
     pub fn stop(&mut self, notify: bool) {
+        self.big = Default::default();
+        if std::mem::take(&mut self.big_tracking) {
+            crate::bigtable::track(false);
+        }
+        self.standby = None;
+        self.standby_key = None;
+        self.standby_secret = None;
+        self.peer_addrs.clear();
+        self.standby_sent = 0;
+        self.electing = None;
+        self.listen_pref = PORT;
         self.save_stamps();
         if let Some(s) = self.punch_stop.take() {
             s.store(true, Ordering::Relaxed);
@@ -1529,6 +1747,9 @@ impl Collab {
     }
 
     pub fn kick(&mut self, id: u32) {
+        // the fail-over secret the removed device knows must not open the successor's door
+        self.standby_key = None;
+        self.peer_addrs.remove(&id);
         let conn = self.conns.iter().find(|(_, c)| c.peer.as_ref().map_or(false, |p| p.id == id)).map(|(k, _)| *k);
         if let Some(k) = conn {
             if let Some(c) = self.conns.remove(&k) {
@@ -1570,7 +1791,13 @@ impl Collab {
         if self.mode != Mode::Hosting || self.baton.is_some() {
             return false;
         }
-        let pick = self.conns.iter().filter(|(_, c)| c.active && c.role == Role::Editor).filter_map(|(k, c)| c.peer.as_ref().map(|p| (p.id, *k, p.name.clone()))).filter(|(id, _, _)| to.map_or(true, |t| *id == t)).min_by_key(|(id, _, _)| *id);
+        let pick = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.active && c.role == Role::Editor)
+            .filter_map(|(k, c)| c.peer.as_ref().map(|p| (p.id, *k, p.name.clone())))
+            .filter(|(id, _, _)| to.map_or(true, |t| *id == t))
+            .min_by_key(|(id, _, _)| *id);
         let Some((_, conn, name)) = pick else {
             self.toast("Nobody can take over right now");
             return false;
@@ -1588,7 +1815,9 @@ impl Collab {
         if self.mode != Mode::Joined || !self.ready || self.rep.is_none() || !self.conns.get(&conn).map_or(false, |c| c.active) {
             return;
         }
-        let Some(session) = self.session.clone() else { return };
+        let Some(session) = self.session.clone() else {
+            return;
+        };
         let base = self.ui.relay_url.trim().trim_end_matches('/').to_owned();
         // a browser cannot listen: it can only host through the site's relay
         let can_host = cfg!(not(target_arch = "wasm32")) || !base.is_empty();
@@ -1624,7 +1853,9 @@ impl Collab {
 
     /// Old host: the successor listens. Tell everybody else, then follow it (or leave).
     fn on_baton_ack(&mut self, conn: ConnId, addrs: Vec<String>, relay: Option<(String, String)>, token: String) {
-        let Some(b) = self.baton.take_if(|b| b.conn == conn) else { return };
+        let Some(b) = self.baton.take_if(|b| b.conn == conn) else {
+            return;
+        };
         if self.mode != Mode::Hosting {
             return;
         }
@@ -1665,7 +1896,9 @@ impl Collab {
             (false, _) => Target::Addr { addr: addrs.join(","), token },
             _ => return false,
         };
-        let Some(session) = self.session.as_ref().map(|s| s.id.clone()) else { return false };
+        let Some(session) = self.session.as_ref().map(|s| s.id.clone()) else {
+            return false;
+        };
         if self.rep.is_none() || !self.ready {
             return false;
         }
@@ -1701,6 +1934,9 @@ impl Collab {
         self.relay_room = None;
         self.addr_hint.clear();
         self.baton = None;
+        self.standby = None;
+        self.standby_sent = 0;
+        self.electing = None;
         self.target = Some(target);
         self.mode = Mode::Joining;
         self.role = Role::Editor;
@@ -1711,7 +1947,9 @@ impl Collab {
     }
 
     fn accept(&mut self, conn: ConnId, role: Role) {
-        let Some(session) = self.session.clone() else { return };
+        let Some(session) = self.session.clone() else {
+            return;
+        };
         if self.conns.values().filter(|c| c.active).count() >= MAX_PEERS {
             if let Some(c) = self.conns.remove(&conn) {
                 c.sink.send(&Msg::Denied { reason: "This session is full".into() });
@@ -1719,11 +1957,18 @@ impl Collab {
             }
             return;
         }
-        let token = self.token.clone();
-        let Some(c) = self.conns.get_mut(&conn) else { return };
+        let mut token = self.token.clone();
+        let Some(c) = self.conns.get_mut(&conn) else {
+            return;
+        };
         c.active = true;
         c.role = role;
         let Some(peer) = c.peer.clone() else { return };
+        if c.via_standby {
+            if let Some(sec) = &self.standby_secret {
+                token = standby_cap(sec, peer.id);
+            }
+        }
         let hash = c.crypt.lock().map(|x| x.hash.clone()).unwrap_or_default();
         c.sink.send(&Msg::Welcome { peer: self.me.clone(), session, role, auth: secure::proof("s", &token, &hash) });
         self.roster.retain(|(p, _)| p.id != peer.id);
@@ -1749,6 +1994,157 @@ impl Collab {
             c.sink.send(&m);
         }
         self.update_beacon();
+        self.push_standby();
+    }
+
+    /// Host: tells every device who takes over if this host disappears (and how to prove itself to that successor).
+    fn push_standby(&mut self) {
+        if self.mode != Mode::Hosting || self.session.is_none() {
+            return;
+        }
+        let key = self.standby_key.get_or_insert_with(|| random_code(16)).clone();
+        let mut order: Vec<u32> = self.roster.iter().filter(|(p, r)| *r == Role::Editor && p.id != self.me.id).map(|(p, _)| p.id).collect();
+        order.sort_unstable();
+        order.truncate(6);
+        let base = self.ui.relay_url.trim().trim_end_matches('/').to_owned();
+        let relay = (!base.is_empty() && self.relay_room.is_some()).then(|| (base, standby_room(&key)));
+        let addrs: Vec<(u32, Vec<String>)> = order.iter().filter_map(|id| self.peer_addrs.get(id).map(|a| (*id, a.clone()))).collect();
+        for c in self.conns.values().filter(|c| c.active) {
+            let Some(p) = c.peer.as_ref() else { continue };
+            c.sink.send(&Msg::Standby {
+                host: self.me.id,
+                order: order.clone(),
+                addrs: addrs.clone(),
+                secret: if c.role == Role::Editor { key.clone() } else { String::new() },
+                cap: standby_cap(&key, p.id),
+                relay: relay.clone(),
+            });
+        }
+    }
+
+    fn on_standby(&mut self, conn: ConnId, sb: Standby) {
+        if self.mode != Mode::Joined || !self.conns.get(&conn).map_or(false, |c| c.active) || sb.order.len() > 8 || sb.addrs.len() > 8 || sb.cap.len() > 40 || sb.secret.len() > 40 {
+            return;
+        }
+        if sb.addrs.iter().any(|(_, a)| a.len() > 12 || (!a.is_empty() && !valid_target(a, &None, &sb.cap))) {
+            return;
+        }
+        let first_for_host = self.standby_sent != sb.host;
+        self.standby = Some(sb.clone());
+        if first_for_host && sb.order.contains(&self.me.id) && !sb.secret.is_empty() {
+            self.standby_sent = sb.host;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let port = standby_port(self.me.id);
+                let addrs: Vec<String> = Self::local_ips().into_iter().map(|ip| format!("{}:{port}", ip.rsplit_once(':').map_or(ip.as_str(), |x| x.0))).collect();
+                if let Some(c) = self.conns.get(&conn) {
+                    c.sink.send(&Msg::StandbyAddr { addrs });
+                }
+            }
+        }
+    }
+
+    fn on_standby_addr(&mut self, conn: ConnId, addrs: Vec<String>) {
+        let Some(id) = self.conns.get(&conn).filter(|c| c.active && c.role == Role::Editor).and_then(|c| c.peer.as_ref().map(|p| p.id)) else {
+            return;
+        };
+        if self.mode != Mode::Hosting
+            || addrs.len() > 12
+            || addrs.iter().any(|a| a.len() > 64 || a.parse::<std::net::SocketAddr>().is_err())
+            || (self.peer_addrs.len() > 64 && !self.peer_addrs.contains_key(&id))
+        {
+            return;
+        }
+        self.peer_addrs.insert(id, addrs);
+        self.push_standby();
+    }
+
+    /// A device that lost its host: picks the first editor of the plan that is not known to be dead. That device takes over (it is us, or
+    /// the target is re-pointed at it). `true` = something to wait for.
+    fn elect(&mut self) -> bool {
+        let Some(sb) = self.standby.clone() else {
+            return false;
+        };
+        let now = mono_ms();
+        let el = self.electing.get_or_insert(Elect { tried: vec![], cand: 0, since: now });
+        if el.cand != 0 && now - el.since > ELECT_WINDOW_MS {
+            let dead = el.cand;
+            el.tried.push(dead);
+            el.cand = 0;
+        }
+        let can_host = cfg!(not(target_arch = "wasm32")) || sb.relay.is_some();
+        loop {
+            let tried = self.electing.as_ref().map(|e| e.tried.clone()).unwrap_or_default();
+            let Some(cand) = sb.order.iter().copied().find(|id| *id != sb.host && !tried.contains(id)) else {
+                return false;
+            };
+            if cand == self.me.id {
+                if sb.secret.is_empty() || !can_host {
+                    if let Some(e) = self.electing.as_mut() {
+                        e.tried.push(cand);
+                    }
+                    continue;
+                }
+                self.promote(sb);
+                return true;
+            }
+            if self.electing.as_ref().map_or(0, |e| e.cand) != cand {
+                let addrs = sb.addrs.iter().find(|(id, _)| *id == cand).map(|(_, a)| a.clone()).unwrap_or_default();
+                let target = match (addrs.is_empty(), sb.relay.clone()) {
+                    (false, _) => Target::Addr { addr: addrs.join(","), token: sb.cap.clone() },
+                    (true, Some((base, room))) => Target::Relay { base, room, token: sb.cap.clone() },
+                    (true, None) => {
+                        if let Some(e) = self.electing.as_mut() {
+                            e.tried.push(cand);
+                        }
+                        continue;
+                    }
+                };
+                self.target = Some(target);
+                if let Some(e) = self.electing.as_mut() {
+                    e.cand = cand;
+                    e.since = now;
+                }
+                self.toast("The host disappeared — switching to another device…");
+            }
+            return true;
+        }
+    }
+
+    /// This device is the successor: it becomes the host of the same session (replica, workspace and roles stay).
+    fn promote(&mut self, sb: Standby) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let base = self.ui.relay_url.trim().trim_end_matches('/').to_owned();
+        self.inherited = self.roster.iter().map(|(p, r)| (p.id, *r)).collect();
+        self.roster.retain(|(p, _)| p.id != sb.host);
+        self.mode = Mode::Hosting;
+        self.role = Role::Editor;
+        self.token = random_code(10);
+        self.standby_secret = Some(sb.secret.clone());
+        self.standby_key = Some(sb.secret.clone());
+        self.standby = None;
+        self.standby_sent = 0;
+        self.electing = None;
+        self.peer_addrs.clear();
+        self.track = true;
+        self.changes.clear();
+        self.resume = None;
+        self.target = None;
+        self.reused = false;
+        for c in self.conns.values() {
+            c.sink.close();
+        }
+        self.conns.clear();
+        self.listen_pref = standby_port(self.me.id);
+        self.open_listener(session.scope, session.name.clone(), false);
+        if let Some((b, room)) = sb.relay.filter(|_| !base.is_empty()) {
+            self.enable_relay_room(b, room);
+        }
+        self.update_beacon();
+        self.next_scan = 0.0;
+        self.toast("The host disappeared — you are now hosting this session");
     }
 
     fn send_digest(&mut self, conn: ConnId) {
@@ -1829,7 +2225,9 @@ impl Collab {
     }
 
     pub fn serve_media(&mut self, conn: ConnId, id: u64, off: u64, name: &str, mime: &str, bytes: Option<&[u8]>) {
-        let Some(c) = self.conns.get(&conn) else { return };
+        let Some(c) = self.conns.get(&conn) else {
+            return;
+        };
         match bytes {
             None => c.sink.send(&Msg::MediaMiss { id }),
             Some(b) => {
@@ -1934,6 +2332,9 @@ impl Collab {
                 if mono_ms() - t_start > 3.0 {
                     break;
                 }
+            }
+            if self.big_tick(ws, now) {
+                changed = true;
             }
             // suggestions of suggesting devices: described (what was there / what is proposed) and held for the host
             while let Some((conn, op)) = self.held_in.pop_front() {
@@ -2096,7 +2497,11 @@ impl Collab {
         self.presence.retain(|_, (_, t)| now - *t < 12_000.0);
         self.found.retain(|f| now - f.seen < 7000.0);
         if self.mode != Mode::Off {
-            self.ctx.request_repaint_after(std::time::Duration::from_millis(if self.conns.values().any(|c| !c.backlog.is_empty()) || !self.ops_in.is_empty() { 8 } else { ((self.next_scan - now).clamp(120.0, 1000.0)) as u64 }));
+            self.ctx.request_repaint_after(std::time::Duration::from_millis(if self.conns.values().any(|c| !c.backlog.is_empty()) || !self.ops_in.is_empty() {
+                8
+            } else {
+                ((self.next_scan - now).clamp(120.0, 1000.0)) as u64
+            }));
         } else if self.ui.discovering {
             self.ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
@@ -2105,7 +2510,9 @@ impl Collab {
 
     /// Describes one operation of a suggesting device and keeps it until the host decides (a newer operation on the same thing replaces it).
     fn hold_suggestion(&mut self, ws: &crate::model::Workspace, conn: ConnId, op: Op) {
-        let Some(who) = self.conns.get(&conn).and_then(|c| c.peer.as_ref().map(|p| p.id)) else { return };
+        let Some(who) = self.conns.get(&conn).and_then(|c| c.peer.as_ref().map(|p| p.id)) else {
+            return;
+        };
         if let Some(r) = self.rep.as_mut() {
             r.clock.observe(op.e.hlc, now_ms());
         }
@@ -2216,7 +2623,24 @@ impl Collab {
                         _ => Arc::new(Mutex::new(secure::Crypt::new())),
                     };
                     let sink: Box<dyn Sink> = Box::new(secure::SecureSink::new(sink, crypt.clone()));
-                    self.conns.insert(conn, Conn { sink, addr, peer: None, role: Role::Editor, active: false, digest: HashMap::new(), backlog: VecDeque::new(), crypt, opened: now, last_rx: now, bucket: 600.0, code: String::new() });
+                    self.conns.insert(
+                        conn,
+                        Conn {
+                            sink,
+                            addr,
+                            peer: None,
+                            role: Role::Editor,
+                            active: false,
+                            digest: HashMap::new(),
+                            backlog: VecDeque::new(),
+                            crypt,
+                            opened: now,
+                            last_rx: now,
+                            bucket: 600.0,
+                            code: String::new(),
+                            via_standby: false,
+                        },
+                    );
                 }
                 Event::Closed { conn, why } => self.on_closed(conn, &why),
                 Event::Msg { conn, msg } => self.on_frame(conn, msg),
@@ -2235,7 +2659,9 @@ impl Collab {
     /// Every frame from the network enters here: flood control, handshake, decryption. Nothing in clear text reaches `on_msg`.
     fn on_frame(&mut self, conn: ConnId, msg: Msg) {
         let now = mono_ms();
-        let Some(c) = self.conns.get_mut(&conn) else { return };
+        let Some(c) = self.conns.get_mut(&conn) else {
+            return;
+        };
         // token bucket: ~500 frames / s sustained, bursts of 800 (a 24 MiB message is ~700 frames, so sync traffic fits)
         c.bucket = (c.bucket + (now - c.last_rx) * 0.5).min(800.0);
         c.last_rx = now;
@@ -2263,9 +2689,13 @@ impl Collab {
     }
 
     fn on_hs(&mut self, conn: ConnId, d: &str) {
-        let Some(keys) = self.keys.clone() else { return };
+        let Some(keys) = self.keys.clone() else {
+            return;
+        };
         let joining = self.mode == Mode::Joining;
-        let Some(c) = self.conns.get_mut(&conn) else { return };
+        let Some(c) = self.conns.get_mut(&conn) else {
+            return;
+        };
         let (out, hash) = {
             let Ok(mut cr) = c.crypt.lock() else { return };
             // a joiner only ever initiates; an unsolicited first message from the other side is not a handshake we asked for
@@ -2350,7 +2780,20 @@ impl Collab {
     }
 
     fn on_closed(&mut self, conn: ConnId, why: &str) {
-        let Some(c) = self.conns.remove(&conn) else { return };
+        let Some(c) = self.conns.remove(&conn) else {
+            // a re-dial that never got as far as a connection (refused / unreachable): count the attempt now instead of waiting 25 s for `reap`
+            if self.mode == Mode::Joining
+                && self.conns.is_empty()
+                && why.starts_with("Could not reach")
+                && self.resume.as_ref().map_or(false, |r| r.next_at == f64::MAX)
+                && !self.try_resume(why, false)
+            {
+                self.stop(false);
+                self.last_error = Some("Could not reconnect — the shared copy stays on this device".into());
+                self.toast("Could not reconnect — the shared copy stays on this device");
+            }
+            return;
+        };
         self.requests.retain(|r| r.conn != conn);
         match self.mode {
             Mode::Hosting => {
@@ -2369,7 +2812,13 @@ impl Collab {
                     if self.try_resume(why, was_joined) {
                         return;
                     }
-                    let msg = if was_joined { "The host ended the session — the shared copy stays on this device".to_owned() } else if why.is_empty() { "Could not reach that device".to_owned() } else { why.to_owned() };
+                    let msg = if was_joined {
+                        "The host ended the session — the shared copy stays on this device".to_owned()
+                    } else if why.is_empty() {
+                        "Could not reach that device".to_owned()
+                    } else {
+                        why.to_owned()
+                    };
                     self.stop(false);
                     self.last_error = Some(msg.clone());
                     self.toast(msg);
@@ -2414,7 +2863,13 @@ impl Collab {
                 let now = mono_ms();
                 let locked = self.fails.get(&peer_key(&addr)).map_or(false, |(n, t)| *n >= 5 && now - *t < 300_000.0);
                 let want = secure::proof("c", &self.token, &hash);
-                let authed = !locked && !auth.is_empty() && secure::ct_eq(&auth, &want);
+                let via_standby = !locked && !auth.is_empty() && self.standby_secret.as_ref().map_or(false, |sec| secure::ct_eq(&auth, &secure::proof("c", &standby_cap(sec, peer.id), &hash)));
+                if via_standby {
+                    if let Some(c) = self.conns.get_mut(&conn) {
+                        c.via_standby = true;
+                    }
+                }
+                let authed = via_standby || (!locked && !auth.is_empty() && secure::ct_eq(&auth, &want));
                 // a device this host approved before is recognised by its channel key (proven by the Noise handshake)
                 let known = !locked && !remote.is_empty() && self.trusted.contains_key(&hex(&remote));
                 if !auth.is_empty() && !authed && !known {
@@ -2544,6 +2999,8 @@ impl Collab {
                     self.roster = peers;
                 }
             }
+            Msg::Standby { host, order, addrs, secret, cap, relay } => self.on_standby(conn, Standby { host, order, addrs, secret, cap, relay }),
+            Msg::StandbyAddr { addrs } => self.on_standby_addr(conn, addrs),
             Msg::Baton { .. } => self.on_baton(conn),
             Msg::BatonAck { addrs, relay, token } => self.on_baton_ack(conn, addrs, relay, token),
             Msg::Moved { addrs, relay, token } => self.on_moved(conn, addrs, relay, token),
@@ -2568,6 +3025,7 @@ impl Collab {
                     c.digest.extend(items.into_iter().map(|(k, h, x)| (k, (h, x))));
                 }
                 if last {
+                    self.big_announce(ws, conn);
                     // everything the other side lacks or has older, pages first; queued and sent a few messages per frame
                     let remote = self.conns.get_mut(&conn).map(|c| std::mem::take(&mut c.digest)).unwrap_or_default();
                     let ops = self.rep.as_ref().map(|r| r.diff(ws, &remote)).unwrap_or_default();
@@ -2579,6 +3037,9 @@ impl Collab {
                     }
                 }
             }
+            Msg::BigDigest { table, items, last } => self.big_on_digest(ws, conn, table, items, last),
+            Msg::BigGet { table, buckets } => self.big_on_get(ws, conn, table, buckets),
+            Msg::BigChunk { table, b, rows, dead } => self.big_on_chunk(ws, conn, table, b, rows, dead),
             Msg::Ops { ops } => {
                 let role = self.conns.get(&conn).map(|c| c.role);
                 let from_viewer = self.mode == Mode::Hosting && role.map_or(true, |r| r == Role::Viewer);
@@ -2646,7 +3107,9 @@ impl Collab {
                 if !self.requested.contains_key(&id) || total > MAX_MEDIA || data.len() > 700_000 || (self.partial.len() >= 8 && !self.partial.contains_key(&id)) {
                     return;
                 }
-                let Some(bytes) = crate::media::b64_decode(&data) else { return };
+                let Some(bytes) = crate::media::b64_decode(&data) else {
+                    return;
+                };
                 let (name, mime) = (clean(&name, 200), clean(&mime, 100));
                 let e = self.partial.entry(id).or_insert_with(|| (Vec::new(), name, mime));
                 if e.0.len() as u64 != off || off + bytes.len() as u64 > total {
@@ -2964,6 +3427,79 @@ mod tests {
     }
 
     #[test]
+    fn the_editors_elect_a_new_host_when_the_host_vanishes() {
+        let (mut host, mut hw, mut a, mut aw, port) = pair();
+        let mut b = Collab::new(&egui::Context::default());
+        let mut bw = Workspace::blank("b", false, 0);
+        bw.pages.clear();
+        bw.current = None;
+        let token = host.token.clone();
+        a.join_addr(&format!("127.0.0.1:{port}"), &token);
+        b.join_addr(&format!("127.0.0.1:{port}"), &token);
+        let blocks = |w: &Workspace| w.pages.iter().map(|p| p.blocks.len()).sum::<usize>();
+        let t0 = Instant::now();
+        let mut synced = false;
+        while t0.elapsed().as_secs() < 12 && !synced {
+            round3(&mut host, &mut hw, &mut a, &mut aw, &mut b, &mut bw);
+            synced = !aw.pages.is_empty() && !bw.pages.is_empty() && blocks(&hw) == blocks(&aw) && blocks(&hw) == blocks(&bw) && host.roster.len() == 3 && a.standby.is_some() && b.standby.is_some();
+        }
+        assert!(synced, "three devices did not sync / receive the fail-over plan");
+        assert!(a.standby.as_ref().unwrap().secret.len() >= 16 && a.standby.as_ref().unwrap().cap != b.standby.as_ref().unwrap().cap, "every device gets its own cap");
+        // the devices would report their addresses themselves (their LAN address is not known in a sandbox): tell the host where they listen
+        for c in [&a, &b] {
+            host.peer_addrs.insert(c.me.id, vec![format!("127.0.0.1:{}", standby_port(c.me.id))]);
+        }
+        host.push_standby();
+        let t0 = Instant::now();
+        while t0.elapsed().as_millis() < 300 {
+            round3(&mut host, &mut hw, &mut a, &mut aw, &mut b, &mut bw);
+        }
+        // the host's process dies: sockets vanish, nobody says goodbye
+        host.net.stop();
+        for c in host.conns.values() {
+            c.sink.close();
+        }
+        host.conns.clear();
+        std::thread::sleep(Duration::from_millis(600)); // the accept thread notices the stop flag (a dead process has no listener at all)
+        let (succ_is_a, pid) = (a.me.id < b.me.id, hw.pages.iter().find(|p| p.blocks.len() > 1).map(|p| p.id).unwrap());
+        let step2 = |a: &mut Collab, aw: &mut Workspace, b: &mut Collab, bw: &mut Workspace| {
+            for (c, w) in [(&mut *a, &mut *aw), (&mut *b, &mut *bw)] {
+                let cur = w.current;
+                c.poll(w, 2, cur, &|_| true);
+            }
+            std::thread::sleep(Duration::from_millis(8));
+        };
+        let t0 = Instant::now();
+        let mut done = false;
+        while t0.elapsed().as_secs() < 45 && !done {
+            step2(&mut a, &mut aw, &mut b, &mut bw);
+            let (s, f) = if succ_is_a { (&a, &b) } else { (&b, &a) };
+            done = s.mode == Mode::Hosting && f.mode == Mode::Joined && s.roster.len() >= 2 && s.conns.values().filter(|c| c.active).count() == 1;
+        }
+        assert!(done, "no new host: a {:?} b {:?} (a is successor: {succ_is_a})", a.mode, b.mode);
+        // the follower's edit reaches the new host, and the new host's edit reaches the follower (the old host is gone)
+        let (sw, fw, s, f) = if succ_is_a { (&mut aw, &mut bw, &mut a, &mut b) } else { (&mut bw, &mut aw, &mut b, &mut a) };
+        fw.page_mut(pid).unwrap().blocks[0].text = "typed after the fail-over".into();
+        f.poke();
+        let t0 = Instant::now();
+        let mut ok = false;
+        while t0.elapsed().as_secs() < 10 && !ok {
+            for (c, w) in [(&mut *s, &mut *sw), (&mut *f, &mut *fw)] {
+                let cur = w.current;
+                c.poll(w, 2, cur, &|_| true);
+            }
+            std::thread::sleep(Duration::from_millis(8));
+            ok = sw.page(pid).map_or(false, |p| p.blocks[0].text == "typed after the fail-over");
+        }
+        assert!(ok, "edit after the fail-over did not arrive");
+        // the dead host cannot walk back in with the old share code (the new host has a new one)
+        assert_ne!(s.token, token);
+        for c in [&mut a, &mut b] {
+            c.stop(true);
+        }
+    }
+
+    #[test]
     fn the_host_hands_the_session_over_and_everybody_follows() {
         let (mut host, mut hw, mut a, mut aw, port) = pair();
         let mut b = Collab::new(&egui::Context::default());
@@ -3064,7 +3600,12 @@ mod tests {
         assert!(port > 0, "host could not listen");
         join.join_addr(&format!("127.0.0.1:{port}"), &host.token.clone());
         let blocks = |w: &Workspace| w.pages.iter().map(|p| p.blocks.len()).sum::<usize>();
-        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 10, |a, b| a.pages.len() == b.pages.len() && blocks(a) == blocks(b) && !b.pages.is_empty()), "initial sync did not finish: {} vs {} pages", hw.pages.len(), jw.pages.len());
+        assert!(
+            until(&mut host, &mut hw, &mut join, &mut jw, 10, |a, b| a.pages.len() == b.pages.len() && blocks(a) == blocks(b) && !b.pages.is_empty()),
+            "initial sync did not finish: {} vs {} pages",
+            hw.pages.len(),
+            jw.pages.len()
+        );
         assert_eq!(host.roster.len(), 2);
         let pid = hw.pages.iter().find(|p| p.blocks.len() > 1).map(|p| p.id).unwrap();
         hw.current = Some(pid);
@@ -3081,7 +3622,12 @@ mod tests {
         extra.text = "added on the phone".into();
         jw.page_mut(pid).unwrap().blocks.push(extra);
         join.poke();
-        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 6, |a, _| a.page(pid).map_or(false, |p| p.blocks[1].text == "edited on the phone" && p.blocks.iter().any(|b| b.text == "added on the phone"))), "joiner edit did not arrive");
+        assert!(
+            until(&mut host, &mut hw, &mut join, &mut jw, 6, |a, _| a
+                .page(pid)
+                .map_or(false, |p| p.blocks[1].text == "edited on the phone" && p.blocks.iter().any(|b| b.text == "added on the phone"))),
+            "joiner edit did not arrive"
+        );
         host.stop(true);
         join.stop(true);
     }
@@ -3097,6 +3643,48 @@ mod tests {
         host.start_host(&mut hw, 1, Scope::ALL, None);
         let port = host.net.port;
         (host, hw, join, jw, port)
+    }
+
+    #[test]
+    fn a_big_table_is_shared_edited_and_deleted_live() {
+        use crate::bigtable as bt;
+        std::env::set_var("LUMEN_TABLES_DIR", std::env::temp_dir().join(format!("lumen-bigtest-{}", std::process::id())));
+        let (mut host, mut hw, mut join, mut jw, port) = pair();
+        let tid = bt::create_sample(&mut hw, "Big", 6000, None).expect("sample table");
+        let rows = |w: &Workspace| bt::store(w, tid).map(|s| s.lock().unwrap().len().unwrap());
+        join.join_addr(&format!("127.0.0.1:{port}"), &host.token.clone());
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 25, |_, b| rows(b) == Some(6000)), "the joiner never received the rows: {:?}", rows(&jw));
+        assert_ne!(hw.bigs[&tid].dir, jw.bigs[&tid].dir, "the joiner has its own store");
+        // host edits one row → the joiner sees it
+        let hs = bt::store(&hw, tid).unwrap();
+        {
+            let mut g = hs.lock().unwrap();
+            let mut r = g.get(77).unwrap().unwrap();
+            r.title = "edited on the host".into();
+            r.updated = now_ms() + 10;
+            g.upsert(r).unwrap();
+        }
+        bt::note_write(&hw.bigs[&tid].dir, 77);
+        bt::bump_version(&hw.bigs[&tid].dir);
+        let title = |w: &Workspace, id: u64| bt::store(w, tid).and_then(|s| s.lock().unwrap().get(id).unwrap()).map(|r| r.title);
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 10, |_, b| title(b, 77).as_deref() == Some("edited on the host")), "live edit did not arrive");
+        // joiner deletes a row and adds one → the host follows
+        let js = bt::store(&jw, tid).unwrap();
+        let jdir = jw.bigs[&tid].dir.clone();
+        let new_id = {
+            let mut g = js.lock().unwrap();
+            g.delete(10).unwrap();
+            let id = bt::new_row_id(&mut g);
+            g.upsert(lumen_store::Row { id, title: "from the phone".into(), updated: now_ms() + 20, props: vec![] }).unwrap();
+            id
+        };
+        bt::note_delete(&jdir, 10);
+        bt::note_write(&jdir, new_id);
+        assert!(new_id > 1 << 40, "rows created in a session come from the device's own id space");
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 10, |a, _| title(a, new_id).as_deref() == Some("from the phone") && title(a, 10).is_none()), "joiner edit / delete did not arrive");
+        assert_eq!(rows(&hw), Some(6000), "one deleted, one added");
+        host.stop(true);
+        join.stop(true);
     }
 
     #[test]
@@ -3117,7 +3705,11 @@ mod tests {
         jw.page_mut(pid).unwrap().blocks[1].text = "typed offline".into();
         host.poke();
         join.poke();
-        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 15, |a, b| b.page(pid).map_or(false, |p| p.blocks[0].text == "typed while you were away") && a.page(pid).map_or(false, |p| p.blocks[1].text == "typed offline")), "both sides must converge after the reconnect");
+        assert!(
+            until(&mut host, &mut hw, &mut join, &mut jw, 15, |a, b| b.page(pid).map_or(false, |p| p.blocks[0].text == "typed while you were away")
+                && a.page(pid).map_or(false, |p| p.blocks[1].text == "typed offline")),
+            "both sides must converge after the reconnect"
+        );
         assert_eq!(join.mode, Mode::Joined);
         assert!(!join.reconnecting());
         assert!(join.want_ws.is_none(), "a reconnect must not create another shared workspace");
@@ -3195,13 +3787,19 @@ mod tests {
         std::thread::sleep(Duration::from_millis(800));
         join.join_relay(&base, &room, &host.token.clone());
         let blocks = |w: &Workspace| w.pages.iter().map(|p| p.blocks.len()).sum::<usize>();
-        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 30, |a, b| !b.pages.is_empty() && a.pages.len() == b.pages.len() && blocks(a) == blocks(b)), "initial sync through the relay did not finish");
+        assert!(
+            until(&mut host, &mut hw, &mut join, &mut jw, 30, |a, b| !b.pages.is_empty() && a.pages.len() == b.pages.len() && blocks(a) == blocks(b)),
+            "initial sync through the relay did not finish"
+        );
         let pid = hw.pages.iter().find(|p| p.blocks.len() > 1).map(|p| p.id).unwrap();
         hw.current = Some(pid);
         jw.current = Some(pid);
         jw.page_mut(pid).unwrap().blocks[0].text = "typed on the other side of the relay".into();
         join.poke();
-        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 30, |a, _| a.page(pid).map_or(false, |p| p.blocks[0].text == "typed on the other side of the relay")), "edit through the relay did not arrive");
+        assert!(
+            until(&mut host, &mut hw, &mut join, &mut jw, 30, |a, _| a.page(pid).map_or(false, |p| p.blocks[0].text == "typed on the other side of the relay")),
+            "edit through the relay did not arrive"
+        );
         host.stop(true);
         join.stop(true);
     }

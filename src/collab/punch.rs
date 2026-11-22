@@ -10,7 +10,7 @@
 //! pure state machine (no sockets, no clock) so the tests can run it over a lossy, reordering simulated link.
 use super::*;
 use std::collections::BTreeMap;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
@@ -60,13 +60,63 @@ pub fn parse_stun(buf: &[u8], tx: &[u8; 12]) -> Option<SocketAddr> {
     None
 }
 
+/// One binding request to one server.
+fn stun_one(sock: &UdpSocket, server: SocketAddr) -> Option<SocketAddr> {
+    let mut tx = [0u8; 12];
+    tx[..8].copy_from_slice(&random_u64().to_le_bytes());
+    tx[8..].copy_from_slice(&(random_u64() as u32).to_le_bytes());
+    for _ in 0..2 {
+        sock.send_to(&stun_request(&tx), server).ok()?;
+        let mut buf = [0u8; 512];
+        if let Ok((n, from)) = sock.recv_from(&mut buf) {
+            if from.ip() == server.ip() {
+                if let Some(a) = parse_stun(&buf[..n], &tx) {
+                    return Some(a);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Two servers saw the same socket under different ports: the NAT assigns a new mapping per destination ("symmetric"), so a punch
+/// towards a third party cannot work and the attempt is better spent on the relay.
+pub fn is_symmetric(a: SocketAddr, b: SocketAddr) -> bool {
+    a.ip() == b.ip() && a.port() != b.port()
+}
+
+/// Asks two STUN servers with different addresses (≤ 1.3 s): `true` only when the NAT is certainly symmetric.
+pub fn nat_is_symmetric(sock: &UdpSocket) -> bool {
+    let old = sock.read_timeout().ok().flatten();
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(600)));
+    let mut seen: Vec<(IpAddr, SocketAddr)> = vec![];
+    for name in STUN {
+        let Some(server) = name.to_socket_addrs().ok().and_then(|mut x| x.find(|x| x.is_ipv4())) else {
+            continue;
+        };
+        if seen.iter().any(|(ip, _)| *ip == server.ip()) {
+            continue;
+        }
+        if let Some(m) = stun_one(sock, server) {
+            seen.push((server.ip(), m));
+        }
+        if seen.len() == 2 {
+            break;
+        }
+    }
+    let _ = sock.set_read_timeout(old);
+    seen.len() == 2 && is_symmetric(seen[0].1, seen[1].1)
+}
+
 /// Asks the STUN servers (in order) for the public address of `sock`.
 pub fn stun_query(sock: &UdpSocket) -> Option<SocketAddr> {
     let old = sock.read_timeout().ok().flatten();
     let _ = sock.set_read_timeout(Some(Duration::from_millis(600)));
     let mut found = None;
     'servers: for name in STUN {
-        let Some(server) = name.to_socket_addrs().ok().and_then(|mut a| a.find(|a| a.is_ipv4())) else { continue };
+        let Some(server) = name.to_socket_addrs().ok().and_then(|mut a| a.find(|a| a.is_ipv4())) else {
+            continue;
+        };
         let mut tx = [0u8; 12];
         tx[..8].copy_from_slice(&random_u64().to_le_bytes());
         tx[8..].copy_from_slice(&(random_u64() as u32).to_le_bytes());
@@ -219,7 +269,9 @@ impl Rudp {
             }
         }
         while self.inflight.len() < WINDOW {
-            let Some(d) = self.queue.pop_front() else { break };
+            let Some(d) = self.queue.pop_front() else {
+                break;
+            };
             let seq = self.next_seq;
             self.next_seq = seq.wrapping_add(1);
             out.push(packet(T_DATA, self.cookie, seq, self.recv_next, &d));
@@ -419,7 +471,10 @@ fn http(req: ehttp::Request) -> Option<serde_json::Value> {
 }
 
 fn post(base: &str, body: serde_json::Value) {
-    let _ = http(ehttp::Request::post(format!("{}/api/collab/punch", base.trim_end_matches('/')), body.to_string().into_bytes()));
+    let _ = http(ehttp::Request::post(
+        format!("{}/api/collab/punch", base.trim_end_matches('/')),
+        body.to_string().into_bytes(),
+    ));
 }
 
 fn bound() -> Option<(UdpSocket, SocketAddr)> {
@@ -444,7 +499,9 @@ fn parse_addr(v: &serde_json::Value, key: &str) -> Option<SocketAddr> {
 /// Joiner: offers a punch through the room, waits for the host's answer, punches. `true` once the link is open (the session got its
 /// `Event::Open`); the caller falls back to the relay otherwise. Runs on its own thread.
 pub fn dial(base: String, room: String, inbox: Inbox, stop: Arc<AtomicBool>) -> bool {
-    let Some((sock, mine)) = bound() else { return false };
+    let Some((sock, mine)) = bound() else {
+        return false;
+    };
     let cookie = random_u64() | 1;
     let c = format!("{cookie:x}");
     post(&base, serde_json::json!({ "room": room, "role": "j", "c": c, "a": mine.to_string() }));
@@ -463,8 +520,9 @@ pub fn dial(base: String, room: String, inbox: Inbox, stop: Arc<AtomicBool>) -> 
         std::thread::sleep(Duration::from_millis(350));
     }
     let Some(host) = host else { return false };
+    let sym = turn.is_some() && nat_is_symmetric(&sock);
     // direct first; when the NATs refuse (symmetric ones assign a new port per destination) both ends meet at the relay instead
-    let peer = if punch(&sock, host, cookie, 7, &stop) {
+    let peer = if !sym && punch(&sock, host, cookie, 7, &stop) {
         host
     } else {
         match turn {
@@ -495,7 +553,8 @@ pub fn host(base: String, room: String, inbox: Inbox, stop: Arc<AtomicBool>) {
                     let _ = std::thread::Builder::new().name("lumen-collab-punch".into()).spawn(move || {
                         let Some((sock, mine)) = bound() else { return };
                         post(&base, serde_json::json!({ "room": room, "role": "h", "c": c, "a": mine.to_string() }));
-                        if punch(&sock, joiner, cookie, 8, &stop) {
+                        let sym = turn.is_some() && nat_is_symmetric(&sock);
+                        if !sym && punch(&sock, joiner, cookie, 8, &stop) {
                             run(sock, joiner, cookie, true, inbox, stop);
                         } else if let Some(t) = turn {
                             // the joiner gave up on the direct path at about the same time and now waits at the relay
@@ -519,6 +578,17 @@ pub fn host(base: String, room: String, inbox: Inbox, stop: Arc<AtomicBool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_nat_that_changes_the_port_per_destination_is_symmetric() {
+        let a: SocketAddr = "203.0.113.5:40000".parse().unwrap();
+        assert!(!is_symmetric(a, "203.0.113.5:40000".parse().unwrap()));
+        assert!(is_symmetric(a, "203.0.113.5:40007".parse().unwrap()));
+        assert!(
+            !is_symmetric(a, "198.51.100.9:40007".parse().unwrap()),
+            "different addresses say nothing about the mapping"
+        );
+    }
 
     /// Deterministic xorshift for the lossy link.
     struct Rng(u64);

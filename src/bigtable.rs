@@ -87,6 +87,129 @@ pub fn bump_version(dir: &str) {
     crate::bigdata::bump();
 }
 
+// ───────────── collaboration hooks (see collab/bigsync.rs) ─────────────
+
+use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
+
+static TRACK: AtomicBool = AtomicBool::new(false);
+static OWN_ID: AtomicU64 = AtomicU64::new(0);
+type DirtyMap = Mutex<Option<HashMap<String, Vec<u64>>>>;
+type GraveMap = Mutex<Option<HashMap<String, BTreeMap<u64, u64>>>>;
+static DIRTY: DirtyMap = Mutex::new(None);
+static GRAVE: GraveMap = Mutex::new(None);
+
+/// More dirty rows than this between two ticks are reported as "everything may have changed" ([`OVERFLOW`]).
+pub const DIRTY_CAP: usize = 20_000;
+/// Marker in a dirty list: too many edits to list, re-scan the table.
+pub const OVERFLOW: u64 = u64::MAX;
+const GRAVE_CAP: usize = 200_000;
+
+/// A session starts (`true`) or ends (`false`) on this process: while at least one runs, row edits are recorded for the other devices
+/// (cheap no-ops otherwise). Counted, so two sessions in one process (tests) cannot switch each other off.
+pub fn track(on: bool) {
+    use std::sync::atomic::AtomicI64;
+    static N: AtomicI64 = AtomicI64::new(0);
+    let n = if on { N.fetch_add(1, Ordering::SeqCst) + 1 } else { (N.fetch_sub(1, Ordering::SeqCst) - 1).max(0) };
+    if n <= 0 {
+        N.store(0, Ordering::SeqCst);
+        TRACK.store(false, Ordering::Relaxed);
+        if let Ok(mut g) = DIRTY.lock() {
+            *g = None;
+        }
+    } else {
+        TRACK.store(true, Ordering::Relaxed);
+    }
+}
+
+fn push_dirty(dir: &str, id: u64) {
+    if let Ok(mut g) = DIRTY.lock() {
+        let v = g.get_or_insert_with(HashMap::new).entry(dir.to_owned()).or_default();
+        if v.last() == Some(&OVERFLOW) {
+            return;
+        }
+        if v.len() >= DIRTY_CAP {
+            v.clear();
+            v.push(OVERFLOW);
+        } else {
+            v.push(id);
+        }
+    }
+}
+
+/// A row was written locally (insert / edit).
+pub fn note_write(dir: &str, id: u64) {
+    if TRACK.load(Ordering::Relaxed) {
+        if let Ok(mut g) = GRAVE.lock() {
+            if let Some(m) = g.as_mut().and_then(|m| m.get_mut(dir)) {
+                m.remove(&id);
+            }
+        }
+        push_dirty(dir, id);
+    }
+}
+
+/// A row was deleted locally: remembered as a tombstone so the deletion travels (and an older copy elsewhere cannot bring it back).
+pub fn note_delete(dir: &str, id: u64) {
+    if TRACK.load(Ordering::Relaxed) {
+        grave_put(dir, id, crate::collab::now_ms().max(1));
+        push_dirty(dir, id);
+    }
+}
+
+/// The ids edited since the last call, for the table directories in `mine` (the others stay queued for their own workspace).
+pub fn take_dirty(mine: &[&str]) -> Vec<(String, Vec<u64>)> {
+    let Ok(mut g) = DIRTY.lock() else {
+        return vec![];
+    };
+    let Some(m) = g.as_mut() else { return vec![] };
+    let keys: Vec<String> = m.keys().filter(|k| mine.contains(&k.as_str())).cloned().collect();
+    keys.into_iter().filter_map(|k| m.remove(&k).map(|v| (k, v))).filter(|(_, v)| !v.is_empty()).collect()
+}
+
+pub fn grave_put(dir: &str, id: u64, ms: u64) {
+    if let Ok(mut g) = GRAVE.lock() {
+        let m = g.get_or_insert_with(HashMap::new).entry(dir.to_owned()).or_default();
+        if m.len() >= GRAVE_CAP && !m.contains_key(&id) {
+            if let Some(oldest) = m.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k) {
+                m.remove(&oldest);
+            }
+        }
+        m.insert(id, ms);
+    }
+}
+
+pub fn grave_get(dir: &str, id: u64) -> Option<u64> {
+    GRAVE.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(dir)).and_then(|m| m.get(&id).copied()))
+}
+
+pub fn grave_drop(dir: &str, id: u64) {
+    if let Ok(mut g) = GRAVE.lock() {
+        if let Some(m) = g.as_mut().and_then(|m| m.get_mut(dir)) {
+            m.remove(&id);
+        }
+    }
+}
+
+/// Tombstones with `lo <= id < hi`.
+pub fn grave_in(dir: &str, lo: u64, hi: u64) -> Vec<(u64, u64)> {
+    GRAVE.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(dir)).map(|m| m.range(lo..hi).map(|(a, b)| (*a, *b)).collect())).unwrap_or_default()
+}
+
+/// Id for a new row. Alone: max + 1. In a session: from this device's private id space (like pages and blocks), so two devices that add
+/// a row at the same moment never produce the same id.
+pub fn new_row_id(st: &mut Store) -> u64 {
+    let base = crate::collab::id_base();
+    if base == 0 {
+        return st.max_id() + 1;
+    }
+    let mut id = base + OWN_ID.fetch_add(1, Ordering::Relaxed);
+    while st.get(id).ok().flatten().is_some() {
+        id = base + OWN_ID.fetch_add(1, Ordering::Relaxed);
+    }
+    id
+}
+
 pub fn set_budget_all(bytes: usize) {
     if let Ok(g) = REG.lock() {
         if let Some(m) = g.as_ref() {
@@ -123,7 +246,13 @@ impl<'a> Csv<'a> {
     pub fn new(text: &'a str) -> Csv<'a> {
         let text = text.trim_start_matches('\u{feff}');
         let first = text.lines().next().unwrap_or("");
-        let delim = if first.matches('\t').count() > first.matches(',').count() { '\t' } else if first.matches(';').count() > first.matches(',').count() { ';' } else { ',' };
+        let delim = if first.matches('\t').count() > first.matches(',').count() {
+            '\t'
+        } else if first.matches(';').count() > first.matches(',').count() {
+            ';'
+        } else {
+            ','
+        };
         Csv { it: text.chars().peekable(), delim }
     }
 }
@@ -344,7 +473,10 @@ pub fn create_sample(ws: &mut Workspace, name: &str, n: u64, parent: Option<u64>
             (done, Value::Check(s == 4)),
         ];
         if h % 3 != 0 {
-            props.push((note, Value::Text(format!("{} {} follow-up", words[((h >> 40) % 12) as usize], words[((h >> 48) % 12) as usize]))));
+            props.push((
+                note,
+                Value::Text(format!("{} {} follow-up", words[((h >> 40) % 12) as usize], words[((h >> 48) % 12) as usize])),
+            ));
         }
         props.sort_by_key(|p| p.0);
         Row { id: i, title: format!("Task {i} — {}", words[(h % 12) as usize]), updated: 1_700_000_000_000 + i, props }
@@ -403,7 +535,11 @@ fn nan_last(a: f64, b: f64, asc: bool) -> std::cmp::Ordering {
         (false, true) => Less,
         _ => {
             let o = a.partial_cmp(&b).unwrap_or(Equal);
-            if asc { o } else { o.reverse() }
+            if asc {
+                o
+            } else {
+                o.reverse()
+            }
         }
     }
 }
@@ -478,7 +614,10 @@ pub fn build_view(st: &Mutex<Store>, db: &Database, sort: Option<(u64, bool)>, q
                             let (dict, codes) = col_text(b, p as u32)?;
                             for i in 0..ids.len() {
                                 if keep[i] {
-                                    strs.push((codes[i].map(|c| dict[c as usize].chars().take(32).collect::<String>().to_lowercase()).unwrap_or_default(), ids[i]));
+                                    strs.push((
+                                        codes[i].map(|c| dict[c as usize].chars().take(32).collect::<String>().to_lowercase()).unwrap_or_default(),
+                                        ids[i],
+                                    ));
                                 }
                             }
                         }
@@ -494,7 +633,13 @@ pub fn build_view(st: &Mutex<Store>, db: &Database, sort: Option<(u64, bool)>, q
             strs.sort_by(|a, b| match (a.0.is_empty(), b.0.is_empty()) {
                 (true, false) => std::cmp::Ordering::Greater,
                 (false, true) => std::cmp::Ordering::Less,
-                _ => if asc { a.0.cmp(&b.0) } else { b.0.cmp(&a.0) },
+                _ => {
+                    if asc {
+                        a.0.cmp(&b.0)
+                    } else {
+                        b.0.cmp(&a.0)
+                    }
+                }
             });
             strs.into_iter().map(|x| x.1).collect()
         } else {
@@ -542,9 +687,27 @@ impl Acc {
     fn value(&self, agg: Agg) -> f64 {
         match agg {
             Agg::Sum => self.sum,
-            Agg::Avg => if self.nvals > 0.0 { self.sum / self.nvals } else { 0.0 },
-            Agg::Min => if self.nvals > 0.0 { self.min } else { 0.0 },
-            Agg::Max => if self.nvals > 0.0 { self.max } else { 0.0 },
+            Agg::Avg => {
+                if self.nvals > 0.0 {
+                    self.sum / self.nvals
+                } else {
+                    0.0
+                }
+            }
+            Agg::Min => {
+                if self.nvals > 0.0 {
+                    self.min
+                } else {
+                    0.0
+                }
+            }
+            Agg::Max => {
+                if self.nvals > 0.0 {
+                    self.max
+                } else {
+                    0.0
+                }
+            }
             Agg::Filled => self.nvals,
             _ => self.count,
         }
@@ -617,7 +780,12 @@ pub fn big_grouped(st: &Mutex<Store>, db: &Database, cfg: &Cfg) -> Dataset {
             }
             PropKind::Checkbox => {
                 for (i, o) in col_check(b, g)?.into_iter().enumerate() {
-                    chk[match o { Some(true) => 0, Some(false) => 1, None => 2 }].row(val(i));
+                    chk[match o {
+                        Some(true) => 0,
+                        Some(false) => 1,
+                        None => 2,
+                    }]
+                    .row(val(i));
                 }
             }
             _ => {
@@ -752,7 +920,14 @@ mod tests {
     fn csv(n: usize) -> String {
         let mut s = String::from("Name,Status,Amount,Done,Due\n");
         for i in 0..n {
-            s.push_str(&format!("Task {i},{},{},{},2024-{:02}-{:02}\n", ["todo", "doing", "done"][i % 3], i % 100, if i % 2 == 0 { "true" } else { "false" }, i % 12 + 1, i % 27 + 1));
+            s.push_str(&format!(
+                "Task {i},{},{},{},2024-{:02}-{:02}\n",
+                ["todo", "doing", "done"][i % 3],
+                i % 100,
+                if i % 2 == 0 { "true" } else { "false" },
+                i % 12 + 1,
+                i % 27 + 1
+            ));
         }
         s
     }
@@ -781,7 +956,11 @@ mod tests {
         assert_eq!(ds.series[0].vals.iter().sum::<f64>(), expect);
         // group by date month, count
         let due = db.props.iter().find(|p| p.name == "Due").unwrap();
-        let ds = big_grouped(&st, &db, &Cfg { db: id, group: due.id, agg: Agg::Count, bucket: Bucket::Month, ..Default::default() });
+        let ds = big_grouped(
+            &st,
+            &db,
+            &Cfg { db: id, group: due.id, agg: Agg::Count, bucket: Bucket::Month, ..Default::default() },
+        );
         assert!(ds.dated && ds.cats.len() == 12 && ds.series[0].vals.iter().sum::<f64>() == 30_000.0);
         // number card from zone maps
         let n = big_number(&st, &Cfg { db: id, value: amount.id, agg: Agg::Max, ..Default::default() });

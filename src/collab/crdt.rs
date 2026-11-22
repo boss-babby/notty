@@ -274,7 +274,13 @@ pub fn describe(ws: &Workspace, op: &Op) -> Option<(&'static str, u64, u64, Stri
     let after = match (&op.key, op.e.val.as_deref()) {
         (Key::Block(..), Some(v)) => serde_json::from_str::<Block>(v).ok().map(|b| {
             let plain = crate::rich::strip(&b.text);
-            if plain.is_empty() { format!("[{:?}]", b.kind) } else if b.kind == crate::model::BlockKind::Todo { format!("[{}] {plain}", if b.checked { "x" } else { " " }) } else { plain }
+            if plain.is_empty() {
+                format!("[{:?}]", b.kind)
+            } else if b.kind == crate::model::BlockKind::Todo {
+                format!("[{}] {plain}", if b.checked { "x" } else { " " })
+            } else {
+                plain
+            }
         }),
         (Key::Page(..), Some(_)) => Some("(page title / settings)".to_owned()),
         (Key::Node(..), Some(v)) => serde_json::from_str::<crate::canvas::Node>(v).ok().map(|n| node_line(&n)),
@@ -317,7 +323,13 @@ fn snapshot(ws: &Workspace, key: &Key) -> Option<(&'static str, String, String)>
             let p = ws.page(pid)?;
             let b = p.blocks.iter().find(|b| b.id == bid)?;
             let plain = crate::rich::strip(&b.text);
-            let txt = if plain.is_empty() { format!("[{:?}]", b.kind) } else if b.kind == crate::model::BlockKind::Todo { format!("[{}] {plain}", if b.checked { "x" } else { " " }) } else { plain };
+            let txt = if plain.is_empty() {
+                format!("[{:?}]", b.kind)
+            } else if b.kind == crate::model::BlockKind::Todo {
+                format!("[{}] {plain}", if b.checked { "x" } else { " " })
+            } else {
+                plain
+            };
             Some(("Block", p.title.clone(), txt))
         }
         Key::Node(pid, nid) => {
@@ -327,7 +339,11 @@ fn snapshot(ws: &Workspace, key: &Key) -> Option<(&'static str, String, String)>
         }
         Key::Comment(pid, cid) => {
             let c = ws.comments.get(&pid)?.iter().find(|c| c.id == cid)?;
-            Some(("Comment", ws.page(pid).map(|p| p.title.clone()).unwrap_or_default(), format!("{}: {}", c.author, c.text)))
+            Some((
+                "Comment",
+                ws.page(pid).map(|p| p.title.clone()).unwrap_or_default(),
+                format!("{}: {}", c.author, c.text),
+            ))
         }
         _ => None,
     }
@@ -444,7 +460,29 @@ fn doc_keys_of_block(b: &Block, docs: &mut HashSet<u64>) {
 impl Replica {
     pub fn new(replica: u32, scope: Scope) -> Self {
         let roots = if scope.kind == ScopeKind::Workspace { HashSet::new() } else { HashSet::from([scope.root]) };
-        Replica { clock: Clock::new(replica), scope, roots, cells: HashMap::new(), groups: HashMap::new(), in_scope: HashSet::new(), docs: HashSet::new(), seen_updated: HashMap::new(), rr: 0, quiet: false, last_cost_ms: 0.0, hist: HashMap::new(), cur_page: None, merges: HashMap::new(), merged: 0, ids_sig: None, ppos: vec![], pidx: HashMap::new(), fps: HashMap::new(), stamp: 0, cap: u64::MAX }
+        Replica {
+            clock: Clock::new(replica),
+            scope,
+            roots,
+            cells: HashMap::new(),
+            groups: HashMap::new(),
+            in_scope: HashSet::new(),
+            docs: HashSet::new(),
+            seen_updated: HashMap::new(),
+            rr: 0,
+            quiet: false,
+            last_cost_ms: 0.0,
+            hist: HashMap::new(),
+            cur_page: None,
+            merges: HashMap::new(),
+            merged: 0,
+            ids_sig: None,
+            ppos: vec![],
+            pidx: HashMap::new(),
+            fps: HashMap::new(),
+            stamp: 0,
+            cap: u64::MAX,
+        }
     }
 
     /// Joiner side: the pages the host calls roots keep this device's own `parent` (none) instead of the host's.
@@ -493,6 +531,11 @@ impl Replica {
     /// Is this page part of what the session shares (a workspace share shares everything)?
     fn in_scope_page(&self, ws: &Workspace, pid: u64) -> bool {
         self.scope.kind == ScopeKind::Workspace || self.in_scope.contains(&pid) || (ws.page(pid).is_none() && self.cells.contains_key(&Key::Page(pid)))
+    }
+
+    /// Whether a page (and therefore the rows of a big table on it) belongs to what this session shares.
+    pub fn page_in_scope(&self, ws: &Workspace, pid: u64) -> bool {
+        self.in_scope_page(ws, pid)
     }
 
     fn page_allowed(&self, pid: u64, parent: Option<u64>) -> bool {
@@ -650,9 +693,13 @@ impl Replica {
         let mut n = 0;
         for line in text.lines().take(MAX_STAMPS) {
             let mut it = line.split(' ');
-            let (Some(tag), Some(a), Some(b), Some(t), Some(r), Some(h)) = (it.next(), it.next(), it.next(), it.next(), it.next(), it.next()) else { continue };
+            let (Some(tag), Some(a), Some(b), Some(t), Some(r), Some(h)) = (it.next(), it.next(), it.next(), it.next(), it.next(), it.next()) else {
+                continue;
+            };
             let hx = |x: &str| u64::from_str_radix(x, 16).ok();
-            let (Some(a), Some(b), Some(t), Some(r), Some(h)) = (hx(a), hx(b), hx(t), hx(r), hx(h)) else { continue };
+            let (Some(a), Some(b), Some(t), Some(r), Some(h)) = (hx(a), hx(b), hx(t), hx(r), hx(h)) else {
+                continue;
+            };
             let key = match tag {
                 "p" => Key::Page(a),
                 "b" => Key::Block(a, b),
@@ -775,11 +822,15 @@ impl Replica {
     pub fn tick_block(&mut self, ws: &Workspace, pid: u64, bid: u64, now: u64) -> Vec<Op> {
         let mut out = vec![];
         let key = Key::Block(pid, bid);
-        let Some(pos) = self.cells.get(&key).filter(|c| !c.dead).map(|c| c.pos) else { return out };
+        let Some(pos) = self.cells.get(&key).filter(|c| !c.dead).map(|c| c.pos) else {
+            return out;
+        };
         if !self.in_scope.contains(&pid) {
             return out;
         }
-        let Some(b) = ws.page(pid).and_then(|p| p.blocks.iter().find(|b| b.id == bid)) else { return out };
+        let Some(b) = ws.page(pid).and_then(|p| p.blocks.iter().find(|b| b.id == bid)) else {
+            return out;
+        };
         if let Ok(s) = serde_json::to_string(b) {
             self.cur_page = Some(pid);
             self.set_cell(key, Some(s), pos, now, &mut out);
@@ -811,7 +862,9 @@ impl Replica {
             self.stamp = ws.page(pid).map_or(0, |p| if p.updated.is_finite() && p.updated > 0.0 { (p.updated as u64).min(self.cap) } else { 0 });
         }
         let is_root = self.roots.contains(&pid);
-        let Some(meta) = meta_string(ws, pid, is_root) else { return };
+        let Some(meta) = meta_string(ws, pid, is_root) else {
+            return;
+        };
         self.set_cell(Key::Page(pid), Some(meta), ppos, now, out);
         let base = crate::collab::id_base();
         let Some(p) = ws.page_mut(pid) else { return };
@@ -869,7 +922,8 @@ impl Replica {
     }
 
     fn scan_annots(&mut self, ws: &Workspace, now: u64, out: &mut Vec<Op>) {
-        let mut docs: HashSet<u64> = if self.scope.kind == ScopeKind::Workspace { ws.pdf_annots.keys().copied().collect() } else { self.docs.iter().copied().filter(|d| ws.pdf_annots.contains_key(d)).collect() };
+        let mut docs: HashSet<u64> =
+            if self.scope.kind == ScopeKind::Workspace { ws.pdf_annots.keys().copied().collect() } else { self.docs.iter().copied().filter(|d| ws.pdf_annots.contains_key(d)).collect() };
         // documents that had annotations and lost the whole list
         docs.extend(self.groups.keys().filter(|g| g.0 == 1).map(|g| g.1));
         for d in docs {
@@ -1150,7 +1204,9 @@ impl Replica {
     }
 
     fn apply_page(&mut self, ws: &mut Workspace, pid: u64, json: &str, applied: &mut Applied) -> bool {
-        let Ok(mut np) = serde_json::from_str::<Page>(json) else { return false };
+        let Ok(mut np) = serde_json::from_str::<Page>(json) else {
+            return false;
+        };
         if !self.page_allowed(pid, np.parent) {
             return false;
         }
@@ -1493,8 +1549,14 @@ mod tests {
         let dig = |r: &Replica| r.digest().into_iter().map(|(k, h, x)| (k, (h, x))).collect::<HashMap<_, _>>();
         let from_a = ra.diff(&mut a, &dig(&rb));
         let from_b = rb.diff(&mut b, &dig(&ra));
-        assert!(from_a.iter().all(|o| o.key != Key::Block(pid, a.page(pid).unwrap().blocks[0].id)), "the older copy must not overwrite the newer edit");
-        assert!(from_b.iter().any(|o| o.key == Key::Block(pid, b.page(pid).unwrap().blocks[0].id)), "the newer edit must travel");
+        assert!(
+            from_a.iter().all(|o| o.key != Key::Block(pid, a.page(pid).unwrap().blocks[0].id)),
+            "the older copy must not overwrite the newer edit"
+        );
+        assert!(
+            from_b.iter().any(|o| o.key == Key::Block(pid, b.page(pid).unwrap().blocks[0].id)),
+            "the newer edit must travel"
+        );
         let other = a.pages.iter().find(|p| p.id != pid && !p.blocks.is_empty()).map(|p| p.id);
         if let Some(o) = other {
             assert!(from_a.iter().chain(from_b.iter()).all(|op| !matches!(op.key, Key::Block(p, _) if p == o)));

@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "14.7.0"
+version = "14.8.0"
 edition = "2021"
 description = "Lumen — a Notion + Obsidian + Miro-lite alternative (infinite canvas) written entirely in Rust with egui (Windows, Android + WebAssembly): Markdown tables, two-way relations, automations, reminders, LumenScript, AI + MCP"
 license = "MIT"
@@ -41,6 +41,8 @@ qrcode = { version = "0.14", default-features = false }
 snow = { version = "0.9", default-features = false, features = ["default-resolver"] }
 miniz_oxide = "0.8"
 getrandom = "0.2"
+x25519-dalek = "2"
+chacha20poly1305 = "0.10"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }

@@ -614,3 +614,124 @@ See `RELEASE-14.7.md` for the exact commands, artefacts and sizes of this delive
 3. **`yrs` / Y.Text** per text block (real intention preservation, exact carets): an editor adapter that diffs egui's `TextEdit` string into CRDT operations.
 4. **FCM push** for a closed app: Firebase in the APK (needs `google-services.json`) + a sender route on the site with a service-account key.
 5. **Mesh / automatic election** when the host's process dies; skip-direct-punch on symmetric NAT detection; `Arc<Page>` copy-on-write snapshots and a per-page store.
+
+## 15. Pass 9 — big tables in a session, automatic fail-over, pairing core, push relay, symmetric-NAT skip (14.8)
+
+Input: the §14.8 list. `PROTO` is now **7** (five new messages: `BigDigest`, `BigGet`, `BigChunk`, `Standby`, `StandbyAddr`); a 14.7 peer is
+refused with the usual "incompatible version" message. Everything below says what was done, how it was verified, and what is left.
+
+### 15.1 Status of the §14.8 list
+
+| # | Item | State |
+|---|---|---|
+| 1 | Big tables in a session | **done and verified** (15.2): per-bucket digests, chunk transfer, tombstones, role gates, live edits, joiner creates its store, collision-free row ids |
+| 2 | BLE pairing | **core done and tested** (15.4): advertised session tag, X25519 + 6-digit code + sealed link + GATT fragmenting. **Not done:** the Java GATT glue and the pairing screen — they need two phones and `BLUETOOTH_*` permissions; untestable radio code is not shipped in the APK |
+| 3 | `yrs` / Y.Text | **not done, deliberately** (15.7). Concurrent typing in one block keeps the three-way merge of §10.2 |
+| 4 | FCM push | **site half done and tested over HTTP** (15.5): token registry + FCM HTTP v1 sender. **Not done:** the Firebase SDK in the APK (needs your `google-services.json`) |
+| 5 | Mesh / automatic election | **automatic election done and verified** (15.3) · **skip-direct-punch on symmetric NAT done** (15.6) · `Arc<Page>` copy-on-write and a per-page store **not done** (15.7) |
+
+### 15.2 Big tables (`collab/bigsync.rs`)
+* **Index.** Row ids are cut into buckets of 512 ids. A bucket is `(live rows, Σ mix(id, updated, content hash))` — a *commutative* sum, so
+  an edit updates one bucket in place. 1 M rows ≈ 2 000 buckets. Tombstones (`id`, deleted-at ms) are inside the sum, so "deleted" ≠ "never had".
+* **Exchange.** After the entity digest each side sends `BigDigest` per shared table (1 500 buckets per frame), compares the other side's
+  with its own and asks for the buckets that differ (`BigGet`); the answer is `BigChunk` = `lumen_store::encode_chunk` (base64) + tombstones.
+  Both sides do it, so the exchange repairs in both directions. Buckets are produced **lazily** (two per connection per frame while that
+  connection's backlog is short): a million-row table neither floods the socket nor the memory.
+* **Merge** per row: newer `updated` wins; same millisecond → higher content hash wins (identical on every device); a tombstone beats a row
+  with the same or an older stamp, a newer row beats an older tombstone ("re-created" wins). Re-applying a chunk is idempotent.
+* **Live edits.** `bigui` calls `bigtable::note_write / note_delete` (no-ops outside a session); each frame the session turns the queued ids
+  into small `BigChunk`s (`b = u64::MAX`). The host relays what it *accepted* to the other devices (never back to the sender); more than
+  20 000 edits between two frames fall back to a digest exchange.
+* **Gates = the gates of `Ops`.** The host drops chunks from viewers and suggesters, only serves / accepts tables whose page is in the scope of the
+  share (`Replica::page_in_scope`) and never creates a store for a guest. A joiner creates a (volatile in the browser, on disk elsewhere)
+  store when the host announces a table whose database page it already has (digests wait up to 90 s for the page). Hostile input: base64 /
+  chunk decoding errors are dropped, ≤ 6 MiB per frame, ≤ 2 000 rows and ≤ 4 000 tombstones per chunk, ≤ 400 000 digest items per table.
+* **Row ids.** In a session `+ Row` takes its id from the device's private id space (`bigtable::new_row_id`, like pages and blocks), so two phones
+  adding a row at the same moment cannot produce the same id.
+* **Index build** of a table over 30 000 rows runs on a worker thread (native); the UI never waits for it.
+* **UI.** The table view re-reads when the shared data version changes; a toast reports "Big tables are in sync (N rows received)";
+  `Collab::big_status()` has the progress line.
+* **Tests.** `bigsync::tests` (5: merge rules, tombstone rules, two 3 000-row stores converge through digest + chunks incl. a deletion and older
+  rows, an edited bucket recomputes to exactly the full-scan value, hostile chunks), `collab::tests::a_big_table_is_shared_edited_and_deleted_live`
+  (host + joiner over real sockets: 6 000 rows arrive in a store of their own, a host edit, a joiner delete and a joiner add arrive live) and
+  the ignored `soak_one_million_rows` (`cargo test --lib soak -- --ignored --nocapture`; figures in RELEASE-14.8.md).
+* **Not done / limits.** Tombstones are kept in memory (200 000 per table, oldest dropped): a row deleted offline and then a restart can be
+  brought back by a peer that still has it. A suggester's direct edits to a big table are dropped, not held for approval. Row edits are
+  not merged cell-by-cell (the newer whole row wins).
+
+### 15.3 Automatic fail-over (`Standby`, `Collab::elect / promote`)
+* **Plan.** The host sends every device `Standby{host, order, addrs, secret, cap, relay}`: `order` = the editors by id (max 6),
+  `addrs` = where each reported it would listen (`StandbyAddr`; a device listens on `47700 + id % 250` when it becomes host), `secret` = a random
+  key (editors only), `cap = SHA-256(secret, device id)` = the token *this* device proves to the successor, `relay` = the site and a room code
+  derived from the secret (so a browser / relay-only session can fail over too). Re-sent whenever the roster changes; **a kick throws the secret
+  away** and mints a new one, so a removed device can never open the successor's door.
+* **Detection.** Unchanged (socket close, 45 s heartbeat). New: a re-dial that is *refused* now counts at once (`on_closed` used to ignore it
+  until the 25 s `reap` timer) — reconnects after a host restart are quicker too.
+* **Election.** After two failed re-dials the first editor of `order` that is not known to be dead becomes the host: if that is this device it
+  **promotes itself** (same replica, workspace and session id; new share token; roles inherited; the vanished host leaves the roster; listens; opens
+  the derived relay room); every other device re-points its resume target at the candidate and dials with its `cap` (the successor accepts it
+  because it knows the secret and the device id — Viewers and Suggesters follow too, with *their* cap, and keep their roles). A candidate that
+  does not come up within 14 s is skipped and the next one is tried. The succession continues: the new host pushes its own plan.
+* **Split brain.** In a network partition both sides may elect (like Raft without a quorum); the replicas merge by the normal rules when the
+  partition heals and somebody re-joins. A device that is the only editor left simply keeps its copy.
+* **Test.** `the_editors_elect_a_new_host_when_the_host_vanishes`: host + two editors over loopback, the host's sockets disappear without a goodbye,
+  the lower-id editor becomes host, the other follows, an edit typed afterwards reaches the new host, the share code changed (8 s).
+* **Not done.** Automatic election while a hand-over is in flight; candidates that are behind a symmetric NAT of their own (use the relay
+  room); several simultaneous host deaths in a long chain.
+
+### 15.4 BLE pairing — what exists (`collab/pair.rs`)
+`session_tag(share)` (16 bytes, the only thing advertised), `Keypair` (X25519, small-order keys refused), `code()` (six digits bound to both
+public keys: a man in the middle ends up with two different codes), `seal / open` (ChaCha20-Poly1305, key = hash of the shared secret; the
+token is never visible), `fragment / Reassembler` (GATT MTU 20, any order, CRC). 4 tests incl. a MITM. **Missing:** `BlePair.java`
+(advertiser + GATT server on the host, scanner + GATT client on the guest), the runtime permission flow (`BLUETOOTH_ADVERTISE/CONNECT/SCAN`),
+the egui "Nearby by Bluetooth" panel with the code and *Accept*. Next step: write them against the six functions above.
+
+### 15.5 Push for a closed app (site: `/api/collab/push`)
+`POST {room, from, k, token}` registers an FCM device token (the device must be a member of the room: the same per-device key as the relay);
+`POST {room, from, k, notify:{title, body}}` wakes the *other* devices through FCM HTTP v1 — the site signs an OAuth JWT with the service account
+in `FCM_SERVICE_ACCOUNT` (JSON or base64 JSON). Without the variable the route answers 501 `configured:false`; `GET` tells the app whether push is
+available. Tested over HTTP (validation, membership, 501). **Not done:** the Firebase SDK + `google-services.json` in the APK, and the call
+from the foreground-service-less path. Dead tokens (HTTP 400/404) are dropped.
+
+### 15.6 Symmetric NAT: skip the direct punch
+`nat_is_symmetric` asks two STUN servers with different addresses from one socket; different public ports ⇒ symmetric. When a relay (`turn`) is
+known the 7–8 s direct attempt is skipped and both ends meet at the relay at once. Without a relay the direct attempt still runs.
+Test: `a_nat_that_changes_the_port_per_destination_is_symmetric` (classification); the STUN calls themselves need the internet.
+
+### 15.7 Not done — why
+* **`yrs` / Y.Text.** An adapter that diffs egui's `TextEdit` string into CRDT operations has to run on every keystroke of every block and the
+  entity model (`Key::Block` = one JSON value, LWW + three-way merge) would have to carry per-character state; I judged a half-wired CRDT more
+  dangerous than the existing merge, which already keeps both people's edits when they type in different places of a paragraph. Plan: a
+  `Key::Text(block, field)` entity that holds an RGA/Y.Text update log, the editor reads/writes through the diff adapter, the old merge stays as the
+  fallback for old peers.
+* **`Arc<Page>` copy-on-write and a per-page store.** Autosave already snapshots by clone on a worker thread; the win is memory only for
+  workspaces with many huge pages. Needs a model refactor across ~60 files; deferred.
+
+### 15.8 "Can two devices connect anywhere in the world with no lookup server at all?"
+**Not with zero help, and nobody can.** Two devices behind home routers have no reachable address; *something* must hand one the other's address.
+What Lumen does, from least to most outside help:
+1. **Same network:** no server — UDP beacons / QR / link.
+2. **Direct internet connect** (`Collab::set_internet`): UPnP opens a port on the host's router; the join link carries `ip:port`. **No relay, no
+   rendezvous, no account** — the *link is the lookup*, delivered by you (chat, QR). It works when the router allows UPnP and has a public IPv4
+   (not behind carrier-grade NAT). The site is only asked "what is my IP" (`/api/collab/ip`); any such service or the router's own UPnP answer can replace it.
+3. **Hole punching** needs the two public addresses exchanged: the site's `/api/collab/punch` does that (two addresses and a cookie; never
+   session data) and public STUN servers tell each device its own mapping. The exchange could also ride in the link / QR both ways (no site) —
+   not built, it needs two scans.
+4. **Relay** (site `/api/collab`, optional `lumen-turn`) is the last resort for symmetric NATs; it only moves sealed frames.
+5. **True serverless discovery** would be a DHT (BitTorrent mainline: well-known bootstrap nodes, nobody owns it) plus IPv6 (no NAT at all: a global
+   address in the link works with a firewall rule). Neither is built; IPv6 listening is the cheapest next step.
+Everything is end-to-end encrypted (Noise XX) whichever path is used, so the helper never sees content.
+
+### 15.9 Verification log (this machine, Linux x86-64, no phones, no second browser)
+See `RELEASE-14.8.md` for commands, artefacts and sizes. `cargo test --lib`: 318 pass, 1 **pre-existing** failure
+(`tests::right_click_keeps_selection_and_opens_menu` fails identically on the untouched 14.7 checkout in this headless environment).
+
+### 15.10 Review — what more can be done (ranked)
+1. **Phones in the loop:** the BLE glue (15.4) and the FCM SDK (15.5) are small once two phones and a Firebase project exist. A test rig that drives
+   two real devices (adb + UI Automator) would also cover the foreground service, NSD and the hotspot hand-off.
+2. **A real text CRDT** (15.7) with the editor adapter — the biggest remaining user-visible gap in simultaneous typing.
+3. **Persist tombstones** of big tables (and a per-table checkpoint of the bucket index) so deletions survive restarts; cell-level merge of rows.
+4. **IPv6 + DHT discovery** (15.8) for "anywhere in the world without our site".
+5. **Quorum for the election** (three or more editors) to avoid split brain in partitions; sign the `Standby` plan with the host's long-term key.
+6. **Per-document access:** share a page with a link that expires and can be revoked, with the roles kept in the encrypted plan.
+7. **Large-scale polish:** memory-mapped chunk reads for tables over 10 M rows, background compaction after a big sync, delta-compressed `BigChunk`s.

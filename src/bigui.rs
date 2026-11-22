@@ -12,7 +12,7 @@ use lumen_store::{Row, Value};
 
 use crate::bigtable::{self as bt, lock, Shared};
 use crate::model::{Database, PropKind, Workspace};
-use crate::theme::{bold, body, tag_color, Palette};
+use crate::theme::{body, bold, tag_color, Palette};
 use crate::widgets::{ghost_button, text_fit, with_alpha};
 
 const ROW_H: f32 = 34.0;
@@ -92,8 +92,10 @@ fn commit(st: &Shared, dir: &str, row_id: u64, prop: u64, val: Option<Value>, ti
                 }
             }
             r.updated = now();
+            let id = r.id;
             let _ = g.upsert(r);
             let _ = g.checkpoint();
+            bt::note_write(dir, id);
         }
     }
     bt::bump_version(dir);
@@ -103,13 +105,31 @@ fn paint_cell(p: &egui::Painter, cr: Rect, c: &Col, row: &Row, db: &Database, pa
     let pad = 10.0;
     let mid = cr.center().y;
     if c.prop == 0 {
-        text_fit(p, pos2(cr.left() + pad, mid), Align2::LEFT_CENTER, &row.title, body(13.5), pal.text, cr.width() - pad * 2.0);
+        text_fit(
+            p,
+            pos2(cr.left() + pad, mid),
+            Align2::LEFT_CENTER,
+            &row.title,
+            body(13.5),
+            pal.text,
+            cr.width() - pad * 2.0,
+        );
         return;
     }
-    let Some(v) = row.get(c.prop as u32) else { return };
+    let Some(v) = row.get(c.prop as u32) else {
+        return;
+    };
     match v {
         Value::Num(x) => {
-            text_fit(p, pos2(cr.right() - pad, mid), Align2::RIGHT_CENTER, &crate::dashdata::fmt_num(*x), body(13.5), pal.text, cr.width() - pad * 2.0);
+            text_fit(
+                p,
+                pos2(cr.right() - pad, mid),
+                Align2::RIGHT_CENTER,
+                &crate::dashdata::fmt_num(*x),
+                body(13.5),
+                pal.text,
+                cr.width() - pad * 2.0,
+            );
         }
         Value::Sel(o) => {
             if let Some(opt) = db.opt(c.prop, *o) {
@@ -139,12 +159,20 @@ fn paint_cell(p: &egui::Painter, cr: Rect, c: &Col, row: &Row, db: &Database, pa
 
 /// The page body of a large dataset. Returns true when the workspace metadata changed (never: rows live in the store).
 pub fn show(ui: &mut Ui, ws: &mut Workspace, id: u64, pal: &Palette, w: f32) -> bool {
-    let Some(meta) = ws.bigs.get(&id).cloned() else { return false };
-    let Some(db) = ws.db(id).cloned() else { return false };
+    let Some(meta) = ws.bigs.get(&id).cloned() else {
+        return false;
+    };
+    let Some(db) = ws.db(id).cloned() else {
+        return false;
+    };
     let ctx = ui.ctx().clone();
     let Some(st) = bt::open_store(&meta, false) else {
         ui.add_space(24.0);
-        ui.label(RichText::new("This dataset is not available in this session. Browser data is kept in memory only — import the CSV again, or use the desktop / Android app for persistent large datasets.").font(body(14.0)).color(pal.muted));
+        ui.label(
+            RichText::new("This dataset is not available in this session. Browser data is kept in memory only — import the CSV again, or use the desktop / Android app for persistent large datasets.")
+                .font(body(14.0))
+                .color(pal.muted),
+        );
         return false;
     };
     let title = ws.page(id).map(|p| p.title.clone()).unwrap_or_default();
@@ -162,9 +190,10 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, id: u64, pal: &Palette, w: f32) -> 
         if ghost_button(ui, pal, "+ Row").clicked() {
             let rid = {
                 let mut g = lock(&st);
-                let rid = g.max_id() + 1;
+                let rid = bt::new_row_id(&mut g);
                 let _ = g.upsert(Row { id: rid, title: "Untitled".into(), updated: now(), props: vec![] });
                 let _ = g.checkpoint();
+                bt::note_write(&meta.dir, rid);
                 rid
             };
             let _ = rid;
@@ -185,12 +214,20 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, id: u64, pal: &Palette, w: f32) -> 
     };
     let rss = crate::memgov::rss_mb().map(|m| format!(" · app memory {m:.0} MB")).unwrap_or_default();
     let storage = if meta.volatile { "in memory (this browser session)" } else { "on disk" };
-    ui.label(RichText::new(format!("{} rows · {storage} {disk_mb:.1} MB · row cache {cache_mb:.1} MB{rss}{}", group(total), if s.note.is_empty() { String::new() } else { format!(" · {}", s.note) })).font(body(11.5)).color(pal.muted));
+    ui.label(
+        RichText::new(format!(
+            "{} rows · {storage} {disk_mb:.1} MB · row cache {cache_mb:.1} MB{rss}{}",
+            group(total),
+            if s.note.is_empty() { String::new() } else { format!(" · {}", s.note) }
+        ))
+        .font(body(11.5))
+        .color(pal.muted),
+    );
     ui.add_space(4.0);
 
     // ── sorted / searched view (worker) ──
     let want_view = s.sort.is_some() || !s.query.trim().is_empty();
-    let vkey = hash((s.sort, s.query.trim().to_lowercase(), s.gen));
+    let vkey = hash((s.sort, s.query.trim().to_lowercase(), s.gen, bt::version(&meta.dir)));
     if !want_view {
         s.view = None;
         s.view_key = 0;
@@ -263,7 +300,7 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, id: u64, pal: &Palette, w: f32) -> 
         let (content, _) = ui.allocate_exact_size(vec2(total_w.max(w), content_h.max(HEAD_H + ROW_H)), Sense::hover());
         let first = ((vp.top() - HEAD_H) / ROW_H).floor().max(0.0) as u64;
         let count = ((vp.height() / ROW_H).ceil() as u64 + 2).min(n.saturating_sub(first));
-        let wkey = hash((first, count, s.gen, s.view_key, n));
+        let wkey = hash((first, count, s.gen, s.view_key, n, bt::version(&meta.dir)));
         if s.win.as_ref().map_or(true, |w| w.0 != wkey) {
             let rows: Vec<Row> = match &s.view {
                 None => lock(&st).window(first, count as usize).unwrap_or_default(),
@@ -345,7 +382,15 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, id: u64, pal: &Palette, w: f32) -> 
                 Some((p, false)) if p == c.prop => " ▼",
                 _ => "",
             };
-            text_fit(&painter, pos2(cr.left() + 10.0, cr.center().y), Align2::LEFT_CENTER, &format!("{}{arrow}", c.name), bold(12.5), if arrow.is_empty() { pal.muted } else { pal.accent }, c.w - 16.0);
+            text_fit(
+                &painter,
+                pos2(cr.left() + 10.0, cr.center().y),
+                Align2::LEFT_CENTER,
+                &format!("{}{arrow}", c.name),
+                bold(12.5),
+                if arrow.is_empty() { pal.muted } else { pal.accent },
+                c.w - 16.0,
+            );
             if resp.clicked() && !matches!(c.kind, PropKind::MultiSelect) {
                 clicked_header = Some(c.prop);
             }
@@ -369,6 +414,7 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, id: u64, pal: &Palette, w: f32) -> 
             let mut g = lock(&st);
             let _ = g.delete(r);
             let _ = g.checkpoint();
+            bt::note_delete(&meta.dir, r);
         }
         bt::bump_version(&meta.dir);
         s.gen += 1;
