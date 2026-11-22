@@ -343,7 +343,11 @@ impl Reader {
             goto: String::new(),
             page: 0,
             first_frame: true,
-            notes: Notes::new(annots),
+            notes: {
+                let mut n = Notes::new(annots);
+                n.doc = req.key;
+                n
+            },
             open_ms: 0.0,
             active_at: now_ms(),
             trim_armed: false,

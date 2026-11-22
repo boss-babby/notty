@@ -161,6 +161,14 @@ pub struct LumenApp {
     wsreg: crate::workspaces::Registry,
     wsother: std::collections::BTreeMap<u64, String>,
     wsdirty: std::collections::HashSet<u64>,
+    /// Temporary shared workspace (id, workspace to go back to): removed when the session ends.
+    temp_ws: Option<(u64, u64)>,
+    temp_loaded: bool,
+    /// Share id of the joined workspace that is kept (its last-sync time is refreshed while joined).
+    joined_share: Option<String>,
+    share_saved_at: f64,
+    /// Flattened visible sidebar rows (id, depth, has children) with the signature they were built for.
+    side_cache: (u64, std::rc::Rc<Vec<(u64, u8, bool)>>),
     ws_confirm_delete: bool,
     /// Raw text of a stored workspace that could not be parsed (kept under its own storage key on the next save).
     rescued: Option<String>,
@@ -273,6 +281,11 @@ impl LumenApp {
             wsreg,
             wsother,
             wsdirty: Default::default(),
+            temp_ws: None,
+            temp_loaded: false,
+            joined_share: None,
+            share_saved_at: 0.0,
+            side_cache: (0, Default::default()),
             ws_confirm_delete: false,
             trash_open: false,
             security: None,
@@ -911,6 +924,7 @@ impl LumenApp {
         }
         ui.add_space(8.0);
 
+        let rows = self.side_rows();
         let footer_h = 78.0;
         let h = (ui.available_height() - footer_h).max(80.0);
         ScrollArea::vertical().id_salt("side_scroll").max_height(h).auto_shrink([false, false]).show(ui, |ui| {
@@ -934,8 +948,37 @@ impl LumenApp {
                 ui.add_space(6.0);
             }
             section_label(ui, pal, "Pages");
-            self.tree(ui, pal, w, None, 0, &mut ev);
-            if self.ws.children(None).is_empty() {
+            // Only the rows on screen are laid out (28 px + 1 px spacing each): a workspace with 100 000 pages costs the same per frame
+            // as one with 30. The flattened list is cached and rebuilt only when the page tree changed.
+            let pitch = 29.0_f32;
+            let n = rows.len();
+            let top = ui.cursor().top();
+            let clip = ui.clip_rect();
+            let first = (((clip.top() - top) / pitch).floor() as isize - 2).clamp(0, n as isize) as usize;
+            let last = (((clip.bottom() - top) / pitch).ceil() as isize + 2).clamp(0, n as isize) as usize;
+            if first > 0 {
+                ui.allocate_space(vec2(w, first as f32 * pitch - 1.0));
+            }
+            for &(id, depth, has) in &rows[first..last.max(first)] {
+                let Some(p) = self.ws.page(id) else { continue };
+                let out = page_row(ui, pal, Id::new(("srow", id)), w, depth as usize, p, self.ws.current == Some(id), has);
+                if out.click {
+                    ev.push(Ev::Open(id));
+                }
+                if out.arrow {
+                    ev.push(Ev::Toggle(id));
+                }
+                if out.plus {
+                    ev.push(Ev::AddChild(id));
+                }
+                if let Some(pos) = out.more.or(out.rclick) {
+                    ev.push(Ev::Menu(id, pos));
+                }
+            }
+            if last < n {
+                ui.allocate_space(vec2(w, (n - last) as f32 * pitch - 1.0));
+            }
+            if n == 0 {
                 ui.add_space(6.0);
                 ui.label(RichText::new("  No pages yet").color(pal.muted).font(body(13.0)));
             }
@@ -979,6 +1022,47 @@ impl LumenApp {
         }
     }
 
+    /// The visible sidebar rows in order (depth-first, collapsed branches skipped), cached by a cheap signature of the page tree.
+    fn side_rows(&mut self) -> std::rc::Rc<Vec<(u64, u8, bool)>> {
+        let sig = self.ws.pages.iter().fold(self.ws.pages.len() as u64, |h, p| {
+            let f = (p.parent.map_or(0, |x| x.wrapping_add(1))).wrapping_mul(31) ^ ((p.trashed as u64) << 1) ^ ((p.row as u64) << 2) ^ ((p.expanded as u64) << 3);
+            (h ^ p.id ^ f.rotate_left(17)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        if self.side_cache.0 == sig && !self.side_cache.1.is_empty() {
+            return self.side_cache.1.clone();
+        }
+        let mut kids: std::collections::HashMap<Option<u64>, Vec<u64>> = std::collections::HashMap::new();
+        let mut expanded: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for p in self.ws.pages.iter().filter(|p| !p.trashed && !p.row) {
+            kids.entry(p.parent).or_default().push(p.id);
+            if p.expanded {
+                expanded.insert(p.id);
+            }
+        }
+        let mut out: Vec<(u64, u8, bool)> = Vec::with_capacity(self.ws.pages.len().min(4096));
+        // explicit stack: (parent, next child index, depth)
+        let mut stack: Vec<(Option<u64>, usize, u8)> = vec![(None, 0, 0)];
+        let mut guard = 0usize;
+        while let Some((parent, i, depth)) = stack.pop() {
+            guard += 1;
+            if guard > self.ws.pages.len() * 2 + 8 {
+                break;
+            }
+            let Some(list) = kids.get(&parent) else { continue };
+            let Some(&id) = list.get(i) else { continue };
+            stack.push((parent, i + 1, depth));
+            let has = kids.contains_key(&Some(id));
+            out.push((id, depth, has));
+            if has && expanded.contains(&id) && depth < 30 {
+                stack.push((Some(id), 0, depth + 1));
+            }
+        }
+        let rc = std::rc::Rc::new(out);
+        self.side_cache = (sig, rc.clone());
+        rc
+    }
+
+    #[allow(dead_code)]
     fn tree(&self, ui: &mut Ui, pal: &Palette, w: f32, parent: Option<u64>, depth: usize, ev: &mut Vec<Ev>) {
         for id in self.ws.children(parent) {
             let Some(p) = self.ws.page(id) else { continue };
@@ -1062,6 +1146,7 @@ impl LumenApp {
         ui.add_space(6.0);
         let open_comments = self.ws.comments.get(&cur).map_or(0, |v| v.iter().filter(|x| !x.resolved).count());
         crate::collab::ui::comments_button(ui, pal, &mut self.collab, open_comments);
+        crate::collab::ui::changes_button(ui, pal, &mut self.collab);
         crate::collab::ui::chip(ui, pal, &mut self.collab);
         let (updated, fav) = self.ws.page(cur).map(|p| (p.updated, p.favorite)).unwrap_or((0.0, false));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1406,14 +1491,15 @@ impl LumenApp {
 
     /// Local collaboration: runs the session once per frame (network events, remote edits, local change scan, media on demand).
     fn run_collab(&mut self, ctx: &Context) {
+        self.collab_housekeeping(ctx);
         if !self.collab.active() && !self.collab.ui.discovering {
             return;
         }
         if ctx.input(|i| !i.events.is_empty()) {
             self.collab.poke();
         }
-        if let Some(name) = self.collab.take_new_workspace() {
-            self.new_shared_workspace(ctx, &name);
+        if let Some(nw) = self.collab.take_new_workspace() {
+            self.new_shared_workspace(ctx, nw);
         }
         let cur = self.ws.current;
         let (page, cursor) = crate::collab::view_state();
@@ -1443,6 +1529,22 @@ impl LumenApp {
     fn collab_overlays(&mut self, ctx: &Context, pal: &Palette) {
         let cur = self.ws.current;
         let ws_id = self.wsreg.active;
+        if self.temp_ws.map_or(false, |t| t.0 == ws_id) && self.collab.active() {
+            let mut keep = false;
+            egui::Area::new(Id::new("temp_chip")).order(egui::Order::Foreground).anchor(Align2::LEFT_BOTTOM, vec2(12.0, -12.0)).show(ctx, |ui| {
+                crate::widgets::popup_frame(pal).corner_radius(egui::CornerRadius::same(18)).inner_margin(egui::Margin::symmetric(12, 6)).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Temporary · removed when the session ends").font(body(12.0)).color(pal.muted));
+                        if ui.add(egui::Button::new(RichText::new("Keep a copy").font(bold(12.0)).color(pal.accent)).frame(false)).clicked() {
+                            keep = true;
+                        }
+                    });
+                });
+            });
+            if keep {
+                self.keep_temp_copy(ctx);
+            }
+        }
         let out = crate::collab::ui::overlays(ctx, pal, &mut self.collab, &mut self.ws, ws_id, cur);
         if let Some(pg) = out.open {
             self.ws.current = Some(pg);
@@ -1459,17 +1561,118 @@ impl LumenApp {
         }
     }
 
-    /// A joined session lands in its own workspace (the host's pages keep their ids, so every edit maps 1:1).
-    fn new_shared_workspace(&mut self, ctx: &Context, name: &str) {
-        let mut ws = Workspace::blank(name, self.ws.dark, self.ws.accent);
+    /// A joined session lands in a workspace of its own (the host's pages keep their ids, so every edit maps 1:1).
+    /// * Shared before and kept → that same workspace opens again (no duplicate), only the difference syncs and is shown for review.
+    /// * Shared as *temporary* → a scratch workspace that disappears when the session ends (unless the user keeps it).
+    fn new_shared_workspace(&mut self, ctx: &Context, nw: crate::collab::NewWs) {
+        let prev = self.wsreg.active;
+        let known: Vec<(String, u64, u64)> = ctx.data_mut(|d| d.get_persisted(Id::new("collab_shares"))).unwrap_or_default();
+        if nw.keep && !nw.share.is_empty() {
+            if let Some((_, id, ts)) = known.iter().find(|k| k.0 == nw.share).cloned() {
+                if self.wsreg.list.iter().any(|m| m.id == id) {
+                    self.switch_workspace(ctx, id);
+                    if self.wsreg.active == id {
+                        self.collab.bind_existing(&mut self.ws, id, ts);
+                        self.joined_share = Some(nw.share);
+                        self.share_saved_at = crate::collab::mono_ms();
+                        self.toast("Opened your earlier copy of this workspace", None);
+                        return;
+                    }
+                }
+            }
+        }
+        let name = if nw.keep { nw.name.clone() } else { nw.name.replacen("Shared", "Temporary", 1) };
+        let mut ws = Workspace::blank(&name, self.ws.dark, self.ws.accent);
         ws.pages.clear();
         ws.current = None;
         let Ok(text) = serde_json::to_string(&ws) else { return };
-        let id = self.wsreg.add(name);
+        let id = self.wsreg.add(&name);
         self.wsother.insert(id, text);
         self.wsdirty.insert(id);
         self.switch_workspace(ctx, id);
+        if nw.keep {
+            if !nw.share.is_empty() {
+                self.remember_share(ctx, &nw.share, id);
+                self.joined_share = Some(nw.share);
+            }
+        } else {
+            self.temp_ws = Some((id, prev));
+            ctx.data_mut(|d| d.insert_persisted(Id::new("collab_temp"), Some((id, prev))));
+        }
+        self.share_saved_at = crate::collab::mono_ms();
         self.collab.bind(self.wsreg.active);
+    }
+
+    fn remember_share(&mut self, ctx: &Context, share: &str, ws_id: u64) {
+        let mut known: Vec<(String, u64, u64)> = ctx.data_mut(|d| d.get_persisted(Id::new("collab_shares"))).unwrap_or_default();
+        known.retain(|k| k.0 != share && self.wsreg.list.iter().any(|m| m.id == k.1));
+        known.push((share.to_owned(), ws_id, now_ms() as u64));
+        if known.len() > 200 {
+            known.remove(0);
+        }
+        ctx.data_mut(|d| d.insert_persisted(Id::new("collab_shares"), known));
+    }
+
+    /// Runs every frame (cheap): keeps the last-sync time of a kept share fresh, removes a temporary workspace when its session ended.
+    fn collab_housekeeping(&mut self, ctx: &Context) {
+        if !self.temp_loaded {
+            self.temp_loaded = true;
+            // a temporary workspace left behind by a crash / forced close is cleaned up at the next start
+            if let Some(Some(t)) = ctx.data_mut(|d| d.get_persisted::<Option<(u64, u64)>>(Id::new("collab_temp"))) {
+                self.temp_ws = Some(t);
+            }
+        }
+        let live = self.collab.active() || self.collab.reconnecting();
+        if live {
+            if let Some(share) = self.joined_share.clone() {
+                let now = crate::collab::mono_ms();
+                if now - self.share_saved_at > 30_000.0 {
+                    self.share_saved_at = now;
+                    let id = self.wsreg.active;
+                    self.remember_share(ctx, &share, id);
+                }
+            }
+            return;
+        }
+        if let Some(share) = self.joined_share.take() {
+            let id = self.wsreg.active;
+            self.remember_share(ctx, &share, id);
+        }
+        if let Some((tid, back)) = self.temp_ws.take() {
+            ctx.data_mut(|d| d.insert_persisted(Id::new("collab_temp"), None::<(u64, u64)>));
+            if self.wsreg.list.iter().any(|m| m.id == tid) {
+                if self.wsreg.active == tid {
+                    let target = if self.wsreg.list.iter().any(|m| m.id == back && m.id != tid) { Some(back) } else { self.wsreg.list.iter().find(|m| m.id != tid).map(|m| m.id) };
+                    if let Some(t) = target {
+                        self.switch_workspace(ctx, t);
+                    }
+                }
+                if self.wsreg.active != tid {
+                    self.wsother.remove(&tid);
+                    self.wsdirty.remove(&tid);
+                    self.wsreg.remove(tid);
+                    self.toast("The temporary shared workspace was closed", None);
+                }
+            }
+        }
+    }
+
+    /// "Keep a copy" for a temporary shared workspace that is still open.
+    fn keep_temp_copy(&mut self, ctx: &Context) {
+        let Some((tid, _)) = self.temp_ws.take() else { return };
+        ctx.data_mut(|d| d.insert_persisted(Id::new("collab_temp"), None::<(u64, u64)>));
+        let name = self.ws.name.replacen("Temporary", "Shared", 1);
+        if self.wsreg.active == tid {
+            self.ws.name = name.clone();
+        }
+        if let Some(m) = self.wsreg.list.iter_mut().find(|m| m.id == tid) {
+            m.name = name;
+        }
+        if let Some(sid) = self.collab.session.as_ref().map(|s| s.share.clone()).filter(|s| !s.is_empty()) {
+            self.remember_share(ctx, &sid, tid);
+            self.joined_share = Some(sid);
+        }
+        self.toast("Kept — this workspace stays after the session", None);
     }
 
     fn switch_workspace(&mut self, ctx: &Context, target: u64) {
@@ -1752,6 +1955,7 @@ impl LumenApp {
             crate::collab::ui::chip(ui, pal, &mut self.collab);
             let open_comments = self.ws.current.and_then(|p| self.ws.comments.get(&p)).map_or(0, |v| v.iter().filter(|x| !x.resolved).count());
             crate::collab::ui::comments_button(ui, pal, &mut self.collab, open_comments);
+            crate::collab::ui::changes_button(ui, pal, &mut self.collab);
             if r.clicked() {
                 self.page_menu = Some(r.rect.left_bottom() + vec2(-230.0, 6.0));
                 self.fresh = true;

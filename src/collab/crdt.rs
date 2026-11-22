@@ -137,6 +137,11 @@ pub struct Applied {
     pub pages: HashSet<u64>,
     pub reorder_pages: bool,
     pub n: usize,
+    /// Record what changed (before / after text) for the review window.
+    pub track: bool,
+    pub log: Vec<super::changes::Change>,
+    /// Remote changes to things that are not itemised (canvas cards, edges, annotations).
+    pub other: usize,
 }
 
 /// Largest accepted value of one entity (a block, a page header, a canvas card …).
@@ -191,6 +196,74 @@ pub struct Replica {
     merges: HashMap<Key, (u64, u32)>,
     /// Number of concurrent edits that were merged instead of overwritten (statistics / tests).
     pub merged: u64,
+    /// Signature of the ordered page list of the last full tick: while it is unchanged the O(pages) bookkeeping (disappeared pages,
+    /// sidebar positions) is skipped — this is what keeps a 100 000-page workspace from stalling every scan.
+    ids_sig: Option<u64>,
+    ppos: Vec<f64>,
+    pidx: HashMap<u64, usize>,
+    /// Fingerprints of annotation / comment lists: an unchanged list is not serialised again.
+    fps: HashMap<(u8, u64), u64>,
+}
+
+fn mix(h: u64, v: u64) -> u64 {
+    (h ^ v).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(5)
+}
+
+/// Order-sensitive fingerprint of a list of annotations (no allocation).
+fn annots_fp(list: &[crate::model::PdfAnnot]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325 ^ list.len() as u64;
+    for a in list {
+        h = mix(h, a.id);
+        h = mix(h, ((a.page as u64) << 8) | a.kind as u64);
+        for r in a.rect {
+            h = mix(h, r.to_bits() as u64);
+        }
+        h = mix(h, a.color as u64);
+        h = mix(h, a.created.to_bits());
+        h = mix(h, crate::media::fnv(a.text.as_bytes()));
+        h = mix(h, crate::media::fnv(a.quote.as_bytes()));
+        h = mix(h, ((a.pts.len() as u64) << 32) | a.quads.len() as u64);
+        for q in &a.pts {
+            h = mix(h, ((q[0].to_bits() as u64) << 32) | q[1].to_bits() as u64);
+        }
+        for q in &a.quads {
+            h = mix(h, q.iter().fold(0u64, |x, v| x ^ (v.to_bits() as u64).rotate_left(7)));
+        }
+    }
+    h | 1
+}
+
+fn comments_fp(list: &[crate::model::Comment]) -> u64 {
+    let mut h = 0x84222325cbf29ce4 ^ list.len() as u64;
+    for c in list {
+        h = mix(h, c.id);
+        h = mix(h, c.block);
+        h = mix(h, c.reply_to);
+        h = mix(h, c.ts as u64);
+        h = mix(h, c.resolved as u64);
+        h = mix(h, crate::media::fnv(c.text.as_bytes()));
+        h = mix(h, crate::media::fnv(c.author.as_bytes()));
+    }
+    h | 1
+}
+
+/// What the review window shows for an entity: (kind of thing, page title, text).
+fn snapshot(ws: &Workspace, key: &Key) -> Option<(&'static str, String, String)> {
+    match *key {
+        Key::Page(pid) => ws.page(pid).map(|p| ("Page", p.title.clone(), p.title.clone())),
+        Key::Block(pid, bid) => {
+            let p = ws.page(pid)?;
+            let b = p.blocks.iter().find(|b| b.id == bid)?;
+            let plain = crate::rich::strip(&b.text);
+            let txt = if plain.is_empty() { format!("[{:?}]", b.kind) } else if b.kind == crate::model::BlockKind::Todo { format!("[{}] {plain}", if b.checked { "x" } else { " " }) } else { plain };
+            Some(("Block", p.title.clone(), txt))
+        }
+        Key::Comment(pid, cid) => {
+            let c = ws.comments.get(&pid)?.iter().find(|c| c.id == cid)?;
+            Some(("Comment", ws.page(pid).map(|p| p.title.clone()).unwrap_or_default(), format!("{}: {}", c.author, c.text)))
+        }
+        _ => None,
+    }
 }
 
 /// Positions for an ordered list: items that already have a position in increasing order keep it (longest increasing subsequence),
@@ -304,7 +377,7 @@ fn doc_keys_of_block(b: &Block, docs: &mut HashSet<u64>) {
 impl Replica {
     pub fn new(replica: u32, scope: Scope) -> Self {
         let roots = if scope.kind == ScopeKind::Workspace { HashSet::new() } else { HashSet::from([scope.root]) };
-        Replica { clock: Clock::new(replica), scope, roots, cells: HashMap::new(), groups: HashMap::new(), in_scope: HashSet::new(), docs: HashSet::new(), seen_updated: HashMap::new(), rr: 0, quiet: false, last_cost_ms: 0.0, hist: HashMap::new(), cur_page: None, merges: HashMap::new(), merged: 0 }
+        Replica { clock: Clock::new(replica), scope, roots, cells: HashMap::new(), groups: HashMap::new(), in_scope: HashSet::new(), docs: HashSet::new(), seen_updated: HashMap::new(), rr: 0, quiet: false, last_cost_ms: 0.0, hist: HashMap::new(), cur_page: None, merges: HashMap::new(), merged: 0, ids_sig: None, ppos: vec![], pidx: HashMap::new(), fps: HashMap::new() }
     }
 
     /// Joiner side: the pages the host calls roots keep this device's own `parent` (none) instead of the host's.
@@ -494,54 +567,60 @@ impl Replica {
         let t0 = crate::collab::mono_ms();
         self.cur_page = current;
         let ids = self.scope_pages(ws);
-        let id_set: HashSet<u64> = ids.iter().copied().collect();
         // id space of this device (no collisions with other peers' new pages / blocks / cards)
         let base = crate::collab::id_base();
         if base != 0 && !(base..base + (1u64 << 40)).contains(&ws.next_id) {
             ws.next_id = base;
         }
-        // pages that disappeared
-        let gone: Vec<u64> = self
-            .cells
-            .iter()
-            .filter_map(|(k, c)| match k {
-                Key::Page(p) if !c.dead && !id_set.contains(p) => Some(*p),
-                _ => None,
-            })
-            .collect();
-        for pid in gone {
-            if self.scope.kind != ScopeKind::Workspace && !self.in_scope.contains(&pid) {
-                continue;
-            }
-            self.set_cell(Key::Page(pid), None, 0.0, now, out);
-            if let Some(g) = self.groups.get(&(0, pid)).cloned() {
-                for k in g {
-                    self.set_cell(k, None, 0.0, now, out);
+        let sig = ids.iter().fold(ids.len() as u64 ^ 0xcbf2_9ce4_8422_2325, |h, id| (h ^ id).wrapping_mul(0x0000_0100_0000_01b3));
+        if self.ids_sig != Some(sig) {
+            let id_set: HashSet<u64> = ids.iter().copied().collect();
+            // pages that disappeared
+            let gone: Vec<u64> = self
+                .cells
+                .iter()
+                .filter_map(|(k, c)| match k {
+                    Key::Page(p) if !c.dead && !id_set.contains(p) => Some(*p),
+                    _ => None,
+                })
+                .collect();
+            for pid in gone {
+                if self.scope.kind != ScopeKind::Workspace && !self.in_scope.contains(&pid) {
+                    continue;
                 }
+                self.set_cell(Key::Page(pid), None, 0.0, now, out);
+                if let Some(g) = self.groups.get(&(0, pid)).cloned() {
+                    for k in g {
+                        self.set_cell(k, None, 0.0, now, out);
+                    }
+                }
+                self.seen_updated.remove(&pid);
             }
-            self.seen_updated.remove(&pid);
+            self.in_scope = id_set;
+            // positions of pages (sidebar order)
+            let existing: Vec<Option<f64>> = ids.iter().map(|id| self.pos_of(Key::Page(*id))).collect();
+            self.ppos = assign_positions(&existing).0;
+            self.pidx = ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+            self.ids_sig = Some(sig);
         }
-        self.in_scope = id_set;
-        // positions of pages (sidebar order)
-        let existing: Vec<Option<f64>> = ids.iter().map(|id| self.pos_of(Key::Page(*id))).collect();
-        let (ppos, _) = assign_positions(&existing);
         // which pages to look at: the open one, pages whose `updated` changed, then a rotating slice
         let mut order: Vec<u64> = vec![];
+        let mut queued: HashSet<u64> = HashSet::new();
         if let Some(c) = current.filter(|c| self.in_scope.contains(c)) {
             order.push(c);
+            queued.insert(c);
         }
         for id in &ids {
             let upd = ws.page(*id).map_or(0.0, |p| p.updated);
-            if self.seen_updated.get(id).map_or(true, |u| *u != upd) && !order.contains(id) {
+            if self.seen_updated.get(id).map_or(true, |u| *u != upd) && queued.insert(*id) {
                 order.push(*id);
             }
         }
-        if !ids.is_empty() {
-            for k in 0..ids.len() {
-                let id = ids[(self.rr + k) % ids.len()];
-                if !order.contains(&id) {
-                    order.push(id);
-                }
+        // a bounded rotating slice: the budget never allows more than a few hundred pages per tick anyway
+        for k in 0..ids.len().min(512) {
+            let id = ids[(self.rr + k) % ids.len()];
+            if queued.insert(id) {
+                order.push(id);
             }
         }
         let mut scanned_rr = 0usize;
@@ -549,7 +628,7 @@ impl Replica {
             if !all && i > 0 && crate::collab::mono_ms() - t0 > budget_ms {
                 break;
             }
-            let pos = ids.iter().position(|x| x == pid).map(|ix| ppos[ix]).unwrap_or(0.0);
+            let pos = self.pidx.get(pid).and_then(|ix| self.ppos.get(*ix)).copied().unwrap_or(0.0);
             self.scan_page(ws, *pid, pos, now, out);
             if i >= 1 {
                 scanned_rr += 1;
@@ -561,6 +640,15 @@ impl Replica {
         self.scan_annots(ws, now, out);
         self.scan_comments(ws, now, out);
         self.last_cost_ms = crate::collab::mono_ms() - t0;
+    }
+
+    /// Cheap scan that runs every frame: annotation and comment lists only (fingerprint-guarded, no serialisation when unchanged),
+    /// so comments and PDF marks reach the other devices at network speed instead of waiting for the adaptive full scan.
+    pub fn tick_hot(&mut self, ws: &Workspace, now: u64) -> Vec<Op> {
+        let mut out = vec![];
+        self.scan_annots(ws, now, &mut out);
+        self.scan_comments(ws, now, &mut out);
+        out
     }
 
     fn scan_page(&mut self, ws: &mut Workspace, pid: u64, ppos: f64, now: u64, out: &mut Vec<Op>) {
@@ -627,6 +715,11 @@ impl Replica {
         // documents that had annotations and lost the whole list
         docs.extend(self.groups.keys().filter(|g| g.0 == 1).map(|g| g.1));
         for d in docs {
+            let fp = ws.pdf_annots.get(&d).map_or(0, |l| annots_fp(l));
+            if self.fps.get(&(1, d)) == Some(&fp) {
+                continue;
+            }
+            self.fps.insert((1, d), fp);
             let mut live: HashSet<Key> = HashSet::new();
             if let Some(list) = ws.pdf_annots.get(&d) {
                 for a in list {
@@ -651,6 +744,11 @@ impl Replica {
         let mut pages: HashSet<u64> = ws.comments.keys().copied().filter(|p| self.scope.kind == ScopeKind::Workspace || self.in_scope.contains(p)).collect();
         pages.extend(self.groups.keys().filter(|g| g.0 == 2).map(|g| g.1));
         for p in pages {
+            let fp = ws.comments.get(&p).map_or(0, |l| comments_fp(l));
+            if self.fps.get(&(2, p)) == Some(&fp) {
+                continue;
+            }
+            self.fps.insert((2, p), fp);
             let mut live: HashSet<Key> = HashSet::new();
             if let Some(list) = ws.comments.get(&p) {
                 for c in list {
@@ -675,6 +773,37 @@ impl Replica {
 
     /// Merges one remote operation. Returns `true` when it changed this replica (the caller then forwards it to the other peers).
     pub fn apply(&mut self, ws: &mut Workspace, op: &Op, now: u64, applied: &mut Applied) -> bool {
+        if !applied.track {
+            return self.apply_inner(ws, op, now, applied);
+        }
+        let before = snapshot(ws, &op.key);
+        let ok = self.apply_inner(ws, op, now, applied);
+        if ok {
+            let after = snapshot(ws, &op.key);
+            let (page, block) = match op.key {
+                Key::Page(p) => (p, 0),
+                Key::Block(p, b) | Key::Comment(p, b) => (p, b),
+                _ => (0, 0),
+            };
+            use super::changes::{Change, Kind};
+            let ch = match (before, after) {
+                (None, Some((what, title, a))) => Some((Kind::Added, what, title, String::new(), a)),
+                (Some((what, title, b)), None) => Some((Kind::Removed, what, title, b, String::new())),
+                (Some((what, title, b)), Some((_, t2, a))) if a != b => Some((Kind::Edited, what, if t2.is_empty() { title } else { t2 }, b, a)),
+                (Some(_), Some(_)) => None, // moved / re-ordered: not a content change
+                (None, None) => {
+                    applied.other += 1;
+                    None
+                }
+            };
+            if let Some((kind, what, title, before, after)) = ch {
+                applied.log.push(Change { kind, what, page, block, title, who: op.e.hlc.r, at: now, before, after });
+            }
+        }
+        ok
+    }
+
+    fn apply_inner(&mut self, ws: &mut Workspace, op: &Op, now: u64, applied: &mut Applied) -> bool {
         // a value this large is an attack (or a bug), not a block: never let one entity swallow the memory of the host
         if op.e.val.as_ref().map_or(false, |v| v.len() > MAX_VALUE) || !op.e.pos.is_finite() || self.cells.len() > MAX_ENTITIES {
             return false;

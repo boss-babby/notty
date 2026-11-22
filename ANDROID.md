@@ -77,3 +77,10 @@ camera QR scanning in `LumenActivity` (→ `collab::Collab::join_text`), `lumen:
 * `CollabKit.java`: camera QR scanner (android.hardware.Camera preview → `Java_com_lumen_app_CollabKit_nativeScanFrame` → `rqrr` → join dialog) and
   `NsdManager` registration / discovery of `_lumen._tcp` (beacon JSON in TXT attributes `i0…i5`). Manifest: `CAMERA` (optional hardware, requested on tap).
 * Build: `./build-android.sh` (arm64-v8a, `android` profile = release + thin LTO, 16 KB page alignment, v2/v3 signed, zip-aligned).
+
+## 14.4 — QR scanner in its own activity
+
+`android/java/com/lumen/app/ScanActivity.java` replaces the old overlay. A NativeActivity's window surface belongs to the native code (egui),
+so Java views added to that window are never drawn above it — the camera preview used to open *behind* the app. The scanner is now a normal
+activity (TextureView preview, centre-crop, rotation, torch, tap-to-focus, viewfinder) that feeds NV21 luma frames to `rqrr` through
+`CollabKit.nativeScanFrame`; the decoded link pre-fills the join dialog when the activity closes. It requests `CAMERA` itself.

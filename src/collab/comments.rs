@@ -172,22 +172,74 @@ pub fn window(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &mut Workspace, 
                     ui.label(egui::RichText::new(format!("On the block I'm editing: “{txt}”")).font(body(12.0)).color(pal.muted));
                 });
             }
-            ui.add(egui::TextEdit::multiline(&mut c.ui.comment_draft).desired_rows(2).hint_text("Add a comment — @name mentions").desired_width(w - 24.0).font(body(13.5)));
-            // @name completion
-            if let Some((_, frag)) = c.ui.comment_draft.rsplit_once('@').filter(|(_, f)| !f.contains(char::is_whitespace)) {
-                let f = frag.to_lowercase();
-                let hits: Vec<&String> = names.iter().filter(|n| n.to_lowercase().starts_with(&f) && n.to_lowercase() != f).take(4).collect();
-                if !hits.is_empty() {
-                    let cut = c.ui.comment_draft.len() - frag.len();
-                    ui.horizontal_wrapped(|ui| {
-                        for n in hits {
-                            if button(ui, pal, &format!("@{n}"), 0, 20.0 + 8.0 * n.chars().count() as f32).clicked() {
-                                c.ui.comment_draft.truncate(cut);
-                                c.ui.comment_draft.push_str(&format!("{n} "));
+            let edit_id = Id::new("comment_draft_edit");
+            let out = egui::TextEdit::multiline(&mut c.ui.comment_draft).id(edit_id).desired_rows(2).hint_text("Add a comment — @name mentions").desired_width(w - 24.0).font(body(13.5)).show(ui);
+            // @name picker: follows the caret (not only the end of the text), matches the start of any word of a name, keyboard + tap
+            let chars: Vec<char> = c.ui.comment_draft.chars().collect();
+            let caret = out.cursor_range.map(|r| r.primary.ccursor.index).unwrap_or(chars.len()).min(chars.len());
+            let mut at = None;
+            let mut i = caret;
+            while i > 0 {
+                let ch = chars[i - 1];
+                if ch == '@' {
+                    if i == 1 || chars[i - 2].is_whitespace() {
+                        at = Some(i - 1);
+                    }
+                    break;
+                }
+                if ch.is_whitespace() {
+                    break;
+                }
+                i -= 1;
+            }
+            let focused = out.response.has_focus();
+            if let (Some(at), true) = (at, focused || c.ui.comment_pick != usize::MAX) {
+                let frag: String = chars[at + 1..caret].iter().collect::<String>().to_lowercase();
+                let mut hits: Vec<&String> = names.iter().filter(|n| frag.is_empty() || n.to_lowercase().split_whitespace().any(|w| w.starts_with(&frag))).collect();
+                hits.dedup();
+                hits.truncate(6);
+                if hits.is_empty() {
+                    ui.label(egui::RichText::new(if names.is_empty() { "Nobody else is in this session yet — share the workspace to mention people." } else { "No one by that name." }).font(body(11.5)).color(pal.muted));
+                } else {
+                    if c.ui.comment_pick >= hits.len() {
+                        c.ui.comment_pick = 0;
+                    }
+                    let (down, up, accept) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown), i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp), i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) || i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)));
+                    if down {
+                        c.ui.comment_pick = (c.ui.comment_pick + 1) % hits.len();
+                    }
+                    if up {
+                        c.ui.comment_pick = (c.ui.comment_pick + hits.len() - 1) % hits.len();
+                    }
+                    let mut chosen: Option<String> = if accept { Some(hits[c.ui.comment_pick].clone()) } else { None };
+                    egui::Frame::new().fill(with_alpha(pal.hover, 0.6)).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::same(3)).show(ui, |ui| {
+                        for (ix, n) in hits.iter().enumerate() {
+                            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
+                            if ix == c.ui.comment_pick || resp.hovered() {
+                                ui.painter().rect_filled(r, 6.0, pal.accent_soft);
+                            }
+                            ui.painter().text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, format!("@{n}"), body(13.0), pal.text);
+                            if resp.clicked() {
+                                chosen = Some((*n).clone());
                             }
                         }
                     });
+                    if let Some(n) = chosen {
+                        let mut s: String = chars[..at + 1].iter().collect();
+                        s.push_str(&n);
+                        s.push(' ');
+                        let new_caret = s.chars().count();
+                        s.extend(chars[caret..].iter());
+                        c.ui.comment_draft = s;
+                        c.ui.comment_pick = 0;
+                        let mut st = egui::TextEdit::load_state(ui.ctx(), edit_id).unwrap_or_default();
+                        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(new_caret))));
+                        st.store(ui.ctx(), edit_id);
+                        ui.ctx().memory_mut(|m| m.request_focus(edit_id));
+                    }
                 }
+            } else {
+                c.ui.comment_pick = 0;
             }
             let empty = c.ui.comment_draft.trim().is_empty();
             ui.horizontal(|ui| {

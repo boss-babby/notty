@@ -1217,14 +1217,21 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
             && kind != BlockKind::DbView
             && !ui.ctx().memory(|m| m.has_focus(Id::new(("blk", bid))))
         {
+            let clip = ui.clip_rect();
+            let top = ui.cursor().top();
             if let Some(&(h, k)) = cx.ed.heights.get(&bid) {
-                let clip = ui.clip_rect();
-                let top = ui.cursor().top();
                 if k == key && (top + h < clip.top() - 800.0 || top > clip.bottom() + 800.0) {
                     let (r, _) = ui.allocate_exact_size(vec2(w + gutter(), h), Sense::hover());
                     cx.rects.push((cur, r));
                     continue;
                 }
+            } else if n > 400 && top > clip.bottom() + 1600.0 && matches!(kind, BlockKind::Text | BlockKind::Bullet | BlockKind::Numbered | BlockKind::Todo | BlockKind::H1 | BlockKind::H2 | BlockKind::H3) {
+                // Large page, block never laid out and far below the screen: reserve an estimate instead of laying out thousands of
+                // blocks in the first frames (the real height is measured when the block scrolls near the viewport).
+                let est = (cx.ed.scale.max(0.5) * 26.0).max(20.0);
+                let (r, _) = ui.allocate_exact_size(vec2(w + gutter(), est), Sense::hover());
+                cx.rects.push((cur, r));
+                continue;
             }
         }
         let bg_slot = ui.painter().add(Shape::Noop);
@@ -2870,6 +2877,13 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         .layouter(&mut layouter)
         .hint_text(RichText::new(hint_txt).font(font).color(with_alpha(pal.muted, 0.75)))
         .show(ui);
+    // collaboration: report my caret, draw the other people's (thin coloured bar + name flag + selection tint)
+    if focused {
+        if let Some(cr) = out.cursor_range {
+            crate::collab::set_caret(b.id, cr.secondary.ccursor.index as u32, cr.primary.ccursor.index as u32);
+        }
+    }
+    crate::collab::paint_carets(ui, b.id, &out.galley, out.galley_pos);
 
     if out.response.changed() {
         if is_code {

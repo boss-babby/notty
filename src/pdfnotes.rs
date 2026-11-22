@@ -227,6 +227,8 @@ struct Draft {
 }
 
 pub struct Notes {
+    /// Document key (the live-drawing presence is matched on it).
+    pub doc: u64,
     pub tool: Tool,
     pub color: u8,
     pub list: Vec<PdfAnnot>,
@@ -244,7 +246,7 @@ pub struct Notes {
 
 impl Notes {
     pub fn new(list: Vec<PdfAnnot>) -> Notes {
-        Notes { tool: Tool::Hand, color: 0, list, draft: None, selected: None, panel: false, bar: false, scroll_to: None, dirty: false, edit: None }
+        Notes { doc: 0, tool: Tool::Hand, color: 0, list, draft: None, selected: None, panel: false, bar: false, scroll_to: None, dirty: false, edit: None }
     }
 
     /// A drawing tool is armed (page dragging is then reserved for marking).
@@ -388,6 +390,7 @@ impl Notes {
                 }
             }
         }
+        paint_remote_drafts(p, prect, self.doc, page as u32);
         // the mark being drawn right now
         if let Some(d) = self.draft.as_ref().filter(|d| d.page == page) {
             let col = color_of(self.color);
@@ -522,6 +525,8 @@ impl Notes {
                         }
                     }
                 }
+                // other people see the stroke while it is being drawn (ephemeral presence; the finished mark syncs as an annotation)
+                crate::collab::set_draft(self.draft.as_ref().map(|d| d.live(self.doc, self.tool, self.color)));
             }
             Tool::Note if self.capturing() => {
                 if resp.clicked() {
@@ -725,6 +730,54 @@ fn bounds_of(a: &PdfAnnot, prect: Rect) -> Rect {
 }
 
 /// Rectangle (screen space) a drag produces: thin drags snap to a line height; underline / strike use the mean height.
+impl Draft {
+    fn live(&self, doc: u64, tool: Tool, color: u8) -> crate::collab::LiveDraft {
+        let (t, pts) = match tool {
+            Tool::Pen => {
+                let step = (self.pts.len() / 96).max(1);
+                let mut v: Vec<[f32; 2]> = self.pts.iter().step_by(step).copied().collect();
+                if let Some(l) = self.pts.last() {
+                    if v.last() != Some(l) {
+                        v.push(*l);
+                    }
+                }
+                (3, v)
+            }
+            Tool::Underline => (1, vec![self.start, self.cur]),
+            Tool::Strike => (2, vec![self.start, self.cur]),
+            _ => (0, vec![self.start, self.cur]),
+        };
+        crate::collab::LiveDraft { doc, page: self.page as u32, tool: t, color, pts }
+    }
+}
+
+/// Marks other people are drawing on this page right now (live, before they are committed).
+pub fn paint_remote_drafts(p: &Painter, prect: Rect, doc: u64, page: u32) {
+    for (who, d) in crate::collab::remote_drafts(doc, page) {
+        let col = crate::collab::ui::COLORS[(who % 8) as usize];
+        let ink = HL_RGB[(d.color as usize).min(HL_RGB.len() - 1)];
+        match d.tool {
+            3 => {
+                let raw: Vec<Pos2> = d.pts.iter().map(|q| pos_of(*q, prect)).collect();
+                paint_ink(p, &raw, 2.4, col);
+            }
+            t if d.pts.len() >= 2 => {
+                let dr = Draft { page: page as usize, start: d.pts[0], cur: d.pts[1], pts: vec![] };
+                let tool = if t == 0 { Tool::Highlight } else if t == 1 { Tool::Underline } else { Tool::Strike };
+                let r = draft_rect(&dr, prect, tool);
+                if t == 0 {
+                    p.rect_filled(r, 2.0, with_alpha(Color32::from_rgb(ink[0], ink[1], ink[2]), 0.45));
+                    p.rect_stroke(r, 2.0, Stroke::new(1.2_f32, col), egui::StrokeKind::Outside);
+                } else {
+                    p.line_segment([r.left_center(), r.right_center()], Stroke::new(2.4_f32, col));
+                }
+            }
+            _ => {}
+        }
+    }
+    p.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+}
+
 fn draft_rect(d: &Draft, prect: Rect, tool: Tool) -> Rect {
     let a = pos_of(d.start, prect);
     let b = pos_of(d.cur, prect);

@@ -2872,7 +2872,7 @@ dependencies = [
 
 [[package]]
 name = "lumen"
-version = "14.3.0"
+version = "14.4.0"
 dependencies = [
  "android-activity",
  "android_logger",

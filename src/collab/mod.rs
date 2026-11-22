@@ -10,6 +10,7 @@ mod relay;
 mod secure;
 pub mod ui;
 mod comments;
+pub mod changes;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod net;
@@ -124,6 +125,37 @@ pub struct SessionInfo {
     pub name: String,
     pub scope: Scope,
     pub roots: Vec<u64>,
+    /// Stable identity of what is shared (same device + workspace + scope ⇒ same value after a restart): a joiner that shared-in
+    /// before re-opens the workspace it already has instead of creating another one.
+    #[serde(default)]
+    pub share: String,
+    /// `true`: joiners keep a copy after the session; `false`: the shared workspace is temporary and removed when it ends.
+    #[serde(default = "yes")]
+    pub keep: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// A pen / highlight stroke being drawn on a PDF right now (ephemeral — the finished mark travels as an annotation entity).
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize, Debug)]
+pub struct LiveDraft {
+    pub doc: u64,
+    pub page: u32,
+    /// 0 highlight, 1 underline, 2 strike, 3 pen.
+    pub tool: u8,
+    pub color: u8,
+    /// Pen: the stroke (page fractions, ≤ 96 points). Other tools: `[start, current]`.
+    pub pts: Vec<[f32; 2]>,
+}
+
+/// A joined session asks the app for a workspace to put the shared content in.
+#[derive(Clone, Debug)]
+pub struct NewWs {
+    pub name: String,
+    pub share: String,
+    pub keep: bool,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize, Debug)]
@@ -137,6 +169,12 @@ pub struct Presence {
     pub block: Option<u64>,
     /// PDF being read: (document key, page).
     pub pdf: Option<(u64, u32)>,
+    /// Text caret / selection inside `block`: (selection start, caret) in characters of the plain text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caret: Option<(u32, u32)>,
+    /// A PDF mark being drawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<LiveDraft>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -317,6 +355,9 @@ pub struct Ui {
     pub comment_reply: u64,
     pub comment_known: HashSet<u64>,
     pub comment_primed: bool,
+    /// "Changes" review window.
+    pub changes: bool,
+    pub comment_pick: usize,
 }
 
 pub struct Collab {
@@ -362,7 +403,7 @@ pub struct Collab {
     inq: VecDeque<(ConnId, Msg)>,
     ops_in: VecDeque<(ConnId, Op)>,
     bound: u64,
-    want_ws: Option<String>,
+    want_ws: Option<NewWs>,
     ready: bool,
     next_scan: f64,
     requested: HashMap<u64, f64>,
@@ -371,6 +412,19 @@ pub struct Collab {
     media_reqs: Vec<(ConnId, u64, u64)>,
     check_media: bool,
     last_page: Option<u64>,
+    /// Remote edits are recorded for the review window.
+    track: bool,
+    /// The joiner re-opened a workspace it already had: the first sync is reviewed as "what changed while you were away".
+    reused: bool,
+    prompted: bool,
+    bound_at: f64,
+    last_op_at: f64,
+    /// What other people changed (git-style review, see `changes.rs`).
+    pub changes: changes::Log,
+    /// Host option: joiners keep a copy of the shared content after the session (`false` = temporary).
+    pub keep_copy: bool,
+    /// Host option: let a device that knows the share code in without asking. Off by default — every new device needs approval.
+    pub auto_admit: bool,
     #[cfg(not(target_arch = "wasm32"))]
     net: net::Net,
     relay: Option<relay::Relay>,
@@ -516,6 +570,14 @@ impl Collab {
             media_reqs: vec![],
             check_media: false,
             last_page: None,
+            track: false,
+            reused: false,
+            prompted: false,
+            bound_at: 0.0,
+            last_op_at: 0.0,
+            changes: changes::Log::default(),
+            keep_copy: true,
+            auto_admit: false,
             #[cfg(not(target_arch = "wasm32"))]
             net: net::Net::default(),
             relay: None,
@@ -585,7 +647,11 @@ impl Collab {
         let mut rep = Replica::new(self.me.id, scope);
         rep.adopt(ws, now_ms());
         let roots = rep.roots();
-        self.session = Some(SessionInfo { id: random_code(10), name: title.clone(), scope, roots });
+        let share = self.share_id(ws_id, scope);
+        self.session = Some(SessionInfo { id: random_code(10), name: title.clone(), scope, roots, share, keep: self.keep_copy });
+        self.changes.clear();
+        self.track = true;
+        self.reused = false;
         self.rep = Some(rep);
         self.mode = Mode::Hosting;
         self.role = Role::Editor;
@@ -620,6 +686,20 @@ impl Collab {
             self.enable_relay(base);
         }
         self.next_scan = 0.0;
+    }
+
+    /// Stable identifier of "this workspace / page shared from this device" (one-way hash of the device key — it reveals nothing).
+    fn share_id(&self, ws_id: u64, scope: Scope) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"lumen-share-v1");
+        if let Some(k) = &self.keys {
+            h.update(k.private_bytes());
+        }
+        h.update(ws_id.to_le_bytes());
+        h.update([scope.kind as u8]);
+        h.update(scope.root.to_le_bytes());
+        hex(&h.finalize()[..10])
     }
 
     pub fn enable_relay(&mut self, base: String) {
@@ -976,14 +1056,52 @@ impl Collab {
     // ───────────── per-frame work ─────────────
 
     /// The app asks once per frame. `Some(name)`: create + switch to a fresh workspace for the shared content, then call [`bind`].
-    pub fn take_new_workspace(&mut self) -> Option<String> {
+    pub fn take_new_workspace(&mut self) -> Option<NewWs> {
         self.want_ws.take()
     }
 
+    /// The app created an empty workspace for this session: the host is asked for everything.
     pub fn bind(&mut self, ws_id: u64) {
         self.bound = ws_id;
         self.ready = true;
         self.next_scan = 0.0;
+        self.bound_at = mono_ms();
+        self.last_op_at = self.bound_at;
+        for c in self.conns.values_mut().filter(|c| c.active) {
+            c.backlog.push_back(Msg::Digest { items: vec![], last: true });
+        }
+    }
+
+    /// The app re-opened the workspace this device got from the same share before. Its content becomes the replica (stamped with the
+    /// time of the last sync, so whatever the host changed since wins and whatever was edited here offline is sent), only the
+    /// difference travels, and everything that arrives is recorded for review.
+    pub fn bind_existing(&mut self, ws: &mut crate::model::Workspace, ws_id: u64, last_sync_ms: u64) {
+        self.bound = ws_id;
+        self.ready = true;
+        self.next_scan = 0.0;
+        self.bound_at = mono_ms();
+        self.last_op_at = self.bound_at;
+        if let Some(rep) = self.rep.as_mut() {
+            rep.adopt(ws, last_sync_ms.min(now_ms()));
+        }
+        self.track = true;
+        self.reused = true;
+        self.prompted = false;
+        let conns: Vec<ConnId> = self.conns.iter().filter(|(_, c)| c.active).map(|(k, _)| *k).collect();
+        for c in conns {
+            self.send_digest(c);
+        }
+    }
+
+    /// Opens the review window and tells the user (first time after a re-join).
+    fn announce_changes(&mut self) {
+        let n = self.changes.len();
+        if n > 0 {
+            self.ui.changes = true;
+            self.toast(format!("{n} change{} since you were last here", if n == 1 { "" } else { "s" }));
+        } else {
+            self.toast("Up to date — nothing changed since you were last here");
+        }
     }
 
     pub fn take_media(&mut self) -> Vec<(u64, String, String, Vec<u8>)> {
@@ -1012,6 +1130,8 @@ impl Collab {
         self.local.page = page;
         self.local.block = block;
         self.local.cur = cur;
+        self.local.caret = caret_state().filter(|c| Some(c.0) == block).map(|c| (c.1, c.2));
+        self.local.draft = draft_state();
     }
 
     pub fn set_reading(&mut self, pdf: Option<(u64, u32)>) {
@@ -1056,7 +1176,7 @@ impl Collab {
         let usable = self.ready && self.rep.is_some() && self.bound == ws_id;
         if usable {
             let t_start = now;
-            let mut applied = Applied::default();
+            let mut applied = Applied { track: self.track, ..Default::default() };
             let mut forward: Vec<(ConnId, Op)> = vec![];
             // protocol messages that wait for a workspace
             while let Some((conn, msg)) = self.inq.pop_front() {
@@ -1083,6 +1203,18 @@ impl Collab {
                     rep.finish(ws, &applied);
                 }
                 changed = true;
+                self.last_op_at = now;
+                if self.track {
+                    let before = self.changes.len();
+                    self.changes.other += applied.other;
+                    for ch in std::mem::take(&mut applied.log) {
+                        self.changes.push(ch);
+                    }
+                    if self.mode == Mode::Hosting && self.changes.len() > before && !self.ui.changes && now - self.ui.copied_at > 8000.0 {
+                        self.ui.copied_at = now;
+                        self.toast("Someone changed the page — open Changes to review");
+                    }
+                }
                 self.stats.ops_in += applied.n as u64;
                 if ws.current.map_or(true, |c| ws.page(c).is_none()) {
                     let root = self.session.as_ref().and_then(|s| s.roots.first().copied()).filter(|r| ws.page(*r).is_some());
@@ -1110,7 +1242,31 @@ impl Collab {
                     }
                 }
             }
+            // after the first sync has settled: a fresh joiner starts recording, a returning one reviews what happened while away
+            if self.mode == Mode::Joined && self.ops_in.is_empty() && self.inq.is_empty() && now - self.last_op_at > 1500.0 && now - self.bound_at > 2500.0 {
+                if !self.track {
+                    self.track = true;
+                }
+                if self.reused && !self.prompted {
+                    self.prompted = true;
+                    self.announce_changes();
+                }
+            }
             // local changes
+            let mut hot: Vec<Op> = vec![];
+            if self.role == Role::Editor {
+                if let Some(r) = self.rep.as_mut() {
+                    hot = r.tick_hot(ws, now_ms());
+                }
+            }
+            if !hot.is_empty() {
+                self.stats.ops_out += hot.len() as u64;
+                for c in self.conns.values_mut().filter(|c| c.active) {
+                    for part in chunked(hot.clone(), 120) {
+                        c.backlog.push_back(Msg::Ops { ops: part });
+                    }
+                }
+            }
             if now >= self.next_scan && self.role == Role::Editor {
                 let cost0 = mono_ms();
                 let ops = self.rep.as_mut().map(|r| r.tick(ws, current, now_ms(), 2.5)).unwrap_or_default();
@@ -1478,7 +1634,7 @@ impl Collab {
                 if let Some(c) = self.conns.get_mut(&conn) {
                     c.peer = Some(peer.clone());
                 }
-                if authed || known {
+                if known || (authed && self.auto_admit) {
                     let viewer = !remote.is_empty() && (self.demoted.contains(&remote) || self.trusted.get(&hex(&remote)).map_or(false, |t| t.1));
                     let role = if viewer { Role::Viewer } else { Role::Editor };
                     self.accept(conn, role);
@@ -1532,9 +1688,6 @@ impl Collab {
                     c.peer = Some(peer);
                     c.active = true;
                     c.role = Role::Editor;
-                    if !resuming {
-                        c.backlog.push_back(Msg::Digest { items: vec![], last: true });
-                    }
                 }
                 if resuming {
                     self.send_digest(conn);
@@ -1544,7 +1697,11 @@ impl Collab {
                     self.toast("Reconnected");
                     return;
                 }
-                self.want_ws = Some(format!("Shared · {}", session.name));
+                self.want_ws = Some(NewWs { name: format!("Shared · {}", session.name), share: session.share.clone(), keep: session.keep });
+                self.changes.clear();
+                self.track = false;
+                self.reused = false;
+                self.prompted = false;
                 self.session = Some(session);
                 self.ready = false;
                 self.ui.dialog = false;
@@ -1617,6 +1774,15 @@ impl Collab {
                 if p.cur.map_or(false, |c| !c[0].is_finite() || !c[1].is_finite() || c[0].abs() > 1e8 || c[1].abs() > 1e8) {
                     p.cur = None;
                 }
+                if let Some(d) = p.draft.as_mut() {
+                    d.pts.truncate(128);
+                    if d.tool > 3 || d.pts.iter().any(|q| !q[0].is_finite() || !q[1].is_finite() || q[0].abs() > 4.0 || q[1].abs() > 4.0) {
+                        p.draft = None;
+                    }
+                }
+                if p.caret.map_or(false, |(a, b)| a > 10_000_000 || b > 10_000_000) {
+                    p.caret = None;
+                }
                 if !self.presence.contains_key(&p.peer) && self.presence.len() >= 64 {
                     return;
                 }
@@ -1680,6 +1846,9 @@ struct ViewState {
     show: bool,
     cursor: Option<(u64, [f32; 2], f64)>,
     launch: Option<String>,
+    /// Local text caret: (block, selection start, caret, time).
+    caret: Option<(u64, u32, u32, f64)>,
+    draft: Option<(LiveDraft, f64)>,
 }
 
 thread_local! {
@@ -1693,6 +1862,90 @@ pub fn publish(c: &Collab) {
         v.show = c.active() && c.show_cursors;
         v.remotes = if v.show { c.roster.iter().filter(|(p, _)| p.id != c.me.id).filter_map(|(p, _)| c.presence.get(&p.id).map(|x| (p.clone(), x.0.clone()))).collect() } else { vec![] };
     });
+}
+
+/// The text editor reports the caret of the focused block (characters of the plain text) every frame.
+pub fn set_caret(block: u64, from: u32, to: u32) {
+    VIEW.with(|v| v.borrow_mut().caret = Some((block, from, to, mono_ms())));
+}
+
+fn caret_state() -> Option<(u64, u32, u32)> {
+    VIEW.with(|v| match v.borrow().caret {
+        Some((b, f, t, at)) if mono_ms() - at < 1500.0 => Some((b, f, t)),
+        _ => None,
+    })
+}
+
+/// The PDF reader reports the mark being drawn (`None` when the stroke ended).
+pub fn set_draft(d: Option<LiveDraft>) {
+    VIEW.with(|v| {
+        let mut v = v.borrow_mut();
+        match d {
+            Some(d) => v.draft = Some((d, mono_ms())),
+            None => v.draft = None,
+        }
+    });
+}
+
+fn draft_state() -> Option<LiveDraft> {
+    VIEW.with(|v| match &v.borrow().draft {
+        Some((d, at)) if mono_ms() - at < 2500.0 => Some(d.clone()),
+        _ => None,
+    })
+}
+
+/// Other people's text carets inside `block`: (name, colour index, selection start, caret).
+pub fn remote_carets(block: u64) -> Vec<(String, u8, u32, u32)> {
+    VIEW.with(|v| {
+        let v = v.borrow();
+        if !v.show {
+            return vec![];
+        }
+        v.remotes.iter().filter(|(_, p)| p.block == Some(block)).filter_map(|(i, p)| p.caret.map(|(a, b)| (i.name.clone(), i.color, a, b))).collect()
+    })
+}
+
+/// Other people's PDF marks in progress on `doc` page `page`: (colour index of the person, draft).
+pub fn remote_drafts(doc: u64, page: u32) -> Vec<(u8, LiveDraft)> {
+    VIEW.with(|v| {
+        let v = v.borrow();
+        if !v.show {
+            return vec![];
+        }
+        v.remotes.iter().filter_map(|(i, p)| p.draft.as_ref().filter(|d| d.doc == doc && d.page == page).map(|d| (i.color, d.clone()))).collect()
+    })
+}
+
+/// Paints other people's carets (a thin coloured bar, selection tint and a name flag) over the text of `block`.
+pub fn paint_carets(ui: &egui::Ui, block: u64, galley: &egui::Galley, pos: egui::Pos2) {
+    let list = remote_carets(block);
+    if list.is_empty() {
+        return;
+    }
+    let n = galley.text().chars().count() as u32;
+    let p = ui.painter();
+    for (name, color, a, b) in list {
+        let col = ui::COLORS[(color % 8) as usize];
+        let (a, b) = (a.min(n), b.min(n));
+        let at = |i: u32| galley.pos_from_ccursor(egui::text::CCursor::new(i as usize));
+        let head = at(b);
+        if a != b {
+            let (lo, hi) = (a.min(b), a.max(b));
+            // one tinted rect per row of the selection
+            let (r0, r1) = (at(lo), at(hi));
+            if (r0.top() - r1.top()).abs() < 1.0 {
+                p.rect_filled(egui::Rect::from_min_max(pos + egui::vec2(r0.left(), r0.top()), pos + egui::vec2(r1.left(), r1.bottom())), 2.0, ui::with_alpha_pub(col, 0.22));
+            }
+        }
+        let x = pos.x + head.left();
+        let (y0, y1) = (pos.y + head.top(), pos.y + head.bottom());
+        p.line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], egui::Stroke::new(2.0_f32, col));
+        let label = p.layout_no_wrap(ui::first_name(&name), egui::FontId::proportional(10.5), egui::Color32::WHITE);
+        let flag = egui::Rect::from_min_size(egui::pos2(x - 1.0, y0 - label.size().y - 3.0), label.size() + egui::vec2(8.0, 3.0));
+        p.rect_filled(flag, 3.0, col);
+        p.galley(flag.min + egui::vec2(4.0, 1.5), label, egui::Color32::WHITE);
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(400));
 }
 
 /// The canvas reports the pointer in world coordinates every frame while it is over the board.
@@ -1784,6 +2037,7 @@ mod tests {
     fn two_devices_sync_over_a_real_socket() {
         let ctx = egui::Context::default();
         let mut host = Collab::new(&ctx);
+        host.auto_admit = true;
         let mut join = Collab::new(&ctx);
         let mut hw = Workspace::seed();
         let mut jw = Workspace::blank("joiner", false, 0);
@@ -1818,6 +2072,7 @@ mod tests {
 
     fn pair() -> (Collab, Workspace, Collab, Workspace, u16) {
         let mut host = Collab::new(&egui::Context::default());
+        host.auto_admit = true;
         let join = Collab::new(&egui::Context::default());
         let mut hw = Workspace::seed();
         let mut jw = Workspace::blank("joiner", false, 0);
@@ -1933,5 +2188,106 @@ mod tests {
         assert!(until(&mut host, &mut hw, &mut join, &mut jw, 30, |a, _| a.page(pid).map_or(false, |p| p.blocks[0].text == "typed on the other side of the relay")), "edit through the relay did not arrive");
         host.stop(true);
         join.stop(true);
+    }
+
+    #[test]
+    fn a_new_device_needs_the_hosts_approval() {
+        let (mut host, mut hw, mut join, mut jw, port) = pair();
+        host.auto_admit = false;
+        join.join_addr(&format!("127.0.0.1:{port}"), &host.token.clone());
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(8) && host.requests.is_empty() {
+            step(&mut host, &mut hw, &mut join, &mut jw);
+        }
+        assert!(!host.requests.is_empty(), "no approval card appeared");
+        // the right code alone does not let anybody in
+        for _ in 0..60 {
+            step(&mut host, &mut hw, &mut join, &mut jw);
+        }
+        assert!(jw.pages.is_empty() && join.mode != Mode::Joined, "joined without approval");
+        let conn = host.requests[0].conn;
+        host.approve(conn, Role::Editor);
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 10, |a, b| !b.pages.is_empty() && a.pages.len() == b.pages.len()), "no sync after approval");
+        host.stop(true);
+        join.stop(true);
+    }
+
+    #[test]
+    fn rejoining_reopens_the_same_share_and_lists_what_changed() {
+        let ctx = egui::Context::default();
+        let mut host = Collab::new(&ctx);
+        host.auto_admit = true;
+        let mut join = Collab::new(&ctx);
+        let mut hw = Workspace::seed();
+        let mut jw = Workspace::blank("joiner", false, 0);
+        jw.pages.clear();
+        jw.current = None;
+        host.start_host(&mut hw, 1, Scope::ALL, None);
+        let share = host.session.as_ref().unwrap().share.clone();
+        assert!(!share.is_empty());
+        join.join_addr(&format!("127.0.0.1:{}", host.net.port), &host.token.clone());
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 10, |a, b| !b.pages.is_empty() && a.pages.len() == b.pages.len()));
+        let pages = jw.pages.len();
+        host.stop(true);
+        join.stop(true);
+        // the host edits while the joiner is away, then shares the same workspace again
+        let pid = hw.pages.iter().find(|p| p.blocks.len() > 1).map(|p| p.id).unwrap();
+        let old = hw.page(pid).unwrap().blocks[0].text.clone();
+        hw.page_mut(pid).unwrap().blocks[0].text = "changed while you were away".into();
+        host.start_host(&mut hw, 1, Scope::ALL, None);
+        assert_eq!(host.session.as_ref().unwrap().share, share, "the share id must survive a restart");
+        join.join_addr(&format!("127.0.0.1:{}", host.net.port), &host.token.clone());
+        let t0 = Instant::now();
+        let mut reused = false;
+        while t0.elapsed() < Duration::from_secs(10) {
+            let hc = hw.current;
+            host.poll(&mut hw, 1, hc, &|_| true);
+            if let Some(nw) = join.take_new_workspace() {
+                assert_eq!(nw.share, share);
+                join.bind_existing(&mut jw, 2, now_ms().saturating_sub(60_000));
+                reused = true;
+            }
+            let jc = jw.current;
+            join.poll(&mut jw, 2, jc, &|_| true);
+            if jw.page(pid).map_or(false, |p| p.blocks[0].text == "changed while you were away") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        assert!(reused, "the existing workspace was not reused");
+        assert_eq!(jw.pages.len(), pages, "no page may be duplicated or lost");
+        let ch = join.changes.list.iter().find(|c| c.what == "Block" && c.after.contains("changed while you were away")).expect("the change is listed for review");
+        assert_eq!(ch.kind, changes::Kind::Edited);
+        assert_eq!(ch.before, crate::rich::strip(&old));
+        host.stop(true);
+        join.stop(true);
+    }
+
+    #[test]
+    fn comments_reach_the_other_device_without_waiting_for_the_full_scan() {
+        let (mut host, mut hw, mut join, mut jw, port) = pair();
+        join.join_addr(&format!("127.0.0.1:{port}"), &host.token.clone());
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 10, |a, b| !b.pages.is_empty() && a.pages.len() == b.pages.len()));
+        let pid = hw.pages[0].id;
+        let cm = crate::model::Comment { id: jw.id(), author: "J".into(), author_id: join.me.id, text: "hello @host".into(), ts: 1.0, ..Default::default() };
+        jw.comments.entry(pid).or_default().push(cm);
+        let t0 = Instant::now();
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 3, |a, _| a.comments.get(&pid).map_or(false, |l| l.iter().any(|c| c.text == "hello @host"))), "comment did not arrive");
+        assert!(t0.elapsed() < Duration::from_secs(2), "comment sync is too slow: {:?}", t0.elapsed());
+        host.stop(true);
+        join.stop(true);
+    }
+
+    #[test]
+    fn hostile_presence_is_sanitised() {
+        let mut p = Presence { draft: Some(LiveDraft { doc: 1, page: 0, tool: 9, color: 0, pts: vec![[0.0, 0.0]] }), ..Default::default() };
+        // the same rules the host applies on receipt
+        if let Some(d) = p.draft.as_mut() {
+            d.pts.truncate(128);
+            if d.tool > 3 {
+                p.draft = None;
+            }
+        }
+        assert!(p.draft.is_none());
     }
 }

@@ -63,6 +63,15 @@
             </intent-filter>
         </activity>
 
+        <!-- QR scanner for joining a shared workspace: its own window (a NativeActivity cannot host a camera preview) -->
+        <activity
+            android:name="com.lumen.app.ScanActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:screenOrientation="fullSensor"
+            android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen"
+            android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout|density" />
+
         <receiver android:name="com.lumen.app.ReminderReceiver" android:exported="false" />
         <receiver android:name="com.lumen.app.BootReceiver" android:exported="true" android:directBootAware="false">
             <intent-filter>

@@ -23,6 +23,14 @@ pub fn color_of(p: &PeerInfo) -> Color32 {
     COLORS[(p.color % 8) as usize]
 }
 
+pub fn with_alpha_pub(c: Color32, a: f32) -> Color32 {
+    with_alpha(c, a)
+}
+
+pub fn first_name(n: &str) -> String {
+    n.split_whitespace().next().unwrap_or(n).chars().take(14).collect()
+}
+
 fn initials(name: &str) -> String {
     let mut it = name.split_whitespace();
     let a = it.next().and_then(|w| w.chars().next());
@@ -117,6 +125,28 @@ pub fn comments_button(ui: &mut Ui, pal: &Palette, c: &mut Collab, open_count: u
     }
 }
 
+/// Top-bar button of the review window (only while a session runs or something is waiting for review).
+pub fn changes_button(ui: &mut Ui, pal: &Palette, c: &mut Collab) {
+    if !c.active() && c.changes.is_empty() {
+        return;
+    }
+    let touch = crate::touch::touchy();
+    let h = if touch { 38.0 } else { 28.0 };
+    let (rect, resp) = ui.allocate_exact_size(vec2(h, h), Sense::click());
+    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || c.ui.changes, 0.12);
+    ui.painter().rect_filled(rect, 7.0, with_alpha(pal.hover, t));
+    crate::icons::glyph(ui.painter(), rect.center(), 16.0, l::HISTORY, crate::theme::lerp_color(pal.muted, pal.text, t));
+    let n = c.changes.len();
+    if n > 0 {
+        let p = pos2(rect.right() - 6.0, rect.top() + 7.0);
+        ui.painter().circle_filled(p, 6.5, COLORS[3]);
+        ui.painter().text(p, Align2::CENTER_CENTER, n.min(9).to_string(), bold(9.0), Color32::WHITE);
+    }
+    if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Changes — what others edited").clicked() {
+        c.ui.changes = !c.ui.changes;
+    }
+}
+
 pub fn chip(ui: &mut Ui, pal: &Palette, c: &mut Collab) {
     let people = c.people();
     let n = if c.active() { people.len().min(3) } else { 0 };
@@ -176,6 +206,11 @@ pub fn overlays(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &mut crate::mo
     super::comments::notify(c, ws);
     if c.ui.comments {
         super::comments::window(ctx, pal, c, ws, current);
+    }
+    if c.ui.changes {
+        if let Some(pg) = super::changes::window(ctx, pal, c) {
+            out.open = Some(pg);
+        }
     }
     if c.ui.dialog {
         let id = Id::new("collab_dialog");
@@ -478,6 +513,28 @@ fn share_tab(ui: &mut Ui, pal: &Palette, c: &mut Collab, ws: &mut crate::model::
                 ui.label(egui::RichText::new(cur_title.clone().map(|t| format!("“{t}”")).unwrap_or_else(|| "Open a page first".into())).font(body(12.5)).color(pal.muted));
             }
         });
+        // lifetime of the shared copy on the other devices + how people get in
+        card(ui, pal, |ui| {
+            ui.horizontal(|ui| {
+                for (keep, lbl, tip) in [(true, "Permanent", "Joiners keep a copy; when they join again later the same workspace opens and shows what changed"), (false, "Temporary", "Joiners get a scratch copy that disappears when the session ends (they can still choose Keep a copy)")] {
+                    let sel = c.keep_copy == keep;
+                    let (r, rs) = ui.allocate_exact_size(vec2((ui.available_width() - 8.0).max(60.0) / if keep { 2.0 } else { 1.0 }, 30.0), Sense::click());
+                    ui.painter().rect_filled(r, 8.0, if sel { pal.accent_soft } else { with_alpha(pal.bg, 0.7) });
+                    ui.painter().rect_stroke(r, 8.0, Stroke::new(if sel { 1.5_f32 } else { 1.0_f32 }, if sel { pal.accent } else { pal.border }), StrokeKind::Inside);
+                    ui.painter().text(r.center(), Align2::CENTER_CENTER, lbl, bold(12.5), if sel { pal.accent } else { pal.text });
+                    if rs.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip).clicked() {
+                        c.keep_copy = keep;
+                    }
+                }
+            });
+            ui.label(egui::RichText::new(if c.keep_copy { "Joiners keep a copy; joining again reopens it and shows what changed." } else { "Joiners get a temporary copy that is removed when the session ends." }).font(body(12.0)).color(pal.muted));
+            ui.horizontal(|ui| {
+                if switch(ui, pal, !c.auto_admit).on_hover_text("Every new device waits for your Accept; devices you accepted before come back without asking").clicked() {
+                    c.auto_admit = !c.auto_admit;
+                }
+                ui.label(egui::RichText::new(if c.auto_admit { "Anyone with the code joins at once" } else { "Ask me before anyone joins" }).font(body(12.5)).color(if c.auto_admit { COLORS[2] } else { pal.muted }));
+            });
+        });
         let can = c.ui.scope_choice == 0 || current.is_some();
         let w = ui.available_width();
         ui.add_enabled_ui(can, |ui| {
@@ -536,7 +593,7 @@ fn share_tab(ui: &mut Ui, pal: &Palette, c: &mut Collab, ws: &mut crate::model::
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 6.0;
                     ui.label(egui::RichText::new("Scan or enter").font(body(12.0)).color(pal.muted));
-                    ui.label(egui::RichText::new(&c.token).font(egui::FontId::monospace(24.0)).color(pal.text)).on_hover_text("Anyone with this code joins without asking");
+                    ui.label(egui::RichText::new(&c.token).font(egui::FontId::monospace(24.0)).color(pal.text)).on_hover_text("The code only proves the link is yours — new devices still need your approval");
                     ui.label(egui::RichText::new(c.addr_hint.first().cloned().unwrap_or_default()).font(egui::FontId::monospace(12.0)).color(pal.muted));
                     ui.horizontal(|ui| {
                         if button(ui, pal, if mono_ms() - c.ui.copied_at < 1500.0 { "Copied" } else { "Copy link" }, 0, 90.0).clicked() {

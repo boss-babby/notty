@@ -508,6 +508,7 @@ fn draw_pdf(f: &Frame, ws: &Workspace, n: &Node, r: Rect, rad: f32, out: &mut Dr
                     let clipped = f.p.with_clip_rect(pr.intersect(f.p.clip_rect()));
                     notes.paint_page(&clipped, pr, page, crate::canvasdraw::is_dark(pal), acc, true);
                 }
+                crate::pdfnotes::paint_remote_drafts(&f.p.with_clip_rect(pr.intersect(f.p.clip_rect())), pr, key, page as u32);
             }
         }
         CoverState::Pending => {
