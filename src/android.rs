@@ -181,6 +181,14 @@ pub fn nsd_register(name: &str, port: u16, info: &str) {
     });
 }
 
+/// Starts / stops the foreground service that keeps a collaboration session connected while the app is in the background.
+pub fn collab_service(on: bool, text: &str) {
+    with_activity(|env, act| {
+        let t = env.new_string(text)?;
+        env.call_method(act, "collabService", "(ZLjava/lang/String;)V", &[JValue::Bool(on as jboolean), JValue::Object(&t)]).map(|_| ())
+    });
+}
+
 pub fn nsd_unregister() {
     call_void("nsdStop", "()V", &[]);
 }

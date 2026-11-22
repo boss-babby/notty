@@ -51,7 +51,8 @@ pub struct Crypt {
     pub hash: Vec<u8>,
     /// The other side's static public key.
     pub remote: Vec<u8>,
-    pending: Vec<String>,
+    /// Messages (already packed: flag + optional deflate) queued while the handshake runs; sealed by the sender, in order, once it is open.
+    pending: Vec<Vec<u8>>,
     rx: Vec<u8>,
 }
 
@@ -117,26 +118,17 @@ impl Crypt {
                 Ok(ts) => self.stage = Stage::Open(Box::new(ts)),
                 Err(_) => return fail,
             }
-            let pending = std::mem::take(&mut self.pending);
-            let mut flushed = vec![];
-            for p in pending {
-                flushed.extend(self.seal(&p));
-            }
-            HsOut { reply, done: true, failed: false, flushed }
+            // Queued messages are NOT sealed here: the connection's sender thread seals everything after the handshake (so the nonce
+            // order always equals the wire order) — see `SecureSink::flush_pending`.
+            HsOut { reply, done: true, failed: false, flushed: vec![] }
         } else {
             self.stage = Stage::Handshake(hs);
             HsOut { reply, done: false, failed: false, flushed: vec![] }
         }
     }
 
-    /// Encrypts one JSON message; before the handshake ends it is queued.
-    pub fn seal(&mut self, json: &str) -> Vec<Msg> {
-        let Stage::Open(ts) = &mut self.stage else {
-            if !matches!(self.stage, Stage::Dead) && self.pending.len() < MAX_PENDING {
-                self.pending.push(json.to_owned());
-            }
-            return vec![];
-        };
+    /// JSON → payload: one flag byte (0 plain, 1 deflate) + body. CPU-heavy for big messages, needs no key: runs without the cipher lock.
+    pub fn pack(json: &str) -> Vec<u8> {
         let raw = json.as_bytes();
         let mut payload = Vec::with_capacity(raw.len() + 1);
         if raw.len() > 400 {
@@ -150,12 +142,50 @@ impl Crypt {
             payload.push(0);
             payload.extend_from_slice(raw);
         }
+        payload
+    }
+
+    /// Encrypts one JSON message; before the handshake ends it is queued.
+    pub fn seal(&mut self, json: &str) -> Vec<Msg> {
+        self.seal_packed(Self::pack(json))
+    }
+
+    /// Seals queued messages (if the channel is open) followed by `payload`, in order.
+    pub fn seal_packed(&mut self, payload: Vec<u8>) -> Vec<Msg> {
+        if !matches!(self.stage, Stage::Open(_)) {
+            if !matches!(self.stage, Stage::Dead) && self.pending.len() < MAX_PENDING {
+                self.pending.push(payload);
+            }
+            return vec![];
+        }
+        let mut out = self.seal_pending();
+        out.extend(self.seal_one(&payload));
+        out
+    }
+
+    /// Seals what was queued during the handshake (nothing when empty / not open yet).
+    pub fn seal_pending(&mut self) -> Vec<Msg> {
+        if !matches!(self.stage, Stage::Open(_)) {
+            return vec![];
+        }
+        let mut out = vec![];
+        for p in std::mem::take(&mut self.pending) {
+            out.extend(self.seal_one(&p));
+        }
+        out
+    }
+
+    fn seal_one(&mut self, payload: &[u8]) -> Vec<Msg> {
+        let Stage::Open(ts) = &mut self.stage else { return vec![] };
         let n = payload.len().div_ceil(FRAG);
         let mut out = Vec::with_capacity(n);
         for (i, chunk) in payload.chunks(FRAG).enumerate() {
             let mut buf = vec![0u8; chunk.len() + 64];
             match ts.write_message(chunk, &mut buf) {
-                Ok(len) => out.push(Msg::Enc { d: crate::media::b64_encode(&buf[..len]), more: i + 1 < n }),
+                Ok(len) => {
+                    buf.truncate(len);
+                    out.push(Msg::Bin { d: buf, more: i + 1 < n });
+                }
                 Err(_) => {
                     self.stage = Stage::Dead;
                     return vec![];
@@ -166,14 +196,13 @@ impl Crypt {
     }
 
     /// Decrypts one frame; `Ok(Some(json))` when a whole message is complete, `Err` when the connection must be dropped.
-    pub fn open(&mut self, d: &str, more: bool) -> Result<Option<String>, ()> {
+    pub fn open(&mut self, bytes: &[u8], more: bool) -> Result<Option<String>, ()> {
         let Stage::Open(ts) = &mut self.stage else { return Err(()) };
-        let bytes = crate::media::b64_decode(d).ok_or(())?;
         if bytes.len() > 65_535 {
             return Err(());
         }
         let mut buf = vec![0u8; bytes.len()];
-        let n = ts.read_message(&bytes, &mut buf).map_err(|_| ())?;
+        let n = ts.read_message(bytes, &mut buf).map_err(|_| ())?;
         if self.rx.len() + n > MAX_PLAIN {
             self.rx.clear();
             return Err(());
@@ -193,28 +222,111 @@ impl Crypt {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+enum Job {
+    Msg(Msg),
+    Flush,
+    Close,
+}
+
 /// Wraps a transport: everything sent through it is encrypted (or queued until the handshake ends); `raw` bypasses the cipher.
+///
+/// Native: serialising, deflating and sealing happen on **one worker thread per connection** (jobs are processed in order, so the
+/// nonce order is the wire order); the UI thread only clones the message into a channel. The browser has no threads and seals inline.
 pub struct SecureSink {
-    pub inner: Box<dyn Sink>,
-    pub crypt: Arc<Mutex<Crypt>>,
+    inner: Arc<Mutex<Box<dyn Sink>>>,
+    #[allow(dead_code)] // native: the worker thread owns its own clone
+    crypt: Arc<Mutex<Crypt>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    tx: std::sync::mpsc::Sender<Job>,
+}
+
+impl SecureSink {
+    pub fn new(inner: Box<dyn Sink>, crypt: Arc<Mutex<Crypt>>) -> SecureSink {
+        let inner = Arc::new(Mutex::new(inner));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            let (i2, c2) = (inner.clone(), crypt.clone());
+            let spawned = std::thread::Builder::new().name("lumen-collab-seal".into()).spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    match job {
+                        Job::Msg(m) => {
+                            let Ok(json) = serde_json::to_string(&m) else { continue };
+                            drop(m);
+                            let packed = Crypt::pack(&json);
+                            drop(json);
+                            Self::emit(&i2, &c2, Some(packed));
+                        }
+                        Job::Flush => Self::emit(&i2, &c2, None),
+                        Job::Close => {
+                            if let Ok(i) = i2.lock() {
+                                i.close();
+                            }
+                            return;
+                        }
+                    }
+                }
+            });
+            debug_assert!(spawned.is_ok());
+            SecureSink { inner, crypt, tx }
+        }
+        #[cfg(target_arch = "wasm32")]
+        SecureSink { inner, crypt }
+    }
+
+    fn emit(inner: &Arc<Mutex<Box<dyn Sink>>>, crypt: &Arc<Mutex<Crypt>>, packed: Option<Vec<u8>>) {
+        let frames = match crypt.lock() {
+            Ok(mut c) => match packed {
+                Some(p) => c.seal_packed(p),
+                None => c.seal_pending(),
+            },
+            Err(_) => return,
+        };
+        if frames.is_empty() {
+            return;
+        }
+        if let Ok(i) = inner.lock() {
+            for f in &frames {
+                i.send(f);
+            }
+        }
+    }
 }
 
 impl Sink for SecureSink {
     fn send(&self, m: &Msg) {
-        let Ok(json) = serde_json::to_string(m) else { return };
-        let frames = match self.crypt.lock() {
-            Ok(mut c) => c.seal(&json),
-            Err(_) => return,
-        };
-        for f in frames {
-            self.inner.send(&f);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = self.tx.send(Job::Msg(m.clone()));
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Ok(json) = serde_json::to_string(m) {
+            Self::emit(&self.inner, &self.crypt, Some(Crypt::pack(&json)));
         }
     }
     fn raw(&self, m: &Msg) {
-        self.inner.send(m);
+        if let Ok(i) = self.inner.lock() {
+            i.send(m);
+        }
+    }
+    fn flush_pending(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = self.tx.send(Job::Flush);
+        }
+        #[cfg(target_arch = "wasm32")]
+        Self::emit(&self.inner, &self.crypt, None);
     }
     fn close(&self) {
-        self.inner.close();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = self.tx.send(Job::Close);
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Ok(i) = self.inner.lock() {
+            i.close();
+        }
     }
 }
 
@@ -275,7 +387,7 @@ mod tests {
     fn deliver(from: &mut Crypt, to: &mut Crypt, json: &str) -> Option<String> {
         let mut out = None;
         for f in from.seal(json) {
-            let Msg::Enc { d, more } = f else { panic!("not an Enc frame") };
+            let Msg::Bin { d, more } = f else { panic!("not an Enc frame") };
             out = to.open(&d, more).unwrap();
         }
         out
@@ -314,7 +426,7 @@ mod tests {
         assert!(frames.len() > 4, "got {} frames", frames.len());
         let mut out = None;
         for f in frames {
-            let Msg::Enc { d, more } = f else { panic!() };
+            let Msg::Bin { d, more } = f else { panic!() };
             out = b.open(&d, more).unwrap();
         }
         assert_eq!(out.as_deref(), Some(noise.as_str()));
@@ -323,16 +435,16 @@ mod tests {
     #[test]
     fn tampering_and_replay_are_rejected() {
         let (mut a, mut b) = pair();
-        let Msg::Enc { d, more } = a.seal("secret").remove(0) else { panic!() };
-        let mut bytes = crate::media::b64_decode(&d).unwrap();
+        let Msg::Bin { d, more } = a.seal("secret").remove(0) else { panic!() };
+        let mut bytes = d;
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
-        assert!(b.open(&crate::media::b64_encode(&bytes), more).is_err());
+        assert!(b.open(&bytes, more).is_err());
         // a plaintext frame, or garbage, never decrypts
         let (mut a2, mut b2) = pair();
-        assert!(b2.open("AAAA", false).is_err());
+        assert!(b2.open(b"AAAA", false).is_err());
         let frames = a2.seal("one");
-        let Msg::Enc { d, more } = frames[0].clone() else { panic!() };
+        let Msg::Bin { d, more } = frames[0].clone() else { panic!() };
         assert!(b2.open(&d, more).is_ok());
         assert!(b2.open(&d, more).is_err(), "replayed frame must fail (nonce counter)");
     }
@@ -353,7 +465,7 @@ mod tests {
             for (i, chunk) in payload.chunks(FRAG).enumerate() {
                 let mut buf = vec![0u8; chunk.len() + 64];
                 let len = ts.write_message(chunk, &mut buf).unwrap();
-                out.push((crate::media::b64_encode(&buf[..len]), i + 1 < n));
+                out.push((buf[..len].to_vec(), i + 1 < n));
             }
             out
         };
@@ -362,5 +474,45 @@ mod tests {
             res = b.open(&d, more);
         }
         assert!(res.is_err());
+    }
+
+    struct Collect(Arc<Mutex<Vec<Msg>>>);
+    impl Sink for Collect {
+        fn send(&self, m: &Msg) {
+            self.0.lock().unwrap().push(m.clone());
+        }
+        fn close(&self) {}
+    }
+
+    #[test]
+    fn the_sender_thread_keeps_wire_order_and_everything_decrypts_in_order() {
+        let (a, mut b) = pair();
+        let got = Arc::new(Mutex::new(vec![]));
+        let sink = SecureSink::new(Box::new(Collect(got.clone())), Arc::new(Mutex::new(a)));
+        let n = 200;
+        for i in 0..n {
+            sink.send(&Msg::MediaMiss { id: i });
+        }
+        sink.flush_pending();
+        let t0 = std::time::Instant::now();
+        while got.lock().unwrap().len() < n as usize && t0.elapsed().as_secs() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let frames = got.lock().unwrap().clone();
+        assert_eq!(frames.len(), n as usize);
+        for (i, f) in frames.into_iter().enumerate() {
+            let Msg::Bin { d, more } = f else { panic!("not binary") };
+            let json = b.open(&d, more).expect("nonce order = wire order").expect("whole message");
+            assert!(matches!(serde_json::from_str::<Msg>(&json), Ok(Msg::MediaMiss { id }) if id == i as u64));
+        }
+    }
+
+    #[test]
+    fn text_transports_carry_binary_frames_as_base64_and_get_them_back() {
+        let m = Msg::Bin { d: vec![0, 1, 2, 250, 251], more: false };
+        let t = m.to_text().unwrap();
+        assert!(t.contains("\"Enc\""));
+        assert!(matches!(Msg::from_text(&t), Some(Msg::Bin { d, more: false }) if d == [0, 1, 2, 250, 251]));
+        assert!(Msg::from_text("{\"t\":\"Enc\",\"d\":\"!!\",\"more\":false}").is_none());
     }
 }

@@ -23,6 +23,10 @@ pub fn mentions(text: &str, name: &str) -> bool {
     t.match_indices(&needle).any(|(i, _)| t[i + needle.len()..].chars().next().map_or(true, |c| !c.is_alphanumeric()))
 }
 
+fn ui_first(n: &str) -> &str {
+    n.split_whitespace().next().unwrap_or(n)
+}
+
 fn ago(ts: f64) -> String {
     let d = (now_ms() as f64 / 1000.0 - ts).max(0.0);
     match d as u64 {
@@ -108,6 +112,13 @@ pub fn window(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &mut Workspace, 
     let can_moderate = c.mode != Mode::Joined || c.role == Role::Editor;
     let viewer = c.mode != Mode::Off && c.role == Role::Viewer;
     let editing_block = c.local.block.filter(|b| ws.page(pid).map_or(false, |p| p.blocks.iter().any(|x| x.id == *b)));
+    // read receipt: this device is looking at the thread list of `pid` right now, up to the newest comment it contains
+    if c.mode != Mode::Off {
+        let newest = list.iter().map(|x| (x.ts * 1000.0) as u64).max().unwrap_or(0);
+        if newest > 0 && c.local.seen != Some((pid, newest)) {
+            c.local.seen = Some((pid, newest));
+        }
+    }
     let names: Vec<String> = c.roster.iter().filter(|(p, _)| p.id != me.id).filter_map(|(p, _)| p.name.split_whitespace().next().map(|s| s.to_owned())).collect();
 
     let mut close = false;
@@ -307,6 +318,14 @@ fn thread(ui: &mut egui::Ui, pal: &Palette, c: &mut Collab, ws: &Workspace, pid:
                 }
             });
             mention_spans(ui, pal, &cm.text, 13.0);
+            // read receipt on my own comments: who has had this page's comments open since it was written
+            if cm.author_id == me.id && c.mode != Mode::Off {
+                let at = (cm.ts * 1000.0) as u64;
+                let seen: Vec<&str> = c.roster.iter().filter(|(p, _)| p.id != me.id && c.presence_of(p.id).and_then(|pr| pr.seen).map_or(false, |(pg, t)| pg == pid && t >= at)).map(|(p, _)| ui_first(&p.name)).collect();
+                if !seen.is_empty() {
+                    ui.label(egui::RichText::new(format!("{} Seen by {}", l::CHECK, seen.join(", "))).font(body(10.5)).color(pal.muted));
+                }
+            }
         };
         one(ui, top, true);
         for r in all.iter().filter(|x| x.reply_to == top.id) {

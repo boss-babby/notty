@@ -301,6 +301,11 @@ public class LumenActivity extends NativeActivity {
         CollabKit.nsdStart(this, name, port, info);
     }
 
+    // ── foreground service while a collaboration session runs (see CollabService) ──
+    public void collabService(boolean on, String text) {
+        if (on) CollabService.start(this, text); else CollabService.stop(this);
+    }
+
     public void nsdStop() {
         CollabKit.nsdStop();
     }

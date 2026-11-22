@@ -28,7 +28,7 @@ pub enum Kind {
 #[derive(Clone, Debug)]
 pub struct Change {
     pub kind: Kind,
-    /// "Page", "Block", "Comment".
+    /// "Page", "Block", "Card" (canvas), "Comment".
     pub what: &'static str,
     pub page: u64,
     pub block: u64,
@@ -337,33 +337,95 @@ impl Suggestion {
     }
 }
 
-/// Puts a block back the way it was before `ch` (formatting included). Returns `false` when there is nothing to restore.
+/// Whether [`revert`] can undo `ch`: blocks and canvas cards (added ⇒ remove, edited / removed ⇒ restore), pages (added ⇒ move to the
+/// trash, edited ⇒ restore the title / icon / settings; a removed page cannot come back because its content is not kept).
+pub fn can_revert(ch: &Change) -> bool {
+    match ch.what {
+        "Block" | "Card" => ch.kind == Kind::Added || ch.raw.is_some(),
+        "Page" => ch.kind == Kind::Added || (ch.kind == Kind::Edited && ch.raw.is_some()),
+        _ => false,
+    }
+}
+
+/// Puts a block, canvas card or page back the way it was before `ch` (formatting included). Returns `false` when there is nothing to restore.
 pub fn revert(ws: &mut crate::model::Workspace, ch: &Change) -> bool {
-    if ch.what != "Block" {
+    if !can_revert(ch) {
         return false;
     }
-    let Some(p) = ws.page_mut(ch.page) else { return false };
-    let done = match ch.kind {
-        Kind::Added => {
-            let n = p.blocks.len();
-            p.blocks.retain(|b| b.id != ch.block);
-            n != p.blocks.len()
-        }
-        Kind::Edited | Kind::Removed => match ch.raw.as_deref().and_then(|r| serde_json::from_str::<crate::model::Block>(r).ok()) {
-            Some(b) => {
-                match p.blocks.iter_mut().find(|x| x.id == b.id) {
-                    Some(slot) => *slot = b,
-                    None => p.blocks.push(b),
+    match ch.what {
+        "Card" => {
+            let Some(c) = ws.page_mut(ch.page).and_then(|p| p.canvas.as_mut()) else { return false };
+            let done = match ch.kind {
+                Kind::Added => {
+                    let n = c.nodes.len();
+                    c.nodes.retain(|x| x.id != ch.block);
+                    c.edges.retain(|e| e.from != ch.block && e.to != ch.block);
+                    n != c.nodes.len()
                 }
-                true
+                Kind::Edited | Kind::Removed => match ch.raw.as_deref().and_then(|r| serde_json::from_str::<crate::canvas::Node>(r).ok()) {
+                    Some(n) => {
+                        match c.nodes.iter_mut().find(|x| x.id == n.id) {
+                            Some(slot) => *slot = n,
+                            None => c.nodes.push(n),
+                        }
+                        true
+                    }
+                    None => false,
+                },
+            };
+            if done {
+                c.rev += 1;
+                if let Some(p) = ws.page_mut(ch.page) {
+                    p.updated = now_ms() as f64;
+                }
             }
-            None => false,
-        },
-    };
-    if done {
-        p.updated = now_ms() as f64;
+            done
+        }
+        "Page" => {
+            let Some(p) = ws.page_mut(ch.page) else { return false };
+            if ch.kind == Kind::Added {
+                p.trashed = true;
+                p.updated = now_ms() as f64;
+                return true;
+            }
+            let Some(mut np) = ch.raw.as_deref().and_then(|r| serde_json::from_str::<crate::model::Page>(r).ok()) else { return false };
+            // only the page's own settings go back: content, history, sidebar state and where it hangs in the tree stay
+            np.id = p.id;
+            np.blocks = std::mem::take(&mut p.blocks);
+            np.history = std::mem::take(&mut p.history);
+            np.favorite = p.favorite;
+            np.expanded = p.expanded;
+            np.parent = p.parent;
+            np.canvas = p.canvas.take();
+            np.updated = now_ms() as f64;
+            *p = np;
+            true
+        }
+        _ => {
+            let Some(p) = ws.page_mut(ch.page) else { return false };
+            let done = match ch.kind {
+                Kind::Added => {
+                    let n = p.blocks.len();
+                    p.blocks.retain(|b| b.id != ch.block);
+                    n != p.blocks.len()
+                }
+                Kind::Edited | Kind::Removed => match ch.raw.as_deref().and_then(|r| serde_json::from_str::<crate::model::Block>(r).ok()) {
+                    Some(b) => {
+                        match p.blocks.iter_mut().find(|x| x.id == b.id) {
+                            Some(slot) => *slot = b,
+                            None => p.blocks.push(b),
+                        }
+                        true
+                    }
+                    None => false,
+                },
+            };
+            if done {
+                p.updated = now_ms() as f64;
+            }
+            done
+        }
     }
-    done
 }
 
 /// The review window. Returns the page the user asked to open.
@@ -497,10 +559,10 @@ pub fn window(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &mut crate::mode
                         ui.label(egui::RichText::new(format!("{} {mark}", ch.what)).font(bold(11.5)).color(col));
                         ui.label(egui::RichText::new(l::CIRCLE).font(body(9.0)).color(pcol));
                         ui.label(egui::RichText::new(format!("{name} · {}", ago(ch.at))).font(body(11.5)).color(pcol));
-                        let can = ch.what == "Block" && (ch.kind == Kind::Added || ch.raw.is_some());
+                        let can = can_revert(ch);
                         if can {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if button(ui, pal, "Revert", 0, 62.0).on_hover_text("Put this block back the way it was").clicked() {
+                                if button(ui, pal, "Revert", 0, 62.0).on_hover_text("Put this back the way it was").clicked() {
                                     revert_ix = Some(ix);
                                 }
                             });
@@ -584,5 +646,38 @@ mod tests {
         assert!(revert(&mut ws, &added));
         assert!(ws.page(pid).unwrap().blocks.iter().all(|b| b.id != before.id));
         assert!(!revert(&mut ws, &Change { what: "Comment", ..ch }));
+    }
+
+    #[test]
+    fn revert_restores_cards_and_pages() {
+        let mut ws = crate::model::Workspace::seed();
+        let pid = ws.pages[0].id;
+        ws.page_mut(pid).unwrap().canvas = Some(crate::canvas::Canvas::default());
+        let card = crate::canvas::Node { id: 77, x: 10.0, y: 20.0, w: 100.0, h: 50.0, text: "hello".into(), ..Default::default() };
+        let raw = serde_json::to_string(&card).unwrap();
+        ws.page_mut(pid).unwrap().canvas.as_mut().unwrap().nodes.push(crate::canvas::Node { x: 999.0, ..card.clone() });
+        let ch = Change { kind: Kind::Edited, what: "Card", page: pid, block: 77, title: String::new(), who: 2, at: 1, before: String::new(), after: String::new(), raw: Some(raw) };
+        assert!(can_revert(&ch));
+        assert!(revert(&mut ws, &ch));
+        assert_eq!(ws.page(pid).unwrap().canvas.as_ref().unwrap().nodes[0].x, 10.0);
+        assert!(revert(&mut ws, &Change { kind: Kind::Added, raw: None, ..ch.clone() }));
+        assert!(ws.page(pid).unwrap().canvas.as_ref().unwrap().nodes.is_empty());
+        // a removed card comes back
+        assert!(revert(&mut ws, &Change { kind: Kind::Removed, ..ch.clone() }));
+        assert_eq!(ws.page(pid).unwrap().canvas.as_ref().unwrap().nodes.len(), 1);
+        // a page: settings back, content untouched
+        let mut before = ws.page(pid).unwrap().clone();
+        before.title = "Old title".into();
+        before.blocks.clear();
+        let n_blocks = ws.page(pid).unwrap().blocks.len();
+        ws.page_mut(pid).unwrap().title = "Renamed by someone".into();
+        let pch = Change { kind: Kind::Edited, what: "Page", page: pid, block: 0, title: String::new(), who: 2, at: 1, before: String::new(), after: String::new(), raw: serde_json::to_string(&before).ok() };
+        assert!(can_revert(&pch));
+        assert!(revert(&mut ws, &pch));
+        assert_eq!(ws.page(pid).unwrap().title, "Old title");
+        assert_eq!(ws.page(pid).unwrap().blocks.len(), n_blocks);
+        assert!(revert(&mut ws, &Change { kind: Kind::Added, raw: None, ..pch.clone() }));
+        assert!(ws.page(pid).unwrap().trashed);
+        assert!(!can_revert(&Change { kind: Kind::Removed, ..pch }));
     }
 }

@@ -1,4 +1,4 @@
-# Local collaboration — design, status and next steps (Lumen 14.5)
+# Local collaboration — design, status and next steps (Lumen 14.6)
 
 > **14.1 update:** the security review and hardening pass is documented in §8 (protocol 2: end-to-end encrypted, authenticated, rate-limited);
 > §4 and §7 below describe the 14.0 state and are annotated with what 14.1 closed.
@@ -416,3 +416,110 @@ Limits: one hotspot at a time; some phones refuse a local-only hotspot while tet
 6. Big tables chunk-wise, binary framing (postcard), host hand-over / mesh.
 7. Comment read-receipts (`Presence` carries the highest comment id seen), "revert" for pages and canvas cards, suggestions for canvas edits (today they are listed as "(canvas change)").
 8. Push while the app is closed: FCM relay worker; or a foreground service on Android with the relay long-poll.
+
+
+## 13. Pass 7 — NAT hole punching, binary framing, off-UI-thread work, stamps, receipts, revert (14.6)
+
+Input: the §12.7 review list (and what was still open from §11.2). Every item below says what was done, how it was verified and what is
+left. Test counts are from `cargo test --lib` on this build machine (Linux x86-64, no phones, no router, no second browser).
+
+### 13.1 Status of the §12.7 list
+
+| # | Item | State |
+|---|---|---|
+| 1 | WebRTC + STUN / hole-punching | **Native hole punching: done** (13.2). **Browser WebRTC: not done** (needs two real browsers; the browser keeps the relay, which is end-to-end encrypted). |
+| 2 | `yrs` Y.Text per block | **not done, deliberately** — see 13.8. |
+| 3 | Per-block stamps persisted | **done** (13.4). |
+| 4 | Autosave off the UI thread | **done** (13.5) — snapshot-by-clone + worker thread. Copy-on-write `Arc<Page>` and a per-page store: **not done** (13.8). |
+| 5 | BLE advertising / QR-less pairing | **not done** (13.8): radio code that nobody can test without two phones is not shipped in the APK. |
+| 6 | Big tables chunk-wise, binary framing, host hand-over | **Binary framing: done** (13.3). Big tables and hand-over: **not done** (13.8). |
+| 7 | Comment read-receipts, revert for pages / cards, canvas suggestions | **done** (13.6). |
+| 8 | Push while the app is closed | **Android foreground service: done** (13.7). FCM relay worker: **not done** (13.8). |
+| – | "Separate the load from the UI thread" | **done where it was measurable**: sealing (13.3) and autosave (13.5) moved to worker threads; sockets already were. See 13.9. |
+
+### 13.2 Direct connection through NATs (`collab/punch.rs`)
+* **STUN** (RFC 5389 binding request, ~60 lines, no dependency): the device asks `stun.l.google.com`, `stun1.l.google.com`, `stun.cloudflare.com`,
+  `global.stun.twilio.com` (in that order, 2 tries each, 600 ms) for the public address of one UDP socket. Only the address is learnt.
+* **Rendezvous** on the site: `POST /api/collab/punch {room, role, c, a}` stores an address under a random cookie (60 s TTL, ≤ 16 per room, address
+  syntax validated); `GET ?room=R&role=h` lists the open offers (host) and `GET ?room=R&c=C` returns the host's answer (joiner). The site sees two
+  addresses and a cookie — never session data, keys or tokens.
+* **Flow**: the host (which already has a relay room) polls the room every 1.5 s; a joiner whose link carries `&p=1` posts an offer, the host answers
+  with its own mapped address, **both sides send probes at each other every 120 ms** (this opens both NAT mappings) until a packet with the right
+  cookie arrives (≤ 7–8 s). The joiner tries this *before* the relay; if it fails it silently falls back to the relay (`Collab::start_relay`), so the
+  worst case costs ≈ 13 s, the usual case is a few hundred ms. Reconnects repeat the same sequence.
+* **Reliable stream** (`Rudp`): a pure state machine — length-prefixed messages cut into 1 100-byte segments, 64-segment window, cumulative acks,
+  retransmission with exponential back-off (220 ms ⇒ ×16), out-of-order reassembly, 512 KiB message cap, 25 s idle timeout, 4 s keep-alives (which also
+  keep the NAT mapping open), FIN. The cookie in every header makes blind injection from outside the path impossible; anything else is stopped by the
+  Noise channel and the token proof, exactly as on TCP.
+* **Session integration**: the link is just another `Sink`; `Event::Open` → the usual encrypted handshake, Hello, host approval card.
+* **Tests (all pass)**: STUN parse (XOR-MAPPED-ADDRESS, wrong transaction, truncated); the stream delivers 26 messages incl. a 300 kB one **in order over
+  a link that drops 30 % and duplicates / reorders** (deterministic PRNG); wrong cookie / oversize frame refused; two sockets punch each other on
+  loopback and a wrong cookie never opens; wire encoding round trip.
+* **Honest limits**: symmetric NATs (many mobile carriers) assign a new port per destination, so the STUN-learnt port is wrong and the punch fails —
+  the relay fallback handles that case. A TURN-style relay for UDP is not offered (the HTTP relay plays that role). Not verified against real NATs
+  here: this machine has none; the parts that can be checked without one are the tests above.
+
+### 13.3 Binary framing and the sealing worker (protocol 5)
+* `Msg::Bin { d, more }` carries an encrypted frame as raw bytes. TCP sends it as a **binary WebSocket frame** `[more][Noise message]`, the punched UDP link
+  as `[1][more][bytes]`; text transports (relay, browser) convert with `Msg::to_text` / `Msg::from_text` (base64 only there). Savings on LAN: the 33 %
+  base64 overhead and the JSON envelope, plus one base64 pass per frame on each side. The browser build understands binary frames too
+  (`binaryType = arraybuffer`), so it can still join a native host directly.
+* **Sealing no longer runs on the UI thread** (native): `SecureSink` owns one thread per connection; `send` clones the message into a channel, the thread
+  serialises, deflates (CPU-heavy part, outside the cipher lock), seals and hands the frames to the transport. Jobs are processed in order, so nonce order
+  = wire order; the messages queued during the handshake are sealed by the same thread (`flush_pending`), which removes the only place the order could
+  have raced. The browser has no threads and seals inline.
+* `PROTO` is **5**: a 14.5 peer cannot read binary frames and is refused with the usual "incompatible version" message.
+* Tests: `the_sender_thread_keeps_wire_order_and_everything_decrypts_in_order` (200 messages), `text_transports_carry_binary_frames_as_base64…`,
+  all earlier secure / session tests (the end-to-end sockets test now runs over binary frames).
+
+### 13.4 Per-block stamps survive a restart
+`Replica::export_stamps` / `import_stamps`: one line per live entity (`kind a b t r content-hash`, ≤ 400 000). The session writes them next to the
+workspace (egui persisted data, key `("collab_stamps", share-id)`) every 2 minutes and when a session ends, and restores them right after `adopt`:
+an entity gets its **real** clock back when its content hash is unchanged; anything edited while the app was closed keeps the page-level stamp of
+`adopt`. Stamps are clamped to the adoption time. Applies to hosts (`start_host`) and to joiners that re-open a share (`bind_existing`).
+Test: `stamps_survive_a_restart_per_block_and_edits_made_while_closed_fall_back_to_the_page`.
+
+### 13.5 Autosave off the UI thread (`src/autosave.rs`)
+While frames are being drawn (focused window, not closing, last frame < 2.5 s ago) `save()` clones the workspace (no formatting, no hashing) and hands it
+to one worker thread, which fingerprints it (FNV over the JSON stream) and, only if it changed, produces the RON text (`eframe::encode_value`, added to
+the vendored eframe). The UI thread stores the finished string in the next frame (`Storage::set_string` + `flush`, eframe writes the file on its own
+thread). **Every path that could lose data stays synchronous**: window closing, focus lost / app in the background, an idle app (nothing is typed, so
+nobody sees the cost), the browser (no threads: the "worker" runs inline). A job in flight is awaited before a synchronous save, so an older result can
+never overwrite a newer one. Test: `a_snapshot_is_serialised_on_the_worker_and_an_unchanged_one_is_skipped`.
+Not done: `Arc<Page>` copy-on-write snapshots (the clone is O(workspace) memory traffic, ~1 ms per MB) and one storage record per page.
+
+### 13.6 Review features
+* **Read receipts.** `Presence.seen = (page, newest comment time ms)`, set while the comments window is open; the author of a comment sees
+  "✓ Seen by Ana, Ben" under it. (A timestamp, not "the highest id": ids are per device, so they cannot be ordered across peers.) Protocol field is
+  optional and skipped when empty.
+* **Revert for pages and canvas cards.** Canvas cards are now itemised in the Changes window (`Card`, one readable line: kind, text, position, size,
+  colour — a move or resize shows as a changed line) instead of being counted. *Revert*: added card ⇒ removed (with its edges), edited / removed card ⇒
+  restored from the stored JSON; added page ⇒ moved to the trash; edited page ⇒ title / icon / settings restored (content, history, sidebar state and
+  tree position stay). A removed page cannot be restored (its content is not kept). Test: `revert_restores_cards_and_pages` and the existing block test.
+* **Canvas suggestions** are described like blocks (`Card` before / after line) instead of "(canvas change)"; edges and PDF marks read "(changed)" /
+  "(removed)".
+
+### 13.7 Android: session stays alive in the background
+`CollabService` (foreground service, type `dataSync`, ongoing low-importance notification, partial CPU wake lock for ≤ 4 h and a Wi-Fi lock) runs exactly
+while a session is hosting or joined (`Collab::poll` follows `mode`; `LumenActivity.collabService`). Without it Android freezes the process shortly after
+the screen turns off and the relay long-poll / UDP path die. Manifest: `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_DATA_SYNC`, `WAKE_LOCK`. Compile- and
+package-verified only (no phone here). FCM push for a *closed* app needs Google services and a server-side sender; it is not part of this build.
+
+### 13.8 Not done — and why (ranked for the next pass)
+1. **Browser WebRTC data channel** (`web_sys::RtcPeerConnection`, signalling through `/api/collab`). Needs two real browsers to verify; the relay is the fallback.
+2. **`yrs` / Y.Text per text block.** The three-way merge (10.2) keeps both edits; real intention preservation and *exact* remote carets need an editor
+   adapter that diffs egui's `TextEdit` string into CRDT operations and rewrites carets on remote edits — a rewrite of `editor.rs` that cannot be
+   verified without a UI test rig. Cheaper intermediate step: map remote carets through the common-prefix/suffix diff of the text instead of aligning by length.
+3. **BLE advertising + GATT hand-off with a numeric comparison** (AirDrop feel). Needs two phones; also needs the `BLUETOOTH_ADVERTISE/SCAN/CONNECT` permission flow.
+4. **Big tables chunk-wise** (`lumen-store` zone maps), **host hand-over / mesh**, **UDP TURN-like relay** for symmetric NATs, **FCM push worker**.
+5. `Arc<Page>` copy-on-write snapshots and a per-page store (13.5); WebRTC-free browser hosting.
+
+### 13.9 Where the work runs now
+| Work | Thread |
+|---|---|
+| socket read / write, WebSocket framing, UDP read / write, retransmission | one thread per connection (existing; UDP new) |
+| JSON serialisation, deflate, AEAD sealing | **one sealing thread per connection (new)** |
+| hole-punch rendezvous, STUN, host listener | their own threads (new) |
+| autosave fingerprint + RON text | **autosave worker (new)** |
+| decrypt, JSON parse, CRDT apply (≤ 4 ms / frame), change scan (≤ 2.5 ms / frame) | UI thread — it mutates the `Workspace` the UI draws, so it stays there and is time-boxed |
+Idle cost is unchanged: no thread spins; sealing and autosave threads block on channels, the host listener polls once per 1.5 s only while a relay room is offered.

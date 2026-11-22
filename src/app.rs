@@ -174,6 +174,11 @@ pub struct LumenApp {
     rescued: Option<String>,
     /// Fingerprint of the state written by the last autosave: an idle app skips serialising / writing the workspace entirely.
     saved_fp: Option<u64>,
+    /// Worker thread that serialises snapshots while the user is working (see `autosave.rs`).
+    autosave: crate::autosave::Autosave,
+    /// The window is closing / was not drawn for a while: `save` must write synchronously.
+    closing: bool,
+    last_frame_ms: f64,
     trash_open: bool,
     security: Option<SecurityDialog>,
     fresh: bool,
@@ -297,6 +302,9 @@ impl LumenApp {
             theme_applied: false,
             rescued,
             saved_fp: None,
+            autosave: crate::autosave::Autosave::new(&cc.egui_ctx, run_save),
+            closing: false,
+            last_frame_ms: 0.0,
             last_active: now_ms() / 1000.0,
             shown_page: None,
             focus_title: None,
@@ -2619,6 +2627,63 @@ fn fingerprint<T: serde::Serialize>(v: &T) -> Option<u64> {
     Some(h.0)
 }
 
+
+/// Runs on the autosave worker: fingerprint + serialise a snapshot.
+fn run_save(job: crate::autosave::SaveJob) -> crate::autosave::SaveDone {
+    let saved = SavedRef { ws: &job.ws, cred: &job.cred, skipped: job.skipped };
+    let fp = fingerprint(&saved);
+    if fp.is_some() && fp == job.known_fp {
+        return crate::autosave::SaveDone { fp, text: None };
+    }
+    crate::autosave::SaveDone { fp, text: eframe::encode_value(&saved) }
+}
+
+impl LumenApp {
+    /// Stores a serialised state: the data-safety rotation (previous version / previous state slots), then the new text.
+    fn write_state(&mut self, storage: &mut dyn eframe::Storage, text: String, fp: Option<u64>) {
+        let old = storage.get_string(STORAGE_KEY).filter(|o| !o.trim().is_empty());
+        if let Some(old) = old {
+            // 2. first save after an app update: keep the previous version's data untouched in its own slot
+            let ver = env!("CARGO_PKG_VERSION");
+            if storage.get_string(VERSION_KEY).as_deref() != Some(ver) {
+                if let Some(prev_ver) = storage.get_string(VERSION_KEY) {
+                    storage.set_string(UPGRADE_KEY, old.clone());
+                    storage.set_string(UPGRADE_VER_KEY, prev_ver);
+                }
+                storage.set_string(VERSION_KEY, ver.to_owned());
+            }
+            // 3. rolling "previous state" slot: at most one rotation every 10 minutes, so it is always a state from before the latest edits
+            let now = now_ms();
+            let last: f64 = storage.get_string(PREV_AT_KEY).and_then(|t| t.parse().ok()).unwrap_or(0.0);
+            if now - last > 10.0 * 60.0 * 1000.0 {
+                storage.set_string(PREV_KEY, old);
+                storage.set_string(PREV_AT_KEY, format!("{now}"));
+            }
+        } else {
+            storage.set_string(VERSION_KEY, env!("CARGO_PKG_VERSION").to_owned());
+        }
+        storage.set_string(STORAGE_KEY, text);
+        self.saved_fp = fp;
+    }
+
+    /// Stores the result of the autosave worker (called every frame; a map insert, never serialises anything).
+    fn collect_autosave(&mut self, frame: &mut eframe::Frame) {
+        let Some(done) = self.autosave.poll() else { return };
+        let Some(storage) = frame.storage_mut() else { return };
+        match done.text {
+            Some(text) => {
+                self.write_state(storage, text, done.fp);
+                storage.flush(); // the file is written by eframe's own writer thread
+            }
+            None => {
+                if done.fp.is_some() {
+                    self.saved_fp = done.fp;
+                }
+            }
+        }
+    }
+}
+
 // ───────────── eframe glue ─────────────
 
 impl eframe::App for LumenApp {
@@ -2630,34 +2695,37 @@ impl eframe::App for LumenApp {
         if let Some(raw) = self.rescued.take() {
             storage.set_string(UNREADABLE_KEY, raw);
         }
-        // Dirty tracking: the state is streamed through a hasher (no allocation, no I/O). Nothing changed since the last save ⇒ the
-        // workspace is neither re-serialised nor written (large workspaces, localStorage on the web, flash wear on phones).
-        let fp = fingerprint(&SavedRef { ws: &self.ws, cred: &self.cred, skipped: self.skipped_setup });
-        let unchanged = fp.is_some() && fp == self.saved_fp;
-        if !unchanged {
-            let old = storage.get_string(STORAGE_KEY).filter(|o| !o.trim().is_empty());
-            if let Some(old) = old {
-                // 2. first save after an app update: keep the previous version's data untouched in its own slot
-                let ver = env!("CARGO_PKG_VERSION");
-                if storage.get_string(VERSION_KEY).as_deref() != Some(ver) {
-                    if let Some(prev_ver) = storage.get_string(VERSION_KEY) {
-                        storage.set_string(UPGRADE_KEY, old.clone());
-                        storage.set_string(UPGRADE_VER_KEY, prev_ver);
-                    }
-                    storage.set_string(VERSION_KEY, ver.to_owned());
-                }
-                // 3. rolling "previous state" slot: at most one rotation every 10 minutes, so it is always a state from before the latest edits
-                let now = now_ms();
-                let last: f64 = storage.get_string(PREV_AT_KEY).and_then(|t| t.parse().ok()).unwrap_or(0.0);
-                if now - last > 10.0 * 60.0 * 1000.0 {
-                    storage.set_string(PREV_KEY, old);
-                    storage.set_string(PREV_AT_KEY, format!("{now}"));
-                }
-            } else {
-                storage.set_string(VERSION_KEY, env!("CARGO_PKG_VERSION").to_owned());
+        // A result the worker finished meanwhile is stored first, so nothing older can overwrite anything newer.
+        if let Some(done) = self.autosave.poll() {
+            if let Some(text) = done.text {
+                self.write_state(storage, text, done.fp);
+            } else if done.fp.is_some() {
+                self.saved_fp = done.fp;
             }
-            eframe::set_value(storage, STORAGE_KEY, &SavedRef { ws: &self.ws, cred: &self.cred, skipped: self.skipped_setup });
-            self.saved_fp = fp;
+        }
+        // While the user is working (frames are being drawn, window focused, not closing) the snapshot is serialised on the worker
+        // thread: this call costs one clone. Every other situation (closing, background, idle, browser) saves synchronously below.
+        let working = !self.closing && !cfg!(target_arch = "wasm32") && now_ms() - self.last_frame_ms < 2500.0;
+        if working && self.autosave.submit(crate::autosave::SaveJob { ws: self.ws.clone(), cred: self.cred.clone(), skipped: self.skipped_setup, known_fp: self.saved_fp }) {
+            // the worker's answer is stored by `collect_autosave` in the next frame
+        } else {
+            if let Some(done) = self.autosave.wait() {
+                if let Some(text) = done.text {
+                    self.write_state(storage, text, done.fp);
+                } else if done.fp.is_some() {
+                    self.saved_fp = done.fp;
+                }
+            }
+            // Dirty tracking: the state is streamed through a hasher (no allocation, no I/O). Nothing changed since the last save ⇒ the
+            // workspace is neither re-serialised nor written (large workspaces, localStorage on the web, flash wear on phones).
+            let saved = SavedRef { ws: &self.ws, cred: &self.cred, skipped: self.skipped_setup };
+            let fp = fingerprint(&saved);
+            if !(fp.is_some() && fp == self.saved_fp) {
+                match eframe::encode_value(&saved) {
+                    Some(text) => self.write_state(storage, text, fp),
+                    None => log::error!("could not encode the workspace"),
+                }
+            }
         }
         // other workspaces (only the ones that changed hands since the last save are rewritten)
         self.wsreg.sync_active_name(&self.ws.name);
@@ -2695,6 +2763,9 @@ impl eframe::App for LumenApp {
     }
 
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+        self.last_frame_ms = now_ms();
+        self.closing = ctx.input(|i| i.viewport().close_requested() || !i.focused);
+        self.collect_autosave(frame);
         crate::crisp::set_ppp(ctx.pixels_per_point());
         crate::crisp::set_zoom(1.0);
         self.ed.embed_rects.clear();

@@ -51,7 +51,7 @@ struct RelaySink {
 
 impl Sink for RelaySink {
     fn send(&self, m: &Msg) {
-        if let Ok(s) = serde_json::to_string(m) {
+        if let Some(s) = m.to_text() {
             push_out(&self.st, self.to, s);
         }
     }
@@ -119,7 +119,7 @@ fn poll_once(st: &Arc<St>) {
         }
         let Ok(p) = serde_json::from_slice::<Polled>(&r.bytes) else { return };
         for it in p.items {
-            let Ok(msg) = serde_json::from_str::<Msg>(&it.m) else { continue };
+            let Some(msg) = Msg::from_text(&it.m) else { continue };
             let conn = {
                 let Ok(mut peers) = st2.peers.lock() else { continue };
                 *peers.entry(it.from).or_insert_with(|| {
@@ -169,7 +169,7 @@ impl Relay {
     }
 
     pub fn hello(&self, m: &Msg) {
-        if let Ok(s) = serde_json::to_string(m) {
+        if let Some(s) = m.to_text() {
             push_out(&self.st, 0, s);
         }
     }

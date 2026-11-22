@@ -3,6 +3,7 @@
 
 #[cfg(target_os = "android")]
 mod android;
+mod autosave;
 mod agent_build;
 mod agent_tools;
 mod ai;

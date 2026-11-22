@@ -16,6 +16,8 @@ pub mod changes;
 mod net;
 #[cfg(not(target_arch = "wasm32"))]
 mod upnp;
+#[cfg(not(target_arch = "wasm32"))]
+mod punch;
 #[cfg(target_arch = "wasm32")]
 mod webnet;
 
@@ -28,7 +30,7 @@ use std::sync::{Arc, Mutex};
 /// Protocol 2: every frame is end-to-end encrypted (`secure.rs`); the share token is proven, never sent.
 /// Protocol 3: `Key::Comment` entities and `Entry::base` (merge bases).
 /// Protocol 4: `Role::Suggester`, `Presence::{typing, len}`. Older peers are refused with a clear message.
-pub const PROTO: u32 = 4;
+pub const PROTO: u32 = 5;
 /// Tombstones are forgotten after this long. A reconnect gives up after ~90 s, so no device can come back with an older view.
 const TOMBSTONE_GRACE_MS: u64 = 10 * 60 * 1000;
 
@@ -187,6 +189,10 @@ pub struct Presence {
     /// fully arrived yet (0 = unknown).
     #[serde(default, skip_serializing_if = "is_zero32")]
     pub len: u32,
+    /// Read receipt: (page, time in ms of the newest comment on that page this device has displayed). Comments are per page and ids are
+    /// per device, so a timestamp — not an id — is the only value every peer can order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen: Option<(u64, u64)>,
 }
 
 fn is_zero32(x: &u32) -> bool {
@@ -200,8 +206,12 @@ pub enum Msg {
     Hello { peer: PeerInfo, #[serde(default)] auth: String, proto: u32 },
     /// Noise handshake message (base64). Always sent in the clear — it is what sets the encryption up.
     Hs { d: String },
-    /// One encrypted frame (base64); `more` = the message continues in the next frame.
+    /// One encrypted frame (base64 text — only used on text transports: the relay and the browser); `more` = continues in the next frame.
     Enc { d: String, more: bool },
+    /// One encrypted frame as raw bytes (protocol 5: a binary WebSocket frame on TCP — no base64, no JSON envelope). Never serialised
+    /// as JSON; text transports convert with [`Msg::to_text`] / [`Msg::from_text`].
+    #[serde(skip)]
+    Bin { d: Vec<u8>, more: bool },
     Pending,
     Welcome { peer: PeerInfo, session: SessionInfo, role: Role, #[serde(default)] auth: String },
     Denied { reason: String },
@@ -213,6 +223,24 @@ pub enum Msg {
     MediaData { id: u64, off: u64, total: u64, name: String, mime: String, data: String },
     MediaMiss { id: u64 },
     Bye,
+}
+
+impl Msg {
+    /// JSON text for a text transport (a `Bin` frame becomes an `Enc` frame with base64).
+    pub fn to_text(&self) -> Option<String> {
+        match self {
+            Msg::Bin { d, more } => serde_json::to_string(&Msg::Enc { d: crate::media::b64_encode(d), more: *more }).ok(),
+            m => serde_json::to_string(m).ok(),
+        }
+    }
+
+    /// Parses a text frame; encrypted frames come out as `Bin`, so the session only ever sees one form.
+    pub fn from_text(s: &str) -> Option<Msg> {
+        match serde_json::from_str::<Msg>(s).ok()? {
+            Msg::Enc { d, more } => Some(Msg::Bin { d: crate::media::b64_decode(&d)?, more }),
+            m => Some(m),
+        }
+    }
 }
 
 /// What a device that offers a session announces on the local network (UDP broadcast, every 2 s).
@@ -245,6 +273,8 @@ pub trait Sink: Send {
     fn raw(&self, m: &Msg) {
         self.send(m)
     }
+    /// Seals messages that were queued while the handshake ran (only the cipher wrapper has anything to do).
+    fn flush_pending(&self) {}
     fn close(&self);
 }
 
@@ -326,6 +356,14 @@ pub struct JoinRequest {
 enum Target {
     Addr { addr: String, token: String },
     Relay { base: String, room: String, token: String },
+}
+
+/// A hole-punch attempt of a joiner (its thread opens the connection itself; on failure the relay takes over).
+struct PunchJoin {
+    rx: std::sync::mpsc::Receiver<bool>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    base: String,
+    room: String,
 }
 
 /// A joined session whose connection broke: the replica and the workspace stay, the dial is retried with a back-off and the next
@@ -454,6 +492,16 @@ pub struct Collab {
     track: bool,
     /// The joiner re-opened a workspace it already had: the first sync is reviewed as "what changed while you were away".
     reused: bool,
+    /// When the per-entity clocks were last written (ms, monotonic).
+    stamps_at: f64,
+    /// Android: the foreground service is running (it follows `mode`).
+    svc_on: bool,
+    /// Host: lets the hole-punch listener thread end (set while a relay room with punching is offered).
+    punch_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Joiner: a hole-punch attempt that runs before the relay is used.
+    punch_join: Option<PunchJoin>,
+    /// The link said the host can punch (`p=1`).
+    want_punch: bool,
     prompted: bool,
     bound_at: f64,
     last_op_at: f64,
@@ -730,6 +778,11 @@ impl Collab {
             last_page: None,
             track: false,
             reused: false,
+            stamps_at: 0.0,
+            svc_on: false,
+            punch_stop: None,
+            punch_join: None,
+            want_punch: false,
             prompted: false,
             bound_at: 0.0,
             last_op_at: 0.0,
@@ -806,6 +859,11 @@ impl Collab {
         rep.adopt(ws, now_ms());
         let roots = rep.roots();
         let share = self.share_id(ws_id, scope);
+        // per-block clocks of the previous run of this share (restart ⇒ no fall-back to page granularity)
+        let stamps: Option<String> = self.ctx.data_mut(|d| d.get_persisted(egui::Id::new(("collab_stamps", share.clone()))));
+        if let Some(t) = stamps {
+            rep.import_stamps(&t);
+        }
         self.session = Some(SessionInfo { id: random_code(10), name: title.clone(), scope, roots, share, keep: self.keep_copy });
         self.changes.clear();
         self.track = true;
@@ -883,12 +941,19 @@ impl Collab {
         }
         let room = random_code(10);
         self.relay = Some(relay::Relay::start(&base, &room, self.me.id, &self.inbox));
+        // peers that can punch through their NATs get a direct UDP path (the room only carries two addresses); everyone else uses the relay
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            punch::host(base, room.clone(), self.inbox.clone(), stop.clone());
+            self.punch_stop = Some(stop);
+        }
         self.relay_room = Some(room);
     }
 
     pub fn relay_link(&self, base: &str) -> Option<String> {
         let room = self.relay_room.as_ref()?;
-        Some(format!("{}/app?join={}&t={}", base.trim_end_matches('/'), room, self.token))
+        Some(format!("{}/app?join={}&t={}{}", base.trim_end_matches('/'), room, self.token, if self.punch_stop.is_some() { "&p=1" } else { "" }))
     }
 
     pub fn lan_link(&self) -> Option<String> {
@@ -1082,6 +1147,7 @@ impl Collab {
         };
         if let Some(room) = q("join") {
             let token = q("t").unwrap_or_default();
+            self.want_punch = q("p").as_deref() == Some("1");
             let base = if t.starts_with("http") { t.split("/app").next().unwrap_or(relay_base).to_owned() } else { relay_base.to_owned() };
             self.join_relay(&base, &room, &token);
         } else if let Some(h) = q("h") {
@@ -1141,15 +1207,35 @@ impl Collab {
             }
             Target::Relay { base, room, token } => {
                 self.token = token;
-                self.relay = Some(relay::Relay::start(&base, &room, self.me.id, &self.inbox));
-                // tell the room we are here (first handshake message): whoever hosts answers, the encrypted channel is set up from there
-                if let (Some(r), Some(keys)) = (&self.relay, self.keys.clone()) {
-                    let mut cr = secure::Crypt::new();
-                    if let Some(d) = cr.start_initiator(&keys) {
-                        self.relay_init = Some(Arc::new(Mutex::new(cr)));
-                        r.hello(&Msg::Hs { d });
+                #[cfg(not(target_arch = "wasm32"))]
+                if self.want_punch && self.punch_join.is_none() {
+                    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let (b2, r2, ib, st, ctx) = (base.clone(), room.clone(), self.inbox.clone(), stop.clone(), self.ctx.clone());
+                    let spawned = std::thread::Builder::new().name("lumen-collab-punchj".into()).spawn(move || {
+                        let ok = punch::dial(b2, r2, ib, st);
+                        let _ = tx.send(ok);
+                        ctx.request_repaint();
+                    });
+                    if spawned.is_ok() {
+                        self.punch_join = Some(PunchJoin { rx, stop, base, room });
+                        return;
                     }
                 }
+                self.start_relay(&base, &room);
+            }
+        }
+    }
+
+    /// Joins through the site's relay room (the first handshake message goes out through the room).
+    fn start_relay(&mut self, base: &str, room: &str) {
+        self.relay = Some(relay::Relay::start(base, room, self.me.id, &self.inbox));
+        // tell the room we are here: whoever hosts answers, the encrypted channel is set up from there
+        if let (Some(r), Some(keys)) = (&self.relay, self.keys.clone()) {
+            let mut cr = secure::Crypt::new();
+            if let Some(d) = cr.start_initiator(&keys) {
+                self.relay_init = Some(Arc::new(Mutex::new(cr)));
+                r.hello(&Msg::Hs { d });
             }
         }
     }
@@ -1201,7 +1287,33 @@ impl Collab {
         Msg::Hello { peer: self.me.clone(), auth: secure::proof("c", &self.token, hash), proto: PROTO }
     }
 
+    /// Writes the per-entity clocks next to the workspace (egui persisted data, keyed by the share id).
+    fn save_stamps(&mut self) {
+        let (Some(rep), Some(s)) = (self.rep.as_ref(), self.session.as_ref()) else { return };
+        if s.share.is_empty() {
+            return;
+        }
+        let text = rep.export_stamps();
+        self.ctx.data_mut(|d| d.insert_persisted(egui::Id::new(("collab_stamps", s.share.clone())), text));
+        self.stamps_at = mono_ms();
+    }
+
+    fn load_stamps(&mut self) {
+        let Some(share) = self.session.as_ref().map(|s| s.share.clone()).filter(|s| !s.is_empty()) else { return };
+        let text: Option<String> = self.ctx.data_mut(|d| d.get_persisted(egui::Id::new(("collab_stamps", share))));
+        if let (Some(t), Some(rep)) = (text, self.rep.as_mut()) {
+            rep.import_stamps(&t);
+        }
+    }
+
     pub fn stop(&mut self, notify: bool) {
+        self.save_stamps();
+        if let Some(s) = self.punch_stop.take() {
+            s.store(true, Ordering::Relaxed);
+        }
+        if let Some(pj) = self.punch_join.take() {
+            pj.stop.store(true, Ordering::Relaxed);
+        }
         for c in self.conns.values() {
             c.sink.send(&Msg::Bye);
             c.sink.close();
@@ -1468,6 +1580,7 @@ impl Collab {
         if let Some(rep) = self.rep.as_mut() {
             rep.adopt(ws, last_sync_ms.min(now_ms()));
         }
+        self.load_stamps();
         self.track = true;
         self.reused = true;
         self.prompted = false;
@@ -1534,6 +1647,17 @@ impl Collab {
 
     /// Runs the session. Returns `true` when the workspace changed because of a remote edit.
     pub fn poll(&mut self, ws: &mut crate::model::Workspace, ws_id: u64, current: Option<u64>, has_media: &dyn Fn(u64) -> bool) -> bool {
+        #[cfg(target_os = "android")]
+        {
+            let want = matches!(self.mode, Mode::Hosting | Mode::Joined);
+            if want != self.svc_on {
+                self.svc_on = want;
+                let text = if self.mode == Mode::Hosting { "Sharing a workspace — tap to open" } else { "Connected to a shared workspace — tap to open" };
+                crate::android::collab_service(want, text);
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        let _ = self.svc_on;
         if self.mode == Mode::Off && self.pending_wifi.is_none() && self.hs.0 == "idle" && !self.ui.dialog && self.inbox.q.lock().map_or(true, |q| q.is_empty()) {
             return false;
         }
@@ -1542,6 +1666,22 @@ impl Collab {
         self.poll_hotspot(now);
         if let Some(r) = &self.relay {
             r.tick();
+        }
+        if let Some(pj) = &self.punch_join {
+            match pj.rx.try_recv() {
+                Ok(true) => self.punch_join = None, // the link's `Open` event is already queued
+                Ok(false) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if let Some(pj) = self.punch_join.take() {
+                        if self.mode == Mode::Joining {
+                            self.start_relay(&pj.base, &pj.room);
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.ctx.request_repaint_after(std::time::Duration::from_millis(200)),
+            }
+        }
+        if matches!(self.mode, Mode::Hosting | Mode::Joined) && now - self.stamps_at > 120_000.0 {
+            self.save_stamps();
         }
         if self.resume.as_ref().map_or(false, |r| now >= r.next_at) && self.conns.is_empty() {
             if let Some(r) = self.resume.as_mut() {
@@ -1751,7 +1891,12 @@ impl Collab {
             let page = match op.key {
                 Key::Node(p, _) | Key::Edge(p, _) | Key::Page(p) | Key::Block(p, _) | Key::Comment(p, _) | Key::Annot(p, _) => p,
             };
-            ("Canvas", page, 0, ws.page(page).map(|p| p.title.clone()).unwrap_or_default(), String::new(), "(canvas change)".to_owned())
+            let what = match op.key {
+                Key::Edge(..) => "Edge",
+                Key::Annot(..) => "Mark",
+                _ => "Canvas",
+            };
+            (what, page, 0, ws.page(page).map(|p| p.title.clone()).unwrap_or_default(), String::new(), if op.e.val.is_some() { "(changed)" } else { "(removed)" }.to_owned())
         });
         let at = now_ms();
         if let Some(x) = self.suggestions.iter_mut().find(|x| x.who == who && x.op.key == op.key) {
@@ -1848,7 +1993,7 @@ impl Collab {
                         }
                         _ => Arc::new(Mutex::new(secure::Crypt::new())),
                     };
-                    let sink: Box<dyn Sink> = Box::new(secure::SecureSink { inner: sink, crypt: crypt.clone() });
+                    let sink: Box<dyn Sink> = Box::new(secure::SecureSink::new(sink, crypt.clone()));
                     self.conns.insert(conn, Conn { sink, addr, peer: None, role: Role::Editor, active: false, digest: HashMap::new(), backlog: VecDeque::new(), crypt, opened: now, last_rx: now, bucket: 600.0, code: String::new() });
                 }
                 Event::Closed { conn, why } => self.on_closed(conn, &why),
@@ -1879,11 +2024,11 @@ impl Collab {
         c.bucket -= 1.0;
         match msg {
             Msg::Hs { d } => self.on_hs(conn, &d),
-            Msg::Enc { d, more } => {
+            Msg::Bin { d, more } => {
                 let r = c.crypt.lock().map(|mut x| x.open(&d, more)).unwrap_or(Err(()));
                 match r {
                     Ok(Some(json)) => match serde_json::from_str::<Msg>(&json) {
-                        Ok(Msg::Hs { .. }) | Ok(Msg::Enc { .. }) | Err(_) => self.drop_conn(conn, "Protocol error"),
+                        Ok(Msg::Hs { .. }) | Ok(Msg::Enc { .. }) | Ok(Msg::Bin { .. }) | Err(_) => self.drop_conn(conn, "Protocol error"),
                         Ok(m) => self.on_msg(conn, m),
                     },
                     Ok(None) => {}
@@ -1921,6 +2066,7 @@ impl Collab {
             c.sink.raw(f);
         }
         if out.done {
+            c.sink.flush_pending();
             c.code = secure::short_code(&hash);
             if joining {
                 let hello = self.hello(&hash);

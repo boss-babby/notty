@@ -150,8 +150,16 @@ fn pump(mut ws: WebSocket<TcpStream>, conn: ConnId, inbox: Inbox, rx: Receiver<O
             Ok(Message::Text(t)) => {
                 last_rx = Instant::now();
                 last_busy = last_rx;
-                if let Ok(m) = serde_json::from_str::<Msg>(t.as_str()) {
+                if let Some(m) = Msg::from_text(t.as_str()) {
                     inbox.push(Event::Msg { conn, msg: m });
+                }
+            }
+            // protocol 5: encrypted frames are binary — [more flag][Noise message]
+            Ok(Message::Binary(b)) => {
+                last_rx = Instant::now();
+                last_busy = last_rx;
+                if let Some((flag, body)) = b.split_first() {
+                    inbox.push(Event::Msg { conn, msg: Msg::Bin { d: body.to_vec(), more: *flag != 0 } });
                 }
             }
             Ok(Message::Close(_)) => {
@@ -170,8 +178,19 @@ fn pump(mut ws: WebSocket<TcpStream>, conn: ConnId, inbox: Inbox, rx: Receiver<O
             match rx.try_recv() {
                 Ok(Some(m)) => {
                     last_busy = Instant::now();
-                    let Ok(s) = serde_json::to_string(&m) else { continue };
-                    if ws.send(Message::text(s)).is_err() {
+                    let frame = match m {
+                        Msg::Bin { d, more } => {
+                            let mut v = Vec::with_capacity(d.len() + 1);
+                            v.push(u8::from(more));
+                            v.extend_from_slice(&d);
+                            Message::binary(v)
+                        }
+                        m => {
+                            let Ok(s) = serde_json::to_string(&m) else { continue };
+                            Message::text(s)
+                        }
+                    };
+                    if ws.send(frame).is_err() {
                         why = "Connection lost";
                         break 'outer;
                     }

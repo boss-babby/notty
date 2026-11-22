@@ -175,6 +175,9 @@ fn hash_of(val: &Option<String>, pos: f64) -> u64 {
     h.wrapping_mul(0x100000001b3)
 }
 
+/// Upper bound of persisted stamps (a pathological workspace must not make the persisted string grow without limit).
+const MAX_STAMPS: usize = 400_000;
+
 pub struct Replica {
     pub clock: Clock,
     pub scope: Scope,
@@ -263,7 +266,7 @@ fn block_json(ws: &Workspace, pid: u64, bid: u64) -> Option<String> {
 pub fn describe(ws: &Workspace, op: &Op) -> Option<(&'static str, u64, u64, String, String, String)> {
     let (page, block) = match op.key {
         Key::Page(p) => (p, 0),
-        Key::Block(p, b) => (p, b),
+        Key::Block(p, b) | Key::Node(p, b) => (p, b),
         _ => return None,
     };
     let before = snapshot(ws, &op.key);
@@ -274,10 +277,37 @@ pub fn describe(ws: &Workspace, op: &Op) -> Option<(&'static str, u64, u64, Stri
             if plain.is_empty() { format!("[{:?}]", b.kind) } else if b.kind == crate::model::BlockKind::Todo { format!("[{}] {plain}", if b.checked { "x" } else { " " }) } else { plain }
         }),
         (Key::Page(..), Some(_)) => Some("(page title / settings)".to_owned()),
+        (Key::Node(..), Some(v)) => serde_json::from_str::<crate::canvas::Node>(v).ok().map(|n| node_line(&n)),
         _ => None,
     };
-    let what = if matches!(op.key, Key::Page(_)) { "Page" } else { "Block" };
+    let what = match op.key {
+        Key::Page(_) => "Page",
+        Key::Node(..) => "Card",
+        _ => "Block",
+    };
     Some((what, page, block, title, before.map(|b| b.2).unwrap_or_default(), after.unwrap_or_default()))
+}
+
+/// One readable line for a canvas card: kind, text and geometry (so a move or a resize shows up as a changed line in the review).
+fn node_line(n: &crate::canvas::Node) -> String {
+    let text: String = crate::rich::strip(&n.text).chars().take(80).collect();
+    let text = text.replace('\n', " ");
+    let mut s = format!("{:?}", n.kind);
+    if !text.is_empty() {
+        s.push_str(&format!(" “{text}”"));
+    } else if !n.url.is_empty() {
+        s.push_str(&format!(" {}", n.url.chars().take(48).collect::<String>()));
+    }
+    s.push_str(&format!(" · at {:.0}, {:.0} · {:.0}×{:.0}", n.x, n.y, n.w, n.h));
+    if n.color != 0 {
+        s.push_str(&format!(" · colour {}", n.color));
+    }
+    s
+}
+
+fn node_json(ws: &Workspace, pid: u64, nid: u64) -> Option<String> {
+    let n = ws.page(pid)?.canvas.as_ref()?.nodes.iter().find(|n| n.id == nid)?;
+    serde_json::to_string(n).ok().filter(|s| s.len() <= 16 * 1024)
 }
 
 fn snapshot(ws: &Workspace, key: &Key) -> Option<(&'static str, String, String)> {
@@ -289,6 +319,11 @@ fn snapshot(ws: &Workspace, key: &Key) -> Option<(&'static str, String, String)>
             let plain = crate::rich::strip(&b.text);
             let txt = if plain.is_empty() { format!("[{:?}]", b.kind) } else if b.kind == crate::model::BlockKind::Todo { format!("[{}] {plain}", if b.checked { "x" } else { " " }) } else { plain };
             Some(("Block", p.title.clone(), txt))
+        }
+        Key::Node(pid, nid) => {
+            let p = ws.page(pid)?;
+            let n = p.canvas.as_ref()?.nodes.iter().find(|n| n.id == nid)?;
+            Some(("Card", p.title.clone(), node_line(n)))
         }
         Key::Comment(pid, cid) => {
             let c = ws.comments.get(&pid)?.iter().find(|c| c.id == cid)?;
@@ -588,6 +623,55 @@ impl Replica {
         self.quiet = false;
     }
 
+    /// Compact text snapshot of the clock of every live entity that has a real stamp (one line each: `kind a b t r content-hash`, hex).
+    /// Persisted next to the workspace by the session, so a restart does not fall back to page granularity ([`Self::import_stamps`]).
+    pub fn export_stamps(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(self.cells.len().min(MAX_STAMPS) * 40);
+        for (k, c) in self.cells.iter().filter(|(_, c)| !c.dead && c.hlc.t != 0).take(MAX_STAMPS) {
+            let (tag, a, b) = match *k {
+                Key::Page(a) => ('p', a, 0),
+                Key::Block(a, b) => ('b', a, b),
+                Key::Node(a, b) => ('n', a, b),
+                Key::Edge(a, b) => ('e', a, b),
+                Key::Annot(a, b) => ('a', a, b),
+                Key::Comment(a, b) => ('c', a, b),
+            };
+            let _ = writeln!(out, "{tag} {a:x} {b:x} {:x} {:x} {:x}", c.hlc.t, c.hlc.r, c.chash);
+        }
+        out
+    }
+
+    /// Gives entities back the exact clock they had when [`Self::export_stamps`] ran — but only those whose *content* is unchanged
+    /// since (an entity edited while the app was closed keeps the stamp of the page edit time it got from [`Self::adopt`]).
+    /// A stamp is never allowed to lie in the future of the adoption time. Returns how many stamps were restored.
+    pub fn import_stamps(&mut self, text: &str) -> usize {
+        let max_t = (self.cap << 16) | 0xffff;
+        let mut n = 0;
+        for line in text.lines().take(MAX_STAMPS) {
+            let mut it = line.split(' ');
+            let (Some(tag), Some(a), Some(b), Some(t), Some(r), Some(h)) = (it.next(), it.next(), it.next(), it.next(), it.next(), it.next()) else { continue };
+            let hx = |x: &str| u64::from_str_radix(x, 16).ok();
+            let (Some(a), Some(b), Some(t), Some(r), Some(h)) = (hx(a), hx(b), hx(t), hx(r), hx(h)) else { continue };
+            let key = match tag {
+                "p" => Key::Page(a),
+                "b" => Key::Block(a, b),
+                "n" => Key::Node(a, b),
+                "e" => Key::Edge(a, b),
+                "a" => Key::Annot(a, b),
+                "c" => Key::Comment(a, b),
+                _ => continue,
+            };
+            if let Some(c) = self.cells.get_mut(&key) {
+                if !c.dead && c.chash == h && t <= max_t {
+                    c.hlc = Hlc { t, r: r as u32 };
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     /// One incremental scan: returns the operations for everything that changed since the last one. `budget_ms` bounds the work spent
     /// on pages other than the open one.
     pub fn tick(&mut self, ws: &mut Workspace, current: Option<u64>, now: u64, budget_ms: f64) -> Vec<Op> {
@@ -853,6 +937,11 @@ impl Replica {
         let before = snapshot(ws, &op.key);
         let raw = match op.key {
             Key::Block(p, b) => block_json(ws, p, b),
+            Key::Node(p, n) => node_json(ws, p, n),
+            Key::Page(p) if ws.page(p).is_some() => {
+                let root = self.roots.contains(&p);
+                meta_string(ws, p, root).filter(|s| s.len() <= 16 * 1024)
+            }
             _ => None,
         };
         let ok = self.apply_inner(ws, op, now, applied);
@@ -860,7 +949,7 @@ impl Replica {
             let after = snapshot(ws, &op.key);
             let (page, block) = match op.key {
                 Key::Page(p) => (p, 0),
-                Key::Block(p, b) | Key::Comment(p, b) => (p, b),
+                Key::Block(p, b) | Key::Comment(p, b) | Key::Node(p, b) => (p, b),
                 _ => (0, 0),
             };
             use super::changes::{Change, Kind};
@@ -1426,5 +1515,33 @@ mod tests {
         let mut ap = Applied::default();
         assert!(rb.apply(&mut b, &re, 3002, &mut ap));
         assert_eq!(b.page(pid).unwrap().blocks[0].text, original);
+    }
+
+    #[test]
+    fn stamps_survive_a_restart_per_block_and_edits_made_while_closed_fall_back_to_the_page() {
+        let mut a = Workspace::seed();
+        let pid = a.pages.iter().find(|p| p.blocks.len() > 2).map(|p| p.id).unwrap();
+        a.page_mut(pid).unwrap().updated = 900_000.0;
+        let mut ra = Replica::new(1, Scope::ALL);
+        ra.adopt(&mut a, 1_000_000);
+        a.page_mut(pid).unwrap().blocks[0].text = "edited later".into();
+        a.page_mut(pid).unwrap().updated = 1_200_000.0;
+        let _ = ra.tick(&mut a, Some(pid), 1_200_000, f64::MAX);
+        let saved = ra.export_stamps();
+        assert!(saved.lines().count() > 0);
+        // restart: a fresh replica adopts the same workspace — page granularity …
+        a.page_mut(pid).unwrap().blocks[2].text = "edited while closed".into();
+        let mut rb = Replica::new(1, Scope::ALL);
+        rb.adopt(&mut a, 2_000_000);
+        let stamp = |r: &Replica, bid: u64| r.digest().into_iter().find(|(k, _, _)| *k == Key::Block(pid, bid)).map(|(_, h, _)| h.t >> 16).unwrap();
+        let ids: Vec<u64> = a.page(pid).unwrap().blocks.iter().map(|b| b.id).collect();
+        assert_eq!(stamp(&rb, ids[1]), 1_200_000);
+        // … until the stamps are imported: the untouched block gets its real (older) clock back, the edited ones keep the page stamp
+        let restored = rb.import_stamps(&saved);
+        assert!(restored > 0);
+        assert_eq!(stamp(&rb, ids[1]), 900_000);
+        assert_eq!(stamp(&rb, ids[0]), 1_200_000);
+        assert_eq!(stamp(&rb, ids[2]), 1_200_000, "content changed while closed: no stale stamp");
+        assert_eq!(rb.import_stamps("garbage\nb zz 1 2 3 4"), 0);
     }
 }
