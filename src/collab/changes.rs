@@ -8,7 +8,7 @@
 //!   block are folded into its entry (first `before`, last `after`). Nothing is kept for untouched content.
 //! * [`diff`] is a small, allocation-conscious Myers-free LCS diff: common prefix/suffix are trimmed first (typing is almost always a
 //!   one-hunk edit), the middle is an LCS over lines (≤ 400) or words (≤ 600) and falls back to "replace" beyond that.
-use super::ui::{button, glyph_button};
+use super::ui::{button, glyph_button, COLORS};
 use super::*;
 use crate::lucide as l;
 use crate::theme::{body, bold, Palette};
@@ -37,6 +37,8 @@ pub struct Change {
     pub at: u64,
     pub before: String,
     pub after: String,
+    /// The block as it was before the change (JSON) — what "Revert" puts back.
+    pub raw: Option<String>,
 }
 
 #[derive(Default)]
@@ -307,14 +309,75 @@ fn ago(at: u64) -> String {
     }
 }
 
+/// A change a *suggesting* device made: held on the host until it is accepted or refused (see `Role::Suggester`).
+#[derive(Clone, Debug)]
+pub struct Suggestion {
+    pub conn: ConnId,
+    pub who: u32,
+    pub op: Op,
+    pub what: &'static str,
+    pub page: u64,
+    pub block: u64,
+    pub title: String,
+    pub before: String,
+    pub after: String,
+    pub at: u64,
+}
+
+impl Suggestion {
+    fn as_change(&self) -> Change {
+        let kind = if self.before.is_empty() && !self.after.is_empty() {
+            Kind::Added
+        } else if self.op.e.val.is_none() {
+            Kind::Removed
+        } else {
+            Kind::Edited
+        };
+        Change { kind, what: self.what, page: self.page, block: self.block, title: self.title.clone(), who: self.who, at: self.at, before: self.before.clone(), after: self.after.clone(), raw: None }
+    }
+}
+
+/// Puts a block back the way it was before `ch` (formatting included). Returns `false` when there is nothing to restore.
+pub fn revert(ws: &mut crate::model::Workspace, ch: &Change) -> bool {
+    if ch.what != "Block" {
+        return false;
+    }
+    let Some(p) = ws.page_mut(ch.page) else { return false };
+    let done = match ch.kind {
+        Kind::Added => {
+            let n = p.blocks.len();
+            p.blocks.retain(|b| b.id != ch.block);
+            n != p.blocks.len()
+        }
+        Kind::Edited | Kind::Removed => match ch.raw.as_deref().and_then(|r| serde_json::from_str::<crate::model::Block>(r).ok()) {
+            Some(b) => {
+                match p.blocks.iter_mut().find(|x| x.id == b.id) {
+                    Some(slot) => *slot = b,
+                    None => p.blocks.push(b),
+                }
+                true
+            }
+            None => false,
+        },
+    };
+    if done {
+        p.updated = now_ms() as f64;
+    }
+    done
+}
+
 /// The review window. Returns the page the user asked to open.
-pub fn window(ctx: &Context, pal: &Palette, c: &mut Collab) -> Option<u64> {
+pub fn window(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &mut crate::model::Workspace) -> Option<u64> {
     let screen = ctx.screen_rect();
     let w = 460.0_f32.min(screen.width() - 16.0);
     let mut open = None;
     let mut close = false;
     let mut clear = false;
-    let names: HashMap<u32, String> = c.roster.iter().map(|(p, _)| (p.id, p.name.clone())).collect();
+    let mut accept: Vec<usize> = vec![];
+    let mut refuse: Vec<usize> = vec![];
+    let mut revert_ix: Option<usize> = None;
+    let names: HashMap<u32, (String, u8)> = c.roster.iter().map(|(p, _)| (p.id, (p.name.clone(), p.color))).collect();
+    let who_of = |id: u32| names.get(&id).cloned().unwrap_or_else(|| ("Someone".to_owned(), (id % 8) as u8));
     egui::Window::new("changes_win")
         .id(Id::new("changes_win"))
         .title_bar(false)
@@ -331,33 +394,82 @@ pub fn window(ctx: &Context, pal: &Palette, c: &mut Collab) -> Option<u64> {
                     if glyph_button(ui, pal, l::X, "Close", None).clicked() {
                         close = true;
                     }
-                    if !c.changes.is_empty() && button(ui, pal, "Mark all reviewed", 3, 132.0).clicked() {
+                    if (!c.changes.is_empty() || !c.away.is_empty()) && button(ui, pal, "Mark all reviewed", 3, 132.0).clicked() {
                         clear = true;
                     }
                 });
             });
-            if c.changes.is_empty() {
+            if c.changes.is_empty() && c.suggestions.is_empty() && c.away.is_empty() {
                 ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new(
-                        "Nothing new. Edits other people make appear here as they happen — what was there (red) and what is there now (green).",
-                    )
-                    .font(body(12.5))
-                    .color(pal.muted),
+                    egui::RichText::new("Nothing new. Edits other people make appear here as they happen — what was there (red) and what is there now (green).")
+                        .font(body(12.5))
+                        .color(pal.muted),
                 );
                 return;
             }
-            let mut sub = format!("{} change{}", c.changes.list.len(), if c.changes.list.len() == 1 { "" } else { "s" });
-            if c.changes.other > 0 {
-                sub.push_str(&format!(" · {} on canvases / annotations", c.changes.other));
-            }
-            if c.changes.dropped > 0 {
-                sub.push_str(&format!(" · {} older not shown", c.changes.dropped));
-            }
-            ui.label(egui::RichText::new(sub).font(body(12.0)).color(pal.muted));
-            ui.add_space(4.0);
             let h = (screen.height() - 150.0).clamp(160.0, 560.0);
             egui::ScrollArea::vertical().id_salt("changes_list").max_height(h).auto_shrink([false, true]).show(ui, |ui| {
+                // 1. suggestions waiting for the host
+                if !c.suggestions.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{} suggestion{} waiting", c.suggestions.len(), if c.suggestions.len() == 1 { "" } else { "s" })).font(bold(12.5)).color(COLORS[3]));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if button(ui, pal, "Refuse all", 3, 84.0).clicked() {
+                                refuse.extend(0..c.suggestions.len());
+                            }
+                            if button(ui, pal, "Accept all", 1, 84.0).clicked() {
+                                accept.extend(0..c.suggestions.len());
+                            }
+                        });
+                    });
+                    for (ix, sg) in c.suggestions.iter().enumerate().take(60) {
+                        let (name, color) = who_of(sg.who);
+                        let col = COLORS[(color % 8) as usize];
+                        let y0 = ui.cursor().top();
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(l::CIRCLE).font(body(10.0)).color(col));
+                            ui.label(egui::RichText::new(format!("{name} suggests · {}", if sg.title.is_empty() { "Untitled" } else { &sg.title })).font(bold(11.5)).color(col));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if button(ui, pal, "Refuse", 3, 64.0).clicked() {
+                                    refuse.push(ix);
+                                }
+                                if button(ui, pal, "Accept", 1, 64.0).clicked() {
+                                    accept.push(ix);
+                                }
+                            });
+                        });
+                        paint_change(ui, pal, &sg.as_change());
+                        let x = ui.min_rect().left() - 5.0;
+                        ui.painter().line_segment([egui::pos2(x, y0), egui::pos2(x, ui.cursor().top())], egui::Stroke::new(2.5_f32, col));
+                        ui.add_space(6.0);
+                    }
+                    ui.separator();
+                }
+                // 2. what this device changed while it was away
+                if !c.away.is_empty() {
+                    ui.label(egui::RichText::new(format!("Edited on this device while you were away ({})", c.away.len())).font(bold(12.5)).color(pal.text));
+                    for (pid, title) in c.away.iter().take(40) {
+                        let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
+                        ui.painter().text(r.left_center(), Align2::LEFT_CENTER, format!("{}  {}", l::FILE_TEXT, if title.is_empty() { "Untitled" } else { title }), body(12.5), pal.muted);
+                        if resp.on_hover_text("Open this page").clicked() {
+                            open = Some(*pid);
+                        }
+                    }
+                    ui.separator();
+                }
+                if c.changes.is_empty() {
+                    return;
+                }
+                let mut sub = format!("{} change{}", c.changes.list.len(), if c.changes.list.len() == 1 { "" } else { "s" });
+                if c.changes.other > 0 {
+                    sub.push_str(&format!(" · {} on canvases / annotations", c.changes.other));
+                }
+                if c.changes.dropped > 0 {
+                    sub.push_str(&format!(" · {} older not shown", c.changes.dropped));
+                }
+                ui.label(egui::RichText::new(sub).font(body(12.0)).color(pal.muted));
+                ui.add_space(4.0);
                 // newest first, grouped by page
                 let mut order: Vec<usize> = (0..c.changes.list.len()).collect();
                 order.sort_by(|a, b| c.changes.list[*b].at.cmp(&c.changes.list[*a].at));
@@ -368,13 +480,7 @@ pub fn window(ctx: &Context, pal: &Palette, c: &mut Collab) -> Option<u64> {
                         last_page = ch.page;
                         ui.add_space(6.0);
                         let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 22.0), Sense::click());
-                        ui.painter().text(
-                            r.left_center(),
-                            Align2::LEFT_CENTER,
-                            format!("{}  {}", l::FILE_TEXT, if ch.title.is_empty() { "Untitled" } else { &ch.title }),
-                            bold(13.0),
-                            pal.text,
-                        );
+                        ui.painter().text(r.left_center(), Align2::LEFT_CENTER, format!("{}  {}", l::FILE_TEXT, if ch.title.is_empty() { "Untitled" } else { &ch.title }), bold(13.0), pal.text);
                         if resp.on_hover_text("Open this page").clicked() {
                             open = Some(ch.page);
                         }
@@ -384,18 +490,43 @@ pub fn window(ctx: &Context, pal: &Palette, c: &mut Collab) -> Option<u64> {
                         Kind::Edited => ("edited", Color32::from_rgb(235, 160, 40)),
                         Kind::Removed => ("removed", Color32::from_rgb(224, 82, 82)),
                     };
+                    let (name, color) = who_of(ch.who);
+                    let pcol = COLORS[(color % 8) as usize];
+                    let y0 = ui.cursor().top();
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(format!("{} {mark}", ch.what)).font(bold(11.5)).color(col));
-                        let who = names.get(&ch.who).cloned().unwrap_or_else(|| "Someone".into());
-                        ui.label(egui::RichText::new(format!("{who} · {}", ago(ch.at))).font(body(11.5)).color(pal.muted));
+                        ui.label(egui::RichText::new(l::CIRCLE).font(body(9.0)).color(pcol));
+                        ui.label(egui::RichText::new(format!("{name} · {}", ago(ch.at))).font(body(11.5)).color(pcol));
+                        let can = ch.what == "Block" && (ch.kind == Kind::Added || ch.raw.is_some());
+                        if can {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if button(ui, pal, "Revert", 0, 62.0).on_hover_text("Put this block back the way it was").clicked() {
+                                    revert_ix = Some(ix);
+                                }
+                            });
+                        }
                     });
                     paint_change(ui, pal, ch);
+                    let x = ui.min_rect().left() - 5.0;
+                    ui.painter().line_segment([egui::pos2(x, y0), egui::pos2(x, ui.cursor().top())], egui::Stroke::new(2.5_f32, pcol));
                     ui.add_space(4.0);
                 }
             });
         });
+    if let Some(ix) = revert_ix {
+        if ix < c.changes.list.len() {
+            let ch = c.changes.list.remove(ix);
+            if revert(ws, &ch) {
+                c.toast("Change reverted");
+            }
+        }
+    }
+    if !accept.is_empty() || !refuse.is_empty() {
+        c.resolve_suggestions(&accept, &refuse);
+    }
     if clear {
         c.changes.clear();
+        c.away.clear();
     }
     if close {
         c.ui.changes = false;
@@ -426,7 +557,7 @@ mod tests {
     #[test]
     fn log_folds_edits_of_one_block() {
         let mk =
-            |k, b: &str, a: &str| Change { kind: k, what: "Block", page: 1, block: 7, title: "P".into(), who: 2, at: 1, before: b.into(), after: a.into() };
+            |k, b: &str, a: &str| Change { kind: k, what: "Block", page: 1, block: 7, title: "P".into(), who: 2, at: 1, before: b.into(), after: a.into(), raw: None };
         let mut log = Log::default();
         log.push(mk(Kind::Edited, "a", "ab"));
         log.push(mk(Kind::Edited, "ab", "abc"));
@@ -437,5 +568,21 @@ mod tests {
         log.push(mk(Kind::Added, "", "x"));
         log.push(mk(Kind::Removed, "x", ""));
         assert!(log.list.is_empty());
+    }
+
+    #[test]
+    fn revert_restores_the_block_with_its_formatting_and_removes_added_ones() {
+        let mut ws = crate::model::Workspace::seed();
+        let pid = ws.pages.iter().find(|p| !p.blocks.is_empty()).map(|p| p.id).unwrap();
+        let before = ws.page(pid).unwrap().blocks[0].clone();
+        let raw = serde_json::to_string(&before).unwrap();
+        ws.page_mut(pid).unwrap().blocks[0].text = "someone else's words".into();
+        let ch = Change { kind: Kind::Edited, what: "Block", page: pid, block: before.id, title: String::new(), who: 2, at: 1, before: String::new(), after: String::new(), raw: Some(raw) };
+        assert!(revert(&mut ws, &ch));
+        assert_eq!(serde_json::to_string(&ws.page(pid).unwrap().blocks[0]).unwrap(), serde_json::to_string(&before).unwrap());
+        let added = Change { kind: Kind::Added, raw: None, ..ch.clone() };
+        assert!(revert(&mut ws, &added));
+        assert!(ws.page(pid).unwrap().blocks.iter().all(|b| b.id != before.id));
+        assert!(!revert(&mut ws, &Change { what: "Comment", ..ch }));
     }
 }

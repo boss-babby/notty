@@ -14,6 +14,8 @@ pub mod changes;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod net;
+#[cfg(not(target_arch = "wasm32"))]
+mod upnp;
 #[cfg(target_arch = "wasm32")]
 mod webnet;
 
@@ -24,8 +26,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Protocol 2: every frame is end-to-end encrypted (`secure.rs`); the share token is proven, never sent.
-/// Protocol 3: `Key::Comment` entities and `Entry::base` (merge bases). Older peers are refused with a clear message.
-pub const PROTO: u32 = 3;
+/// Protocol 3: `Key::Comment` entities and `Entry::base` (merge bases).
+/// Protocol 4: `Role::Suggester`, `Presence::{typing, len}`. Older peers are refused with a clear message.
+pub const PROTO: u32 = 4;
 /// Tombstones are forgotten after this long. A reconnect gives up after ~90 s, so no device can come back with an older view.
 const TOMBSTONE_GRACE_MS: u64 = 10 * 60 * 1000;
 
@@ -117,6 +120,8 @@ pub struct PeerInfo {
 pub enum Role {
     Editor,
     Viewer,
+    /// Can edit, but the host sees every change as a suggestion (accept / refuse in the Changes window) before it takes effect.
+    Suggester,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
@@ -175,6 +180,17 @@ pub struct Presence {
     /// A PDF mark being drawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<LiveDraft>,
+    /// Typed in the last two seconds ("typing…" badge).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub typing: bool,
+    /// Length (characters) of the text of `block` when `caret` was taken: lets the receiver line the caret up with text that has not
+    /// fully arrived yet (0 = unknown).
+    #[serde(default, skip_serializing_if = "is_zero32")]
+    pub len: u32,
+}
+
+fn is_zero32(x: &u32) -> bool {
+    *x == 0
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -358,6 +374,28 @@ pub struct Ui {
     /// "Changes" review window.
     pub changes: bool,
     pub comment_pick: usize,
+    pub hs_poll: f64,
+}
+
+/// Direct internet access to this host (UPnP port mapping + the public address). See `upnp.rs`.
+#[derive(Default, Clone, Debug)]
+pub struct Wan {
+    /// 0 off, 1 looking, 2 ready, 3 failed.
+    pub state: u8,
+    pub ip: String,
+    pub port: u16,
+    /// The router forwarded the port by itself.
+    pub mapped: bool,
+    pub note: String,
+}
+
+/// A link that carries the credentials of a nearby phone's hotspot: connect to that Wi-Fi first, then dial.
+struct PendingWifi {
+    ssid: String,
+    hosts: String,
+    token: String,
+    since: f64,
+    next_check: f64,
 }
 
 pub struct Collab {
@@ -425,6 +463,19 @@ pub struct Collab {
     pub keep_copy: bool,
     /// Host option: let a device that knows the share code in without asking. Off by default — every new device needs approval.
     pub auto_admit: bool,
+    /// Changes of *suggesting* devices, held until the host decides.
+    pub suggestions: Vec<changes::Suggestion>,
+    held_in: VecDeque<(ConnId, Op)>,
+    reassert: Vec<(Key, Hlc)>,
+    /// Pages edited on this device while it was away from the host (listed in the Changes window).
+    pub away: Vec<(u64, String)>,
+    /// Host option: reachable from the internet (UPnP + public address).
+    pub internet: bool,
+    pub wan: Arc<Mutex<Wan>>,
+    wan_gw: Arc<Mutex<Option<(String, u16)>>>,
+    /// Nearby hotspot of this phone: (state, ssid, passphrase) as last reported by Android.
+    pub hs: (String, String, String),
+    pending_wifi: Option<PendingWifi>,
     #[cfg(not(target_arch = "wasm32"))]
     net: net::Net,
     relay: Option<relay::Relay>,
@@ -492,6 +543,115 @@ pub fn device_name() -> String {
     "Web browser".into()
 }
 
+/// Seals / opens the device key with the Android Keystore (other platforms: the key stays in the app-private store as before).
+fn vault_seal(b: &[u8]) -> Option<Vec<u8>> {
+    #[cfg(target_os = "android")]
+    {
+        crate::android::vault_seal(b)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = b;
+        None
+    }
+}
+
+fn vault_open(b: &[u8]) -> Option<Vec<u8>> {
+    #[cfg(target_os = "android")]
+    {
+        crate::android::vault_open(b)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = b;
+        None
+    }
+}
+
+/// The device key is created once and kept (approve a device once, it is recognised next time). Stored as `ks1:<hex>` when it is wrapped by
+/// the Android Keystore (the raw key never touches storage there), as plain hex elsewhere; an older plain key is wrapped on first start.
+fn load_device_key(ctx: &egui::Context) -> Option<Arc<secure::Keys>> {
+    let id = egui::Id::new("collab_key");
+    let stored = ctx.data_mut(|d| d.get_persisted::<String>(id));
+    let saved = stored.as_deref().and_then(|s| match s.strip_prefix("ks1:") {
+        Some(w) => unhex(w).and_then(|b| vault_open(&b)).and_then(secure::Keys::from_private),
+        None => unhex(s).and_then(secure::Keys::from_private),
+    });
+    let remember = |k: &secure::Keys| {
+        let v = match vault_seal(k.private_bytes()) {
+            Some(w) => format!("ks1:{}", hex(&w)),
+            None => hex(k.private_bytes()),
+        };
+        ctx.data_mut(|d| d.insert_persisted(id, v));
+    };
+    match saved {
+        Some(k) => {
+            if stored.as_deref().is_some_and(|s| !s.starts_with("ks1:")) {
+                remember(&k); // upgrade a plain key to a wrapped one
+            }
+            Some(Arc::new(k))
+        }
+        None => {
+            let k = secure::gen_keys()?;
+            remember(&k);
+            Some(Arc::new(k))
+        }
+    }
+}
+
+fn with_port(a: &str) -> String {
+    if a.starts_with('[') {
+        if a.contains("]:") { a.to_owned() } else { format!("{a}:{PORT}") }
+    } else if a.contains(':') {
+        a.to_owned()
+    } else {
+        format!("{a}:{PORT}")
+    }
+}
+
+/// Percent-encoding for the values inside a join link (SSIDs and passphrases may contain anything).
+pub fn pct_encode(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            o.push(b as char);
+        } else {
+            o.push_str(&format!("%{b:02X}"));
+        }
+    }
+    o
+}
+
+pub fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// What the internet sees of this device: asks the relay site (`/api/collab/ip`). Native only; blocks (runs on a worker thread).
+#[cfg(not(target_arch = "wasm32"))]
+fn fetch_public_ip(site: &str) -> Option<String> {
+    let r = ehttp::fetch_blocking(&ehttp::Request::get(format!("{site}/api/collab/ip"))).ok()?;
+    if !r.ok {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&r.bytes).ok()?;
+    let ip = v.get("ip")?.as_str()?.trim().to_owned();
+    (ip.parse::<std::net::IpAddr>().is_ok() && !ip.is_empty()).then_some(ip)
+}
+
 /// Printable, bounded text from the network (names that end up in menus and toasts).
 fn clean(s: &str, max: usize) -> String {
     s.chars().filter(|c| !c.is_control()).take(max).collect::<String>().trim().to_owned()
@@ -530,21 +690,19 @@ impl Collab {
             stats: Stats::default(),
             last_reap: 0.0,
             joining_since: 0.0,
-            keys: {
-                // the device key is created once and kept (approve a device once, it is recognised next time)
-                let id = egui::Id::new("collab_key");
-                let saved = ctx.data_mut(|d| d.get_persisted::<String>(id)).and_then(|h| unhex(&h)).and_then(secure::Keys::from_private);
-                let k = saved.or_else(|| {
-                    let k = secure::gen_keys()?;
-                    let h = hex(k.private_bytes());
-                    ctx.data_mut(|d| d.insert_persisted(id, h));
-                    Some(k)
-                });
-                k.map(Arc::new)
-            },
+            keys: load_device_key(ctx),
             trusted: ctx.data_mut(|d| d.get_persisted::<Vec<(String, String, bool)>>(egui::Id::new("collab_trusted"))).unwrap_or_default().into_iter().map(|(k, n, v)| (k, (n, v))).collect(),
             last_gc: 0.0,
             relay_init: None,
+            suggestions: vec![],
+            held_in: VecDeque::new(),
+            reassert: vec![],
+            away: vec![],
+            internet: false,
+            wan: Arc::new(Mutex::new(Wan::default())),
+            wan_gw: Arc::new(Mutex::new(None)),
+            hs: ("idle".into(), String::new(), String::new()),
+            pending_wifi: None,
             fails: HashMap::new(),
             target: None,
             resume: None,
@@ -664,7 +822,7 @@ impl Collab {
         {
             match self.net.listen(&self.inbox) {
                 Ok(port) => {
-                    self.addr_hint = net::local_addrs().into_iter().map(|ip| format!("{ip}:{port}")).collect();
+                    self.addr_hint = Self::local_ips().into_iter().map(|ip| format!("{ip}:{port}")).collect();
                     let b = Beacon { v: PROTO, id: self.me.id, device: self.me.device.clone(), name: self.me.name.clone(), platform: self.me.platform.clone(), port, what: Self::scope_label(scope).into(), title, people: 1 };
                     if let Ok(mut g) = self.beacon.lock() {
                         *g = Some(b);
@@ -686,6 +844,23 @@ impl Collab {
             self.enable_relay(base);
         }
         self.next_scan = 0.0;
+        if self.internet {
+            let site = self.ui.relay_url.clone();
+            self.set_internet(true, &site);
+        }
+    }
+
+    /// Addresses of this device that peers on the same network can dial (every interface on Android, the default routes elsewhere).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn local_ips() -> Vec<String> {
+        let mut v = net::local_addrs();
+        #[cfg(target_os = "android")]
+        for ip in crate::android::local_ips() {
+            if !v.contains(&ip) {
+                v.push(ip);
+            }
+        }
+        v
     }
 
     /// Stable identifier of "this workspace / page shared from this device" (one-way hash of the device key — it reveals nothing).
@@ -717,8 +892,185 @@ impl Collab {
     }
 
     pub fn lan_link(&self) -> Option<String> {
-        let a = self.addr_hint.first()?;
-        Some(format!("lumen://join?h={}&t={}", a, self.token))
+        if self.addr_hint.is_empty() {
+            return None;
+        }
+        Some(format!("lumen://join?h={}&t={}", self.addr_hint.join(","), self.token))
+    }
+
+    /// The address a device on another network dials (only while *Internet access* is on and ready).
+    pub fn wan_address(&self) -> Option<String> {
+        if !self.internet {
+            return None;
+        }
+        let w = self.wan.lock().ok()?;
+        if w.state != 2 || w.ip.is_empty() {
+            return None;
+        }
+        Some(if w.ip.contains(':') { format!("[{}]:{}", w.ip, w.port) } else { format!("{}:{}", w.ip, w.port) })
+    }
+
+    /// One link with every way to reach this host: LAN addresses, the public address and — when a nearby hotspot is up — its Wi-Fi
+    /// credentials. The joiner dials all addresses at once and keeps the first that answers.
+    pub fn direct_link(&self) -> Option<String> {
+        let mut hosts = self.addr_hint.clone();
+        if let Some(w) = self.wan_address() {
+            hosts.push(w);
+        }
+        if hosts.is_empty() {
+            return None;
+        }
+        let mut s = format!("lumen://join?h={}&t={}", hosts.join(","), self.token);
+        if self.hs.0 == "up" && !self.hs.1.is_empty() {
+            s.push_str(&format!("&ws={}&wp={}", pct_encode(&self.hs.1), pct_encode(&self.hs.2)));
+        }
+        Some(s)
+    }
+
+    /// Opt in / out of direct internet access. Maps the port on the router (UPnP) and finds the public address.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_internet(&mut self, on: bool, site: &str) {
+        self.internet = on;
+        if !on {
+            self.release_wan();
+            return;
+        }
+        if self.mode != Mode::Hosting || self.net.port == 0 {
+            return;
+        }
+        let port = self.net.port;
+        let (wan, gw, ctx) = (self.wan.clone(), self.wan_gw.clone(), self.ctx.clone());
+        let site = site.trim().trim_end_matches('/').to_owned();
+        if let Ok(mut w) = wan.lock() {
+            *w = Wan { state: 1, port, ..Default::default() };
+        }
+        let _ = std::thread::Builder::new().name("lumen-collab-wan".into()).spawn(move || {
+            let mut w = Wan { state: 2, port, ..Default::default() };
+            let mut router_ip = None;
+            match upnp::discover() {
+                Some(g) => match g.add(port, port) {
+                    Ok(ext) => {
+                        w.port = ext;
+                        w.mapped = true;
+                        router_ip = g.external_ip();
+                        if let Ok(mut x) = gw.lock() {
+                            *x = Some((format!("{}|{}|{}", g.host, g.path, g.service), ext));
+                        }
+                    }
+                    Err(e) => w.note = format!("Your router refused automatic forwarding ({e}). Forward TCP port {port} to this device in the router settings."),
+                },
+                None => w.note = format!("No UPnP router found. Forward TCP port {port} to this device in the router settings, or use the link relay."),
+            }
+            // what the internet sees (the site answers with the caller's address); the router's own answer wins when it is public
+            let seen = if site.is_empty() { None } else { fetch_public_ip(&site) };
+            let ip = match (&router_ip, &seen) {
+                (Some(r), _) if !upnp::is_private_v4(r) => r.clone(),
+                (_, Some(s)) => s.clone(),
+                _ => String::new(),
+            };
+            if router_ip.as_deref().is_some_and(upnp::is_private_v4) {
+                // the router itself sits behind another NAT (carrier-grade NAT, double router): nobody outside can dial in
+                w.mapped = false;
+                w.note = "Your internet provider shares one public address between customers (CGNAT) — a direct connection is not possible here. Use the link relay instead.".into();
+                w.state = 3;
+            } else if ip.is_empty() {
+                w.state = 3;
+                if w.note.is_empty() {
+                    w.note = "Could not find out the public address (offline, or no relay site is set).".into();
+                }
+            } else {
+                w.ip = ip;
+            }
+            if let Ok(mut x) = wan.lock() {
+                *x = w;
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn set_internet(&mut self, on: bool, _site: &str) {
+        self.internet = on;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn release_wan(&mut self) {
+        if let Ok(mut w) = self.wan.lock() {
+            *w = Wan::default();
+        }
+        let taken = self.wan_gw.lock().ok().and_then(|mut g| g.take());
+        if let Some((desc, port)) = taken {
+            let mut it = desc.splitn(3, '|');
+            if let (Some(host), Some(path), Some(service)) = (it.next(), it.next(), it.next()) {
+                let g = upnp::Gateway { host: host.to_owned(), path: path.to_owned(), service: service.to_owned() };
+                let _ = std::thread::Builder::new().name("lumen-collab-unmap".into()).spawn(move || g.remove(port));
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn release_wan(&mut self) {}
+
+    /// Starts / stops this phone's private hotspot (Android only; elsewhere a no-op).
+    pub fn set_hotspot(&mut self, on: bool) {
+        #[cfg(target_os = "android")]
+        {
+            if on {
+                crate::android::hotspot_start();
+            } else {
+                crate::android::hotspot_stop();
+                self.hs = ("idle".into(), String::new(), String::new());
+            }
+        }
+        let _ = on;
+    }
+
+    pub fn hotspot_supported() -> bool {
+        cfg!(target_os = "android")
+    }
+
+    /// Refreshes the hotspot state (cheap JNI call, at most 3 times a second while it matters).
+    fn poll_hotspot(&mut self, now: f64) {
+        #[cfg(target_os = "android")]
+        if (self.hs.0 != "idle" || self.ui.dialog) && now - self.ui.hs_poll > 330.0 {
+            self.ui.hs_poll = now;
+            let st = crate::android::hotspot_state();
+            if st != self.hs {
+                let came_up = st.0 == "up" && self.hs.0 != "up";
+                self.hs = st;
+                if came_up && self.mode == Mode::Hosting {
+                    let port = self.addr_hint.first().and_then(|a| a.rsplit_once(':')).map_or(PORT, |(_, p)| p.parse().unwrap_or(PORT));
+                    self.addr_hint = Self::local_ips().into_iter().map(|ip| format!("{ip}:{port}")).collect();
+                    self.ui.qr_cache = None;
+                }
+                self.ctx.request_repaint();
+            }
+        }
+        let _ = now;
+    }
+
+    /// Wi-Fi join that precedes a dial (link with `ws` / `wp`): waits for Android, then dials.
+    fn poll_wifi(&mut self, now: f64) {
+        let Some(p) = self.pending_wifi.as_mut() else { return };
+        if now < p.next_check {
+            return;
+        }
+        p.next_check = now + 300.0;
+        let timed_out = now - p.since > 55_000.0;
+        #[cfg(target_os = "android")]
+        let (state, msg) = crate::android::wifi_state();
+        #[cfg(not(target_os = "android"))]
+        let (state, msg) = ("failed".to_owned(), String::new());
+        if state == "up" {
+            if let Some(p) = self.pending_wifi.take() {
+                self.join_addr(&p.hosts, &p.token);
+            }
+        } else if state == "failed" || timed_out {
+            let ssid = self.pending_wifi.take().map(|p| p.ssid).unwrap_or_default();
+            self.mode = Mode::Off;
+            self.last_error = Some(if msg.is_empty() { format!("Could not join the Wi-Fi “{ssid}”") } else { msg });
+        }
+        self.ctx.request_repaint_after(std::time::Duration::from_millis(300));
     }
 
     /// Joins by whatever the user typed / scanned: `ip:port`, `lumen://join?h=…&t=…`, or a link with `join=ROOM&t=TOKEN`.
@@ -726,14 +1078,18 @@ impl Collab {
         let t = text.trim();
         let q = |key: &str| -> Option<String> {
             let after = t.split_once('?')?.1;
-            after.split('&').find_map(|kv| kv.strip_prefix(&format!("{key}=")).map(|v| v.to_owned()))
+            after.split('&').find_map(|kv| kv.strip_prefix(&format!("{key}=")).map(pct_decode))
         };
         if let Some(room) = q("join") {
             let token = q("t").unwrap_or_default();
             let base = if t.starts_with("http") { t.split("/app").next().unwrap_or(relay_base).to_owned() } else { relay_base.to_owned() };
             self.join_relay(&base, &room, &token);
         } else if let Some(h) = q("h") {
-            self.join_addr(&h, &q("t").unwrap_or_default());
+            let token = q("t").unwrap_or_default();
+            match (q("ws"), q("wp")) {
+                (Some(ssid), pass) if cfg!(target_os = "android") && !ssid.is_empty() => self.join_via_wifi(&ssid, &pass.unwrap_or_default(), &h, &token),
+                _ => self.join_addr(&h, &token),
+            }
         } else if t.contains(':') || t.contains('.') {
             self.join_addr(t, "");
         } else if t.len() >= 4 {
@@ -741,11 +1097,26 @@ impl Collab {
         }
     }
 
+    /// `addr` may list several candidates separated by commas (LAN, public, hotspot): all are tried at once.
     pub fn join_addr(&mut self, addr: &str, token: &str) {
         self.stop(false);
-        let addr = if addr.contains(':') { addr.to_owned() } else { format!("{addr}:{PORT}") };
+        let addr = addr.split(',').map(str::trim).filter(|a| !a.is_empty()).take(8).map(with_port).collect::<Vec<_>>().join(",");
         self.target = Some(Target::Addr { addr, token: token.to_owned() });
         self.dial();
+    }
+
+    /// A link made by a phone that opened its private hotspot: join that Wi-Fi (Android asks the user once), then dial.
+    pub fn join_via_wifi(&mut self, ssid: &str, pass: &str, hosts: &str, token: &str) {
+        self.stop(false);
+        #[cfg(target_os = "android")]
+        crate::android::wifi_join(ssid, pass);
+        let _ = pass;
+        self.mode = Mode::Joining;
+        self.joining_since = mono_ms();
+        self.last_error = None;
+        let now = mono_ms();
+        self.pending_wifi = Some(PendingWifi { ssid: ssid.to_owned(), hosts: hosts.to_owned(), token: token.to_owned(), since: now, next_check: now + 500.0 });
+        self.ctx.request_repaint_after(std::time::Duration::from_millis(300));
     }
 
     pub fn join_relay(&mut self, base: &str, room: &str, token: &str) {
@@ -766,7 +1137,7 @@ impl Collab {
                 #[cfg(not(target_arch = "wasm32"))]
                 self.net.connect(&addr, &self.inbox);
                 #[cfg(target_arch = "wasm32")]
-                webnet::connect(&addr, &self.inbox);
+                webnet::connect(addr.split(',').next().unwrap_or(&addr), &self.inbox);
             }
             Target::Relay { base, room, token } => {
                 self.token = token;
@@ -835,7 +1206,16 @@ impl Collab {
             c.sink.send(&Msg::Bye);
             c.sink.close();
         }
-        let _ = notify;
+        if notify {
+            self.release_wan();
+            self.set_hotspot(false);
+            self.pending_wifi = None;
+            #[cfg(target_os = "android")]
+            crate::android::wifi_leave();
+        }
+        self.suggestions.clear();
+        self.held_in.clear();
+        self.reassert.clear();
         self.conns.clear();
         self.relay_init = None;
         #[cfg(not(target_arch = "wasm32"))]
@@ -910,6 +1290,9 @@ impl Collab {
     }
 
     fn remember_device(&mut self, conn: ConnId, role: Role) {
+        if role == Role::Suggester {
+            return; // a suggester is asked again next time
+        }
         let found = self.conns.get(&conn).and_then(|c| {
             let name = c.peer.as_ref()?.name.clone();
             let key = c.crypt.lock().ok()?.remote.clone();
@@ -952,7 +1335,7 @@ impl Collab {
         let mut dirty = false;
         for k in keys.iter().filter(|k| !k.is_empty()) {
             if let Some(t) = self.trusted.get_mut(&hex(k)) {
-                t.1 = role == Role::Viewer;
+                t.1 = role != Role::Editor;
                 dirty = true;
             }
         }
@@ -960,7 +1343,7 @@ impl Collab {
             self.save_trusted();
         }
         for k in keys.into_iter().filter(|k| !k.is_empty()) {
-            if role == Role::Viewer {
+            if role != Role::Editor {
                 self.demoted.insert(k);
             } else {
                 self.demoted.remove(&k);
@@ -1081,6 +1464,7 @@ impl Collab {
         self.next_scan = 0.0;
         self.bound_at = mono_ms();
         self.last_op_at = self.bound_at;
+        self.away = ws.pages.iter().filter(|p| !p.trashed && !p.row && p.updated.is_finite() && p.updated > last_sync_ms as f64 + 1500.0).map(|p| (p.id, p.title.clone())).take(200).collect();
         if let Some(rep) = self.rep.as_mut() {
             rep.adopt(ws, last_sync_ms.min(now_ms()));
         }
@@ -1095,7 +1479,7 @@ impl Collab {
 
     /// Opens the review window and tells the user (first time after a re-join).
     fn announce_changes(&mut self) {
-        let n = self.changes.len();
+        let n = self.changes.len() + self.away.len();
         if n > 0 {
             self.ui.changes = true;
             self.toast(format!("{n} change{} since you were last here", if n == 1 { "" } else { "s" }));
@@ -1132,6 +1516,8 @@ impl Collab {
         self.local.cur = cur;
         self.local.caret = caret_state().filter(|c| Some(c.0) == block).map(|c| (c.1, c.2));
         self.local.draft = draft_state();
+        self.local.typing = typing_active();
+        self.local.len = if self.local.caret.is_some() { caret_len() } else { 0 };
     }
 
     pub fn set_reading(&mut self, pdf: Option<(u64, u32)>) {
@@ -1148,10 +1534,12 @@ impl Collab {
 
     /// Runs the session. Returns `true` when the workspace changed because of a remote edit.
     pub fn poll(&mut self, ws: &mut crate::model::Workspace, ws_id: u64, current: Option<u64>, has_media: &dyn Fn(u64) -> bool) -> bool {
-        if self.mode == Mode::Off && self.inbox.q.lock().map_or(true, |q| q.is_empty()) {
+        if self.mode == Mode::Off && self.pending_wifi.is_none() && self.hs.0 == "idle" && !self.ui.dialog && self.inbox.q.lock().map_or(true, |q| q.is_empty()) {
             return false;
         }
         let now = mono_ms();
+        self.poll_wifi(now);
+        self.poll_hotspot(now);
         if let Some(r) = &self.relay {
             r.tick();
         }
@@ -1183,6 +1571,24 @@ impl Collab {
                 self.handle_ready(ws, conn, msg);
                 if mono_ms() - t_start > 3.0 {
                     break;
+                }
+            }
+            // suggestions of suggesting devices: described (what was there / what is proposed) and held for the host
+            while let Some((conn, op)) = self.held_in.pop_front() {
+                self.hold_suggestion(ws, conn, op);
+            }
+            if !self.reassert.is_empty() {
+                let list = std::mem::take(&mut self.reassert);
+                let mut ops = vec![];
+                if let Some(rep) = self.rep.as_mut() {
+                    for (key, min) in list {
+                        ops.extend(rep.reassert(ws, key, min, now_ms()));
+                    }
+                }
+                for c in self.conns.values_mut().filter(|c| c.active) {
+                    for part in chunked(ops.clone(), 120) {
+                        c.backlog.push_back(Msg::Ops { ops: part });
+                    }
                 }
             }
             // remote operations, bounded per frame so a big initial sync never freezes the UI
@@ -1254,9 +1660,13 @@ impl Collab {
             }
             // local changes
             let mut hot: Vec<Op> = vec![];
-            if self.role == Role::Editor {
+            if self.role != Role::Viewer {
                 if let Some(r) = self.rep.as_mut() {
                     hot = r.tick_hot(ws, now_ms());
+                    // the block being typed in leaves in the same frame (keeps the other side's text and caret in step)
+                    if let (Some(cur), Some(b)) = (current, self.local.block) {
+                        hot.extend(r.tick_block(ws, cur, b, now_ms()));
+                    }
                 }
             }
             if !hot.is_empty() {
@@ -1267,7 +1677,7 @@ impl Collab {
                     }
                 }
             }
-            if now >= self.next_scan && self.role == Role::Editor {
+            if now >= self.next_scan && self.role != Role::Viewer {
                 let cost0 = mono_ms();
                 let ops = self.rep.as_mut().map(|r| r.tick(ws, current, now_ms(), 2.5)).unwrap_or_default();
                 let cost = mono_ms() - cost0;
@@ -1329,6 +1739,51 @@ impl Collab {
             self.ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
         changed
+    }
+
+    /// Describes one operation of a suggesting device and keeps it until the host decides (a newer operation on the same thing replaces it).
+    fn hold_suggestion(&mut self, ws: &crate::model::Workspace, conn: ConnId, op: Op) {
+        let Some(who) = self.conns.get(&conn).and_then(|c| c.peer.as_ref().map(|p| p.id)) else { return };
+        if let Some(r) = self.rep.as_mut() {
+            r.clock.observe(op.e.hlc, now_ms());
+        }
+        let (what, page, block, title, before, after) = crdt::describe(ws, &op).unwrap_or_else(|| {
+            let page = match op.key {
+                Key::Node(p, _) | Key::Edge(p, _) | Key::Page(p) | Key::Block(p, _) | Key::Comment(p, _) | Key::Annot(p, _) => p,
+            };
+            ("Canvas", page, 0, ws.page(page).map(|p| p.title.clone()).unwrap_or_default(), String::new(), "(canvas change)".to_owned())
+        });
+        let at = now_ms();
+        if let Some(x) = self.suggestions.iter_mut().find(|x| x.who == who && x.op.key == op.key) {
+            x.after = after;
+            x.op = op;
+            x.at = at;
+            return;
+        }
+        if self.suggestions.len() >= 500 {
+            return;
+        }
+        let first = self.suggestions.is_empty();
+        self.suggestions.push(changes::Suggestion { conn, who, op, what, page, block, title, before, after, at });
+        if first {
+            self.ui.changes = true;
+            self.toast("A suggestion is waiting — open Changes to accept or refuse it");
+        }
+    }
+
+    /// Host: apply (`accept`) or undo (`refuse`) held suggestions by index into [`Collab::suggestions`].
+    pub fn resolve_suggestions(&mut self, accept: &[usize], refuse: &[usize]) {
+        let mut drop: Vec<usize> = accept.iter().chain(refuse.iter()).copied().filter(|i| *i < self.suggestions.len()).collect();
+        drop.sort_unstable();
+        drop.dedup();
+        for i in drop.into_iter().rev() {
+            let sg = self.suggestions.remove(i);
+            if accept.contains(&i) {
+                self.ops_in.push_front((sg.conn, sg.op));
+            } else {
+                self.reassert.push((sg.op.key, sg.op.e.hlc));
+            }
+        }
     }
 
     fn request_media(&mut self, id: u64, off: u64) {
@@ -1752,12 +2207,23 @@ impl Collab {
                 }
             }
             Msg::Ops { ops } => {
-                let from_viewer = self.mode == Mode::Hosting && self.conns.get(&conn).map_or(true, |c| c.role == Role::Viewer);
+                let role = self.conns.get(&conn).map(|c| c.role);
+                let from_viewer = self.mode == Mode::Hosting && role.map_or(true, |r| r == Role::Viewer);
+                let suggest = self.mode == Mode::Hosting && role == Some(Role::Suggester);
                 if ops.len() > 1000 || self.ops_in.len() + ops.len() > MAX_OPS_QUEUE {
                     self.drop_conn(conn, "Too many operations");
                     return;
                 }
-                if !from_viewer {
+                if suggest {
+                    // comments and PDF marks take effect at once; everything else waits for the host's decision
+                    for o in ops {
+                        if matches!(o.key, Key::Comment(..) | Key::Annot(..)) {
+                            self.ops_in.push_back((conn, o));
+                        } else if self.held_in.len() < 2000 {
+                            self.held_in.push_back((conn, o));
+                        }
+                    }
+                } else if !from_viewer {
                     self.ops_in.extend(ops.into_iter().map(|o| (conn, o)));
                 }
             }
@@ -1848,6 +2314,8 @@ struct ViewState {
     launch: Option<String>,
     /// Local text caret: (block, selection start, caret, time).
     caret: Option<(u64, u32, u32, f64)>,
+    caret_len: u32,
+    typing_at: f64,
     draft: Option<(LiveDraft, f64)>,
 }
 
@@ -1865,8 +2333,26 @@ pub fn publish(c: &Collab) {
 }
 
 /// The text editor reports the caret of the focused block (characters of the plain text) every frame.
-pub fn set_caret(block: u64, from: u32, to: u32) {
-    VIEW.with(|v| v.borrow_mut().caret = Some((block, from, to, mono_ms())));
+pub fn set_caret(block: u64, from: u32, to: u32, len: u32) {
+    VIEW.with(|v| {
+        let mut v = v.borrow_mut();
+        v.caret = Some((block, from, to, mono_ms()));
+        v.caret_len = len;
+    });
+}
+
+fn caret_len() -> u32 {
+    VIEW.with(|v| v.borrow().caret_len)
+}
+
+/// The text of a block was edited by this user just now ("typing…" badge for the others; clears itself after two seconds).
+pub fn set_typing(ctx: &egui::Context) {
+    VIEW.with(|v| v.borrow_mut().typing_at = mono_ms());
+    ctx.request_repaint_after(std::time::Duration::from_millis(2100));
+}
+
+fn typing_active() -> bool {
+    VIEW.with(|v| mono_ms() - v.borrow().typing_at < 2000.0)
 }
 
 fn caret_state() -> Option<(u64, u32, u32)> {
@@ -1895,13 +2381,13 @@ fn draft_state() -> Option<LiveDraft> {
 }
 
 /// Other people's text carets inside `block`: (name, colour index, selection start, caret).
-pub fn remote_carets(block: u64) -> Vec<(String, u8, u32, u32)> {
+pub fn remote_carets(block: u64) -> Vec<(String, u8, u32, u32, u32, bool)> {
     VIEW.with(|v| {
         let v = v.borrow();
         if !v.show {
             return vec![];
         }
-        v.remotes.iter().filter(|(_, p)| p.block == Some(block)).filter_map(|(i, p)| p.caret.map(|(a, b)| (i.name.clone(), i.color, a, b))).collect()
+        v.remotes.iter().filter(|(_, p)| p.block == Some(block)).filter_map(|(i, p)| p.caret.map(|(a, b)| (i.name.clone(), i.color, a, b, p.len, p.typing))).collect()
     })
 }
 
@@ -1924,9 +2410,13 @@ pub fn paint_carets(ui: &egui::Ui, block: u64, galley: &egui::Galley, pos: egui:
     }
     let n = galley.text().chars().count() as u32;
     let p = ui.painter();
-    for (name, color, a, b) in list {
+    for (name, color, a, b, len, typing) in list {
         let col = ui::COLORS[(color % 8) as usize];
-        let (a, b) = (a.min(n), b.min(n));
+        // the caret was taken against a text of `len` characters; ours has `n` (an edit is still on its way): the missing / extra
+        // characters lie before the caret when somebody types or deletes at it, so shift by the difference instead of jumping
+        let adj = if len != 0 && len != n { (n as i64 - len as i64).clamp(-64, 64) } else { 0 };
+        let shift = |x: u32| (x as i64 + adj).clamp(0, n as i64) as u32;
+        let (a, b) = (shift(a), shift(b));
         let at = |i: u32| galley.pos_from_ccursor(egui::text::CCursor::new(i as usize));
         let head = at(b);
         if a != b {
@@ -1940,7 +2430,7 @@ pub fn paint_carets(ui: &egui::Ui, block: u64, galley: &egui::Galley, pos: egui:
         let x = pos.x + head.left();
         let (y0, y1) = (pos.y + head.top(), pos.y + head.bottom());
         p.line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], egui::Stroke::new(2.0_f32, col));
-        let label = p.layout_no_wrap(ui::first_name(&name), egui::FontId::proportional(10.5), egui::Color32::WHITE);
+        let label = p.layout_no_wrap(if typing { format!("{} · typing…", ui::first_name(&name)) } else { ui::first_name(&name) }, egui::FontId::proportional(10.5), egui::Color32::WHITE);
         let flag = egui::Rect::from_min_size(egui::pos2(x - 1.0, y0 - label.size().y - 3.0), label.size() + egui::vec2(8.0, 3.0));
         p.rect_filled(flag, 3.0, col);
         p.galley(flag.min + egui::vec2(4.0, 1.5), label, egui::Color32::WHITE);
@@ -2289,5 +2779,81 @@ mod tests {
             }
         }
         assert!(p.draft.is_none());
+    }
+
+    #[test]
+    fn link_values_survive_percent_encoding_and_candidates_get_ports() {
+        for v in ["Lumen-AB12", "My Phone's Wi-Fi", "pä$$w0rd=&?%", "日本語"] {
+            assert_eq!(pct_decode(&pct_encode(v)), v);
+        }
+        assert_eq!(with_port("10.0.0.2"), format!("10.0.0.2:{PORT}"));
+        assert_eq!(with_port("10.0.0.2:5000"), "10.0.0.2:5000");
+        assert_eq!(with_port("[::1]"), format!("[::1]:{PORT}"));
+        assert_eq!(with_port("[::1]:7"), "[::1]:7");
+    }
+
+    #[test]
+    fn one_link_carries_every_address_and_the_hotspot() {
+        let (mut host, _hw, _join, _jw, port) = pair();
+        host.addr_hint = vec![format!("192.168.1.5:{port}"), format!("10.0.0.7:{port}")];
+        let l = host.lan_link().unwrap();
+        assert!(l.contains(&format!("h=192.168.1.5:{port},10.0.0.7:{port}")), "{l}");
+        host.hs = ("up".into(), "DIRECT-lumen 1".into(), "pw d/1".into());
+        host.internet = true;
+        *host.wan.lock().unwrap() = Wan { state: 2, ip: "203.0.113.9".into(), port: 40000, mapped: true, note: String::new() };
+        let d = host.direct_link().unwrap();
+        assert!(d.contains(",203.0.113.9:40000"), "{d}");
+        assert!(d.contains("&ws=DIRECT-lumen%201&wp=pw%20d%2F1"), "{d}");
+        host.stop(true);
+    }
+
+    #[test]
+    fn a_device_dials_every_candidate_and_keeps_the_one_that_answers() {
+        let (mut host, mut hw, mut join, mut jw, port) = pair();
+        // first candidate is a dead address (nothing listens on port 1), the second is the host
+        join.join_text(&format!("lumen://join?h=127.0.0.1:1,127.0.0.1:{port}&t={}", host.token), "");
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 12, |a, b| !b.pages.is_empty() && a.pages.len() == b.pages.len()), "did not connect through the second candidate");
+        host.stop(true);
+        join.stop(true);
+    }
+
+    #[test]
+    fn a_suggestion_waits_for_the_host_and_a_refusal_restores_the_joiner() {
+        let (mut host, mut hw, mut join, mut jw, port) = pair();
+        host.auto_admit = false;
+        join.join_addr(&format!("127.0.0.1:{port}"), &host.token.clone());
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(8) && host.requests.is_empty() {
+            step(&mut host, &mut hw, &mut join, &mut jw);
+        }
+        let conn = host.requests[0].conn;
+        host.approve(conn, Role::Suggester);
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 10, |a, b| !b.pages.is_empty() && a.pages.len() == b.pages.len()), "no sync");
+        assert_eq!(join.role, Role::Suggester);
+        let pid = hw.pages.iter().find(|p| p.blocks.len() > 1).map(|p| p.id).unwrap();
+        hw.current = Some(pid);
+        jw.current = Some(pid);
+        let original = hw.page(pid).unwrap().blocks[0].text.clone();
+        jw.page_mut(pid).unwrap().blocks[0].text = "my suggestion".into();
+        join.poke();
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(8) && host.suggestions.is_empty() {
+            step(&mut host, &mut hw, &mut join, &mut jw);
+        }
+        assert_eq!(host.suggestions.len(), 1, "the suggestion was not held");
+        assert_eq!(hw.page(pid).unwrap().blocks[0].text, original, "a suggestion must not change the host");
+        assert_eq!(host.suggestions[0].after, "my suggestion");
+        host.resolve_suggestions(&[], &[0]);
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 8, |_, b| b.page(pid).unwrap().blocks[0].text == original), "refusal did not restore the joiner");
+        jw.page_mut(pid).unwrap().blocks[0].text = "second suggestion".into();
+        join.poke();
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(8) && host.suggestions.is_empty() {
+            step(&mut host, &mut hw, &mut join, &mut jw);
+        }
+        host.resolve_suggestions(&[0], &[]);
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 8, |a, _| a.page(pid).unwrap().blocks[0].text == "second suggestion"), "accepted suggestion did not apply");
+        host.stop(true);
+        join.stop(true);
     }
 }

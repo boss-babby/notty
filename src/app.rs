@@ -172,6 +172,8 @@ pub struct LumenApp {
     ws_confirm_delete: bool,
     /// Raw text of a stored workspace that could not be parsed (kept under its own storage key on the next save).
     rescued: Option<String>,
+    /// Fingerprint of the state written by the last autosave: an idle app skips serialising / writing the workspace entirely.
+    saved_fp: Option<u64>,
     trash_open: bool,
     security: Option<SecurityDialog>,
     fresh: bool,
@@ -294,6 +296,7 @@ impl LumenApp {
             last_theme_t: -1.0,
             theme_applied: false,
             rescued,
+            saved_fp: None,
             last_active: now_ms() / 1000.0,
             shown_page: None,
             focus_title: None,
@@ -2596,6 +2599,26 @@ impl LumenApp {
     }
 }
 
+/// FNV-1a over the bytes `serde_json` produces for `v`, without building the string. `None` when the value cannot be serialised that way
+/// (the caller then simply saves).
+fn fingerprint<T: serde::Serialize>(v: &T) -> Option<u64> {
+    struct Fnv(u64);
+    impl std::io::Write for Fnv {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            for &x in b {
+                self.0 = (self.0 ^ u64::from(x)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+    serde_json::to_writer(&mut h, v).ok()?;
+    Some(h.0)
+}
+
 // ───────────── eframe glue ─────────────
 
 impl eframe::App for LumenApp {
@@ -2607,28 +2630,35 @@ impl eframe::App for LumenApp {
         if let Some(raw) = self.rescued.take() {
             storage.set_string(UNREADABLE_KEY, raw);
         }
-        let old = storage.get_string(STORAGE_KEY).filter(|o| !o.trim().is_empty());
-        if let Some(old) = old {
-            // 2. first save after an app update: keep the previous version's data untouched in its own slot
-            let ver = env!("CARGO_PKG_VERSION");
-            if storage.get_string(VERSION_KEY).as_deref() != Some(ver) {
-                if let Some(prev_ver) = storage.get_string(VERSION_KEY) {
-                    storage.set_string(UPGRADE_KEY, old.clone());
-                    storage.set_string(UPGRADE_VER_KEY, prev_ver);
+        // Dirty tracking: the state is streamed through a hasher (no allocation, no I/O). Nothing changed since the last save ⇒ the
+        // workspace is neither re-serialised nor written (large workspaces, localStorage on the web, flash wear on phones).
+        let fp = fingerprint(&SavedRef { ws: &self.ws, cred: &self.cred, skipped: self.skipped_setup });
+        let unchanged = fp.is_some() && fp == self.saved_fp;
+        if !unchanged {
+            let old = storage.get_string(STORAGE_KEY).filter(|o| !o.trim().is_empty());
+            if let Some(old) = old {
+                // 2. first save after an app update: keep the previous version's data untouched in its own slot
+                let ver = env!("CARGO_PKG_VERSION");
+                if storage.get_string(VERSION_KEY).as_deref() != Some(ver) {
+                    if let Some(prev_ver) = storage.get_string(VERSION_KEY) {
+                        storage.set_string(UPGRADE_KEY, old.clone());
+                        storage.set_string(UPGRADE_VER_KEY, prev_ver);
+                    }
+                    storage.set_string(VERSION_KEY, ver.to_owned());
                 }
-                storage.set_string(VERSION_KEY, ver.to_owned());
+                // 3. rolling "previous state" slot: at most one rotation every 10 minutes, so it is always a state from before the latest edits
+                let now = now_ms();
+                let last: f64 = storage.get_string(PREV_AT_KEY).and_then(|t| t.parse().ok()).unwrap_or(0.0);
+                if now - last > 10.0 * 60.0 * 1000.0 {
+                    storage.set_string(PREV_KEY, old);
+                    storage.set_string(PREV_AT_KEY, format!("{now}"));
+                }
+            } else {
+                storage.set_string(VERSION_KEY, env!("CARGO_PKG_VERSION").to_owned());
             }
-            // 3. rolling "previous state" slot: at most one rotation every 10 minutes, so it is always a state from before the latest edits
-            let now = now_ms();
-            let last: f64 = storage.get_string(PREV_AT_KEY).and_then(|t| t.parse().ok()).unwrap_or(0.0);
-            if now - last > 10.0 * 60.0 * 1000.0 {
-                storage.set_string(PREV_KEY, old);
-                storage.set_string(PREV_AT_KEY, format!("{now}"));
-            }
-        } else {
-            storage.set_string(VERSION_KEY, env!("CARGO_PKG_VERSION").to_owned());
+            eframe::set_value(storage, STORAGE_KEY, &SavedRef { ws: &self.ws, cred: &self.cred, skipped: self.skipped_setup });
+            self.saved_fp = fp;
         }
-        eframe::set_value(storage, STORAGE_KEY, &SavedRef { ws: &self.ws, cred: &self.cred, skipped: self.skipped_setup });
         // other workspaces (only the ones that changed hands since the last save are rewritten)
         self.wsreg.sync_active_name(&self.ws.name);
         for id in std::mem::take(&mut self.wsdirty) {

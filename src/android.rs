@@ -189,6 +189,84 @@ pub fn nsd_discover(on: bool) {
     call_void("nsdDiscover", "(Z)V", &[JValue::Bool(on as jboolean)]);
 }
 
+// ───────────────────────────── nearby pairing (local-only hotspot) + Keystore vault ─────────────────────────────
+
+fn call_string(name: &str) -> String {
+    with_activity(|env, act| {
+        let o = env.call_method(act, name, "()Ljava/lang/String;", &[])?.l()?;
+        if o.is_null() {
+            return Ok(String::new());
+        }
+        let js = jni::objects::JString::from(o);
+        let s: String = env.get_string(&js)?.into();
+        Ok(s)
+    })
+    .unwrap_or_default()
+}
+
+/// Opens a private, internet-less Wi-Fi hotspot (LocalOnlyHotspot) so a phone that is not on this Wi-Fi can still reach this one.
+pub fn hotspot_start() {
+    call_void("hotspotStart", "()V", &[]);
+}
+
+pub fn hotspot_stop() {
+    call_void("hotspotStop", "()V", &[]);
+}
+
+/// `(state, ssid, passphrase)`; state is one of idle / perm / starting / up / failed (then `ssid` carries the reason).
+pub fn hotspot_state() -> (String, String, String) {
+    let s = call_string("hotspotState");
+    let mut it = s.splitn(3, '|');
+    (it.next().unwrap_or("idle").to_owned(), it.next().unwrap_or("").to_owned(), it.next().unwrap_or("").to_owned())
+}
+
+/// Connects to a hotspot created by another Lumen phone (WifiNetworkSpecifier, Android 10+) and routes this process through it.
+pub fn wifi_join(ssid: &str, pass: &str) {
+    with_activity(|env, act| {
+        let a = env.new_string(ssid)?;
+        let b = env.new_string(pass)?;
+        env.call_method(act, "wifiJoin", "(Ljava/lang/String;Ljava/lang/String;)V", &[JValue::Object(&a), JValue::Object(&b)]).map(|_| ())
+    });
+}
+
+pub fn wifi_leave() {
+    call_void("wifiLeave", "()V", &[]);
+}
+
+/// `(state, message)`: idle / joining / up / failed.
+pub fn wifi_state() -> (String, String) {
+    let s = call_string("wifiState");
+    let (a, b) = s.split_once('|').unwrap_or((s.as_str(), ""));
+    (a.to_owned(), b.to_owned())
+}
+
+/// Every IPv4 address of every up interface (Wi-Fi, hotspot, USB tether).
+pub fn local_ips() -> Vec<String> {
+    call_string("localIps").split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect()
+}
+
+fn call_bytes(name: &str, input: &[u8]) -> Option<Vec<u8>> {
+    with_activity(|env, act| {
+        let arr = env.byte_array_from_slice(input)?;
+        let o = env.call_method(act, name, "([B)[B", &[JValue::Object(&arr)])?.l()?;
+        if o.is_null() {
+            return Ok(None);
+        }
+        let out = jni::objects::JByteArray::from(o);
+        Ok(Some(env.convert_byte_array(&out)?))
+    })
+    .flatten()
+}
+
+/// Seals bytes with a non-exportable Android Keystore key (AES-256-GCM). `None` when the Keystore is not usable.
+pub fn vault_seal(plain: &[u8]) -> Option<Vec<u8>> {
+    call_bytes("keyWrap", plain)
+}
+
+pub fn vault_open(blob: &[u8]) -> Option<Vec<u8>> {
+    call_bytes("keyUnwrap", blob)
+}
+
 /// A preview frame of the QR scanner (luma plane of an NV21 image). `true` = a join code was found and queued.
 #[no_mangle]
 pub extern "system" fn Java_com_lumen_app_CollabKit_nativeScanFrame(env: JNIEnv, _c: JClass, luma: JByteArray, w: jint, h: jint) -> jboolean {
@@ -200,7 +278,7 @@ pub extern "system" fn Java_com_lumen_app_CollabKit_nativeScanFrame(env: JNIEnv,
     let mut img = rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| bytes[y * w + x]);
     for grid in img.detect_grids() {
         if let Ok((_, text)) = grid.decode() {
-            if text.len() <= 512 && (text.starts_with("lumen://join") || text.contains("join=")) {
+            if text.len() <= 1024 && (text.starts_with("lumen://join") || text.contains("join=")) {
                 crate::collab::push_launch_link(text);
                 wake();
                 return 1;

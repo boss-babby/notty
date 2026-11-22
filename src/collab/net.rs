@@ -244,18 +244,54 @@ impl Net {
         Ok(port)
     }
 
+    /// `addr` is one `host:port` or several separated by commas (LAN, public, hotspot addresses of the same host): every candidate is
+    /// dialled at once and the first TCP connection that succeeds is used (the others are dropped) — this is what makes a link that
+    /// works on the same Wi-Fi *and* across networks connect quickly either way.
     pub fn connect(&mut self, addr: &str, inbox: &Inbox) {
         let stop = self.stop.get_or_insert_with(|| Arc::new(AtomicBool::new(false))).clone();
         let inbox = inbox.clone();
-        let addr = addr.to_owned();
+        let list: Vec<String> = addr.split(',').map(|a| a.trim().to_owned()).filter(|a| !a.is_empty()).take(8).collect();
         let _ = std::thread::Builder::new().name("lumen-collab-dial".into()).spawn(move || {
             let conn = inbox.conn_id();
             let fail = |why: &str| inbox.push(Event::Closed { conn, why: why.to_owned() });
-            let Some(sa) = addr.to_socket_addrs().ok().and_then(|mut a| a.next()) else { return fail("That address is not valid") };
-            let Ok(stream) = TcpStream::connect_timeout(&sa, Duration::from_secs(4)) else { return fail("Could not reach that device — are you on the same Wi-Fi?") };
+            let mut cands: Vec<(String, SocketAddr)> = vec![];
+            for a in &list {
+                if let Some(sa) = a.to_socket_addrs().ok().and_then(|mut x| x.next()) {
+                    cands.push((a.clone(), sa));
+                }
+            }
+            if cands.is_empty() {
+                return fail("That address is not valid");
+            }
+            let (tx, rx) = channel::<(String, SocketAddr, TcpStream)>();
+            let n = cands.len();
+            for (name, sa) in cands {
+                let tx = tx.clone();
+                let _ = std::thread::Builder::new().name("lumen-collab-try".into()).spawn(move || {
+                    if let Ok(s) = TcpStream::connect_timeout(&sa, Duration::from_secs(5)) {
+                        let _ = tx.send((name, sa, s));
+                    }
+                });
+            }
+            drop(tx);
+            let t0 = Instant::now();
+            let mut won = None;
+            while t0.elapsed() < Duration::from_secs(6) {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(x) => {
+                        won = Some(x);
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(_) => {}
+                }
+            }
+            let Some((name, sa, stream)) = won else {
+                return fail(if n > 1 { "Could not reach that device on any of its addresses — same Wi-Fi? Is its Internet access switched on?" } else { "Could not reach that device — are you on the same Wi-Fi?" });
+            };
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
             let guard = HandshakeGuard::arm(&stream, 8);
-            let Ok((ws, _)) = tungstenite::client::client_with_config(format!("ws://{addr}/"), stream, Some(ws_config())) else { return fail("That device did not answer as a Lumen host") };
+            let Ok((ws, _)) = tungstenite::client::client_with_config(format!("ws://{name}/"), stream, Some(ws_config())) else { return fail("That device did not answer as a Lumen host") };
             drop(guard);
             let (tx, rx) = channel();
             inbox.push(Event::Open { conn, sink: Box::new(WsSink { tx }), addr: sa.ip().to_string(), incoming: false });

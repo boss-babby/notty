@@ -127,7 +127,7 @@ pub fn comments_button(ui: &mut Ui, pal: &Palette, c: &mut Collab, open_count: u
 
 /// Top-bar button of the review window (only while a session runs or something is waiting for review).
 pub fn changes_button(ui: &mut Ui, pal: &Palette, c: &mut Collab) {
-    if !c.active() && c.changes.is_empty() {
+    if !c.active() && c.changes.is_empty() && c.suggestions.is_empty() && c.away.is_empty() {
         return;
     }
     let touch = crate::touch::touchy();
@@ -136,7 +136,7 @@ pub fn changes_button(ui: &mut Ui, pal: &Palette, c: &mut Collab) {
     let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || c.ui.changes, 0.12);
     ui.painter().rect_filled(rect, 7.0, with_alpha(pal.hover, t));
     crate::icons::glyph(ui.painter(), rect.center(), 16.0, l::HISTORY, crate::theme::lerp_color(pal.muted, pal.text, t));
-    let n = c.changes.len();
+    let n = c.changes.len() + c.suggestions.len() + c.away.len();
     if n > 0 {
         let p = pos2(rect.right() - 6.0, rect.top() + 7.0);
         ui.painter().circle_filled(p, 6.5, COLORS[3]);
@@ -208,7 +208,7 @@ pub fn overlays(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &mut crate::mo
         super::comments::window(ctx, pal, c, ws, current);
     }
     if c.ui.changes {
-        if let Some(pg) = super::changes::window(ctx, pal, c) {
+        if let Some(pg) = super::changes::window(ctx, pal, c, ws) {
             out.open = Some(pg);
         }
     }
@@ -285,7 +285,7 @@ fn menu(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &crate::model::Workspa
                     ui.add(egui::Label::new(egui::RichText::new(title).font(bold(14.0)).color(pal.text)).truncate());
                     let sub = match (c.mode, c.session.as_ref()) {
                         (Mode::Hosting, Some(s)) => format!("Sharing · {}", Collab::scope_label(s.scope)),
-                        (Mode::Joined, _) => format!("Shared with you · {}", if c.role == Role::Viewer { "view only" } else { "can edit" }),
+                        (Mode::Joined, _) => format!("Shared with you · {}", match c.role { Role::Viewer => "view only", Role::Suggester => "suggesting", Role::Editor => "can edit" }),
                         _ => "Connecting…".into(),
                     };
                     ui.label(egui::RichText::new(sub).font(body(12.0)).color(pal.muted));
@@ -364,9 +364,9 @@ fn menu(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &crate::model::Workspa
                     let pres = c.presence_of(p.id).cloned();
                     let on = pres.as_ref().and_then(|x| x.page).and_then(|pg| ws.page(pg)).map(|pg| if pg.title.is_empty() { "Untitled".to_owned() } else { pg.title.clone() });
                     ui.painter().text(pos2(r.left() + 38.0, r.center().y - 7.0), Align2::LEFT_CENTER, if *you { format!("{} · you", p.name) } else { p.name.clone() }, bold(13.0), pal.text);
-                    let sub = on.map(|t| format!("on {t}")).unwrap_or_else(|| platform_label(&p.platform).to_owned());
+                    let sub = if pres.as_ref().is_some_and(|x| x.typing) { "typing…".to_owned() } else { on.map(|t| format!("on {t}")).unwrap_or_else(|| platform_label(&p.platform).to_owned()) };
                     ui.painter().text(pos2(r.left() + 38.0, r.center().y + 8.0), Align2::LEFT_CENTER, sub, body(11.5), pal.muted);
-                    let chip_txt = if *role == Role::Viewer { "View" } else { "Edit" };
+                    let chip_txt = match role { Role::Viewer => "View", Role::Suggester => "Suggest", Role::Editor => "Edit" };
                     ui.painter().text(pos2(r.right() - 8.0, r.center().y), Align2::RIGHT_CENTER, chip_txt, body(11.5), pal.muted);
                     if !*you {
                         if rs.clicked() {
@@ -390,9 +390,10 @@ fn menu(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &crate::model::Workspa
                             c.ui.follow = if c.ui.follow == Some(pid) { None } else { Some(pid) };
                         }
                         if hosting {
-                            let (lbl, nr) = if role == Role::Editor { ("Make viewer", Role::Viewer) } else { ("Make editor", Role::Editor) };
-                            if button(ui, pal, lbl, 0, 104.0).clicked() {
-                                c.set_role(pid, nr);
+                            for (lbl, nr, w) in [("Make editor", Role::Editor, 104.0), ("Suggest only", Role::Suggester, 104.0), ("Make viewer", Role::Viewer, 104.0)] {
+                                if role != nr && button(ui, pal, lbl, 0, w).on_hover_text(match nr { Role::Suggester => "Their changes wait for your approval", Role::Viewer => "They can look but not change anything", Role::Editor => "They can edit freely" }).clicked() {
+                                    c.set_role(pid, nr);
+                                }
                             }
                             if button(ui, pal, "Remove", 2, 76.0).clicked() {
                                 c.kick(pid);
@@ -584,7 +585,8 @@ fn share_tab(ui: &mut Ui, pal: &Palette, c: &mut Collab, ws: &mut crate::model::
             ui.label(egui::RichText::new(session.as_ref().map(|s| s.name.clone()).unwrap_or_default()).font(body(13.0)).color(pal.muted));
         });
         let base = c.ui.relay_url.trim().to_owned();
-        let links: Vec<(&str, String)> = [("Wi-Fi", c.lan_link()), ("Link", c.relay_link(&base))].into_iter().filter_map(|(n, v)| v.map(|v| (n, v))).collect();
+        let direct_on = c.wan_address().is_some() || c.hs.0 == "up";
+        let links: Vec<(&str, String)> = [(if direct_on { "Direct" } else { "Wi-Fi" }, if direct_on { c.direct_link() } else { c.lan_link() }), ("Link", c.relay_link(&base))].into_iter().filter_map(|(n, v)| v.map(|v| (n, v))).collect();
         if !links.is_empty() {
             let pick = (c.ui.qr_pick as usize).min(links.len() - 1);
             let (name, text) = (links[pick].0, links[pick].1.clone());
@@ -594,7 +596,7 @@ fn share_tab(ui: &mut Ui, pal: &Palette, c: &mut Collab, ws: &mut crate::model::
                     ui.spacing_mut().item_spacing.y = 6.0;
                     ui.label(egui::RichText::new("Scan or enter").font(body(12.0)).color(pal.muted));
                     ui.label(egui::RichText::new(&c.token).font(egui::FontId::monospace(24.0)).color(pal.text)).on_hover_text("The code only proves the link is yours — new devices still need your approval");
-                    ui.label(egui::RichText::new(c.addr_hint.first().cloned().unwrap_or_default()).font(egui::FontId::monospace(12.0)).color(pal.muted));
+                    ui.label(egui::RichText::new(c.wan_address().or_else(|| c.addr_hint.first().cloned()).unwrap_or_default()).font(egui::FontId::monospace(12.0)).color(pal.muted));
                     ui.horizontal(|ui| {
                         if button(ui, pal, if mono_ms() - c.ui.copied_at < 1500.0 { "Copied" } else { "Copy link" }, 0, 90.0).clicked() {
                             ui.ctx().copy_text(text.clone());
@@ -608,6 +610,7 @@ fn share_tab(ui: &mut Ui, pal: &Palette, c: &mut Collab, ws: &mut crate::model::
             });
         }
     });
+    connect_card(ui, pal, c);
     // join requests inline
     let reqs: Vec<(ConnId, PeerInfo, String)> = c.requests.iter().map(|r| (r.conn, r.peer.clone(), r.code.clone())).collect();
     for (conn, p, code) in reqs {
@@ -619,6 +622,9 @@ fn share_tab(ui: &mut Ui, pal: &Palette, c: &mut Collab, ws: &mut crate::model::
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if button(ui, pal, "Edit", 1, 52.0).clicked() {
                         c.approve(conn, Role::Editor);
+                    }
+                    if button(ui, pal, "Suggest", 0, 62.0).on_hover_text("They can edit, but you approve every change").clicked() {
+                        c.approve(conn, Role::Suggester);
                     }
                     if button(ui, pal, "View", 0, 52.0).clicked() {
                         c.approve(conn, Role::Viewer);
@@ -652,6 +658,66 @@ fn share_tab(ui: &mut Ui, pal: &Palette, c: &mut Collab, ws: &mut crate::model::
         c.stop(true);
         c.toast("Sharing stopped");
     }
+}
+
+/// "Connect from anywhere": direct internet access (UPnP + public address) and the nearby hotspot (phones that share no Wi-Fi).
+fn connect_card(ui: &mut Ui, pal: &Palette, c: &mut Collab) {
+    card(ui, pal, |ui| {
+        let can_wan = cfg!(not(target_arch = "wasm32"));
+        let mut toggled: Option<bool> = None;
+        if can_wan {
+            ui.horizontal(|ui| {
+                if switch(ui, pal, c.internet).on_hover_text("Lets a device on another network dial this one directly. Everything stays end-to-end encrypted and every new device still needs your approval.").clicked() {
+                    toggled = Some(!c.internet);
+                }
+                ui.label(egui::RichText::new("Internet access (direct, no relay)").font(bold(12.5)).color(pal.text));
+            });
+            if c.internet {
+                let w = c.wan.lock().map(|w| w.clone()).unwrap_or_default();
+                let (txt, col) = match w.state {
+                    1 => ("Opening the port on your router…".to_owned(), pal.muted),
+                    2 if w.mapped => (format!("Reachable at {}:{} (port opened automatically)", w.ip, w.port), COLORS[3]),
+                    2 => (format!("Address {}:{} — {}", w.ip, w.port, if w.note.is_empty() { "forward this TCP port on your router if it does not connect" } else { &w.note }), pal.muted),
+                    _ => (if w.note.is_empty() { "Not available".to_owned() } else { w.note.clone() }, COLORS[0]),
+                };
+                ui.label(egui::RichText::new(txt).font(body(11.5)).color(col));
+                if w.state == 1 {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                }
+            }
+        }
+        if Collab::hotspot_supported() {
+            ui.add_space(4.0);
+            let on = c.hs.0 != "idle";
+            let mut flip = false;
+            ui.horizontal(|ui| {
+                if switch(ui, pal, on).on_hover_text("Creates a private Wi-Fi hotspot so a phone that is not on your Wi-Fi can join in seconds — like AirDrop. The QR code carries the Wi-Fi password and the join link.").clicked() {
+                    flip = true;
+                }
+                ui.label(egui::RichText::new("Nearby device without shared Wi-Fi").font(bold(12.5)).color(pal.text));
+            });
+            if flip {
+                c.set_hotspot(!on);
+            }
+            match c.hs.0.as_str() {
+                "starting" | "perm" => {
+                    ui.label(egui::RichText::new(if c.hs.0 == "perm" { "Allow “nearby devices” when Android asks…" } else { "Starting the hotspot…" }).font(body(11.5)).color(pal.muted));
+                }
+                "up" => {
+                    ui.label(egui::RichText::new(format!("Hotspot “{}” is on — the other phone scans the Direct code with Lumen's scanner and joins by itself", c.hs.1)).font(body(11.5)).color(COLORS[3]));
+                    ui.label(egui::RichText::new(format!("Wi-Fi password: {}", c.hs.2)).font(egui::FontId::monospace(11.5)).color(pal.muted));
+                }
+                "failed" => {
+                    ui.label(egui::RichText::new(c.hs.1.clone()).font(body(11.5)).color(COLORS[0]));
+                }
+                _ => {}
+            }
+        }
+        if let Some(on) = toggled {
+            let site = c.ui.relay_url.clone();
+            c.set_internet(on, &site);
+        }
+    });
 }
 
 fn qr(ui: &mut Ui, c: &mut Collab, text: &str, size: f32) {

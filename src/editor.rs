@@ -2880,12 +2880,13 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
     // collaboration: report my caret, draw the other people's (thin coloured bar + name flag + selection tint)
     if focused {
         if let Some(cr) = out.cursor_range {
-            crate::collab::set_caret(b.id, cr.secondary.ccursor.index as u32, cr.primary.ccursor.index as u32);
+            crate::collab::set_caret(b.id, cr.secondary.ccursor.index as u32, cr.primary.ccursor.index as u32, out.galley.text().chars().count() as u32);
         }
     }
     crate::collab::paint_carets(ui, b.id, &out.galley, out.galley_pos);
 
     if out.response.changed() {
+        crate::collab::set_typing(ui.ctx());
         if is_code {
             b.text = buf.clone();
         } else {

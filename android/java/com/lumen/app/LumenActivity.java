@@ -309,10 +309,48 @@ public class LumenActivity extends NativeActivity {
         CollabKit.nsdDiscover(this, on);
     }
 
+    // ── nearby pairing without a shared Wi-Fi (local-only hotspot) + device-key vault (see NearbyKit) ──
+    public void hotspotStart() {
+        NearbyKit.hotspotStart(this);
+    }
+
+    public void hotspotStop() {
+        NearbyKit.hotspotStop();
+    }
+
+    public String hotspotState() {
+        return NearbyKit.hotspot();
+    }
+
+    public void wifiJoin(String ssid, String pass) {
+        NearbyKit.wifiJoin(this, ssid, pass);
+    }
+
+    public void wifiLeave() {
+        NearbyKit.wifiLeave(this);
+    }
+
+    public String wifiState() {
+        return NearbyKit.join();
+    }
+
+    public String localIps() {
+        return NearbyKit.localIps();
+    }
+
+    public byte[] keyWrap(byte[] b) {
+        return NearbyKit.keyWrap(b);
+    }
+
+    public byte[] keyUnwrap(byte[] b) {
+        return NearbyKit.keyUnwrap(b);
+    }
+
     @Override
     public void onRequestPermissionsResult(int code, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(code, permissions, results);
         CollabKit.onPermission(this, code, results);
+        NearbyKit.onPermission(this, code, results);
     }
 
     public void showIme() {

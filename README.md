@@ -313,3 +313,15 @@ bash build-android.sh           # -> ../public/downloads/Lumen-android-arm64.apk
 
 ## 13.6 (Android + Canvas release)
 Rich canvas nodes (embeds, PDF covers, files, database windows, 8 editable widgets) — see [CANVAS.md](CANVAS.md). Build everything headlessly with `./tools/pipeline.sh` or `./build-all.sh` (Windows `.exe`, signed Android APK, WebAssembly into `../public`). The Next.js site in the parent folder serves `/app` (WebAssembly), `/downloads/*` and the `/api/*` helpers the app talks to (`preview`, `flow-proxy`, `ai-proxy`, `hooks`, `mcp`, `bridge`).
+
+
+## 14.5 highlights (collaboration pass 6)
+
+* **Connect from anywhere**: *Share → Internet access* opens the port with UPnP and puts the public address into the same QR / link
+  (`lumen://join?h=lan,public&t=…`); the joiner dials every address at once. Still end-to-end encrypted, still needs the host's approval.
+* **Nearby phones without a shared Wi-Fi** (Android): a private hotspot whose credentials travel in the QR; the other phone joins it from the in-app scanner.
+* **Suggest-edit mode**, per-person coloured diffs and *Revert* in the Changes window; "typing…" badges; caret alignment; per-frame hot path for the block being typed in.
+* **Host-restart stamps**, "edited while you were away", dirty-tracked autosave, Android Keystore-wrapped device key.
+* Website (Next.js) now hosts the relay (`/api/collab`, `/api/collab/ip`), serves the WebAssembly app at `/app` and the downloads.
+
+Details, limits and the ranked list of what is still open: `COLLAB.md` §12.

@@ -203,6 +203,11 @@ pub struct Replica {
     pidx: HashMap<u64, usize>,
     /// Fingerprints of annotation / comment lists: an unchanged list is not serialised again.
     fps: HashMap<(u8, u64), u64>,
+    /// Wall-clock stamp (ms) given to entities adopted without operations: the `updated` time of the page being scanned. A host that
+    /// restarted its session and a joiner that re-opened its copy therefore compare *real* edit times instead of all-zero clocks.
+    stamp: u64,
+    /// Upper bound of adopt stamps (the wall clock at adoption): a page "updated" in the future must not outrank every later edit.
+    cap: u64,
 }
 
 fn mix(h: u64, v: u64) -> u64 {
@@ -248,6 +253,33 @@ fn comments_fp(list: &[crate::model::Comment]) -> u64 {
 }
 
 /// What the review window shows for an entity: (kind of thing, page title, text).
+/// The whole block as JSON (kept in the change log so a change can be reverted without losing formatting); bounded.
+fn block_json(ws: &Workspace, pid: u64, bid: u64) -> Option<String> {
+    let b = ws.page(pid)?.blocks.iter().find(|b| b.id == bid)?;
+    serde_json::to_string(b).ok().filter(|s| s.len() <= 16 * 1024)
+}
+
+/// What an incoming operation would change, without applying it: (what, page, block, title, before text, after text).
+pub fn describe(ws: &Workspace, op: &Op) -> Option<(&'static str, u64, u64, String, String, String)> {
+    let (page, block) = match op.key {
+        Key::Page(p) => (p, 0),
+        Key::Block(p, b) => (p, b),
+        _ => return None,
+    };
+    let before = snapshot(ws, &op.key);
+    let title = ws.page(page).map(|p| p.title.clone()).unwrap_or_default();
+    let after = match (&op.key, op.e.val.as_deref()) {
+        (Key::Block(..), Some(v)) => serde_json::from_str::<Block>(v).ok().map(|b| {
+            let plain = crate::rich::strip(&b.text);
+            if plain.is_empty() { format!("[{:?}]", b.kind) } else if b.kind == crate::model::BlockKind::Todo { format!("[{}] {plain}", if b.checked { "x" } else { " " }) } else { plain }
+        }),
+        (Key::Page(..), Some(_)) => Some("(page title / settings)".to_owned()),
+        _ => None,
+    };
+    let what = if matches!(op.key, Key::Page(_)) { "Page" } else { "Block" };
+    Some((what, page, block, title, before.map(|b| b.2).unwrap_or_default(), after.unwrap_or_default()))
+}
+
 fn snapshot(ws: &Workspace, key: &Key) -> Option<(&'static str, String, String)> {
     match *key {
         Key::Page(pid) => ws.page(pid).map(|p| ("Page", p.title.clone(), p.title.clone())),
@@ -377,7 +409,7 @@ fn doc_keys_of_block(b: &Block, docs: &mut HashSet<u64>) {
 impl Replica {
     pub fn new(replica: u32, scope: Scope) -> Self {
         let roots = if scope.kind == ScopeKind::Workspace { HashSet::new() } else { HashSet::from([scope.root]) };
-        Replica { clock: Clock::new(replica), scope, roots, cells: HashMap::new(), groups: HashMap::new(), in_scope: HashSet::new(), docs: HashSet::new(), seen_updated: HashMap::new(), rr: 0, quiet: false, last_cost_ms: 0.0, hist: HashMap::new(), cur_page: None, merges: HashMap::new(), merged: 0, ids_sig: None, ppos: vec![], pidx: HashMap::new(), fps: HashMap::new() }
+        Replica { clock: Clock::new(replica), scope, roots, cells: HashMap::new(), groups: HashMap::new(), in_scope: HashSet::new(), docs: HashSet::new(), seen_updated: HashMap::new(), rr: 0, quiet: false, last_cost_ms: 0.0, hist: HashMap::new(), cur_page: None, merges: HashMap::new(), merged: 0, ids_sig: None, ppos: vec![], pidx: HashMap::new(), fps: HashMap::new(), stamp: 0, cap: u64::MAX }
     }
 
     /// Joiner side: the pages the host calls roots keep this device's own `parent` (none) instead of the host's.
@@ -470,7 +502,7 @@ impl Replica {
                 base = c.chash;
             }
         }
-        let hlc = if self.quiet { Hlc::default() } else { self.clock.tick(now) };
+        let hlc = if self.quiet { Hlc { t: self.stamp << 16, r: 0 } } else { self.clock.tick(now) };
         self.cells.insert(key, Cell { hlc, pos, hash: h, chash: ch, dead });
         if let Some(g) = key.group() {
             self.groups.entry(g).or_default().insert(key);
@@ -550,6 +582,7 @@ impl Replica {
     /// Takes a baseline of an existing workspace without producing operations (every entity gets the oldest possible clock).
     pub fn adopt(&mut self, ws: &mut Workspace, now: u64) {
         self.quiet = true;
+        self.cap = now;
         let mut sink = vec![];
         self.tick_inner(ws, None, now, f64::MAX, true, &mut sink);
         self.quiet = false;
@@ -637,6 +670,7 @@ impl Replica {
         if !ids.is_empty() {
             self.rr = (self.rr + scanned_rr.max(1)) % ids.len();
         }
+        self.stamp = 0;
         self.scan_annots(ws, now, out);
         self.scan_comments(ws, now, out);
         self.last_cost_ms = crate::collab::mono_ms() - t0;
@@ -651,7 +685,47 @@ impl Replica {
         out
     }
 
+    /// Per-frame scan of the one block being typed in: its edit leaves in the same frame (no waiting for the adaptive full scan), so the
+    /// other side's text and the caret that travels in `Presence` stay in step. The block must already be known (new blocks are found
+    /// by the full scan, which also assigns their order).
+    pub fn tick_block(&mut self, ws: &Workspace, pid: u64, bid: u64, now: u64) -> Vec<Op> {
+        let mut out = vec![];
+        let key = Key::Block(pid, bid);
+        let Some(pos) = self.cells.get(&key).filter(|c| !c.dead).map(|c| c.pos) else { return out };
+        if !self.in_scope.contains(&pid) {
+            return out;
+        }
+        let Some(b) = ws.page(pid).and_then(|p| p.blocks.iter().find(|b| b.id == bid)) else { return out };
+        if let Ok(s) = serde_json::to_string(b) {
+            self.cur_page = Some(pid);
+            self.set_cell(key, Some(s), pos, now, &mut out);
+        }
+        out
+    }
+
+    /// The host refused a suggestion: assert the value it holds (or a deletion) with a clock newer than the suggestion, so the
+    /// suggesting device's copy goes back to what the host has.
+    pub fn reassert(&mut self, ws: &mut Workspace, key: Key, min: Hlc, now: u64) -> Option<Op> {
+        self.clock.observe(min, now);
+        let hlc = self.clock.tick(now);
+        let live = self.cells.get(&key).filter(|c| !c.dead).copied();
+        match live {
+            Some(c) => {
+                let val = self.materialize(ws, key, &mut HashMap::new(), &mut HashMap::new())?;
+                self.cells.insert(key, Cell { hlc, ..c });
+                Some(Op { key, e: Entry { hlc, pos: c.pos, val: Some(val), base: 0 } })
+            }
+            None => {
+                self.cells.insert(key, Cell { hlc, pos: 0.0, hash: hash_of(&None, 0.0), chash: chash_of(&None), dead: true });
+                Some(Op { key, e: Entry { hlc, pos: 0.0, val: None, base: 0 } })
+            }
+        }
+    }
+
     fn scan_page(&mut self, ws: &mut Workspace, pid: u64, ppos: f64, now: u64, out: &mut Vec<Op>) {
+        if self.quiet {
+            self.stamp = ws.page(pid).map_or(0, |p| if p.updated.is_finite() && p.updated > 0.0 { (p.updated as u64).min(self.cap) } else { 0 });
+        }
         let is_root = self.roots.contains(&pid);
         let Some(meta) = meta_string(ws, pid, is_root) else { return };
         self.set_cell(Key::Page(pid), Some(meta), ppos, now, out);
@@ -777,6 +851,10 @@ impl Replica {
             return self.apply_inner(ws, op, now, applied);
         }
         let before = snapshot(ws, &op.key);
+        let raw = match op.key {
+            Key::Block(p, b) => block_json(ws, p, b),
+            _ => None,
+        };
         let ok = self.apply_inner(ws, op, now, applied);
         if ok {
             let after = snapshot(ws, &op.key);
@@ -797,7 +875,7 @@ impl Replica {
                 }
             };
             if let Some((kind, what, title, before, after)) = ch {
-                applied.log.push(Change { kind, what, page, block, title, who: op.e.hlc.r, at: now, before, after });
+                applied.log.push(Change { kind, what, page, block, title, who: op.e.hlc.r, at: now, before, after, raw });
             }
         }
         ok
@@ -1310,5 +1388,43 @@ mod tests {
         assert!(would_cycle(&a, x, Some(x)));
         assert!(!would_cycle(&a, y, Some(x)));
         assert!(!would_cycle(&a, x, None));
+    }
+
+    #[test]
+    fn restart_stamps_let_the_newer_page_win_and_keep_unchanged_ones_quiet() {
+        let mut a = Workspace::seed();
+        let pid = a.pages.iter().find(|p| !p.blocks.is_empty()).map(|p| p.id).unwrap();
+        a.page_mut(pid).unwrap().updated = 1_000_000.0;
+        let mut b: Workspace = serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
+        b.page_mut(pid).unwrap().blocks[0].text = "edited while away".into();
+        b.page_mut(pid).unwrap().updated = 1_005_000.0;
+        let (mut ra, mut rb) = (Replica::new(1, Scope::ALL), Replica::new(2, Scope::ALL));
+        ra.adopt(&mut a, 2_000_000);
+        rb.adopt(&mut b, 2_000_000);
+        let dig = |r: &Replica| r.digest().into_iter().map(|(k, h, x)| (k, (h, x))).collect::<HashMap<_, _>>();
+        let from_a = ra.diff(&mut a, &dig(&rb));
+        let from_b = rb.diff(&mut b, &dig(&ra));
+        assert!(from_a.iter().all(|o| o.key != Key::Block(pid, a.page(pid).unwrap().blocks[0].id)), "the older copy must not overwrite the newer edit");
+        assert!(from_b.iter().any(|o| o.key == Key::Block(pid, b.page(pid).unwrap().blocks[0].id)), "the newer edit must travel");
+        let other = a.pages.iter().find(|p| p.id != pid && !p.blocks.is_empty()).map(|p| p.id);
+        if let Some(o) = other {
+            assert!(from_a.iter().chain(from_b.iter()).all(|op| !matches!(op.key, Key::Block(p, _) if p == o)));
+        }
+    }
+
+    #[test]
+    fn the_typed_block_is_scanned_on_its_own_and_a_refusal_reasserts_the_hosts_text() {
+        let (mut a, mut b, mut ra, mut rb) = two();
+        let pid = a.pages.iter().find(|p| p.blocks.len() > 1).map(|p| p.id).unwrap();
+        let bid = a.page(pid).unwrap().blocks[0].id;
+        let original = a.page(pid).unwrap().blocks[0].text.clone();
+        b.page_mut(pid).unwrap().blocks[0].text = "suggested".into();
+        let ops = rb.tick_block(&b, pid, bid, 3000);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].key, Key::Block(pid, bid));
+        let re = ra.reassert(&mut a, Key::Block(pid, bid), ops[0].e.hlc, 3001).expect("reassert");
+        let mut ap = Applied::default();
+        assert!(rb.apply(&mut b, &re, 3002, &mut ap));
+        assert_eq!(b.page(pid).unwrap().blocks[0].text, original);
     }
 }

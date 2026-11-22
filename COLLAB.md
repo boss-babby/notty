@@ -1,4 +1,4 @@
-# Local collaboration — design, status and next steps (Lumen 14.4)
+# Local collaboration — design, status and next steps (Lumen 14.5)
 
 > **14.1 update:** the security review and hardening pass is documented in §8 (protocol 2: end-to-end encrypted, authenticated, rate-limited);
 > §4 and §7 below describe the 14.0 state and are annotated with what 14.1 closed.
@@ -349,3 +349,70 @@ but nobody has held a phone to a screen in this pass.
 6. Sync of `lumen-store` big tables chunk-wise; binary framing; host hand-over / mesh; Wi-Fi Direct / Nearby Share hand-off.
 7. Android: Keystore-wrapped device key; CameraX instead of the deprecated `android.hardware.Camera` (kept: zero dependencies, works API 26–34); ML-free QR decode is `rqrr` (~30 ms per 1280×720 frame on a mid phone).
 8. Presence "typing…" badges, read-receipts for comments, notification push through the relay while the app is closed.
+
+
+## 12. Pass 6 — direct internet connect, nearby hotspot, suggest-edit, restart stamps, dirty-tracked autosave (14.5)
+
+Input: the §11.2 review list plus the field notes "realtime / cursors still unreliable", "no peer-to-peer option for devices on different Wi-Fi",
+"how do two nearby devices without a shared Wi-Fi connect fast, like AirDrop". Everything below is covered by `cargo test --lib collab`
+(37 tests, 9 of them new) unless marked *(device-only)*.
+
+### 12.1 Status of the §11.2 list
+
+| # | Item | State |
+|---|---|---|
+| 1 | WebRTC data channels | **not done** — see 12.6. The same goal for *native* devices is met by 12.2 (direct internet connect) and 12.3 (hotspot); browsers still use the relay. |
+| 2 | Host restart stamps | **done** — see 12.4. The "edited while you were away" list is in the Changes window. |
+| 3 | Autosave dirty tracking | **done (hash-based, option "or a hash of the changed pages")** — see 12.5. Serialising on a worker thread is still open. |
+| 4 | `yrs` text CRDT | **not done** (deliberately): the three-way merge of 10.2 keeps both edits; `yrs` would need an editor adapter that diffs egui's `TextEdit` string into Y operations and rewrites the caret on remote edits — a rewrite of the text editor, which cannot be verified without a UI test rig. Kept as the top item of 12.7. |
+| 5 | Suggest-edit mode, per-person diff colours, revert | **done** — see 12.4. |
+| 6 | Big-table sync, binary framing, host hand-over, Wi-Fi Direct / Nearby Share | **Wi-Fi hand-off done in another way** (12.3: LocalOnlyHotspot — Nearby Share / Wi-Fi Direct have no public API for third-party apps). Big tables, binary framing, hand-over: open. |
+| 7 | Keystore-wrapped device key | **done** — `NearbyKit.keyWrap/keyUnwrap` (AES-256-GCM key that never leaves the Keystore); the device key is stored as `ks1:<hex>`; an older plain key is wrapped on the first start. CameraX: **not done** (kept `android.hardware.Camera`: zero dependencies, API 26–34). *(device-only)* |
+| 8 | Typing badges | **done** (12.1a). Read receipts for comments and push while the app is closed: **not done** (push needs a server that can reach FCM / a background service; the relay is stateless by design). |
+
+### 12.1a Realtime and cursors — what was actually wrong
+Reading the path from keystroke to the other screen found four causes of "unreliable":
+1. **Latency of the text itself.** A typed character waited for the next adaptive full scan (160 ms … 1.5 s, 90 ms after `poke`). Now the block being typed in is scanned **every frame** (`Replica::tick_block`, one serialisation of one block) and leaves in the same frame.
+2. **The caret outran the text.** `Presence` (carets) travelled immediately, the text edit a scan later, so the caret was drawn against a text that was a few characters short and jumped. `Presence.len` carries the text length at the time the caret was taken; the painter shifts the caret by `local_len − len` (typing / deleting happens at the caret, so the missing characters are before it) instead of clamping.
+3. **No sign of life.** `Presence.typing` (set for 2 s after an edit; the editor schedules the repaint that clears it) drives a "· typing…" flag on the remote caret and "typing…" in the people list.
+4. Everything else (heartbeat 3 s, stale after 12 s, host fan-out, sanitising) was already correct and is unchanged.
+The pass also fixed that a device's presence is no longer hidden while the app polls: `Collab::poll` now also runs while a Wi-Fi join or the hotspot is pending.
+
+### 12.2 Direct internet connect (peer-to-peer, no relay)
+* **Opt-in**: *Share → Internet access*. Off by default; nothing is exposed until the host switches it on.
+* **How**: the host maps its TCP port on the router with **UPnP-IGD** (`collab/upnp.rs`, no dependency: SSDP → description XML → SOAP `AddPortMapping`, lease 2 h with a lease-0 fallback, removed again when the session ends) and learns the public address from the router (`GetExternalIPAddress`) and from this site (`GET /api/collab/ip` answers with the caller's address). A router address in 10/8, 172.16/12, 192.168/16, 100.64/10 means CGNAT / double NAT: the UI says so and points to the relay instead of pretending.
+* **The link carries every way in**: `lumen://join?h=192.168.1.5:47615,203.0.113.9:40000&t=TOKEN[&ws=SSID&wp=PASS]`. The joiner dials **all candidates at once** (`net::Net::connect`, one thread each, 5 s timeout) and keeps the first TCP connection that completes — same-Wi-Fi joins stay as fast as before, cross-network joins work from the same QR. Typed addresses accept the same comma lists.
+* **Security** (unchanged protocol, now reachable from outside): Noise XX with the share token bound to the channel, host approval card with a 4-digit channel code to compare, ≤ 48 connections / 6 per address, 8 s handshake deadline, wrong-token lock-out after 5 tries, banned / demoted keys. A port scanner finds a WebSocket server that closes anything that is not a valid Lumen handshake. The mapping exists only while the session runs.
+* **Not verified here**: this build machine has no router. UPnP request / response parsing, the link format and the multi-candidate dial are unit-tested (`upnp::tests`, `a_device_dials_every_candidate_…`); the router conversation itself needs a real router.
+
+### 12.3 "AirDrop for two phones on different networks": private hotspot hand-off *(device-only)*
+Android allows an app to open a **LocalOnlyHotspot** (private access point without internet) and to join a specific network with `WifiNetworkSpecifier` — no Wi-Fi settings screen. `NearbyKit.java`:
+1. Host: *Share → Nearby device without shared Wi-Fi* starts the hotspot (asks for *Nearby devices* / location once). The Direct QR now contains the join link **and** the hotspot's SSID / password (`ws`, `wp`), and the host's interface addresses (`NetworkInterface`, hotspot included) are added as candidates.
+2. Joiner: scans the code with Lumen's scanner (Android 10+) → `join_via_wifi` → Android shows its one-tap "connect to …" sheet → the process is bound to that network → the candidates are dialled. Android 8/9 joiners are told to join the Wi-Fi in Settings and scan again.
+3. Hand-off time is dominated by the OS Wi-Fi association (a few seconds); after it, the usual encrypted join + approval. Desktop joiners join the shown SSID manually and use the link.
+Limits: one hotspot at a time; some phones refuse a local-only hotspot while tethering or Wi-Fi Direct is active (the reason is shown); while bound to the hotspot the app has no internet (it is released on *Stop sharing*). Compile-verified and packaged; nobody has held two phones to each other in this pass.
+
+### 12.4 Collaboration features
+* **Restart stamps.** Entities adopted without operations (`Replica::adopt`) were all stamped with the zero clock, so after a host restart a joiner's offline edit and the host's copy were separated by a hash coin-flip. They are now stamped with their page's `updated` time (capped at "now"), on both sides, so the later edit wins deterministically and untouched pages produce no traffic. Granularity is the page: if both sides edited *different blocks of the same page* while apart, the page with the later `updated` wins for the blocks that differ (an ordinary reconnect without a restart keeps both, as before). Test `restart_stamps_let_the_newer_page_win_…`.
+* **Edited while away.** When a joiner re-opens a share, the pages it edited since the last sync are listed in the Changes window (click to open) and counted in the badge.
+* **Suggest-edit mode.** New role `Suggester` (host approval card: *Edit / Suggest / View / No*; per person: *Make editor / Suggest only / Make viewer*; protocol 4). The device edits normally; the host does **not** apply its changes: they are described (what was there / what is proposed), folded per block, and shown at the top of the Changes window with *Accept / Refuse* (and *all*). *Accept* applies the operation and fans it out; *Refuse* makes the host **re-assert** its own value with a newer clock (`Replica::reassert`), so the suggester's copy snaps back. Comments and PDF marks are not held. Suggesters are not remembered as trusted devices (they are asked again). Test `a_suggestion_waits_for_the_host_and_a_refusal_restores_the_joiner` (real sockets: held, host unchanged, refused → restored, second suggestion accepted → applied).
+* **Revert this change.** Every logged block change keeps the block as it was (JSON ≤ 16 KiB, formatting included); *Revert* restores it, deletes a block that was added, or re-inserts one that was removed (at the end of the page). Test `revert_restores_the_block_…`.
+* **Per-person colours** in the Changes window (bar, dot and name in the person's colour, also for suggestions).
+
+### 12.5 Autosave
+`save()` used to serialise the whole workspace every 30 s, read the previous copy back for the safety rotation and rewrite the key. Now the state is streamed through an FNV hasher (`serde_json::to_writer` into a `Write` that hashes — no allocation, no I/O); if the fingerprint equals the last saved one the workspace, the rotation logic and the storage write are skipped. An idle app therefore costs one hashing pass per 30 s and **zero** writes (localStorage on the web, flash on phones). A failed serialisation just means "save". Still open: the hashing pass runs on the UI thread, and a truly incremental save (per page) needs a store that is not one JSON value.
+
+### 12.6 What is not done, honestly
+* **WebRTC** (browser ↔ browser without the relay). Needs `RtcPeerConnection` / `RtcDataChannel` through `web_sys`, signalling over `/api/collab` and a `Sink` for the channel (~300 lines, design in 11.2 #1). It can only be verified in two real browsers; this environment has none, and an unverified transport inside the shipped wasm bundle is a risk to the working web app. Browsers keep using the relay (which is end-to-end encrypted, so the relay never sees content).
+* `yrs`, big-table sync, binary framing, host hand-over, CameraX, comment read-receipts, push while closed (see 12.1).
+* Verification gaps: UPnP against a real router, hotspot / `WifiNetworkSpecifier` / Keystore on real phones. `tests::right_click_keeps_selection_and_opens_menu` fails in this headless environment **before and after** these changes (it fails identically on the untouched 14.4 tree; it depends on font metrics); the other 288 library tests pass.
+
+### 12.7 Review — what more can be done (ranked)
+1. **WebRTC data channels** + a tiny STUN list: browser↔browser, and the missing piece for hole-punching between two phones behind NATs without UPnP (native: `webrtc-rs` or a hand-rolled UDP punch with the relay as the rendezvous).
+2. **`yrs` Y.Text per text block** with a `TextEdit` adapter — real intention preservation and exact remote carets (today's carets are aligned by length).
+3. **Per-block stamps on the host** (persist `(hlc)` per entity next to the workspace) so a restart does not fall back to page granularity.
+4. **Autosave off the UI thread**: snapshot-by-pages (`Arc<Page>` copy-on-write) and a store with one record per page.
+5. **BLE advertising + QR-less pairing** (Android `BluetoothLeAdvertiser` carrying the share id; the hotspot credentials delivered over GATT behind a numeric comparison) — the real AirDrop feel; today a QR scan starts the hand-off.
+6. Big tables chunk-wise, binary framing (postcard), host hand-over / mesh.
+7. Comment read-receipts (`Presence` carries the highest comment id seen), "revert" for pages and canvas cards, suggestions for canvas edits (today they are listed as "(canvas change)").
+8. Push while the app is closed: FCM relay worker; or a foreground service on Android with the relay long-poll.
