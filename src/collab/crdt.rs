@@ -12,7 +12,7 @@
 //! The text *inside* one block is still last-writer-wins; the next step is a `yrs` (Y.Text) register per block — the entity model
 //! was chosen so that this is a drop-in replacement of the value, not a redesign.
 use crate::canvas::{Edge, Node};
-use crate::model::{Block, Page, PdfAnnot, Workspace};
+use crate::model::{Block, Comment, Page, PdfAnnot, Workspace};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -50,6 +50,8 @@ pub enum Key {
     Node(u64, u64),
     Edge(u64, u64),
     Annot(u64, u64),
+    /// (page, comment id)
+    Comment(u64, u64),
 }
 
 impl Key {
@@ -59,12 +61,13 @@ impl Key {
             Key::Page(_) => None,
             Key::Block(p, _) | Key::Node(p, _) | Key::Edge(p, _) => Some((0, p)),
             Key::Annot(d, _) => Some((1, d)),
+            Key::Comment(p, _) => Some((2, p)),
         }
     }
     fn rank(&self) -> u8 {
         match self {
             Key::Page(_) => 0,
-            Key::Annot(..) => 2,
+            Key::Annot(..) | Key::Comment(..) => 2,
             _ => 1,
         }
     }
@@ -76,6 +79,14 @@ pub struct Entry {
     pub pos: f64,
     /// JSON of the entity; `None` = deleted (tombstone).
     pub val: Option<String>,
+    /// Content hash of the value this one was derived from (0 = unknown). Lets a receiver tell a concurrent edit from a plain update
+    /// and merge the two (see `textmerge.rs`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub base: u64,
+}
+
+fn is_zero(x: &u64) -> bool {
+    *x == 0
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -89,8 +100,18 @@ struct Cell {
     hlc: Hlc,
     pos: f64,
     hash: u64,
+    /// Hash of the content alone (without the position) — what `Entry::base` refers to.
+    chash: u64,
     dead: bool,
 }
+
+fn chash_of(val: &Option<String>) -> u64 {
+    val.as_ref().map_or(0, |s| crate::media::fnv(s.as_bytes()))
+}
+
+/// Previous versions of a block kept as merge bases (open page + blocks that received remote edits only).
+const HIST_KEYS: usize = 4096;
+const HIST_DEPTH: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum ScopeKind {
@@ -162,6 +183,14 @@ pub struct Replica {
     rr: usize,
     quiet: bool,
     pub last_cost_ms: f64,
+    /// Recent block values by content hash: the bases of three-way merges.
+    hist: HashMap<Key, std::collections::VecDeque<(u64, String)>>,
+    /// Page the user is looking at (its blocks are remembered as merge bases).
+    cur_page: Option<u64>,
+    /// Ping-pong limiter of the merge: (window start ms, merges in the window) per entity.
+    merges: HashMap<Key, (u64, u32)>,
+    /// Number of concurrent edits that were merged instead of overwritten (statistics / tests).
+    pub merged: u64,
 }
 
 /// Positions for an ordered list: items that already have a position in increasing order keep it (longest increasing subsequence),
@@ -275,7 +304,7 @@ fn doc_keys_of_block(b: &Block, docs: &mut HashSet<u64>) {
 impl Replica {
     pub fn new(replica: u32, scope: Scope) -> Self {
         let roots = if scope.kind == ScopeKind::Workspace { HashSet::new() } else { HashSet::from([scope.root]) };
-        Replica { clock: Clock::new(replica), scope, roots, cells: HashMap::new(), groups: HashMap::new(), in_scope: HashSet::new(), docs: HashSet::new(), seen_updated: HashMap::new(), rr: 0, quiet: false, last_cost_ms: 0.0 }
+        Replica { clock: Clock::new(replica), scope, roots, cells: HashMap::new(), groups: HashMap::new(), in_scope: HashSet::new(), docs: HashSet::new(), seen_updated: HashMap::new(), rr: 0, quiet: false, last_cost_ms: 0.0, hist: HashMap::new(), cur_page: None, merges: HashMap::new(), merged: 0 }
     }
 
     /// Joiner side: the pages the host calls roots keep this device's own `parent` (none) instead of the host's.
@@ -335,22 +364,110 @@ impl Replica {
 
     // ───────────── local changes → operations ─────────────
 
+    fn remember(&mut self, key: Key, val: &str, ch: u64) {
+        if !matches!(key, Key::Block(..)) {
+            return;
+        }
+        if self.hist.len() > HIST_KEYS {
+            self.hist.clear();
+        }
+        let q = self.hist.entry(key).or_default();
+        if q.front().map_or(true, |(h, _)| *h != ch) {
+            q.push_front((ch, val.to_owned()));
+            q.truncate(HIST_DEPTH);
+        }
+    }
+
     fn set_cell(&mut self, key: Key, val: Option<String>, pos: f64, now: u64, out: &mut Vec<Op>) {
+        let ch = chash_of(&val);
         let h = hash_of(&val, pos);
         let dead = val.is_none();
+        // blocks of the open page are remembered, so the first local edit already has its base on record
+        if let (Key::Block(p, _), Some(v)) = (key, val.as_ref()) {
+            if !self.quiet && (self.cur_page == Some(p) || self.hist.contains_key(&key)) {
+                self.remember(key, v, ch);
+            }
+        }
+        let mut base = 0;
         if let Some(c) = self.cells.get(&key) {
             if c.hash == h && c.dead == dead {
                 return;
             }
+            if !c.dead {
+                base = c.chash;
+            }
         }
         let hlc = if self.quiet { Hlc::default() } else { self.clock.tick(now) };
-        self.cells.insert(key, Cell { hlc, pos, hash: h, dead });
+        self.cells.insert(key, Cell { hlc, pos, hash: h, chash: ch, dead });
         if let Some(g) = key.group() {
             self.groups.entry(g).or_default().insert(key);
         }
         if !self.quiet {
-            out.push(Op { key, e: Entry { hlc, pos, val } });
+            out.push(Op { key, e: Entry { hlc, pos, val, base } });
         }
+    }
+
+    /// Forgets tombstones older than `cutoff_ms` (wall clock). Safe because a device that was away for longer than the grace period is
+    /// re-synchronised as a fresh join (see `Collab::try_resume`), so it can never bring a deleted entity back.
+    pub fn gc(&mut self, cutoff_ms: u64) -> usize {
+        let dead: Vec<Key> = self.cells.iter().filter(|(_, c)| c.dead && (c.hlc.t >> 16) < cutoff_ms && c.hlc.t != 0).map(|(k, _)| *k).collect();
+        for k in &dead {
+            self.cells.remove(k);
+            if let Some(g) = k.group() {
+                if let Some(set) = self.groups.get_mut(&g) {
+                    set.remove(k);
+                }
+            }
+            self.hist.remove(k);
+        }
+        dead.len()
+    }
+
+    /// Number of tombstones (statistics).
+    pub fn tombstones(&self) -> usize {
+        self.cells.values().filter(|c| c.dead).count()
+    }
+
+    /// Concurrent edit of one block: merges the remote value into the local one when the base of the remote edit is known.
+    /// `Some(changed)` = handled here, `None` = use the normal last-writer-wins path.
+    fn merge_block(&mut self, ws: &mut Workspace, pid: u64, bid: u64, op: &Op, val: &str, new_hash: u64, now: u64, applied: &mut Applied) -> Option<bool> {
+        let c = *self.cells.get(&op.key)?;
+        if c.dead || op.e.base == 0 || !self.page_allowed(pid, None) {
+            return None;
+        }
+        let rch = crate::media::fnv(val.as_bytes());
+        if rch == c.chash || op.e.base == c.chash {
+            return None; // same content, or the remote edit was made on what we hold: plain update
+        }
+        let local = serde_json::to_string(ws.page(pid)?.blocks.iter().find(|b| b.id == bid)?).ok()?;
+        let base = self.hist.get(&op.key)?.iter().find(|(h, _)| *h == op.e.base)?.1.clone();
+        // ping-pong guard: at most 4 merges of one block per 3 s, then last-writer-wins takes over
+        let e = self.merges.entry(op.key).or_insert((now, 0));
+        if now.saturating_sub(e.0) > 3000 {
+            *e = (now, 0);
+        }
+        if e.1 >= 4 {
+            return None;
+        }
+        e.1 += 1;
+        let remote_wins = (op.e.hlc, new_hash) > (c.hlc, c.hash);
+        let merged = super::textmerge::merge_json(&base, &local, val, remote_wins)?;
+        let nb: Block = serde_json::from_str(&merged).ok()?;
+        let merged = serde_json::to_string(&nb).ok()?;
+        self.remember(op.key, &local, chash_of(&Some(local.clone())));
+        self.remember(op.key, val, rch);
+        let page = ws.page_mut(pid)?;
+        let slot = page.blocks.iter_mut().find(|b| b.id == bid)?;
+        *slot = nb;
+        applied.pages.insert(pid);
+        applied.n += 1;
+        self.merged += 1;
+        if remote_wins {
+            // the cell now stands for the remote value; the local scan sees the merged text differs and emits one newer operation
+            self.cells.insert(op.key, Cell { hlc: op.e.hlc, pos: op.e.pos, hash: new_hash, chash: rch, dead: false });
+        }
+        let _ = merged;
+        Some(true)
     }
 
     fn pos_of(&self, key: Key) -> Option<f64> {
@@ -375,6 +492,7 @@ impl Replica {
 
     fn tick_inner(&mut self, ws: &mut Workspace, current: Option<u64>, now: u64, budget_ms: f64, all: bool, out: &mut Vec<Op>) {
         let t0 = crate::collab::mono_ms();
+        self.cur_page = current;
         let ids = self.scope_pages(ws);
         let id_set: HashSet<u64> = ids.iter().copied().collect();
         // id space of this device (no collisions with other peers' new pages / blocks / cards)
@@ -441,6 +559,7 @@ impl Replica {
             self.rr = (self.rr + scanned_rr.max(1)) % ids.len();
         }
         self.scan_annots(ws, now, out);
+        self.scan_comments(ws, now, out);
         self.last_cost_ms = crate::collab::mono_ms() - t0;
     }
 
@@ -528,6 +647,30 @@ impl Replica {
         }
     }
 
+    fn scan_comments(&mut self, ws: &Workspace, now: u64, out: &mut Vec<Op>) {
+        let mut pages: HashSet<u64> = ws.comments.keys().copied().filter(|p| self.scope.kind == ScopeKind::Workspace || self.in_scope.contains(p)).collect();
+        pages.extend(self.groups.keys().filter(|g| g.0 == 2).map(|g| g.1));
+        for p in pages {
+            let mut live: HashSet<Key> = HashSet::new();
+            if let Some(list) = ws.comments.get(&p) {
+                for c in list {
+                    let key = Key::Comment(p, c.id);
+                    live.insert(key);
+                    if let Ok(s) = serde_json::to_string(c) {
+                        self.set_cell(key, Some(s), 0.0, now, out);
+                    }
+                }
+            }
+            if let Some(g) = self.groups.get(&(2, p)).cloned() {
+                for k in g {
+                    if !live.contains(&k) && self.cells.get(&k).map_or(false, |c| !c.dead) {
+                        self.set_cell(k, None, 0.0, now, out);
+                    }
+                }
+            }
+        }
+    }
+
     // ───────────── remote operations → workspace ─────────────
 
     /// Merges one remote operation. Returns `true` when it changed this replica (the caller then forwards it to the other peers).
@@ -538,9 +681,24 @@ impl Replica {
         }
         self.clock.observe(op.e.hlc, now);
         let new_hash = hash_of(&op.e.val, op.e.pos);
+        if let (Key::Block(pid, bid), Some(val)) = (&op.key, &op.e.val) {
+            if let Some(done) = self.merge_block(ws, *pid, *bid, op, val, new_hash, now, applied) {
+                return done;
+            }
+        }
         if let Some(c) = self.cells.get(&op.key) {
             if (op.e.hlc, new_hash) <= (c.hlc, c.hash) {
                 return false;
+            }
+        }
+        if let (Key::Block(pid, bid), Some(_)) = (&op.key, &op.e.val) {
+            // the value we are about to overwrite may be the base of a concurrent edit that arrives next
+            if !self.hist.contains_key(&op.key) {
+                let old = ws.page(*pid).and_then(|p| p.blocks.iter().find(|b| b.id == *bid)).and_then(|b| serde_json::to_string(b).ok());
+                if let Some(old) = old {
+                    let h = chash_of(&Some(old.clone()));
+                    self.remember(op.key, &old, h);
+                }
             }
         }
         let ok = match (&op.key, &op.e.val) {
@@ -619,6 +777,28 @@ impl Replica {
                 }
                 _ => false,
             },
+            (Key::Comment(pid, cid), val) => {
+                if !(ws.page(*pid).is_some() && self.in_scope_page(ws, *pid)) {
+                    return false;
+                }
+                let list = ws.comments.entry(*pid).or_default();
+                match val {
+                    None => {
+                        list.retain(|c| c.id != *cid);
+                        true
+                    }
+                    Some(j) => match serde_json::from_str::<Comment>(j) {
+                        Ok(c) if c.id == *cid && list.len() < 5000 || list.iter().any(|x| x.id == *cid) => {
+                            match list.iter_mut().find(|x| x.id == *cid) {
+                                Some(x) => *x = c,
+                                None => list.push(c),
+                            }
+                            true
+                        }
+                        _ => false,
+                    },
+                }
+            }
             (Key::Annot(doc, _), _) if self.scope.kind != ScopeKind::Workspace && !self.docs.contains(doc) => false,
             (Key::Annot(doc, aid), val) => {
                 let list = ws.pdf_annots.entry(*doc).or_default();
@@ -652,7 +832,14 @@ impl Replica {
             _ => new_hash,
         };
         let dead = op.e.val.is_none();
-        self.cells.insert(op.key, Cell { hlc: op.e.hlc, pos: op.e.pos, hash, dead });
+        let ch = chash_of(&op.e.val);
+        if let (Key::Block(..), Some(v)) = (&op.key, &op.e.val) {
+            // remote edits keep their predecessor around: that is the base of a later concurrent edit
+            if self.hist.contains_key(&op.key) || self.cur_page.map_or(false, |p| matches!(op.key, Key::Block(q, _) if q == p)) {
+                self.remember(op.key, v, ch);
+            }
+        }
+        self.cells.insert(op.key, Cell { hlc: op.e.hlc, pos: op.e.pos, hash, chash: ch, dead });
         if let Some(g) = op.key.group() {
             self.groups.entry(g).or_default().insert(op.key);
             if let Key::Block(p, _) | Key::Node(p, _) = op.key {
@@ -764,7 +951,7 @@ impl Replica {
             if val.is_none() && !c.dead {
                 continue;
             }
-            out.push(Op { key, e: Entry { hlc: c.hlc, pos: c.pos, val } });
+            out.push(Op { key, e: Entry { hlc: c.hlc, pos: c.pos, val, base: 0 } });
         }
         out
     }
@@ -784,6 +971,7 @@ impl Replica {
             }
             Key::Edge(pid, id) => serde_json::to_string(ws.page(pid)?.canvas.as_ref()?.edges.iter().find(|e| e.id == id)?).ok(),
             Key::Annot(doc, id) => serde_json::to_string(ws.pdf_annots.get(&doc)?.iter().find(|a| a.id == id)?).ok(),
+            Key::Comment(pid, id) => serde_json::to_string(ws.comments.get(&pid)?.iter().find(|a| a.id == id)?).ok(),
         }
     }
 
@@ -886,7 +1074,7 @@ mod tests {
         p.id = pid;
         p.parent = parent;
         p.blocks.clear();
-        Op { key: Key::Page(pid), e: Entry { hlc: Hlc { t: hlc, r: 9 }, pos: 1.0, val: serde_json::to_string(&p).ok() } }
+        Op { key: Key::Page(pid), e: Entry { hlc: Hlc { t: hlc, r: 9 }, pos: 1.0, val: serde_json::to_string(&p).ok(), base: 0 } }
     }
 
     #[test]
@@ -901,7 +1089,7 @@ mod tests {
         ra.adopt(&mut a, 1000);
         let mut ap = Applied::default();
         // 1. delete a page outside the shared tree
-        let del = Op { key: Key::Page(other), e: Entry { hlc: Hlc { t: 5_000_000_000_000, r: 9 }, pos: 1.0, val: None } };
+        let del = Op { key: Key::Page(other), e: Entry { hlc: Hlc { t: 5_000_000_000_000, r: 9 }, pos: 1.0, val: None, base: 0 } };
         assert!(!ra.apply(&mut a, &del, 6000, &mut ap), "delete outside scope must be refused");
         assert!(a.page(other).is_some());
         // 2. pull an existing outside page into the tree by claiming the shared root as its parent
@@ -914,6 +1102,74 @@ mod tests {
         let mut big = page_op(&mut a, root, None, 5_000_000_000_002);
         big.e.val = Some("x".repeat(MAX_VALUE + 1));
         assert!(!ra.apply(&mut a, &big, 6000, &mut ap), "oversize value must be refused");
+    }
+
+    /// Delivers operations to a replica.
+    fn deliver(ops: &[Op], r: &mut Replica, w: &mut Workspace, now: u64) {
+        let mut ap = Applied::default();
+        for op in ops {
+            r.apply(w, op, now, &mut ap);
+        }
+        r.finish(w, &ap);
+    }
+
+    #[test]
+    fn two_people_typing_in_the_same_paragraph_keep_both_edits() {
+        let (mut a, mut b, mut ra, mut rb) = two();
+        let pid = a.pages.iter().find(|p| p.blocks.len() > 2).map(|p| p.id).unwrap();
+        let original = a.page(pid).unwrap().blocks[0].text.clone();
+        // both look at the page (their first tick records the base of the coming edits)
+        ra.tick(&mut a, Some(pid), 3000, f64::MAX);
+        rb.tick(&mut b, Some(pid), 3000, f64::MAX);
+        a.page_mut(pid).unwrap().blocks[0].text = format!("{original} (A)");
+        b.page_mut(pid).unwrap().blocks[0].text = format!("(B) {original}");
+        let oa = ra.tick(&mut a, Some(pid), 4000, f64::MAX);
+        let ob = rb.tick(&mut b, Some(pid), 4000, f64::MAX);
+        assert!(!oa.is_empty() && !ob.is_empty());
+        deliver(&ob, &mut ra, &mut a, 5000);
+        deliver(&oa, &mut rb, &mut b, 5000);
+        // the merge results are re-published by the next scan and must converge
+        for round in 0..4u64 {
+            let na = ra.tick(&mut a, Some(pid), 6000 + round, f64::MAX);
+            let nb = rb.tick(&mut b, Some(pid), 6000 + round, f64::MAX);
+            deliver(&nb, &mut ra, &mut a, 7000 + round);
+            deliver(&na, &mut rb, &mut b, 7000 + round);
+        }
+        let want = format!("(B) {original} (A)");
+        assert_eq!(a.page(pid).unwrap().blocks[0].text, want);
+        assert_eq!(b.page(pid).unwrap().blocks[0].text, want);
+        assert!(ra.merged + rb.merged >= 1);
+    }
+
+    #[test]
+    fn comments_sync_resolve_and_delete() {
+        let (mut a, mut b, mut ra, mut rb) = two();
+        let pid = a.pages[0].id;
+        a.comments.entry(pid).or_default().push(Comment { id: 77, text: "hi @Bob".into(), author: "Ann".into(), author_id: 1, ts: 1.0, ..Default::default() });
+        let ops = ra.tick(&mut a, Some(pid), 4000, f64::MAX);
+        assert!(ops.iter().any(|o| matches!(o.key, Key::Comment(..))));
+        deliver(&ops, &mut rb, &mut b, 5000);
+        assert_eq!(b.comments[&pid][0].text, "hi @Bob");
+        b.comments.get_mut(&pid).unwrap()[0].resolved = true;
+        let ops = rb.tick(&mut b, Some(pid), 6000, f64::MAX);
+        deliver(&ops, &mut ra, &mut a, 7000);
+        assert!(a.comments[&pid][0].resolved);
+        a.comments.get_mut(&pid).unwrap().clear();
+        let ops = ra.tick(&mut a, Some(pid), 8000, f64::MAX);
+        deliver(&ops, &mut rb, &mut b, 9000);
+        assert!(b.comments[&pid].is_empty());
+    }
+
+    #[test]
+    fn old_tombstones_are_collected_and_young_ones_stay() {
+        let (mut a, _b, mut ra, _rb) = two();
+        let pid = a.pages.iter().find(|p| p.blocks.len() > 2).map(|p| p.id).unwrap();
+        a.page_mut(pid).unwrap().blocks.remove(0);
+        ra.tick(&mut a, Some(pid), 10_000, f64::MAX);
+        assert_eq!(ra.tombstones(), 1);
+        assert_eq!(ra.gc(5_000), 0, "younger than the cut-off");
+        assert_eq!(ra.gc(20_000), 1);
+        assert_eq!(ra.tombstones(), 0);
     }
 
     #[test]

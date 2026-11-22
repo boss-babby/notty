@@ -1,3 +1,5 @@
+# Lumen 14.3 — see [RELEASE-14.3.md](RELEASE-14.3.md) and [COLLAB.md §10](COLLAB.md): text merge, trusted devices, comments, GC, Android QR + NSD.
+
 # Lumen 14.1 — encrypted collaboration, Android deep links, security review
 
 * **Collaboration is now end-to-end encrypted** (Noise XX, ChaCha20-Poly1305, forward secrecy) on the LAN socket, the browser WebSocket and the

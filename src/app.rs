@@ -1060,6 +1060,8 @@ impl LumenApp {
             self.fresh = true;
         }
         ui.add_space(6.0);
+        let open_comments = self.ws.comments.get(&cur).map_or(0, |v| v.iter().filter(|x| !x.resolved).count());
+        crate::collab::ui::comments_button(ui, pal, &mut self.collab, open_comments);
         crate::collab::ui::chip(ui, pal, &mut self.collab);
         let (updated, fav) = self.ws.page(cur).map(|p| (p.updated, p.favorite)).unwrap_or((0.0, false));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1748,6 +1750,8 @@ impl LumenApp {
             ui.add_space(4.0);
             let r = icon_button(ui, pal, Icon::Dots, 18.0, "Page options");
             crate::collab::ui::chip(ui, pal, &mut self.collab);
+            let open_comments = self.ws.current.and_then(|p| self.ws.comments.get(&p)).map_or(0, |v| v.iter().filter(|x| !x.resolved).count());
+            crate::collab::ui::comments_button(ui, pal, &mut self.collab, open_comments);
             if r.clicked() {
                 self.page_menu = Some(r.rect.left_bottom() + vec2(-230.0, 6.0));
                 self.fresh = true;

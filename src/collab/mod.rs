@@ -5,9 +5,11 @@
 //! (star); the host merges and fans out. The data model is the entity CRDT in [`crdt`]; the transports (WebSocket over TCP on native,
 //! browser WebSocket on the web, HTTP relay everywhere) only move [`Msg`] frames — the session code below never touches a socket.
 pub mod crdt;
+mod textmerge;
 mod relay;
 mod secure;
 pub mod ui;
+mod comments;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod net;
@@ -21,7 +23,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Protocol 2: every frame is end-to-end encrypted (`secure.rs`); the share token is proven, never sent.
-pub const PROTO: u32 = 2;
+/// Protocol 3: `Key::Comment` entities and `Entry::base` (merge bases). Older peers are refused with a clear message.
+pub const PROTO: u32 = 3;
+/// Tombstones are forgotten after this long. A reconnect gives up after ~90 s, so no device can come back with an older view.
+const TOMBSTONE_GRACE_MS: u64 = 10 * 60 * 1000;
+
+pub fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+pub fn unhex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 || !s.is_ascii() {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+}
 /// Hard limits (denial-of-service protection of a host): connections, signed-in people, waiting approval cards.
 const MAX_CONNS: usize = 40;
 const MAX_PEERS: usize = 16;
@@ -293,6 +309,14 @@ pub struct Ui {
     pub use_relay: bool,
     pub show_relay: bool,
     pub qr_pick: u8,
+    /// Comments window.
+    pub comments: bool,
+    pub comment_draft: String,
+    pub comment_on_block: bool,
+    pub comment_resolved: bool,
+    pub comment_reply: u64,
+    pub comment_known: HashSet<u64>,
+    pub comment_primed: bool,
 }
 
 pub struct Collab {
@@ -313,6 +337,9 @@ pub struct Collab {
     last_reap: f64,
     joining_since: f64,
     keys: Option<Arc<secure::Keys>>,
+    /// Devices the host approved once (Noise static key as hex → (name, viewer)): they join again without a card. Persisted.
+    trusted: HashMap<String, (String, bool)>,
+    last_gc: f64,
     /// A relay joiner's handshake that already sent its first message (adopted by the first virtual connection that answers).
     relay_init: Option<Arc<Mutex<secure::Crypt>>>,
     /// Wrong-token attempts per address: (count, last time).
@@ -353,6 +380,8 @@ pub struct Collab {
 
 #[derive(Default, Clone)]
 pub struct Stats {
+    /// Tombstones forgotten so far.
+    pub gc: u64,
     pub ops_in: u64,
     pub ops_out: u64,
     pub scan_ms: f64,
@@ -447,7 +476,20 @@ impl Collab {
             stats: Stats::default(),
             last_reap: 0.0,
             joining_since: 0.0,
-            keys: secure::gen_keys().map(Arc::new),
+            keys: {
+                // the device key is created once and kept (approve a device once, it is recognised next time)
+                let id = egui::Id::new("collab_key");
+                let saved = ctx.data_mut(|d| d.get_persisted::<String>(id)).and_then(|h| unhex(&h)).and_then(secure::Keys::from_private);
+                let k = saved.or_else(|| {
+                    let k = secure::gen_keys()?;
+                    let h = hex(k.private_bytes());
+                    ctx.data_mut(|d| d.insert_persisted(id, h));
+                    Some(k)
+                });
+                k.map(Arc::new)
+            },
+            trusted: ctx.data_mut(|d| d.get_persisted::<Vec<(String, String, bool)>>(egui::Id::new("collab_trusted"))).unwrap_or_default().into_iter().map(|(k, n, v)| (k, (n, v))).collect(),
+            last_gc: 0.0,
             relay_init: None,
             fails: HashMap::new(),
             target: None,
@@ -562,6 +604,14 @@ impl Collab {
                         *g = Some(b);
                     }
                     self.net.announce(self.beacon.clone());
+                    #[cfg(target_os = "android")]
+                    if let Some(b) = self.beacon.lock().ok().and_then(|g| g.clone()) {
+                        let mut compact = b.clone();
+                        compact.title = compact.title.chars().take(40).collect();
+                        if let Ok(j) = serde_json::to_string(&compact) {
+                            crate::android::nsd_register(&format!("{:x}", self.me.id), port, &j);
+                        }
+                    }
                 }
                 Err(e) => self.last_error = Some(format!("Could not open a port: {e}")),
             }
@@ -716,6 +766,8 @@ impl Collab {
         if let Ok(mut g) = self.beacon.lock() {
             *g = None;
         }
+        #[cfg(target_os = "android")]
+        crate::android::nsd_unregister();
         self.mode = Mode::Off;
         self.resume = None;
         self.banned.clear();
@@ -747,6 +799,8 @@ impl Collab {
                 self.net.stop_discovery();
                 self.found.clear();
             }
+            #[cfg(target_os = "android")]
+            crate::android::nsd_discover(on);
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -757,7 +811,40 @@ impl Collab {
 
     // ───────────── host actions ─────────────
 
+    /// Devices this host recognises: (key id, name, viewer).
+    pub fn trusted_list(&self) -> Vec<(String, String, bool)> {
+        let mut v: Vec<_> = self.trusted.iter().map(|(k, (n, viewer))| (k.clone(), n.clone(), *viewer)).collect();
+        v.sort_by(|a, b| a.1.cmp(&b.1));
+        v
+    }
+
+    pub fn forget_trusted(&mut self, key: &str) {
+        if self.trusted.remove(key).is_some() {
+            self.save_trusted();
+        }
+    }
+
+    fn save_trusted(&self) {
+        let v: Vec<(String, String, bool)> = self.trusted.iter().map(|(k, (n, viewer))| (k.clone(), n.clone(), *viewer)).collect();
+        self.ctx.data_mut(|d| d.insert_persisted(egui::Id::new("collab_trusted"), v));
+    }
+
+    fn remember_device(&mut self, conn: ConnId, role: Role) {
+        let found = self.conns.get(&conn).and_then(|c| {
+            let name = c.peer.as_ref()?.name.clone();
+            let key = c.crypt.lock().ok()?.remote.clone();
+            (!key.is_empty()).then_some((hex(&key), name))
+        });
+        if let Some((k, name)) = found {
+            if self.trusted.len() < 200 {
+                self.trusted.insert(k, (name, role == Role::Viewer));
+                self.save_trusted();
+            }
+        }
+    }
+
     pub fn approve(&mut self, conn: ConnId, role: Role) {
+        self.remember_device(conn, role);
         self.requests.retain(|r| r.conn != conn);
         self.accept(conn, role);
     }
@@ -781,6 +868,16 @@ impl Collab {
                     keys.push(x.remote.clone());
                 }
             }
+        }
+        let mut dirty = false;
+        for k in keys.iter().filter(|k| !k.is_empty()) {
+            if let Some(t) = self.trusted.get_mut(&hex(k)) {
+                t.1 = role == Role::Viewer;
+                dirty = true;
+            }
+        }
+        if dirty {
+            self.save_trusted();
         }
         for k in keys.into_iter().filter(|k| !k.is_empty()) {
             if role == Role::Viewer {
@@ -806,6 +903,9 @@ impl Collab {
                 if let Ok(x) = c.crypt.lock() {
                     if !x.remote.is_empty() {
                         self.banned.insert(x.remote.clone());
+                        if self.trusted.remove(&hex(&x.remote)).is_some() {
+                            self.save_trusted();
+                        }
                     }
                 }
                 c.sink.send(&Msg::Denied { reason: "You were removed from the session".into() });
@@ -946,6 +1046,12 @@ impl Collab {
             self.last_reap = now;
             self.reap(now);
         }
+        if now - self.last_gc > 60_000.0 {
+            self.last_gc = now;
+            if let Some(r) = self.rep.as_mut() {
+                self.stats.gc += r.gc(now_ms().saturating_sub(TOMBSTONE_GRACE_MS)) as u64;
+            }
+        }
         let mut changed = false;
         let usable = self.ready && self.rep.is_some() && self.bound == ws_id;
         if usable {
@@ -1083,6 +1189,10 @@ impl Collab {
     // ───────────── message handling ─────────────
 
     fn handle_events(&mut self) {
+        #[cfg(target_os = "android")]
+        for (b, ip) in crate::android::nsd_take() {
+            self.inbox.push(Event::Found(b, ip));
+        }
         for ev in self.inbox.drain() {
             match ev {
                 Event::Found(mut b, ip) => {
@@ -1326,7 +1436,9 @@ impl Collab {
                 let locked = self.fails.get(&peer_key(&addr)).map_or(false, |(n, t)| *n >= 5 && now - *t < 300_000.0);
                 let want = secure::proof("c", &self.token, &hash);
                 let authed = !locked && !auth.is_empty() && secure::ct_eq(&auth, &want);
-                if !auth.is_empty() && !authed {
+                // a device this host approved before is recognised by its channel key (proven by the Noise handshake)
+                let known = !locked && !remote.is_empty() && self.trusted.contains_key(&hex(&remote));
+                if !auth.is_empty() && !authed && !known {
                     if !locked {
                         let e = self.fails.entry(peer_key(&addr)).or_insert((0, now));
                         e.0 += 1;
@@ -1350,7 +1462,7 @@ impl Collab {
                 let existing: Vec<ConnId> = self.conns.iter().filter(|(k, c)| **k != conn && c.peer.as_ref().map_or(false, |p| p.id == peer.id)).map(|(k, _)| *k).collect();
                 for s in existing {
                     let same_key = !remote.is_empty() && self.conns.get(&s).and_then(|c| c.crypt.lock().ok().map(|x| x.remote == remote)).unwrap_or(false);
-                    if authed || same_key {
+                    if authed || known || same_key {
                         if let Some(c) = self.conns.remove(&s) {
                             c.sink.close();
                         }
@@ -1366,8 +1478,9 @@ impl Collab {
                 if let Some(c) = self.conns.get_mut(&conn) {
                     c.peer = Some(peer.clone());
                 }
-                if authed {
-                    let role = if !remote.is_empty() && self.demoted.contains(&remote) { Role::Viewer } else { Role::Editor };
+                if authed || known {
+                    let viewer = !remote.is_empty() && (self.demoted.contains(&remote) || self.trusted.get(&hex(&remote)).map_or(false, |t| t.1));
+                    let role = if viewer { Role::Viewer } else { Role::Editor };
                     self.accept(conn, role);
                 } else if self.requests.len() >= MAX_REQUESTS {
                     if let Some(c) = self.conns.get(&conn) {
@@ -1704,9 +1817,8 @@ mod tests {
     }
 
     fn pair() -> (Collab, Workspace, Collab, Workspace, u16) {
-        let ctx = egui::Context::default();
-        let mut host = Collab::new(&ctx);
-        let join = Collab::new(&ctx);
+        let mut host = Collab::new(&egui::Context::default());
+        let join = Collab::new(&egui::Context::default());
         let mut hw = Workspace::seed();
         let mut jw = Workspace::blank("joiner", false, 0);
         jw.pages.clear();
@@ -1762,6 +1874,39 @@ mod tests {
         }
         assert_ne!(join.mode, Mode::Joined, "a removed device must stay out");
         assert_eq!(host.roster.len(), 1);
+        host.stop(true);
+        join.stop(true);
+    }
+
+    #[test]
+    fn an_approved_device_is_recognised_next_time() {
+        let (mut host, mut hw, mut join, mut jw, port) = pair();
+        let addr = format!("127.0.0.1:{port}");
+        join.join_addr(&addr, "");
+        let t0 = Instant::now();
+        while host.requests.is_empty() && t0.elapsed() < Duration::from_secs(8) {
+            step(&mut host, &mut hw, &mut join, &mut jw);
+        }
+        assert_eq!(host.requests.len(), 1, "an unknown device must ask first");
+        let conn = host.requests[0].conn;
+        host.approve(conn, Role::Editor);
+        assert!(until(&mut host, &mut hw, &mut join, &mut jw, 10, |_, b| !b.pages.is_empty()), "initial sync");
+        join.stop(true);
+        let t1 = Instant::now();
+        while t1.elapsed() < Duration::from_secs(1) {
+            step(&mut host, &mut hw, &mut join, &mut jw);
+        }
+        assert_eq!(host.trusted_list().len(), 1);
+        join.join_addr(&addr, "");
+        let t2 = Instant::now();
+        while t2.elapsed() < Duration::from_secs(6) && join.mode != Mode::Joined {
+            step(&mut host, &mut hw, &mut join, &mut jw);
+        }
+        assert_eq!(join.mode, Mode::Joined, "a trusted device joins without a card");
+        assert!(host.requests.is_empty());
+        let id = host.trusted_list()[0].0.clone();
+        host.forget_trusted(&id);
+        assert!(host.trusted_list().is_empty());
         host.stop(true);
         join.stop(true);
     }

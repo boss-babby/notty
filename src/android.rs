@@ -158,6 +158,80 @@ pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeKey(_env: JNIEnv, 
     wake();
 }
 
+// ───────────────────────────── collaboration: camera QR + NSD ─────────────────────────────
+
+/// Hosts found through Android NSD (DNS-SD), waiting to be merged into the Nearby list by the collaboration session.
+static NSD: Mutex<Vec<(crate::collab::Beacon, String)>> = Mutex::new(Vec::new());
+
+pub fn nsd_take() -> Vec<(crate::collab::Beacon, String)> {
+    NSD.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default()
+}
+
+/// Opens the camera overlay of the activity; a decoded QR code arrives as a launch link.
+pub fn scan_qr() {
+    call_void("scanQr", "()V", &[]);
+}
+
+/// Publishes this device as a host (`_lumen._tcp`). `info` is the beacon JSON.
+pub fn nsd_register(name: &str, port: u16, info: &str) {
+    with_activity(|env, act| {
+        let n = env.new_string(name)?;
+        let i = env.new_string(info)?;
+        env.call_method(act, "nsdStart", "(Ljava/lang/String;ILjava/lang/String;)V", &[JValue::Object(&n), JValue::Int(port as i32), JValue::Object(&i)]).map(|_| ())
+    });
+}
+
+pub fn nsd_unregister() {
+    call_void("nsdStop", "()V", &[]);
+}
+
+pub fn nsd_discover(on: bool) {
+    call_void("nsdDiscover", "(Z)V", &[JValue::Bool(on as jboolean)]);
+}
+
+/// A preview frame of the QR scanner (luma plane of an NV21 image). `true` = a join code was found and queued.
+#[no_mangle]
+pub extern "system" fn Java_com_lumen_app_CollabKit_nativeScanFrame(env: JNIEnv, _c: JClass, luma: JByteArray, w: jint, h: jint) -> jboolean {
+    let Ok(bytes) = env.convert_byte_array(&luma) else { return 0 };
+    let (w, h) = (w.max(0) as usize, h.max(0) as usize);
+    if w == 0 || h == 0 || bytes.len() < w * h {
+        return 0;
+    }
+    let mut img = rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| bytes[y * w + x]);
+    for grid in img.detect_grids() {
+        if let Ok((_, text)) = grid.decode() {
+            if text.len() <= 512 && (text.starts_with("lumen://join") || text.contains("join=")) {
+                crate::collab::push_launch_link(text);
+                wake();
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+/// A host resolved by NsdManager: the beacon it published, plus its address.
+#[no_mangle]
+pub extern "system" fn Java_com_lumen_app_CollabKit_nativeNsdFound(mut env: JNIEnv, _c: JClass, _name: JString, host: JString, port: jint, info: JString) {
+    let (Ok(host), Ok(info)) = (env.get_string(&host), env.get_string(&info)) else { return };
+    let (host, info): (String, String) = (host.into(), info.into());
+    if info.len() > 1500 || !(1..=65535).contains(&port) {
+        return;
+    }
+    let Ok(mut b) = serde_json::from_str::<crate::collab::Beacon>(&info) else { return };
+    if b.v != crate::collab::PROTO {
+        return;
+    }
+    b.port = port as u16;
+    let ip = format!("{host}:{port}");
+    if let Ok(mut v) = NSD.lock() {
+        if v.len() < 64 {
+            v.push((b, ip));
+        }
+    }
+    wake();
+}
+
 /// `lumen://join?…` delivered by the activity (intent filter): handed to the collaboration dialog on the next frame.
 #[no_mangle]
 pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeLink(mut env: JNIEnv, _c: JClass, link: JString) {

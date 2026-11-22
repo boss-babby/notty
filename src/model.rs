@@ -852,6 +852,9 @@ pub struct Workspace {
     /// PDF annotations (highlights, underlines, notes, drawings) per document key — see `pdf.rs`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pdf_annots: BTreeMap<u64, Vec<PdfAnnot>>,
+    /// Comment threads per page id (page-level or attached to a block; `@mentions` are plain text). Synced as `Key::Comment` entities.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub comments: BTreeMap<u64, Vec<Comment>>,
     /// Customisable dashboard: boards of widgets (see `dashcfg.rs`).
     #[serde(default)]
     pub dash: crate::dashcfg::Dash,
@@ -867,6 +870,25 @@ pub enum AnnotKind {
     Strike,
     Note,
     Ink,
+}
+
+/// A comment on a page (`block == 0`) or on one block of it. Replies point at their parent through `reply_to`.
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug, Default)]
+pub struct Comment {
+    pub id: u64,
+    #[serde(default)]
+    pub block: u64,
+    #[serde(default)]
+    pub reply_to: u64,
+    pub author: String,
+    #[serde(default)]
+    pub author_id: u32,
+    pub text: String,
+    /// Wall-clock time (seconds since the Unix epoch).
+    #[serde(default)]
+    pub ts: f64,
+    #[serde(default)]
+    pub resolved: bool,
 }
 
 /// One annotation on a PDF page. All coordinates are fractions (0‥1) of the page width / height, so they survive any zoom level.
@@ -1863,7 +1885,7 @@ impl Workspace {
 
     /// An empty workspace for the workspace switcher: one welcome page, no sample data. Look (dark mode, accent) is inherited.
     pub fn blank(name: &str, dark: bool, accent: usize) -> Self {
-        let mut ws = Workspace { name: name.into(), pages: vec![], next_id: 0, bigs: BTreeMap::new(), current: None, dark, sidebar_open: true, accent, icons_v2: false, pdf_annots: BTreeMap::new(), dash: Default::default(), auto: Default::default() };
+        let mut ws = Workspace { name: name.into(), pages: vec![], next_id: 0, bigs: BTreeMap::new(), current: None, dark, sidebar_open: true, accent, icons_v2: false, pdf_annots: BTreeMap::new(), comments: BTreeMap::new(), dash: Default::default(), auto: Default::default() };
         let start = ws.add_page(None, PageKind::Doc);
         let bl = vec![
             ws.blk(BlockKind::Text, "This is a fresh workspace — pages, databases, canvases and dashboards you create here stay separate from your other workspaces.", 0),
@@ -1880,7 +1902,7 @@ impl Workspace {
     }
 
     pub fn seed() -> Self {
-        let mut ws = Workspace { name: "My Workspace".into(), pages: vec![], next_id: 0, bigs: BTreeMap::new(), current: None, dark: false, sidebar_open: true, accent: 0, icons_v2: false, pdf_annots: BTreeMap::new(), dash: Default::default(), auto: Default::default() };
+        let mut ws = Workspace { name: "My Workspace".into(), pages: vec![], next_id: 0, bigs: BTreeMap::new(), current: None, dark: false, sidebar_open: true, accent: 0, icons_v2: false, pdf_annots: BTreeMap::new(), comments: BTreeMap::new(), dash: Default::default(), auto: Default::default() };
         use BlockKind::*;
 
         let start = ws.add_page(None, PageKind::Doc);

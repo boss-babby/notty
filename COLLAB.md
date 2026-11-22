@@ -249,3 +249,65 @@ Frames are opaque sealed Noise records — losing one (log trimmed) breaks the A
 running site: Noise handshake over the room, initial sync, joiner → host edit (stable over repeated runs). Note: the relay shows a device only frames posted
 *after* it first appeared in the room (so a late joiner never receives somebody else's old handshake); a host therefore has to be polling before the link is
 shared — which is always the case in the app (the link only exists once the room does).
+
+## 10. Pass 4 — concurrent text merge, trusted devices, comments, tombstone GC, Android QR + NSD (14.3)
+
+Everything below is covered by `cargo test --lib collab` (21 tests) unless marked *(device-only)*.
+
+### 10.1 Task list status (after pass 4)
+| # | Task | State |
+|---|---|---|
+| 1 | Text CRDT inside blocks | **done in a different way than planned** — field-wise **three-way merge** (`textmerge.rs`) instead of `yrs`. See 10.2. Remote carets inside a paragraph are *not* drawn (only the block id travels in `Presence`). |
+| 2 | Trusted devices / persisted device key | **done** — the Noise static key is created once and stored with the app data; a host remembers every device it approved (name, role) and lets it in without a card next time; *Forget* in the Share dialog revokes (and a kick bans). The key sits in egui's persisted storage (app-private dir on Android); wrapping it in the Android Keystore is still open. |
+| 3 | Android camera QR scan + NSD | **done, compile-verified, not exercised on a physical phone** *(device-only)* — `CollabKit.java` (camera preview → Rust `rqrr` decoder → join dialog; `NsdManager` register/discover of `_lumen._tcp` with the beacon in TXT records). Nearby shows NSD hosts next to UDP ones. |
+| 4 | PDF reader realtime | open — `Presence::pdf` is carried and stored, the reader does not draw other readers yet. |
+| 5 | Mesh / host hand-over | open — joiner-side reconnect (pass 3) stays; a session still ends when the host leaves. Design sketch in 10.5. |
+| 6 | Big tables (`bigs`) sync | open. |
+| 7 | Binary framing | open (deflate from pass 2 already removes most of the JSON overhead). |
+| 8 | Tombstone GC | **done** — see 10.3. |
+| 9 | WebRTC for browser hosting | open. |
+| 10 | Comments / @mentions | **done** — see 10.4. |
+
+### 10.2 Concurrent edits of one block: three-way merge
+* Every `Entry` carries `base` = content hash of the value it replaced (0 = unknown, old behaviour). `Replica` keeps the last four versions of
+  the blocks of the open page (and of any block that received a remote edit) in `hist` — the *merge bases*.
+* `Replica::apply` → `merge_block`: if an incoming block op is neither identical to nor built on what we hold, and its base is in `hist`,
+  the block JSON is merged field by field (`textmerge::merge_json`): a field only one side touched wins; a text field both touched goes
+  through a character-level three-way merge (`merge3`: edits in different places are both kept, identical edits apply once, overlapping edits
+  keep both versions in a deterministic order); other conflicting fields fall back to the newer clock.
+* The merge is **symmetric** for non-overlapping edits, so both peers compute the same result and converge without negotiation; the merged
+  value is re-published by the normal local scan with a newer clock. A limiter (4 merges / 3 s / block) rules out ping-pong.
+* Tests: `two_people_typing_in_the_same_paragraph_keep_both_edits` (A appends, B prepends, both texts survive on both sides),
+  `merge_is_symmetric`, `json_fields_merge_independently`.
+* Limits: single-hunk diff per side (two far-apart edits by the *same* person inside one scan interval collapse to one wider hunk — still
+  loss-free, only coarser); blocks of pages nobody has open on the merging device have no base and keep last-writer-wins.
+  A real sequence CRDT (`yrs`) would also give intention preservation and remote carets — see 10.5.
+
+### 10.3 Tombstone garbage collection
+Tombstones (48 B) older than 10 minutes are dropped every minute (`Replica::gc`, `Collab::poll`). This is safe because a dropped connection
+gives up after ≈ 90 s (`RESUME_DELAYS`) — no device can come back with a view older than the grace period; a later join is a fresh
+workspace anyway. Test: `old_tombstones_are_collected_and_young_ones_stay`. `Stats::gc` counts what was freed.
+
+### 10.4 Comments and @mentions
+* Model: `Workspace::comments: BTreeMap<page id, Vec<Comment>>` — `Comment { id, block, reply_to, author, author_id, text, ts, resolved }`.
+* Sync: `Key::Comment(page, id)` entities (group 2 of the page), scan / apply / digest / diff like annotations, scope-checked on the host
+  (a guest can only comment on pages in the shared scope; ≤ 5 000 comments per page). **`PROTO` is now 3** (old peers are refused with a message).
+* UI (`collab/comments.rs`): speech-bubble button with the number of open comments in the top bar (desktop and phone layouts), a window with
+  threads, replies, *Resolve / Reopen / Delete*, "resolved" filter, optional attachment to the block being edited, `@name` completion from the
+  people in the session, highlighted mentions, and a toast when someone else comments or mentions you. Works offline too.
+* Tests: `comments_sync_resolve_and_delete`, `mentions_match_first_names_only_at_word_ends`.
+
+### 10.5 Review — what more can be done (ranked)
+1. **Host hand-over.** Cheapest design: host sends `Handover{to, token}` to the longest-connected editor; that device starts listening (it
+   already holds the replica and the session id), answers with its port, the host broadcasts `Moved{ip, port, token}` and the others re-dial
+   through the existing resume path (same session id ⇒ digest resync). Relay sessions need no hand-over (the room is the host). Needs a 3-device
+   test harness.
+2. **`yrs` Y.Text per text block** for intention preservation and live remote carets (block id is already in `Presence`); keep the entity map for
+   structure and use the merge of 10.2 as the fallback for old peers.
+3. **PDF reader realtime**: draw `Presence::pdf` as small avatars on the page thumbnail strip + live stroke drafts.
+4. **WebRTC data channels** (signalling over `/api/collab`) so a browser tab can host and LAN devices can reach it without the relay.
+5. **Big tables**: sync `lumen-store` zone-map chunks instead of pages; per-database permission scopes.
+6. Binary framing (postcard) for the relay; snapshot checkpoints; Android Keystore wrapping of the device key; Wi-Fi Direct / Quick Share hand-off
+   across networks; end-to-end tests on real phones (QR + NSD are verified to compile and package only).
+7. Product ideas beyond sync: comment notifications while the app is closed (relay push), per-block "suggest edit" mode, presence "typing…"
+   badges, session recording / audit log for hosts, read-only share links with expiry, workspace snapshots to roll back a bad merge.

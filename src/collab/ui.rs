@@ -34,7 +34,7 @@ fn initials(name: &str) -> String {
     }
 }
 
-fn avatar(p: &Painter, c: Pos2, r: f32, peer: &PeerInfo, ring: Color32) {
+pub(super) fn avatar(p: &Painter, c: Pos2, r: f32, peer: &PeerInfo, ring: Color32) {
     p.circle_filled(c, r + 1.8, ring);
     p.circle_filled(c, r, color_of(peer));
     p.text(c, Align2::CENTER_CENTER, initials(&peer.name), bold(r * 0.88), Color32::WHITE);
@@ -57,7 +57,7 @@ pub struct Out {
 }
 
 /// 0 = secondary, 1 = primary, 2 = danger, 3 = quiet.
-fn button(ui: &mut Ui, pal: &Palette, label: &str, kind: u8, w: f32) -> egui::Response {
+pub(super) fn button(ui: &mut Ui, pal: &Palette, label: &str, kind: u8, w: f32) -> egui::Response {
     let h = if crate::touch::touchy() { 38.0 } else { 30.0 };
     let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
     let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
@@ -75,13 +75,17 @@ fn button(ui: &mut Ui, pal: &Palette, label: &str, kind: u8, w: f32) -> egui::Re
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
-fn glyph_button(ui: &mut Ui, pal: &Palette, g: &str, tip: &str, tint: Option<Color32>) -> egui::Response {
+pub(super) fn glyph_button(ui: &mut Ui, pal: &Palette, g: &str, tip: &str, tint: Option<Color32>) -> egui::Response {
     let s = if crate::touch::touchy() { 36.0 } else { 26.0 };
     let (rect, resp) = ui.allocate_exact_size(vec2(s, s), Sense::click());
     let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
     ui.painter().rect_filled(rect, 7.0, with_alpha(pal.hover, t));
     crate::icons::glyph(ui.painter(), rect.center(), 15.0, g, tint.unwrap_or_else(|| crate::theme::lerp_color(pal.muted, pal.text, t)));
     resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip)
+}
+
+pub(super) fn switch_public(ui: &mut Ui, pal: &Palette, on: bool) -> egui::Response {
+    switch(ui, pal, on)
 }
 
 fn switch(ui: &mut Ui, pal: &Palette, on: bool) -> egui::Response {
@@ -95,6 +99,24 @@ fn switch(ui: &mut Ui, pal: &Palette, on: bool) -> egui::Response {
 // ───────────── top bar chip ─────────────
 
 /// The sharing button: an icon when nobody is connected, a stack of avatars while a session runs.
+/// Comments button of the top bar: speech bubble with the number of open comments on this page.
+pub fn comments_button(ui: &mut Ui, pal: &Palette, c: &mut Collab, open_count: usize) {
+    let touch = crate::touch::touchy();
+    let h = if touch { 38.0 } else { 28.0 };
+    let (rect, resp) = ui.allocate_exact_size(vec2(h, h), Sense::click());
+    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || c.ui.comments, 0.12);
+    ui.painter().rect_filled(rect, 7.0, with_alpha(pal.hover, t));
+    crate::icons::glyph(ui.painter(), rect.center(), 16.0, l::MESSAGE_SQUARE, crate::theme::lerp_color(pal.muted, pal.text, t));
+    if open_count > 0 {
+        let p = pos2(rect.right() - 6.0, rect.top() + 7.0);
+        ui.painter().circle_filled(p, 6.5, pal.accent);
+        ui.painter().text(p, Align2::CENTER_CENTER, open_count.min(9).to_string(), bold(9.0), Color32::WHITE);
+    }
+    if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Comments").clicked() {
+        c.ui.comments = !c.ui.comments;
+    }
+}
+
 pub fn chip(ui: &mut Ui, pal: &Palette, c: &mut Collab) {
     let people = c.people();
     let n = if c.active() { people.len().min(3) } else { 0 };
@@ -150,6 +172,10 @@ pub fn overlays(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &mut crate::mo
     }
     if c.ui.menu && c.active() {
         menu(ctx, pal, c, ws, &mut out);
+    }
+    super::comments::notify(c, ws);
+    if c.ui.comments {
+        super::comments::window(ctx, pal, c, ws, current);
     }
     if c.ui.dialog {
         let id = Id::new("collab_dialog");
@@ -547,6 +573,23 @@ fn share_tab(ui: &mut Ui, pal: &Palette, c: &mut Collab, ws: &mut crate::model::
             });
         });
     }
+    let trusted = c.trusted_list();
+    if !trusted.is_empty() {
+        card(ui, pal, |ui| {
+            ui.label(egui::RichText::new("Trusted devices").font(bold(13.5)).color(pal.text));
+            ui.label(egui::RichText::new("Approved once — they join without a card. Removing one also revokes the share for that device.").font(body(12.0)).color(pal.muted));
+            for (key, name, viewer) in trusted {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("{name} · {}", if viewer { "view" } else { "edit" })).font(body(13.0)).color(pal.text));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if button(ui, pal, "Forget", 3, 64.0).clicked() {
+                            c.forget_trusted(&key);
+                        }
+                    });
+                });
+            }
+        });
+    }
     let w = ui.available_width();
     if button(ui, pal, "Stop sharing", 2, w).clicked() {
         c.stop(true);
@@ -632,7 +675,14 @@ fn nearby_tab(ui: &mut Ui, pal: &Palette, c: &mut Collab) {
                 c.join_text(&t, &base);
             }
         });
-        ui.label(egui::RichText::new("Phones: show the QR on the host, or type the 6-character code.").font(body(12.0)).color(pal.muted));
+        #[cfg(target_os = "android")]
+        {
+            let w = ui.available_width();
+            if button(ui, pal, "Scan the host's QR code", 0, w).clicked() {
+                crate::android::scan_qr();
+            }
+        }
+        ui.label(egui::RichText::new("Phones: scan the QR on the host, or type the 6-character code.").font(body(12.0)).color(pal.muted));
     });
 }
 

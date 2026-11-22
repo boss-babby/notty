@@ -22,6 +22,16 @@ pub struct Keys {
     private: Vec<u8>,
 }
 
+impl Keys {
+    /// Restores a device key saved by [`Keys::private_bytes`] (X25519 private keys are 32 bytes).
+    pub fn from_private(b: Vec<u8>) -> Option<Keys> {
+        (b.len() == 32).then_some(Keys { private: b })
+    }
+    pub fn private_bytes(&self) -> &[u8] {
+        &self.private
+    }
+}
+
 pub fn gen_keys() -> Option<Keys> {
     let b = Builder::new(PATTERN.parse().ok()?);
     let kp = b.generate_keypair().ok()?;

@@ -292,6 +292,29 @@ public class LumenActivity extends NativeActivity {
 
     // ───────────────────────────── called from Rust ─────────────────────────────
 
+    // ── local collaboration: camera QR scan + NSD discovery (see CollabKit) ──
+    public void scanQr() {
+        CollabKit.scanQr(this);
+    }
+
+    public void nsdStart(String name, int port, String info) {
+        CollabKit.nsdStart(this, name, port, info);
+    }
+
+    public void nsdStop() {
+        CollabKit.nsdStop();
+    }
+
+    public void nsdDiscover(boolean on) {
+        CollabKit.nsdDiscover(this, on);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int code, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(code, permissions, results);
+        CollabKit.onPermission(this, code, results);
+    }
+
     public void showIme() {
         runOnUiThread(new Runnable() {
             @Override

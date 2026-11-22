@@ -72,3 +72,8 @@ The same Rust session code runs on the phone (see [COLLAB.md](COLLAB.md)). Permi
 `ACCESS_NETWORK_STATE`, `ACCESS_WIFI_STATE`, `CHANGE_WIFI_MULTICAST_STATE`, `NEARBY_WIFI_DEVICES (neverForLocation)`. Discovery is UDP
 broadcast on port 47616, sessions use TCP 47615. Open points for the next pass: a `WifiManager.MulticastLock` + `NsdManager` discovery,
 camera QR scanning in `LumenActivity` (→ `collab::Collab::join_text`), `lumen://join` deep link.
+
+## 14.3 additions
+* `CollabKit.java`: camera QR scanner (android.hardware.Camera preview → `Java_com_lumen_app_CollabKit_nativeScanFrame` → `rqrr` → join dialog) and
+  `NsdManager` registration / discovery of `_lumen._tcp` (beacon JSON in TXT attributes `i0…i5`). Manifest: `CAMERA` (optional hardware, requested on tap).
+* Build: `./build-android.sh` (arm64-v8a, `android` profile = release + thin LTO, 16 KB page alignment, v2/v3 signed, zip-aligned).

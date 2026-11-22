@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "14.1.0"
+version = "14.3.0"
 edition = "2021"
 description = "Lumen — a Notion + Obsidian + Miro-lite alternative (infinite canvas) written entirely in Rust with egui (Windows, Android + WebAssembly): Markdown tables, two-way relations, automations, reminders, LumenScript, AI + MCP"
 license = "MIT"
@@ -58,6 +58,7 @@ android-activity = { version = "0.6", features = ["native-activity"] }
 egui-winit = { version = "0.31.1", default-features = false }
 jni = "0.21"
 android_logger = "0.14"
+rqrr = { version = "0.8", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 # lower fragmentation and RSS that is returned to the OS (large workspaces); Windows only — Android's scudo and wasm's dlmalloc stay
