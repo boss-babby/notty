@@ -1,4 +1,4 @@
-# Delivery — Lumen 14.8 · pass 10 (the `COLLAB.md` §15.10 list)
+# Delivery — Lumen 14.8 · pass 11 (carets, follow-the-cursor, universal Nearby, one link anywhere — `COLLAB.md` §17)
 
 Everything is built from this repository, headless, on Linux x86-64: no Android Studio, no GUI. The website in `../` serves all three
 artefacts; the WebAssembly build is linked into the page at `/app` (and `/webapp`).
@@ -85,3 +85,12 @@ cd ../ && npx next typegen && npm exec tsc -- --noEmit && npm run build   # the 
   mmap-after-compaction fix in `lumen-store` (a stale memory map could return old bytes for a table ≥ 256 MB after a compaction; it has a
   regression test).
 * The grants **UI card** and the live per-keystroke `TextOp` frames are not in this pass — the model and the API are (§16.8 items 1–2).
+
+
+## Pass 11 additions (details in `COLLAB.md` §17)
+1. Remote carets: sticky while idle, multi-line selections painted row by row, halo + flag that is never clipped.
+2. **Follow** also follows the caret / pointer (scroll / pan), with an always-visible "Following …" pill.
+3. `collab/mdns.rs`: desktop builds publish and browse `_lumen._tcp` (DNS-SD) — Windows / Linux / macOS ⇄ Android in both directions.
+4. One direct link also names its relay room: LAN → IPv6 → public IPv4 → punch → relay, automatically; IPv6 fall-back for "Internet access".
+5. Share-links card (role, lifetime, uses, copy, revoke).
+6. The website's relay / rendezvous / proxy routes are part of the repository now (`../src/app/api/**`), plus `Lumen-source.zip` (`make-source.sh`).

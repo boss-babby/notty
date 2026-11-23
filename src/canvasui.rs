@@ -986,6 +986,17 @@ fn run(ui: &mut Ui, ws: &mut Workspace, page: u64, pal: &Palette, c: &mut Canvas
         crate::collab::canvas_cursor(page, [w.x, w.y]);
     }
     crate::collab::paint_canvas_cursors(&painter, pal, page, &|w: Pos2| c.view.to_screen(origin, w));
+    // following somebody: when their pointer leaves the middle of the screen the board glides after it
+    if let Some(w) = crate::collab::follow_pointer(page) {
+        let s = c.view.to_screen(origin, pos2(w[0], w[1]));
+        if !rect.shrink(rect.size().min_elem() * 0.18).contains(s) {
+            let z = c.view.zoom.max(0.01);
+            let (tx, ty) = (w[0] - rect.width() * 0.5 / z, w[1] - rect.height() * 0.5 / z);
+            c.view.x += (tx - c.view.x) * 0.2;
+            c.view.y += (ty - c.view.y) * 0.2;
+            ctx.request_repaint();
+        }
+    }
     // auto-grow
     for (id, h) in dout.grow {
         if let Some(n) = c.node_mut(id) {

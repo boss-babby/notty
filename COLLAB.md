@@ -932,3 +932,109 @@ tools/phone-rig.sh      new   two-device adb + UI Automator rig (dry-run mode fo
 
 `DELIVERY.md` in the repository root lists the three artefacts with their sizes and SHA-256, the exact build commands, how the website
 serves them (`/downloads`, `/app`, `/webapp`), and the limitations of this machine. `VERIFY.md` records the commands and their output.
+
+## 17. Pass 11 — reliable carets, follow-the-cursor, universal Nearby, one link that works anywhere, share-link UI (14.8 · this delivery)
+
+Input: the field reports of the last pass (carets unreliable, selections only drawn on one line, a "follow the cursor" mode wanted, *is Nearby only
+for Android?*, *how can any device connect without UPnP or a public address?*) plus the open items of §16.8. Nothing here changes `PROTO` (8): a new
+link only carries two more optional query keys (`rr`, `rb`).
+
+### 17.1 Carets: what was wrong, what changed
+Reading the path from `TextEdit` to the other screen again found **three** causes, all on the *sending* and *painting* side:
+1. **The caret expired while you were idle.** `caret_state()` returned `None` 1.5 s after the last frame that reported it, and an idle focused editor
+   does not repaint every frame, so the next presence heartbeat went out *without* a caret and the remote bar vanished — "sometimes it doesn't show".
+   Now the caret is **sticky** (45 s safety limit) and ends exactly when the editor of that block stops being focused (`collab::clear_caret`,
+   called from `editor.rs` for every unfocused block).
+2. **Multi-line selections were not drawn at all.** The painter only filled a rectangle when the first and last position were on the same row.
+   `collab::selection_spans` (pure, unit-tested) now returns one span per row the selection touches (wrapped lines, hard line breaks, empty selected
+   lines get a small marker), and `paint_carets` fills each row from `Row::x_offset`.
+3. **Low contrast / clipped label.** The 2 px bar now has a soft halo, and the name flag moves *below* the caret on the first visible line instead
+   of being clipped by the top of the scroll area.
+
+### 17.2 Follow mode that follows the cursor
+* **Follow** (person menu) already opened the page the other person was on. It now also chases **where they are**: on document pages the scroll
+  area scrolls to their caret whenever it moves (one `scroll_to_rect` per move, never per frame, so you can still scroll away between moves); on
+  canvas pages the board glides (20 % per frame) when their pointer leaves the middle 64 % of the screen.
+* A **"Following Ada · Cursor ✓ · Stop"** pill sits at the top of the screen (touch-sized targets) so the mode is visible and one tap ends it;
+  "Cursor" switches the chasing off and keeps the page-following (`Ui::follow_cursor_off`). Following also forces the person's cursor to be shown,
+  whatever the "show cursors" switch says.
+
+### 17.3 "Is Nearby only for Android?" — no, and now it is symmetric
+Before: every native build already sent / received the UDP beacons (broadcast + multicast, IPv4 + IPv6), but **only Android spoke DNS-SD**
+(`NsdManager`, `_lumen._tcp`). On Wi-Fi that blocks broadcast, a phone could see a laptop but never the other way round.
+Now `collab/mdns.rs` (pure Rust, `socket2` for `SO_REUSEADDR` on port 5353 and per-interface multicast) publishes and browses the **same**
+`_lumen._tcp.local` records with the **same TXT layout** (`i0…i5` chunks of the beacon JSON) that `CollabKit.nsdStart` writes:
+
+| Device A → Device B | Windows / Linux / macOS | Android | Browser |
+|---|---|---|---|
+| **Windows / Linux / macOS** | UDP beacon **and** mDNS (new) | UDP beacon **and** mDNS ⇄ NSD (new direction) | — (no UDP in a page) |
+| **Android** | same | NSD + UDP beacon | — |
+| **Browser** | joins by QR / link / code → relay or WebRTC | same | same |
+
+Also: the multicast group is joined on **every** IPv4 interface and queries / announcements leave through each (VPN, Hyper-V, Docker and Wi-Fi at
+once used to hide the right one); a goodbye (ttl 0) removes a host at once. `avahi-browse -r _lumen._tcp` and Apple Bonjour see the same service.
+macOS / iOS: the macOS build uses the same code; there is no iOS build. **Tests (4):** record round-trip, goodbye + source-address fallback,
+Android-compatible chunking, 4 000 mutated packets never panic.
+**Not done:** a page cannot send UDP, so the browser still needs a link; the planned "same public address" rendezvous on the site
+(`/api/collab/near`, list the hosts published from the caller's NAT) would close that and is the first item of §17.8.
+
+### 17.4 "How do I connect any device through the internet with no UPnP and no public address?" — research and what is built
+There is no magic; the options differ in **who must help** and **what the NAT must allow**:
+
+| Path | Needs | Router must | Built? |
+|---|---|---|---|
+| Same LAN | nothing | allow LAN traffic | yes (UDP beacon, **mDNS**, QR) |
+| **Global IPv6** | the two devices have a global v6 address (most mobile and many home ISPs) | allow inbound to the host (firewall pinhole — PCP / UPnP-IGDv2 / one click) | **yes** — link carries the v6 hints; `Internet access` now falls back to the v6 address when there is no IPv4 mapping |
+| UPnP / NAT-PMP | cooperative router with a public IPv4 | map a port | yes (pass 6) |
+| UDP hole punching (STUN + rendezvous) | a rendezvous to swap two addresses | cone NAT on at least one side | yes (pass 7, `punch.rs`) |
+| UDP relay (TURN-like) | one reachable host running `lumen-turn` | nothing | yes (pass 8) |
+| BitTorrent DHT lookup | nothing of ours | outbound UDP | yes (pass 10) |
+| **HTTPS relay on the site** | the site | outbound HTTPS only | yes — and works from browsers; **re-implemented in this repository's site** (§17.6) |
+
+What was missing was the *glue*: a link of the "direct" kind (`lumen://join?h=…`) had no way to say "and if none of these answers, use the relay
+room". Now `direct_link()` appends `&rr=<room>&rb=<site>` whenever the host has a relay room, `join_text` remembers it (`relay_fb`), and
+`on_closed` — when every direct address failed — re-joins **the same session through the relay** (`Target::Relay`, hole punch first, then relay) with a
+toast "No direct path — connecting through the relay". One link, any network: *LAN → IPv6 → public IPv4 → punched UDP → relay*, tried in that order
+of cost, automatically. The fall-back fires once (no loops) and only before a session exists (a running session uses the existing resume logic).
+**Test:** `a_direct_link_names_its_relay_and_falls_back_to_it`.
+**What the relay sees:** opaque Noise-encrypted frames; the room code is random; a device id is bound to a per-session key; nothing is written to disk.
+
+### 17.5 Share links with a role, lifetime and use count — the UI (§16.8 item 1)
+The *Share* tab of a hosting device has a **Share links** card: one tap cycles *role* (edit / suggest / view), *lifetime* (1 h / 24 h / 7 d / none) and
+*uses* (any / 1 / 5); **+ Link** creates the grant, copies the link and lists it with **Copy** and **Revoke** (revoking also removes whoever joined with it).
+It uses only the tested core (`create_grant`, `revoke_grant`, `grant_link`, `grant_lan_text`, `Grants::describe`) and is hidden on a provisional host.
+
+### 17.6 The website (this repository's `../src`, `../public`)
+The earlier deliveries described a Next.js site but its source was not in the repository, so the checked-out tree had no relay to talk to.
+It is now part of the delivery: `/api/collab` (long-poll relay, per-device key binding, 30-minute idle TTL, 16 MB log cap, frame ≤ 400 KB),
+`/api/collab/punch`, `/api/collab/rtc`, `/api/collab/ip`, `/api/collab/info`, `/api/collab/push` (501 unless `FCM_SERVICE_ACCOUNT`),
+`/api/download/[file]` (streams, `Range`, counts in PostgreSQL), `/api/flow-proxy`, `/api/ai-proxy`, `/api/hooks/[channel]` (SSRF-guarded), the
+landing page and the rewrites `/app`, `/webapp` → the WebAssembly build. `LUMEN_TURN=host:port` is advertised to punching clients.
+**Not re-implemented** (were in the earlier site, not needed by the app's core): `/api/mcp` + `/api/bridge/poll` (cloud MCP bridge) and
+`/api/preview`; the app reports "That server has no Lumen bridge" for the first one.
+
+### 17.7 Status of the §16.8 / §16.9 lists
+| Item | State |
+|---|---|
+| 16.8-1 Grants UI | **done** (17.5) |
+| 16.8-2 Live `TextOp` frames | **not done.** Reason unchanged: it replaces the whole-block `Ops` for text fields and needs an on-device typing soak (IME composition, undo) that cannot run here. The CRDT merge (`merge3`) is what keeps concurrent edits today. |
+| 16.8-3 Real-device pass (BLE, FCM) | **not done** — no radios in this environment; `tools/phone-rig.sh` is the closing step |
+| 16.8-4 Compressed `BigChunk`s | **not done** |
+| 16.8-5 Cell deletions / new columns in cell merge | **not done** |
+| 16.8-6 IPv6 first-class | **partly**: v6 fall-back for "Internet access" and v6 in every link; no AAAA publication and no PCP pinhole request |
+| 16.8-7 `Arc<Page>` copy-on-write | **not done** (model refactor across ~60 files) |
+| 16.9-2 Signed introduction | **done in a simpler form**: the link names the room, the relay stays untrusted (17.4) |
+
+### 17.8 Review — what more can be done (ranked)
+1. **`/api/collab/near`**: hosts opt in to publish their beacon under the hash of their public address; any device (browsers included) behind the same
+   NAT lists them. Gives the web build a real "Nearby".
+2. **PCP / UPnP-IGDv2 `AddPinhole`** so that IPv6-direct works behind home routers that firewall inbound v6 by default; publish an AAAA for the host.
+3. **Live `TextOp`** (16.8-2) with an IME soak test on a phone; then drop the whole-block ops for text.
+4. **Relay over WebSocket / SSE** when the platform allows it (Next.js route handlers cannot upgrade): today a frame waits at most one long-poll round
+   trip; a dedicated `lumen-relay` binary next to `lumen-turn` would give sub-100 ms through the relay.
+5. **Compressed BigChunks**, deleted-cell markers, mmap-backed `Arc<Page>` store.
+6. **Real hardware CI** (two emulators + `adb` + a netns pair for the LAN and NAT cases).
+7. Remote carets inside table cells, code blocks and database cells (today: text blocks and the title field only).
+
+### 17.9 Verification log (this machine, Linux x86-64, Rust 1.100)
+See `VERIFY.md` for the exact command tails. New tests: 4 (`mdns`), 4 (`collab::tests`: spans, sticky caret, link fall-back, follow); all collab tests pass.

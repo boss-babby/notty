@@ -2882,6 +2882,8 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         if let Some(cr) = out.cursor_range {
             crate::collab::set_caret(b.id, cr.secondary.ccursor.index as u32, cr.primary.ccursor.index as u32, out.galley.text().chars().count() as u32);
         }
+    } else {
+        crate::collab::clear_caret(b.id);
     }
     crate::collab::paint_carets(ui, b.id, &out.galley, out.galley_pos);
 

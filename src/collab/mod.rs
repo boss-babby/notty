@@ -17,6 +17,8 @@ pub mod textcrdt;
 mod textmerge;
 pub mod ui;
 
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+mod mdns;
 #[cfg(not(target_arch = "wasm32"))]
 mod net;
 #[cfg(not(target_arch = "wasm32"))]
@@ -629,6 +631,12 @@ pub struct Ui {
     pub qr_cache: Option<(String, Vec<bool>, usize)>,
     pub person_menu: Option<u32>,
     pub follow: Option<u32>,
+    /// While following: stay on the person's page only (the default also scrolls / pans to wherever their caret or pointer is).
+    pub follow_cursor_off: bool,
+    /// New share link in the dialog: role / lifetime / use-count choices (indices).
+    pub grant_role: u8,
+    pub grant_ttl: u8,
+    pub grant_uses: u8,
     pub toast: Option<(String, f64)>,
     pub discovering: bool,
     pub details: bool,
@@ -685,6 +693,8 @@ pub struct Collab {
     pub token: String,
     pub addr_hint: Vec<String>,
     pub relay_room: Option<String>,
+    /// A direct link that also names a relay room: when no direct address answers, the join falls back to the relay (`(base, room)`).
+    relay_fb: Option<(String, String)>,
     pub show_cursors: bool,
     pub last_error: Option<String>,
     pub stats: Stats,
@@ -1048,6 +1058,7 @@ impl Collab {
             token: String::new(),
             addr_hint: vec![],
             relay_room: None,
+            relay_fb: None,
             show_cursors,
             last_error: None,
             stats: Stats::default(),
@@ -1434,6 +1445,13 @@ impl Collab {
             return None;
         }
         let mut s = format!("lumen://join?h={}&t={}", hosts.join(","), self.token);
+        // the same link also names the relay room: a joiner that reaches no direct address falls back to the relay by itself
+        if let (Some(room), false) = (&self.relay_room, self.ui.relay_url.trim().is_empty()) {
+            s.push_str(&format!(
+                "&rr={room}&rb={}",
+                pct_encode(self.ui.relay_url.trim().trim_end_matches('/'))
+            ));
+        }
         if self.hs.0 == "up" && !self.hs.1.is_empty() {
             s.push_str(&format!(
                 "&ws={}&wp={}",
@@ -1504,6 +1522,16 @@ impl Collab {
                 }
             } else {
                 w.ip = ip;
+            }
+            // no usable IPv4 path (no UPnP, CGNAT, no public address): a global IPv6 address needs neither a mapping nor a relay
+            if w.ip.is_empty() || w.state == 3 {
+                if let Some(v6) = net::local_addrs6().into_iter().find(|a| !a.starts_with("fd") && !a.starts_with("fc")) {
+                    w.ip = v6;
+                    w.port = port;
+                    w.mapped = false;
+                    w.state = 2;
+                    w.note = "Direct over IPv6 — no router setup needed (your router's IPv6 firewall must allow incoming connections to this device).".into();
+                }
             }
             if let Ok(mut x) = wan.lock() {
                 *x = w;
@@ -1655,7 +1683,20 @@ impl Collab {
                 (Some(ssid), pass) if cfg!(target_os = "android") && !ssid.is_empty() => {
                     self.join_via_wifi(&ssid, &pass.unwrap_or_default(), &h, &token)
                 }
-                _ => self.join_addr(&h, &token),
+                _ => {
+                    self.join_addr(&h, &token);
+                    if let Some(room) = q("rr").filter(|r| {
+                        (4..=32).contains(&r.len()) && r.chars().all(|c| c.is_ascii_alphanumeric())
+                    }) {
+                        let base = q("rb")
+                            .filter(|b| b.starts_with("http"))
+                            .unwrap_or_else(|| relay_base.to_owned());
+                        if !base.trim().is_empty() {
+                            self.relay_fb =
+                                Some((base.trim().trim_end_matches('/').to_owned(), room));
+                        }
+                    }
+                }
             }
         } else if t.contains(':') || t.contains('.') {
             self.join_addr(t, "");
@@ -1964,6 +2005,7 @@ impl Collab {
         self.inq.clear();
         self.ops_in.clear();
         self.relay_room = None;
+        self.relay_fb = None;
         self.addr_hint.clear();
         self.want_ws = None;
         self.ready = false;
@@ -3757,6 +3799,16 @@ impl Collab {
 
     fn on_closed(&mut self, conn: ConnId, why: &str) {
         let Some(c) = self.conns.remove(&conn) else {
+            // the direct addresses of a link did not answer and the link names a relay room: use the relay instead
+            if self.mode == Mode::Joining && self.conns.is_empty() && self.session.is_none() {
+                if let Some((base, room)) = self.relay_fb.clone() {
+                    let token = self.token.clone();
+                    self.want_punch = true;
+                    self.join_relay(&base, &room, &token);
+                    self.toast("No direct path — connecting through the relay");
+                    return;
+                }
+            }
             // a re-dial that never got as far as a connection (refused / unreachable): count the attempt now instead of waiting 25 s for `reap`
             if self.mode == Mode::Joining
                 && self.conns.is_empty()
@@ -4344,6 +4396,11 @@ struct ViewState {
     draft: Option<(LiveDraft, f64)>,
     /// Remote carets followed through other people's edits: (peer, block) → [`Track`].
     tracks: HashMap<(u32, u64), Track>,
+    /// The person being followed and whether the view also chases their caret / pointer (not only their page).
+    follow: Option<u32>,
+    follow_cursor: bool,
+    /// Last followed caret the view was scrolled to: (peer, block, selection start, caret) — one scroll per move, never per frame.
+    follow_seen: Option<(u32, u64, u32, u32)>,
 }
 
 /// A remote caret as last drawn: the text it was drawn against and where it was mapped to, so that an edit by anybody (the remote
@@ -4363,7 +4420,10 @@ thread_local! {
 pub fn publish(c: &Collab) {
     VIEW.with(|v| {
         let mut v = v.borrow_mut();
-        v.show = c.active() && c.show_cursors;
+        // following somebody always shows their cursor, whatever the "show cursors" switch says
+        v.show = c.active() && (c.show_cursors || c.ui.follow.is_some());
+        v.follow = c.ui.follow;
+        v.follow_cursor = !c.ui.follow_cursor_off;
         if !v.show {
             v.tracks.clear();
         }
@@ -4388,6 +4448,17 @@ pub fn set_caret(block: u64, from: u32, to: u32, len: u32) {
     });
 }
 
+/// The editor of `block` is not focused (any more): its caret is no longer mine.
+pub fn clear_caret(block: u64) {
+    VIEW.with(|v| {
+        let mut v = v.borrow_mut();
+        if matches!(v.caret, Some((b, ..)) if b == block) {
+            v.caret = None;
+            v.caret_len = 0;
+        }
+    });
+}
+
 fn caret_len() -> u32 {
     VIEW.with(|v| v.borrow().caret_len)
 }
@@ -4404,7 +4475,8 @@ fn typing_active() -> bool {
 
 fn caret_state() -> Option<(u64, u32, u32)> {
     VIEW.with(|v| match v.borrow().caret {
-        Some((b, f, t, at)) if mono_ms() - at < 1500.0 => Some((b, f, t)),
+        // sticky: an idle, focused editor does not repaint, so the caret must outlive the frames; `clear_caret` ends it when focus leaves
+        Some((b, f, t, at)) if mono_ms() - at < 45_000.0 => Some((b, f, t)),
         _ => None,
     })
 }
@@ -4530,7 +4602,38 @@ fn track_caret(peer: u32, block: u64, raw: (u32, u32), len: u32, text: &str, n: 
     })
 }
 
-/// Paints other people's carets (a thin coloured bar, selection tint and a name flag) over the text of `block`.
+/// The rows of a galley that a selection `[lo, hi)` (characters) touches, as `(row, first column, last column)`; the last column is
+/// `None` when the selection runs on to the end of the row (and past its line break). `rows` = `(characters without the break, ends with a
+/// break)` per row. Pure, so it is tested without a font.
+pub fn selection_spans(
+    rows: &[(usize, bool)],
+    lo: usize,
+    hi: usize,
+) -> Vec<(usize, usize, Option<usize>)> {
+    let mut out = vec![];
+    let mut start = 0usize;
+    for (i, &(n, nl)) in rows.iter().enumerate() {
+        let end = start + n + nl as usize;
+        let (a, b) = (lo.max(start), hi.min(end));
+        if a < b || (a == b && lo < start && hi > start && n == 0) {
+            let first = a - start;
+            let last = if b > start + n || (nl && b == end) {
+                None
+            } else {
+                Some(b - start)
+            };
+            out.push((i, first.min(n), last));
+        }
+        start = end;
+        if start >= hi {
+            break;
+        }
+    }
+    out
+}
+
+/// Paints other people's carets (a thin coloured bar, selection tint — across every row of a multi-line selection — and a name flag) over
+/// the text of `block`. The person being followed also pulls the surrounding scroll area to their caret.
 pub fn paint_carets(ui: &egui::Ui, block: u64, galley: &egui::Galley, pos: egui::Pos2) {
     let list = remote_carets(block);
     if list.is_empty() {
@@ -4539,28 +4642,50 @@ pub fn paint_carets(ui: &egui::Ui, block: u64, galley: &egui::Galley, pos: egui:
     let text = galley.text();
     let n = text.chars().count() as u32;
     let p = ui.painter();
+    let (follow, follow_cursor, follow_seen) = VIEW.with(|v| {
+        let v = v.borrow();
+        (v.follow, v.follow_cursor, v.follow_seen)
+    });
+    let rows: Vec<(usize, bool)> = galley
+        .rows
+        .iter()
+        .map(|r| (r.char_count_excluding_newline(), r.ends_with_newline))
+        .collect();
     for (name, color, a, b, len, typing, peer) in list {
         let col = ui::COLORS[(color % 8) as usize];
         let (a, b) = track_caret(peer, block, (a, b), len, text, n);
         let at = |i: u32| galley.pos_from_ccursor(egui::text::CCursor::new(i as usize));
         let head = at(b);
         if a != b {
-            let (lo, hi) = (a.min(b), a.max(b));
-            // one tinted rect per row of the selection
-            let (r0, r1) = (at(lo), at(hi));
-            if (r0.top() - r1.top()).abs() < 1.0 {
+            let (lo, hi) = (a.min(b) as usize, a.max(b) as usize);
+            for (ri, c0, c1) in selection_spans(&rows, lo, hi) {
+                let Some(row) = galley.rows.get(ri) else {
+                    continue;
+                };
+                let x0 = row.x_offset(c0);
+                let x1 = match c1 {
+                    // a selected line break is drawn as a short extra bit so an empty selected row is visible
+                    None => row.rect.right() + if row.ends_with_newline { 5.0 } else { 0.0 },
+                    Some(c) => row.x_offset(c),
+                };
+                let (x0, x1) = (x0.min(x1), x0.max(x1).max(x0 + 2.0));
                 p.rect_filled(
                     egui::Rect::from_min_max(
-                        pos + egui::vec2(r0.left(), r0.top()),
-                        pos + egui::vec2(r1.left(), r1.bottom()),
+                        pos + egui::vec2(x0, row.rect.top()),
+                        pos + egui::vec2(x1, row.rect.bottom()),
                     ),
                     2.0,
-                    ui::with_alpha_pub(col, 0.22),
+                    ui::with_alpha_pub(col, 0.24),
                 );
             }
         }
         let x = pos.x + head.left();
         let (y0, y1) = (pos.y + head.top(), pos.y + head.bottom());
+        // a soft halo under the bar keeps it visible on any page colour
+        p.line_segment(
+            [egui::pos2(x, y0), egui::pos2(x, y1)],
+            egui::Stroke::new(4.0_f32, ui::with_alpha_pub(col, 0.18)),
+        );
         p.line_segment(
             [egui::pos2(x, y0), egui::pos2(x, y1)],
             egui::Stroke::new(2.0_f32, col),
@@ -4574,15 +4699,46 @@ pub fn paint_carets(ui: &egui::Ui, block: u64, galley: &egui::Galley, pos: egui:
             egui::FontId::proportional(10.5),
             egui::Color32::WHITE,
         );
-        let flag = egui::Rect::from_min_size(
-            egui::pos2(x - 1.0, y0 - label.size().y - 3.0),
-            label.size() + egui::vec2(8.0, 3.0),
-        );
+        // the flag sits above the caret, or under it on the first line of a block at the top of the screen
+        let above = y0 - label.size().y - 3.0 >= ui.clip_rect().top();
+        let fy = if above {
+            y0 - label.size().y - 3.0
+        } else {
+            y1 + 1.0
+        };
+        let flag =
+            egui::Rect::from_min_size(egui::pos2(x - 1.0, fy), label.size() + egui::vec2(8.0, 3.0));
         p.rect_filled(flag, 3.0, col);
         p.galley(flag.min + egui::vec2(4.0, 1.5), label, egui::Color32::WHITE);
+        if follow == Some(peer) && follow_cursor && follow_seen != Some((peer, block, a, b)) {
+            VIEW.with(|v| v.borrow_mut().follow_seen = Some((peer, block, a, b)));
+            ui.scroll_to_rect(
+                egui::Rect::from_min_max(
+                    egui::pos2(x - 8.0, y0 - 56.0),
+                    egui::pos2(x + 8.0, y1 + 96.0),
+                ),
+                None,
+            );
+            ui.ctx().request_repaint();
+        }
     }
     ui.ctx()
         .request_repaint_after(std::time::Duration::from_millis(400));
+}
+
+/// While following with "follow cursor" on: the pointer of the followed person on canvas `page` (world coordinates).
+pub fn follow_pointer(page: u64) -> Option<[f32; 2]> {
+    VIEW.with(|v| {
+        let v = v.borrow();
+        if !v.follow_cursor {
+            return None;
+        }
+        let f = v.follow?;
+        v.remotes
+            .iter()
+            .find(|(i, p)| i.id == f && p.page == Some(page))
+            .and_then(|(_, p)| p.cur)
+    })
 }
 
 /// The canvas reports the pointer in world coordinates every frame while it is over the board.
@@ -5545,5 +5701,80 @@ mod tests {
         );
         host.stop(true);
         join.stop(true);
+    }
+
+    #[test]
+    fn selection_spans_cover_every_row_of_a_multi_line_selection() {
+        // "abc\n" / "" (an empty line) / "defg"
+        let rows = [(3, true), (0, true), (4, false)];
+        assert_eq!(
+            selection_spans(&rows, 1, 7),
+            vec![(0, 1, None), (1, 0, None), (2, 0, Some(2))]
+        );
+        // inside one row
+        assert_eq!(selection_spans(&[(10, false)], 2, 5), vec![(0, 2, Some(5))]);
+        // ends exactly where the next row starts: the next row is not touched
+        assert_eq!(selection_spans(&rows, 0, 4), vec![(0, 0, None)]);
+        // a wrapped paragraph (no line break between the two rows)
+        assert_eq!(
+            selection_spans(&[(6, false), (5, false)], 4, 9),
+            vec![(0, 4, Some(6)), (1, 0, Some(3))]
+        );
+        assert!(selection_spans(&rows, 3, 3).is_empty());
+    }
+
+    #[test]
+    fn a_remote_caret_outlives_idle_frames_and_ends_on_blur() {
+        set_caret(5, 1, 2, 10);
+        assert_eq!(caret_state(), Some((5, 1, 2)));
+        clear_caret(6); // another block losing focus does not touch mine
+        assert_eq!(caret_state(), Some((5, 1, 2)));
+        clear_caret(5);
+        assert_eq!(caret_state(), None);
+    }
+
+    #[test]
+    fn a_direct_link_names_its_relay_and_falls_back_to_it() {
+        let ctx = egui::Context::default();
+        let mut host = Collab::new(&ctx);
+        host.relay_room = Some("ROOM123456".into());
+        host.addr_hint = vec!["127.0.0.1:1".into()];
+        host.ui.relay_url = "http://127.0.0.1:9".into();
+        let link = host.direct_link().expect("link");
+        assert!(link.contains("&rr=ROOM123456&rb="), "{link}");
+        let mut join = Collab::new(&ctx);
+        join.join_text(&link, "");
+        assert_eq!(
+            join.relay_fb,
+            Some(("http://127.0.0.1:9".to_owned(), "ROOM123456".to_owned()))
+        );
+        assert!(matches!(join.target, Some(Target::Addr { .. })));
+        // the direct dial fails: the very same join continues through the relay room
+        join.on_closed(
+            987_654,
+            "Could not reach that device on any of its addresses",
+        );
+        assert!(
+            matches!(join.target, Some(Target::Relay { ref room, .. }) if room == "ROOM123456")
+        );
+        assert!(join.relay_fb.is_none(), "one fall-back only, never a loop");
+        join.stop(false);
+    }
+
+    #[test]
+    fn following_pulls_the_view_to_the_person_only_when_cursor_following_is_on() {
+        let ctx = egui::Context::default();
+        let mut c = Collab::new(&ctx);
+        c.ui.follow = Some(7);
+        publish(&c);
+        VIEW.with(|v| {
+            let v = v.borrow();
+            assert_eq!(v.follow, Some(7));
+            assert!(v.follow_cursor);
+        });
+        c.ui.follow_cursor_off = true;
+        publish(&c);
+        assert!(follow_pointer(1).is_none());
+        VIEW.with(|v| assert!(!v.borrow().follow_cursor));
     }
 }

@@ -456,6 +456,9 @@ impl Net {
             .stop
             .get_or_insert_with(|| Arc::new(AtomicBool::new(false)))
             .clone();
+        // DNS-SD (`_lumen._tcp`) next to the UDP beacons: Android NSD, Bonjour and Avahi see this device too
+        #[cfg(not(target_os = "android"))]
+        super::mdns::advertise(beacon.clone(), stop.clone());
         let _ = std::thread::Builder::new()
             .name("lumen-collab-beacon".into())
             .spawn(move || {
@@ -509,6 +512,8 @@ impl Net {
         }
         let stop = Arc::new(AtomicBool::new(false));
         self.disc_stop = Some(stop.clone());
+        #[cfg(not(target_os = "android"))]
+        super::mdns::browse(inbox.clone(), stop.clone());
         let (inbox6, stop6) = (inbox.clone(), stop.clone());
         let _ = std::thread::Builder::new()
             .name("lumen-collab-discover6".into())

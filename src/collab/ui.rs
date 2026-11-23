@@ -230,6 +230,73 @@ pub fn overlays(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &mut crate::mo
             }
         }
     }
+    // a pill while following: who, whether the cursor is chased too, and a way out that is always one tap away (phones included)
+    if let Some(f) = c.ui.follow {
+        if let Some((p, _)) = c.roster.iter().find(|(p, _)| p.id == f).cloned() {
+            let mut stop = false;
+            let mut toggle = false;
+            egui::Area::new(Id::new("collab_follow_pill"))
+                .order(egui::Order::Foreground)
+                .anchor(Align2::CENTER_TOP, vec2(0.0, 52.0))
+                .show(ctx, |ui| {
+                    crate::widgets::popup_frame(pal)
+                        .corner_radius(egui::CornerRadius::same(20))
+                        .inner_margin(egui::Margin::symmetric(12, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Following {}",
+                                        first_name(&p.name)
+                                    ))
+                                    .font(body(13.0))
+                                    .color(pal.text),
+                                );
+                                let cur = !c.ui.follow_cursor_off;
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new(if cur {
+                                                "Cursor ✓"
+                                            } else {
+                                                "Cursor"
+                                            })
+                                            .font(body(12.5))
+                                            .color(if cur { pal.accent } else { pal.muted }),
+                                        )
+                                        .frame(false)
+                                        .min_size(vec2(64.0, 32.0)),
+                                    )
+                                    .on_hover_text("Chase their caret / pointer")
+                                    .clicked()
+                                {
+                                    toggle = true;
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("Stop")
+                                                .font(body(12.5))
+                                                .color(pal.muted),
+                                        )
+                                        .frame(false)
+                                        .min_size(vec2(48.0, 32.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    stop = true;
+                                }
+                            });
+                        });
+                });
+            if toggle {
+                c.ui.follow_cursor_off = !c.ui.follow_cursor_off;
+            }
+            if stop {
+                c.ui.follow = None;
+            }
+        }
+    }
     // toast
     if let Some((msg, t0)) = c.ui.toast.clone() {
         let age = mono_ms() - t0;
@@ -388,6 +455,12 @@ fn menu(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &crate::model::Workspa
                     ui.horizontal_wrapped(|ui| {
                         if button(ui, pal, if c.ui.follow == Some(pid) { "Stop following" } else { "Follow" }, 0, 100.0).clicked() {
                             c.ui.follow = if c.ui.follow == Some(pid) { None } else { Some(pid) };
+                        }
+                        if c.ui.follow == Some(pid) {
+                            let lbl = if c.ui.follow_cursor_off { "Follow cursor: off" } else { "Follow cursor: on" };
+                            if button(ui, pal, lbl, 0, 140.0).on_hover_text("Scroll / pan to wherever their caret or pointer is, not only to their page").clicked() {
+                                c.ui.follow_cursor_off = !c.ui.follow_cursor_off;
+                            }
                         }
                         if hosting {
                             for (lbl, nr, w) in [("Make editor", Role::Editor, 104.0), ("Suggest only", Role::Suggester, 104.0), ("Make viewer", Role::Viewer, 104.0)] {
@@ -664,6 +737,7 @@ fn share_tab(ui: &mut Ui, pal: &Palette, c: &mut Collab, ws: &mut crate::model::
             }
         });
     }
+    grants_card(ui, pal, c);
     let w = ui.available_width();
     if button(ui, pal, "Stop sharing", 2, w).clicked() {
         c.stop(true);
@@ -854,4 +928,103 @@ pub fn paint_cursor_list(p: &Painter, _pal: &Palette, list: &[(&PeerInfo, &Prese
         p.rect_filled(r, 9.0, col);
         p.galley(r.min + vec2(6.0, 3.0), galley, Color32::WHITE);
     }
+}
+
+/// Per-document share links: own role, lifetime and use count, copyable and revocable (`Collab::create_grant` / `revoke_grant`).
+fn grants_card(ui: &mut Ui, pal: &Palette, c: &mut Collab) {
+    if c.provisional() {
+        return;
+    }
+    const ROLES: [(&str, Role); 3] = [
+        ("Can edit", Role::Editor),
+        ("Can suggest", Role::Suggester),
+        ("Can view", Role::Viewer),
+    ];
+    const TTLS: [(&str, u64); 4] = [
+        ("1 hour", 3_600_000),
+        ("24 hours", 86_400_000),
+        ("7 days", 604_800_000),
+        ("No expiry", 0),
+    ];
+    const USES: [(&str, u32); 3] = [
+        ("Any number of people", 0),
+        ("One person", 1),
+        ("Up to 5 people", 5),
+    ];
+    let now = now_ms();
+    let base = c.ui.relay_url.trim().to_owned();
+    let rows: Vec<(String, String, String)> = c
+        .grants
+        .list
+        .iter()
+        .filter(|g| g.live(now))
+        .map(|g| (g.id.clone(), g.token.clone(), g.describe(now)))
+        .collect();
+    card(ui, pal, |ui| {
+        ui.label(
+            egui::RichText::new("Share links")
+                .font(bold(13.5))
+                .color(pal.text),
+        );
+        ui.label(egui::RichText::new("Give each person their own link: choose what they can do, how long it works and how many can use it. Revoking removes whoever joined with it.").font(body(12.0)).color(pal.muted));
+        for (id, token, text) in rows {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(text).font(body(12.5)).color(pal.text));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if button(ui, pal, "Revoke", 3, 64.0).clicked() {
+                        c.revoke_grant(&id);
+                    }
+                    if button(ui, pal, "Copy", 0, 52.0).clicked() {
+                        if let Some(link) = c
+                            .grant_link(&token, &base)
+                            .or_else(|| c.grant_lan_text(&token))
+                        {
+                            ui.ctx().copy_text(link);
+                            c.toast("Link copied");
+                        }
+                    }
+                });
+            });
+        }
+        ui.horizontal_wrapped(|ui| {
+            if button(ui, pal, ROLES[c.ui.grant_role as usize % 3].0, 0, 104.0)
+                .on_hover_text("What the person can do — tap to change")
+                .clicked()
+            {
+                c.ui.grant_role = (c.ui.grant_role + 1) % 3;
+            }
+            if button(ui, pal, TTLS[c.ui.grant_ttl as usize % 4].0, 0, 92.0)
+                .on_hover_text("How long the link works — tap to change")
+                .clicked()
+            {
+                c.ui.grant_ttl = (c.ui.grant_ttl + 1) % 4;
+            }
+            if button(ui, pal, USES[c.ui.grant_uses as usize % 3].0, 0, 150.0)
+                .on_hover_text("How many people can use it — tap to change")
+                .clicked()
+            {
+                c.ui.grant_uses = (c.ui.grant_uses + 1) % 3;
+            }
+            if button(ui, pal, "+ Link", 1, 76.0).clicked() {
+                let (role, ttl, uses) = (
+                    ROLES[c.ui.grant_role as usize % 3].1,
+                    TTLS[c.ui.grant_ttl as usize % 4].1,
+                    USES[c.ui.grant_uses as usize % 3].1,
+                );
+                let label = format!("Link {}", c.grants.list.len() + 1);
+                match c.create_grant(role, &label, ttl, uses) {
+                    Some(token) => {
+                        if let Some(link) = c
+                            .grant_link(&token, &base)
+                            .or_else(|| c.grant_lan_text(&token))
+                        {
+                            ui.ctx().copy_text(link);
+                        }
+                        c.toast("Link created and copied");
+                    }
+                    None => c.toast("Only the host can create links"),
+                }
+            }
+        });
+    });
 }

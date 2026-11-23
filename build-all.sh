@@ -11,4 +11,6 @@ step() { echo; echo "════ $* ════ $(date +%T)"; }
 step "web (WebAssembly)";  bash build-web.sh
 step "android (arm64 APK)"; bash build-android.sh
 step "windows (x64 exe)";   bash build-windows.sh
+step "source zip";          bash make-source.sh
+bash make-sums.sh >/dev/null
 step "done"

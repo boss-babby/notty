@@ -50,6 +50,8 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
+# mDNS / DNS-SD sockets (SO_REUSEADDR on the shared port 5353, per-interface multicast)
+socket2 = { version = "0.5", features = ["all"] }
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "persistence", "x11", "wayland"] }
 env_logger = "0.11"
 arboard = { version = "3", default-features = false }
