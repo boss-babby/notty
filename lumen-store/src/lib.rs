@@ -601,7 +601,15 @@ pub struct FileSource {
     data: std::fs::File,
     wal: std::fs::File,
     len: u64,
+    /// Read-only memory map of `data.lst`, created lazily once the file is over [`MMAP_MIN`] (≈ 10 M rows) and re-created when reads go
+    /// past its end. Chunks are only ever appended, so the mapped prefix never changes under a reader; `compact` drops the map first.
+    #[cfg(any(unix, windows))]
+    map: std::sync::Mutex<Option<memmap2::Mmap>>,
+    mmap_min: u64,
 }
+
+/// Data files at least this big are read through a memory map instead of one `pread` per chunk.
+pub const MMAP_MIN: u64 = 256 << 20;
 
 #[cfg(unix)]
 fn read_at(f: &std::fs::File, buf: &mut [u8], off: u64) -> io::Result<()> {
@@ -627,6 +635,38 @@ fn read_at(_f: &std::fs::File, _buf: &mut [u8], _off: u64) -> io::Result<()> {
 }
 
 impl FileSource {
+    /// Copies `len` bytes at `off` out of the memory map (mapping the file first, or again when it has grown). `None` = use `pread`.
+    #[cfg(any(unix, windows))]
+    fn mapped(&self, off: u64, len: usize) -> Option<Vec<u8>> {
+        let end = off.checked_add(len as u64)?;
+        let mut g = self.map.lock().ok()?;
+        if g.as_ref().map_or(true, |m| (m.len() as u64) < end) {
+            // SAFETY: the file is opened by this process only, grows by appending and is replaced (not rewritten in place) by `compact`,
+            // which drops the map first; a truncated file would raise SIGBUS, which is why the length is re-checked against `self.len`.
+            let m = unsafe { memmap2::Mmap::map(&self.data) }.ok()?;
+            *g = Some(m);
+        }
+        let m = g.as_ref()?;
+        (m.len() as u64 >= end && self.len >= end).then(|| m[off as usize..end as usize].to_vec())
+    }
+
+    /// Lowers (tests) or raises the size from which reads go through a memory map.
+    pub fn with_mmap_min(mut self, bytes: u64) -> Self {
+        self.mmap_min = bytes;
+        self
+    }
+
+    pub fn is_mapped(&self) -> bool {
+        #[cfg(any(unix, windows))]
+        {
+            self.map.lock().map_or(false, |m| m.is_some())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
+        }
+    }
+
     pub fn open(dir: impl AsRef<std::path::Path>) -> io::Result<Self> {
         use std::fs::OpenOptions;
         let dir = dir.as_ref().to_path_buf();
@@ -634,7 +674,15 @@ impl FileSource {
         let data = OpenOptions::new().read(true).append(true).create(true).open(dir.join("data.lst"))?;
         let wal = OpenOptions::new().read(true).append(true).create(true).open(dir.join("wal.lst"))?;
         let len = data.metadata()?.len();
-        Ok(FileSource { dir, data, wal, len })
+        Ok(FileSource {
+            dir,
+            data,
+            wal,
+            len,
+            #[cfg(any(unix, windows))]
+            map: std::sync::Mutex::new(None),
+            mmap_min: MMAP_MIN,
+        })
     }
 }
 
@@ -643,6 +691,12 @@ impl Source for FileSource {
         self.len
     }
     fn read(&self, off: u64, len: usize) -> io::Result<Vec<u8>> {
+        #[cfg(any(unix, windows))]
+        if self.len >= self.mmap_min {
+            if let Some(v) = self.mapped(off, len) {
+                return Ok(v);
+            }
+        }
         let mut b = vec![0u8; len];
         read_at(&self.data, &mut b, off)?;
         Ok(b)
@@ -686,6 +740,10 @@ impl Source for FileSource {
     }
     fn compact(&mut self, live: &[(u64, u32)]) -> io::Result<Vec<u64>> {
         use std::io::Write;
+        #[cfg(any(unix, windows))]
+        if let Ok(mut m) = self.map.lock() {
+            *m = None;
+        }
         let tmp = self.dir.join("data.tmp");
         let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
         let mut offs = vec![];
@@ -699,6 +757,11 @@ impl Source for FileSource {
         std::fs::rename(&tmp, self.dir.join("data.lst"))?;
         self.data = std::fs::OpenOptions::new().read(true).append(true).open(self.dir.join("data.lst"))?;
         self.len = at;
+        // `read` above may have mapped the OLD file again: the map must never outlive the file it was made from
+        #[cfg(any(unix, windows))]
+        if let Ok(mut m) = self.map.lock() {
+            *m = None;
+        }
         Ok(offs)
     }
 }

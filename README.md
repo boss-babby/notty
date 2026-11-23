@@ -1,5 +1,12 @@
 # Lumen 14.3 — see [RELEASE-14.3.md](RELEASE-14.3.md) and [COLLAB.md §10](COLLAB.md): text merge, trusted devices, comments, GC, Android QR + NSD.
 
+> **This delivery (14.8 · pass 10):** the seven items of [`COLLAB.md` §15.10](COLLAB.md) — a real text CRDT with the editor adapter
+> (`src/collab/textcrdt.rs`), persistent big-table tombstones + index checkpoint + cell-level row merge + delta sync + memory-mapped reads +
+> background compaction, IPv6 LAN discovery and `dht:CODE` through the public BitTorrent DHT, Ed25519-signed fail-over plans with a quorum
+> for three or more editors, revocable/expiring per-document share links, the Android BLE pairing + FCM kits and a two-phone test rig.
+> Prebuilt artefacts (signed APK, Windows exe, WebAssembly) and the exact build/verify commands: [`DELIVERY.md`](DELIVERY.md) and
+> [`VERIFY.md`](VERIFY.md); design and status: [`COLLAB.md` §16](COLLAB.md).
+
 # Lumen 14.1 — encrypted collaboration, Android deep links, security review
 
 * **Collaboration is now end-to-end encrypted** (Noise XX, ChaCha20-Poly1305, forward secrecy) on the LAN socket, the browser WebSocket and the

@@ -5,7 +5,9 @@
 //! of its own address and a site-local multicast group; a device that is looking binds the discovery port while the dialog is open.
 use super::*;
 use std::io::ErrorKind;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
+};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
@@ -13,13 +15,19 @@ use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
 
 const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 76, 77);
+/// Link-local IPv6 multicast group for the same beacons (IPv6-only Wi-Fi, 464XLAT mobile networks).
+const GROUP6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0x4c75, 0x6d65);
 /// Frames are ≤ ~66 KB (Noise limit + base64); anything bigger is an attack, not a message.
 const MAX_FRAME: usize = 256 * 1024;
 const MAX_LIVE: usize = 48;
 const MAX_PER_IP: usize = 6;
 
 fn ws_config() -> WebSocketConfig {
-    WebSocketConfig::default().max_message_size(Some(MAX_FRAME)).max_frame_size(Some(MAX_FRAME)).write_buffer_size(64 * 1024).max_write_buffer_size(4 * 1024 * 1024)
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_FRAME))
+        .max_frame_size(Some(MAX_FRAME))
+        .write_buffer_size(64 * 1024)
+        .max_write_buffer_size(4 * 1024 * 1024)
 }
 
 /// Counts a live connection per address; released when the connection thread ends.
@@ -37,7 +45,10 @@ impl Slot {
             return None;
         }
         *n += 1;
-        Some(Slot { ip, live: live.clone() })
+        Some(Slot {
+            ip,
+            live: live.clone(),
+        })
     }
 }
 
@@ -63,15 +74,17 @@ impl HandshakeGuard {
         let done = Arc::new(AtomicBool::new(false));
         if let Ok(s) = stream.try_clone() {
             let d = done.clone();
-            let _ = std::thread::Builder::new().name("lumen-collab-guard".into()).spawn(move || {
-                for _ in 0..secs * 5 {
-                    std::thread::sleep(Duration::from_millis(200));
-                    if d.load(Ordering::Relaxed) {
-                        return;
+            let _ = std::thread::Builder::new()
+                .name("lumen-collab-guard".into())
+                .spawn(move || {
+                    for _ in 0..secs * 5 {
+                        std::thread::sleep(Duration::from_millis(200));
+                        if d.load(Ordering::Relaxed) {
+                            return;
+                        }
                     }
-                }
-                let _ = s.shutdown(std::net::Shutdown::Both);
-            });
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                });
         }
         HandshakeGuard(done)
     }
@@ -106,7 +119,12 @@ pub struct Net {
 /// Addresses other devices can reach this one on (private IPv4 first).
 pub fn local_addrs() -> Vec<String> {
     let mut out = vec![];
-    for probe in ["192.168.1.1:80", "10.0.0.1:80", "172.16.0.1:80", "8.8.8.8:80"] {
+    for probe in [
+        "192.168.1.1:80",
+        "10.0.0.1:80",
+        "172.16.0.1:80",
+        "8.8.8.8:80",
+    ] {
         if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
             if s.connect(probe).is_ok() {
                 if let Ok(a) = s.local_addr() {
@@ -121,8 +139,16 @@ pub fn local_addrs() -> Vec<String> {
     out
 }
 
-fn pump(mut ws: WebSocket<TcpStream>, conn: ConnId, inbox: Inbox, rx: Receiver<Option<Msg>>, stop: Arc<AtomicBool>) {
-    let _ = ws.get_ref().set_read_timeout(Some(Duration::from_millis(15)));
+fn pump(
+    mut ws: WebSocket<TcpStream>,
+    conn: ConnId,
+    inbox: Inbox,
+    rx: Receiver<Option<Msg>>,
+    stop: Arc<AtomicBool>,
+) {
+    let _ = ws
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(15)));
     let _ = ws.get_ref().set_nodelay(true);
     let mut last_rx = Instant::now();
     let mut last_ping = Instant::now();
@@ -138,7 +164,9 @@ fn pump(mut ws: WebSocket<TcpStream>, conn: ConnId, inbox: Inbox, rx: Receiver<O
         let want_slow = last_busy.elapsed() > Duration::from_secs(2);
         if want_slow != slow {
             slow = want_slow;
-            let _ = ws.get_ref().set_read_timeout(Some(Duration::from_millis(if slow { 90 } else { 15 })));
+            let _ = ws
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_millis(if slow { 90 } else { 15 })));
         }
         // back-pressure: while the UI thread has a big backlog (screen off, huge sync) stop reading, so the kernel's TCP window fills
         // instead of this process's memory
@@ -159,7 +187,13 @@ fn pump(mut ws: WebSocket<TcpStream>, conn: ConnId, inbox: Inbox, rx: Receiver<O
                     last_rx = Instant::now();
                     last_busy = last_rx;
                     if let Some((flag, body)) = b.split_first() {
-                        inbox.push(Event::Msg { conn, msg: Msg::Bin { d: body.to_vec(), more: *flag != 0 } });
+                        inbox.push(Event::Msg {
+                            conn,
+                            msg: Msg::Bin {
+                                d: body.to_vec(),
+                                more: *flag != 0,
+                            },
+                        });
                     }
                 }
                 Ok(Message::Close(_)) => {
@@ -167,7 +201,8 @@ fn pump(mut ws: WebSocket<TcpStream>, conn: ConnId, inbox: Inbox, rx: Receiver<O
                     break;
                 }
                 Ok(_) => last_rx = Instant::now(),
-                Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(tungstenite::Error::Io(e))
+                    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
                 Err(_) => {
                     why = "Connection lost";
                     break;
@@ -219,7 +254,90 @@ fn pump(mut ws: WebSocket<TcpStream>, conn: ConnId, inbox: Inbox, rx: Receiver<O
             break;
         }
     }
-    inbox.push(Event::Closed { conn, why: why.to_owned() });
+    inbox.push(Event::Closed {
+        conn,
+        why: why.to_owned(),
+    });
+}
+
+/// Global / unique-local IPv6 addresses of this device as `[addr]` (the port is appended by the caller): reachable without NAT, so no
+/// UPnP or hole punch is needed when both sides have IPv6.
+pub fn local_addrs6() -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for probe in ["[2001:4860:4860::8888]:80", "[fd00::1]:80"] {
+        if let Ok(s) = UdpSocket::bind("[::]:0") {
+            if s.connect(probe).is_ok() {
+                if let Ok(a) = s.local_addr() {
+                    if let IpAddr::V6(v6) = a.ip() {
+                        let seg = v6.segments()[0];
+                        let usable =
+                            !v6.is_unspecified() && !v6.is_loopback() && (seg & 0xffc0) != 0xfe80;
+                        let ip = format!("[{v6}]");
+                        if usable && !out.contains(&ip) {
+                            out.push(ip);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One accept thread per listening socket.
+fn accept_loop(
+    l: TcpListener,
+    inbox: Inbox,
+    stop: Arc<AtomicBool>,
+    live: Arc<Mutex<HashMap<IpAddr, usize>>>,
+) -> Result<(), String> {
+    l.set_nonblocking(true).map_err(|e| e.to_string())?;
+    std::thread::Builder::new()
+        .name("lumen-collab-accept".into())
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match l.accept() {
+                    Ok((stream, peer)) => {
+                        let inbox = inbox.clone();
+                        let stop = stop.clone();
+                        // flood protection: a limited number of simultaneous sockets overall and per address
+                        let ip = peer.ip().to_canonical();
+                        let Some(slot) = Slot::take(&live, ip) else {
+                            continue;
+                        };
+                        let _ = std::thread::Builder::new()
+                            .name("lumen-collab-conn".into())
+                            .spawn(move || {
+                                let _slot = slot;
+                                let _ = stream.set_nonblocking(false);
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                                let guard = HandshakeGuard::arm(&stream, 8);
+                                let Ok(ws) =
+                                    tungstenite::accept_with_config(stream, Some(ws_config()))
+                                else {
+                                    return;
+                                };
+                                drop(guard);
+                                let (tx, rx) = channel();
+                                let conn = inbox.conn_id();
+                                inbox.push(Event::Open {
+                                    conn,
+                                    sink: Box::new(WsSink { tx }),
+                                    addr: ip.to_string(),
+                                    incoming: true,
+                                });
+                                pump(ws, conn, inbox, rx, stop);
+                            });
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(60))
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(250)),
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 impl Net {
@@ -233,47 +351,36 @@ impl Net {
         if !keep {
             self.stop();
         }
-        let l = TcpListener::bind(("0.0.0.0", pref)).or_else(|_| TcpListener::bind(("0.0.0.0", PORT))).or_else(|_| TcpListener::bind(("0.0.0.0", 0))).map_err(|e| e.to_string())?;
-        let port = l.local_addr().map_err(|e| e.to_string())?.port();
-        l.set_nonblocking(true).map_err(|e| e.to_string())?;
+        // dual stack: `[::]` first (on Linux / Android it also takes IPv4), then `0.0.0.0` on the same port (Windows keeps them apart; elsewhere
+        // the second bind fails harmlessly)
+        let (l, port) = {
+            let first = [pref, PORT, 0]
+                .into_iter()
+                .find_map(|p| TcpListener::bind(("::", p)).ok());
+            match first {
+                Some(l6) => {
+                    let port = l6.local_addr().map_err(|e| e.to_string())?.port();
+                    (l6, port)
+                }
+                None => {
+                    let l = TcpListener::bind(("0.0.0.0", pref))
+                        .or_else(|_| TcpListener::bind(("0.0.0.0", PORT)))
+                        .or_else(|_| TcpListener::bind(("0.0.0.0", 0)))
+                        .map_err(|e| e.to_string())?;
+                    let port = l.local_addr().map_err(|e| e.to_string())?.port();
+                    (l, port)
+                }
+            }
+        };
+        let l4 = TcpListener::bind(("0.0.0.0", port)).ok();
         let stop = Arc::new(AtomicBool::new(false));
         self.stop = Some(stop.clone());
         self.port = port;
-        let inbox = inbox.clone();
         let live: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::new(Mutex::new(HashMap::new()));
-        std::thread::Builder::new()
-            .name("lumen-collab-accept".into())
-            .spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    match l.accept() {
-                        Ok((stream, peer)) => {
-                            let inbox = inbox.clone();
-                            let stop = stop.clone();
-                            // flood protection: a limited number of simultaneous sockets overall and per address
-                            let Some(slot) = Slot::take(&live, peer.ip()) else {
-                                continue;
-                            };
-                            let _ = std::thread::Builder::new().name("lumen-collab-conn".into()).spawn(move || {
-                                let _slot = slot;
-                                let _ = stream.set_nonblocking(false);
-                                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                                let guard = HandshakeGuard::arm(&stream, 8);
-                                let Ok(ws) = tungstenite::accept_with_config(stream, Some(ws_config())) else {
-                                    return;
-                                };
-                                drop(guard);
-                                let (tx, rx) = channel();
-                                let conn = inbox.conn_id();
-                                inbox.push(Event::Open { conn, sink: Box::new(WsSink { tx }), addr: peer.ip().to_string(), incoming: true });
-                                pump(ws, conn, inbox, rx, stop);
-                            });
-                        }
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(60)),
-                        Err(_) => std::thread::sleep(Duration::from_millis(250)),
-                    }
-                }
-            })
-            .map_err(|e| e.to_string())?;
+        accept_loop(l, inbox.clone(), stop.clone(), live.clone())?;
+        if let Some(l4) = l4 {
+            accept_loop(l4, inbox.clone(), stop, live)?;
+        }
         Ok(port)
     }
 
@@ -281,9 +388,17 @@ impl Net {
     /// dialled at once and the first TCP connection that succeeds is used (the others are dropped) — this is what makes a link that
     /// works on the same Wi-Fi *and* across networks connect quickly either way.
     pub fn connect(&mut self, addr: &str, inbox: &Inbox) {
-        let stop = self.stop.get_or_insert_with(|| Arc::new(AtomicBool::new(false))).clone();
+        let stop = self
+            .stop
+            .get_or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone();
         let inbox = inbox.clone();
-        let list: Vec<String> = addr.split(',').map(|a| a.trim().to_owned()).filter(|a| !a.is_empty()).take(8).collect();
+        let list: Vec<String> = addr
+            .split(',')
+            .map(|a| a.trim().to_owned())
+            .filter(|a| !a.is_empty())
+            .take(8)
+            .collect();
         let _ = std::thread::Builder::new().name("lumen-collab-dial".into()).spawn(move || {
             let conn = inbox.conn_id();
             let fail = |why: &str| inbox.push(Event::Closed { conn, why: why.to_owned() });
@@ -337,37 +452,55 @@ impl Net {
     }
 
     pub fn announce(&mut self, beacon: Arc<Mutex<Option<Beacon>>>) {
-        let stop = self.stop.get_or_insert_with(|| Arc::new(AtomicBool::new(false))).clone();
-        let _ = std::thread::Builder::new().name("lumen-collab-beacon".into()).spawn(move || {
-            let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
-                return;
-            };
-            let _ = sock.set_broadcast(true);
-            let _ = sock.set_multicast_ttl_v4(2);
-            while !stop.load(Ordering::Relaxed) {
-                let b = beacon.lock().ok().and_then(|g| g.clone());
-                if let Some(b) = b {
-                    if let Ok(bytes) = serde_json::to_vec(&b) {
-                        let mut targets: Vec<SocketAddr> = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), DISCOVERY_PORT), SocketAddr::new(IpAddr::V4(GROUP), DISCOVERY_PORT)];
-                        for ip in local_addrs() {
-                            if let Ok(IpAddr::V4(v4)) = ip.parse::<IpAddr>() {
-                                let o = v4.octets();
-                                targets.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], 255)), DISCOVERY_PORT));
+        let stop = self
+            .stop
+            .get_or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone();
+        let _ = std::thread::Builder::new()
+            .name("lumen-collab-beacon".into())
+            .spawn(move || {
+                let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
+                    return;
+                };
+                let _ = sock.set_broadcast(true);
+                let _ = sock.set_multicast_ttl_v4(2);
+                let sock6 = UdpSocket::bind("[::]:0").ok();
+                while !stop.load(Ordering::Relaxed) {
+                    let b = beacon.lock().ok().and_then(|g| g.clone());
+                    if let Some(b) = b {
+                        if let Ok(bytes) = serde_json::to_vec(&b) {
+                            let mut targets: Vec<SocketAddr> = vec![
+                                SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), DISCOVERY_PORT),
+                                SocketAddr::new(IpAddr::V4(GROUP), DISCOVERY_PORT),
+                            ];
+                            for ip in local_addrs() {
+                                if let Ok(IpAddr::V4(v4)) = ip.parse::<IpAddr>() {
+                                    let o = v4.octets();
+                                    targets.push(SocketAddr::new(
+                                        IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], 255)),
+                                        DISCOVERY_PORT,
+                                    ));
+                                }
+                            }
+                            for t in targets {
+                                let _ = sock.send_to(&bytes, t);
+                            }
+                            if let Some(s6) = &sock6 {
+                                let _ = s6.send_to(
+                                    &bytes,
+                                    SocketAddr::new(IpAddr::V6(GROUP6), DISCOVERY_PORT),
+                                );
                             }
                         }
-                        for t in targets {
-                            let _ = sock.send_to(&bytes, t);
+                    }
+                    for _ in 0..20 {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
                         }
+                        std::thread::sleep(Duration::from_millis(100));
                     }
                 }
-                for _ in 0..20 {
-                    if stop.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            }
-        });
+            });
     }
 
     pub fn discover(&mut self, inbox: &Inbox) {
@@ -376,25 +509,52 @@ impl Net {
         }
         let stop = Arc::new(AtomicBool::new(false));
         self.disc_stop = Some(stop.clone());
-        let inbox = inbox.clone();
-        let _ = std::thread::Builder::new().name("lumen-collab-discover".into()).spawn(move || {
-            let Ok(sock) = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) else {
-                return;
-            };
-            let _ = sock.join_multicast_v4(&GROUP, &Ipv4Addr::UNSPECIFIED);
-            let _ = sock.set_read_timeout(Some(Duration::from_millis(300)));
-            let mut buf = vec![0u8; 2048];
-            while !stop.load(Ordering::Relaxed) {
-                if let Ok((n, from)) = sock.recv_from(&mut buf) {
-                    if let Ok(b) = serde_json::from_slice::<Beacon>(&buf[..n]) {
-                        if b.v == PROTO {
-                            let ip = format!("{}:{}", from.ip(), b.port);
-                            inbox.push(Event::Found(b, ip));
+        let (inbox6, stop6) = (inbox.clone(), stop.clone());
+        let _ = std::thread::Builder::new()
+            .name("lumen-collab-discover6".into())
+            .spawn(move || {
+                // best effort: where the OS keeps IPv4 and IPv6 sockets apart (Windows) or the IPv4 socket could not bind
+                let Ok(sock) = UdpSocket::bind(("::", DISCOVERY_PORT)) else {
+                    return;
+                };
+                let _ = sock.join_multicast_v6(&GROUP6, 0);
+                let _ = sock.set_read_timeout(Some(Duration::from_millis(300)));
+                let mut buf = vec![0u8; 2048];
+                while !stop6.load(Ordering::Relaxed) {
+                    if let Ok((n, from)) = sock.recv_from(&mut buf) {
+                        if let Ok(b) = serde_json::from_slice::<Beacon>(&buf[..n]) {
+                            if b.v == PROTO {
+                                let ip = match from.ip().to_canonical() {
+                                    IpAddr::V6(v6) => format!("[{v6}]:{}", b.port),
+                                    v4 => format!("{v4}:{}", b.port),
+                                };
+                                inbox6.push(Event::Found(b, ip));
+                            }
                         }
                     }
                 }
-            }
-        });
+            });
+        let inbox = inbox.clone();
+        let _ = std::thread::Builder::new()
+            .name("lumen-collab-discover".into())
+            .spawn(move || {
+                let Ok(sock) = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) else {
+                    return;
+                };
+                let _ = sock.join_multicast_v4(&GROUP, &Ipv4Addr::UNSPECIFIED);
+                let _ = sock.set_read_timeout(Some(Duration::from_millis(300)));
+                let mut buf = vec![0u8; 2048];
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok((n, from)) = sock.recv_from(&mut buf) {
+                        if let Ok(b) = serde_json::from_slice::<Beacon>(&buf[..n]) {
+                            if b.v == PROTO {
+                                let ip = format!("{}:{}", from.ip(), b.port);
+                                inbox.push(Event::Found(b, ip));
+                            }
+                        }
+                    }
+                }
+            });
     }
 
     pub fn stop_discovery(&mut self) {

@@ -10,7 +10,9 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use lumen_store::{chunk_ids, chunk_titles, col_check, col_num, col_sel, col_text, shared_scan, Row, Store, Value};
+use lumen_store::{
+    chunk_ids, chunk_titles, col_check, col_num, col_sel, col_text, shared_scan, Row, Store, Value,
+};
 
 use crate::dashcfg::{Agg, Bucket, Cfg};
 use crate::dashdata::{Dataset, Num, Scatter, Ser};
@@ -33,13 +35,17 @@ pub(crate) fn lock(s: &Shared) -> std::sync::MutexGuard<'_, Store> {
 #[cfg(not(target_arch = "wasm32"))]
 fn root() -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
-    let base = std::env::var_os("LUMEN_TABLES_DIR").map(PathBuf::from).or_else(|| {
-        let b = std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))?;
-        Some(b.join("Lumen").join("tables"))
-    })?;
+    let base = std::env::var_os("LUMEN_TABLES_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let b = std::env::var_os("APPDATA")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
+                })?;
+            Some(b.join("Lumen").join("tables"))
+        })?;
     std::fs::create_dir_all(&base).ok()?;
     Some(base)
 }
@@ -77,12 +83,18 @@ pub fn store(ws: &Workspace, db: u64) -> Option<Shared> {
 
 /// Data version of a dataset (changes with every edit): the cache key of dashboard results.
 pub fn version(dir: &str) -> u64 {
-    VERSIONS.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(dir).copied())).unwrap_or(0)
+    VERSIONS
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(dir).copied()))
+        .unwrap_or(0)
 }
 
 pub fn bump_version(dir: &str) {
     if let Ok(mut g) = VERSIONS.lock() {
-        *g.get_or_insert_with(HashMap::new).entry(dir.to_owned()).or_default() += 1;
+        *g.get_or_insert_with(HashMap::new)
+            .entry(dir.to_owned())
+            .or_default() += 1;
     }
     crate::bigdata::bump();
 }
@@ -103,14 +115,18 @@ static GRAVE: GraveMap = Mutex::new(None);
 pub const DIRTY_CAP: usize = 20_000;
 /// Marker in a dirty list: too many edits to list, re-scan the table.
 pub const OVERFLOW: u64 = u64::MAX;
-const GRAVE_CAP: usize = 200_000;
+const GRAVE_CAP: usize = 2_000_000;
 
 /// A session starts (`true`) or ends (`false`) on this process: while at least one runs, row edits are recorded for the other devices
 /// (cheap no-ops otherwise). Counted, so two sessions in one process (tests) cannot switch each other off.
 pub fn track(on: bool) {
     use std::sync::atomic::AtomicI64;
     static N: AtomicI64 = AtomicI64::new(0);
-    let n = if on { N.fetch_add(1, Ordering::SeqCst) + 1 } else { (N.fetch_sub(1, Ordering::SeqCst) - 1).max(0) };
+    let n = if on {
+        N.fetch_add(1, Ordering::SeqCst) + 1
+    } else {
+        (N.fetch_sub(1, Ordering::SeqCst) - 1).max(0)
+    };
     if n <= 0 {
         N.store(0, Ordering::SeqCst);
         TRACK.store(false, Ordering::Relaxed);
@@ -124,7 +140,10 @@ pub fn track(on: bool) {
 
 fn push_dirty(dir: &str, id: u64) {
     if let Ok(mut g) = DIRTY.lock() {
-        let v = g.get_or_insert_with(HashMap::new).entry(dir.to_owned()).or_default();
+        let v = g
+            .get_or_insert_with(HashMap::new)
+            .entry(dir.to_owned())
+            .or_default();
         if v.last() == Some(&OVERFLOW) {
             return;
         }
@@ -139,20 +158,57 @@ fn push_dirty(dir: &str, id: u64) {
 
 /// A row was written locally (insert / edit).
 pub fn note_write(dir: &str, id: u64) {
+    grave_drop(dir, id);
     if TRACK.load(Ordering::Relaxed) {
-        if let Ok(mut g) = GRAVE.lock() {
-            if let Some(m) = g.as_mut().and_then(|m| m.get_mut(dir)) {
-                m.remove(&id);
-            }
-        }
         push_dirty(dir, id);
+    }
+}
+
+type CellMap = Mutex<Option<HashMap<(String, u64), (u64, Vec<u32>)>>>;
+static CELLS: CellMap = Mutex::new(None);
+const CELLS_CAP: usize = 100_000;
+
+/// The property `prop` (0 = the title) of row `id` was edited locally: remembered (with the time) so a concurrent edit of *another* cell
+/// of the same row from another device merges cell by cell instead of the newer whole row winning.
+pub fn note_cell(dir: &str, id: u64, prop: u32) {
+    if !TRACK.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(mut g) = CELLS.lock() {
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.len() >= CELLS_CAP {
+            m.clear();
+        }
+        let e = m.entry((dir.to_owned(), id)).or_insert((0, vec![]));
+        e.0 = crate::collab::now_ms();
+        if !e.1.contains(&prop) {
+            e.1.push(prop);
+        }
+    }
+}
+
+/// Cells of a row edited locally since the session started: `(ms of the last edit, properties)`.
+pub fn cells_get(dir: &str, id: u64) -> Option<(u64, Vec<u32>)> {
+    CELLS.lock().ok().and_then(|g| {
+        g.as_ref()
+            .and_then(|m| m.get(&(dir.to_owned(), id)).cloned())
+    })
+}
+
+pub fn cells_put(dir: &str, id: u64, v: (u64, Vec<u32>)) {
+    if let Ok(mut g) = CELLS.lock() {
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.len() < CELLS_CAP {
+            m.insert((dir.to_owned(), id), v);
+        }
     }
 }
 
 /// A row was deleted locally: remembered as a tombstone so the deletion travels (and an older copy elsewhere cannot bring it back).
 pub fn note_delete(dir: &str, id: u64) {
+    // always remembered (and written to disk): a row deleted while nobody was connected must not come back from a peer that still has it
+    grave_put(dir, id, crate::collab::now_ms().max(1));
     if TRACK.load(Ordering::Relaxed) {
-        grave_put(dir, id, crate::collab::now_ms().max(1));
         push_dirty(dir, id);
     }
 }
@@ -163,13 +219,162 @@ pub fn take_dirty(mine: &[&str]) -> Vec<(String, Vec<u64>)> {
         return vec![];
     };
     let Some(m) = g.as_mut() else { return vec![] };
-    let keys: Vec<String> = m.keys().filter(|k| mine.contains(&k.as_str())).cloned().collect();
-    keys.into_iter().filter_map(|k| m.remove(&k).map(|v| (k, v))).filter(|(_, v)| !v.is_empty()).collect()
+    let keys: Vec<String> = m
+        .keys()
+        .filter(|k| mine.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    keys.into_iter()
+        .filter_map(|k| m.remove(&k).map(|v| (k, v)))
+        .filter(|(_, v)| !v.is_empty())
+        .collect()
+}
+
+// ───────────── persistent tombstones: `graves.log` next to the store (16-byte records `id, ms`; ms = 0 undoes a tombstone) ─────────────
+
+#[cfg(not(target_arch = "wasm32"))]
+mod grave_file {
+    use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    static LOADED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+    pub fn path(dir: &str) -> Option<PathBuf> {
+        Some(super::root()?.join(dir).join("graves.log"))
+    }
+
+    pub fn replay(bytes: &[u8]) -> BTreeMap<u64, u64> {
+        let mut m = BTreeMap::new();
+        for r in bytes.chunks_exact(16) {
+            let id = u64::from_le_bytes(r[..8].try_into().unwrap_or([0; 8]));
+            let ms = u64::from_le_bytes(r[8..].try_into().unwrap_or([0; 8]));
+            if ms == 0 {
+                m.remove(&id);
+            } else {
+                m.insert(id, ms);
+            }
+        }
+        m
+    }
+
+    /// Reads the log of `dir` once per process (before the first use of the in-memory map).
+    pub fn ensure(dir: &str) {
+        let first = LOADED.lock().ok().map_or(false, |mut l| {
+            l.get_or_insert_with(Default::default)
+                .insert(dir.to_owned())
+        });
+        if !first {
+            return;
+        }
+        let Some(p) = path(dir) else { return };
+        let Ok(bytes) = std::fs::read(&p) else { return };
+        let m = replay(&bytes);
+        let live = m.len();
+        if let Ok(mut g) = GRAVE.lock() {
+            let e = g
+                .get_or_insert_with(HashMap::new)
+                .entry(dir.to_owned())
+                .or_default();
+            for (k, v) in m {
+                e.entry(k).or_insert(v);
+            }
+        }
+        // the log only grows: rewrite it when most of it is dead records
+        if bytes.len() / 16 > live * 4 + 4096 {
+            rewrite(dir);
+        }
+    }
+
+    pub fn append(dir: &str, id: u64, ms: u64) {
+        let Some(p) = path(dir) else { return };
+        if !p.parent().map_or(false, |d| d.exists()) {
+            return; // a table without a directory (not created yet) has nothing to persist
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+        {
+            let mut rec = [0u8; 16];
+            rec[..8].copy_from_slice(&id.to_le_bytes());
+            rec[8..].copy_from_slice(&ms.to_le_bytes());
+            let _ = f.write_all(&rec);
+        }
+    }
+
+    pub fn rewrite(dir: &str) {
+        let Some(p) = path(dir) else { return };
+        let list: Vec<(u64, u64)> = GRAVE
+            .lock()
+            .ok()
+            .and_then(|g| {
+                g.as_ref()
+                    .and_then(|m| m.get(dir))
+                    .map(|m| m.iter().map(|(a, b)| (*a, *b)).collect())
+            })
+            .unwrap_or_default();
+        let mut out = Vec::with_capacity(list.len() * 16);
+        for (id, ms) in list {
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&ms.to_le_bytes());
+        }
+        let tmp = p.with_extension("tmp");
+        if std::fs::write(&tmp, &out).is_ok() {
+            let _ = std::fs::rename(&tmp, &p);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn grave_load(dir: &str) {
+    grave_file::ensure(dir);
+}
+#[cfg(target_arch = "wasm32")]
+fn grave_load(_dir: &str) {}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn grave_log(dir: &str, id: u64, ms: u64) {
+    grave_file::append(dir, id, ms);
+}
+#[cfg(target_arch = "wasm32")]
+fn grave_log(_dir: &str, _id: u64, _ms: u64) {}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub fn grave_replay_for_test(bytes: &[u8]) -> Vec<(u64, u64)> {
+    grave_file::replay(bytes).into_iter().collect()
+}
+
+/// A cheap fingerprint of the tombstones of a table (count and a commutative sum): part of the index checkpoint's validity stamp.
+pub fn grave_stamp(dir: &str) -> u64 {
+    grave_load(dir);
+    GRAVE
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref().and_then(|m| m.get(dir)).map(|m| {
+                m.iter().fold(m.len() as u64, |a, (k, v)| {
+                    a.wrapping_add(k.wrapping_mul(0x9E37_79B9).wrapping_add(*v))
+                })
+            })
+        })
+        .unwrap_or(0)
+}
+
+/// The directory of a table (native only).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn table_path(dir: &str) -> Option<std::path::PathBuf> {
+    Some(root()?.join(dir))
 }
 
 pub fn grave_put(dir: &str, id: u64, ms: u64) {
+    grave_load(dir);
+    grave_log(dir, id, ms);
     if let Ok(mut g) = GRAVE.lock() {
-        let m = g.get_or_insert_with(HashMap::new).entry(dir.to_owned()).or_default();
+        let m = g
+            .get_or_insert_with(HashMap::new)
+            .entry(dir.to_owned())
+            .or_default();
         if m.len() >= GRAVE_CAP && !m.contains_key(&id) {
             if let Some(oldest) = m.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k) {
                 m.remove(&oldest);
@@ -180,20 +385,38 @@ pub fn grave_put(dir: &str, id: u64, ms: u64) {
 }
 
 pub fn grave_get(dir: &str, id: u64) -> Option<u64> {
-    GRAVE.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(dir)).and_then(|m| m.get(&id).copied()))
+    grave_load(dir);
+    GRAVE.lock().ok().and_then(|g| {
+        g.as_ref()
+            .and_then(|m| m.get(dir))
+            .and_then(|m| m.get(&id).copied())
+    })
 }
 
 pub fn grave_drop(dir: &str, id: u64) {
-    if let Ok(mut g) = GRAVE.lock() {
-        if let Some(m) = g.as_mut().and_then(|m| m.get_mut(dir)) {
-            m.remove(&id);
-        }
+    grave_load(dir);
+    let had = GRAVE.lock().ok().map_or(false, |mut g| {
+        g.as_mut()
+            .and_then(|m| m.get_mut(dir))
+            .map_or(false, |m| m.remove(&id).is_some())
+    });
+    if had {
+        grave_log(dir, id, 0);
     }
 }
 
 /// Tombstones with `lo <= id < hi`.
 pub fn grave_in(dir: &str, lo: u64, hi: u64) -> Vec<(u64, u64)> {
-    GRAVE.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(dir)).map(|m| m.range(lo..hi).map(|(a, b)| (*a, *b)).collect())).unwrap_or_default()
+    grave_load(dir);
+    GRAVE
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref()
+                .and_then(|m| m.get(dir))
+                .map(|m| m.range(lo..hi).map(|(a, b)| (*a, *b)).collect())
+        })
+        .unwrap_or_default()
 }
 
 /// Id for a new row. Alone: max + 1. In a session: from this device's private id space (like pages and blocks), so two devices that add
@@ -253,7 +476,10 @@ impl<'a> Csv<'a> {
         } else {
             ','
         };
-        Csv { it: text.chars().peekable(), delim }
+        Csv {
+            it: text.chars().peekable(),
+            delim,
+        }
     }
 }
 
@@ -313,7 +539,10 @@ struct ColStat {
 }
 
 fn is_bool(v: &str) -> bool {
-    matches!(v.to_lowercase().as_str(), "true" | "false" | "yes" | "no" | "x" | "✓")
+    matches!(
+        v.to_lowercase().as_str(),
+        "true" | "false" | "yes" | "no" | "x" | "✓"
+    )
 }
 
 fn kind_of(s: &ColStat) -> PropKind {
@@ -336,7 +565,10 @@ fn kind_of(s: &ColStat) -> PropKind {
 
 fn new_meta(id: u64) -> BigMeta {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    BigMeta { dir: format!("t{id}-{:x}-{n}", crate::auth::now_ms() as u64), volatile: cfg!(target_arch = "wasm32") }
+    BigMeta {
+        dir: format!("t{id}-{:x}-{n}", crate::auth::now_ms() as u64),
+        volatile: cfg!(target_arch = "wasm32"),
+    }
 }
 
 fn finish(ws: &mut Workspace, id: u64, name: &str, meta: BigMeta) {
@@ -356,7 +588,17 @@ pub fn import_csv(ws: &mut Workspace, name: &str, text: &str, parent: Option<u64
         return None;
     }
     let nc = header.len();
-    let mut stats: Vec<ColStat> = (1..nc).map(|_| ColStat { nonempty: 0, num: true, boolean: true, date: true, url: true, distinct: BTreeSet::new(), overflow: false }).collect();
+    let mut stats: Vec<ColStat> = (1..nc)
+        .map(|_| ColStat {
+            nonempty: 0,
+            num: true,
+            boolean: true,
+            date: true,
+            url: true,
+            distinct: BTreeSet::new(),
+            overflow: false,
+        })
+        .collect();
     let mut total = 0usize;
     for rec in Csv::new(text).skip(1) {
         total += 1;
@@ -399,7 +641,11 @@ pub fn import_csv(ws: &mut Workspace, name: &str, text: &str, parent: Option<u64
     let mut cols: Vec<(u32, PropKind, HashMap<String, u64>)> = vec![];
     for (k, st) in stats.iter().enumerate() {
         let kind = kind_of(st);
-        let opts: Vec<&str> = if kind == PropKind::Select { st.distinct.iter().map(|s| s.as_str()).collect() } else { vec![] };
+        let opts: Vec<&str> = if kind == PropKind::Select {
+            st.distinct.iter().map(|s| s.as_str()).collect()
+        } else {
+            vec![]
+        };
         let h = header[k + 1].trim();
         let pid = ws.add_prop(id, if h.is_empty() { "Column" } else { h }, kind, &opts);
         let mut map = HashMap::new();
@@ -423,7 +669,10 @@ pub fn import_csv(ws: &mut Workspace, name: &str, text: &str, parent: Option<u64
             }
             let v = match kind {
                 PropKind::Number => s.parse::<f64>().ok().map(Value::Num),
-                PropKind::Checkbox => Some(Value::Check(matches!(s.to_lowercase().as_str(), "true" | "yes" | "x" | "✓"))),
+                PropKind::Checkbox => Some(Value::Check(matches!(
+                    s.to_lowercase().as_str(),
+                    "true" | "yes" | "x" | "✓"
+                ))),
                 PropKind::Select => map.get(s).map(|o| Value::Sel(*o)),
                 _ => Some(Value::Text(s.to_owned())),
             };
@@ -432,7 +681,12 @@ pub fn import_csv(ws: &mut Workspace, name: &str, text: &str, parent: Option<u64
             }
         }
         props.sort_by_key(|p| p.0);
-        Row { id: i as u64 + 1, title: rec.first().cloned().unwrap_or_default(), updated: crate::auth::now_ms() as u64, props }
+        Row {
+            id: i as u64 + 1,
+            title: rec.first().cloned().unwrap_or_default(),
+            updated: crate::auth::now_ms() as u64,
+            props,
+        }
     });
     lock(&shared).bulk_append(rows).ok()?;
     finish(ws, id, name, meta);
@@ -446,8 +700,15 @@ pub fn create_sample(ws: &mut Workspace, name: &str, n: u64, parent: Option<u64>
     if let Some(d) = ws.db_mut(id) {
         d.props.clear();
     }
-    let status = ws.add_prop(id, "Status", PropKind::Select, &["Backlog", "Todo", "In progress", "Review", "Done"]) as u32;
-    let owners = ["Ava", "Noor", "Ravi", "Mei", "Tariq", "Lena", "Omar", "Sofia"];
+    let status = ws.add_prop(
+        id,
+        "Status",
+        PropKind::Select,
+        &["Backlog", "Todo", "In progress", "Review", "Done"],
+    ) as u32;
+    let owners = [
+        "Ava", "Noor", "Ravi", "Mei", "Tariq", "Lena", "Omar", "Sofia",
+    ];
     let owner = ws.add_prop(id, "Owner", PropKind::Select, &owners) as u32;
     let amount = ws.add_prop(id, "Amount", PropKind::Number, &[]) as u32;
     let score = ws.add_prop(id, "Score", PropKind::Number, &[]) as u32;
@@ -455,10 +716,16 @@ pub fn create_sample(ws: &mut Workspace, name: &str, n: u64, parent: Option<u64>
     let done = ws.add_prop(id, "Done", PropKind::Checkbox, &[]) as u32;
     let note = ws.add_prop(id, "Notes", PropKind::Text, &[]) as u32;
     let opt = |p: u32, name: &str| ws.opt_id(id, p as u64, name).unwrap_or(0);
-    let st_ids: Vec<u64> = ["Backlog", "Todo", "In progress", "Review", "Done"].iter().map(|s| opt(status, s)).collect();
+    let st_ids: Vec<u64> = ["Backlog", "Todo", "In progress", "Review", "Done"]
+        .iter()
+        .map(|s| opt(status, s))
+        .collect();
     let ow_ids: Vec<u64> = owners.iter().map(|s| opt(owner, s)).collect();
     let base = crate::dates::today_day() - 700;
-    let words = ["billing", "login", "export", "sync", "search", "mobile", "chart", "import", "report", "emoji", "pdf", "canvas"];
+    let words = [
+        "billing", "login", "export", "sync", "search", "mobile", "chart", "import", "report",
+        "emoji", "pdf", "canvas",
+    ];
     let meta = new_meta(id);
     let shared = open_store(&meta, true)?;
     let rows = (1..=n).map(|i| {
@@ -469,17 +736,29 @@ pub fn create_sample(ws: &mut Workspace, name: &str, n: u64, parent: Option<u64>
             (owner, Value::Sel(ow_ids[((h >> 8) % 8) as usize])),
             (amount, Value::Num(((h >> 16) % 100_000) as f64 / 10.0)),
             (score, Value::Num(((h >> 24) % 101) as f64)),
-            (due, Value::Text(crate::dates::iso_of_day(base + ((h >> 32) % 1400) as i64))),
+            (
+                due,
+                Value::Text(crate::dates::iso_of_day(base + ((h >> 32) % 1400) as i64)),
+            ),
             (done, Value::Check(s == 4)),
         ];
         if h % 3 != 0 {
             props.push((
                 note,
-                Value::Text(format!("{} {} follow-up", words[((h >> 40) % 12) as usize], words[((h >> 48) % 12) as usize])),
+                Value::Text(format!(
+                    "{} {} follow-up",
+                    words[((h >> 40) % 12) as usize],
+                    words[((h >> 48) % 12) as usize]
+                )),
             ));
         }
         props.sort_by_key(|p| p.0);
-        Row { id: i, title: format!("Task {i} — {}", words[(h % 12) as usize]), updated: 1_700_000_000_000 + i, props }
+        Row {
+            id: i,
+            title: format!("Task {i} — {}", words[(h % 12) as usize]),
+            updated: 1_700_000_000_000 + i,
+            props,
+        }
     });
     lock(&shared).bulk_append(rows).ok()?;
     finish(ws, id, name, meta);
@@ -490,8 +769,16 @@ pub fn cell_text(db: &Database, prop: u32, v: &Value) -> String {
     match v {
         Value::Text(s) => s.clone(),
         Value::Num(x) => crate::dashdata::fmt_num(*x),
-        Value::Sel(o) => db.opt(prop as u64, *o).map(|o| o.name.clone()).unwrap_or_default(),
-        Value::Multi(m) => m.iter().filter_map(|o| db.opt(prop as u64, *o)).map(|o| o.name.clone()).collect::<Vec<_>>().join("; "),
+        Value::Sel(o) => db
+            .opt(prop as u64, *o)
+            .map(|o| o.name.clone())
+            .unwrap_or_default(),
+        Value::Multi(m) => m
+            .iter()
+            .filter_map(|o| db.opt(prop as u64, *o))
+            .map(|o| o.name.clone())
+            .collect::<Vec<_>>()
+            .join("; "),
         Value::Check(b) => if *b { "true" } else { "false" }.to_owned(),
     }
 }
@@ -500,7 +787,16 @@ pub fn cell_text(db: &Database, prop: u32, v: &Value) -> String {
 pub fn export_csv(ws: &Workspace, id: u64) -> Option<String> {
     let st = store(ws, id)?;
     let db = ws.db(id)?;
-    let props: Vec<&crate::model::Prop> = db.props.iter().filter(|p| !matches!(p.kind, PropKind::Formula | PropKind::Relation | PropKind::Rollup)).collect();
+    let props: Vec<&crate::model::Prop> = db
+        .props
+        .iter()
+        .filter(|p| {
+            !matches!(
+                p.kind,
+                PropKind::Formula | PropKind::Relation | PropKind::Rollup
+            )
+        })
+        .collect();
     let mut out = String::new();
     out.push_str("Name");
     for p in &props {
@@ -545,19 +841,47 @@ fn nan_last(a: f64, b: f64, asc: bool) -> std::cmp::Ordering {
 }
 
 /// Row ids matching `query` (title and text columns, case-insensitive) in the order of `sort` (`(property or 0 = title, ascending)`).
-pub fn build_view(st: &Mutex<Store>, db: &Database, sort: Option<(u64, bool)>, query: &str, limit: usize) -> io::Result<Vec<u64>> {
+pub fn build_view(
+    st: &Mutex<Store>,
+    db: &Database,
+    sort: Option<(u64, bool)>,
+    query: &str,
+    limit: usize,
+) -> io::Result<Vec<u64>> {
     let q = query.trim().to_lowercase();
-    let text_props: Vec<u32> = if q.is_empty() { vec![] } else { db.props.iter().filter(|p| matches!(p.kind, PropKind::Text | PropKind::Url | PropKind::Date)).map(|p| p.id as u32).collect() };
-    let skind = sort.map(|(p, _)| if p == 0 { PropKind::Text } else { db.kind_of(p) });
+    let text_props: Vec<u32> = if q.is_empty() {
+        vec![]
+    } else {
+        db.props
+            .iter()
+            .filter(|p| matches!(p.kind, PropKind::Text | PropKind::Url | PropKind::Date))
+            .map(|p| p.id as u32)
+            .collect()
+    };
+    let skind = sort.map(|(p, _)| {
+        if p == 0 {
+            PropKind::Text
+        } else {
+            db.kind_of(p)
+        }
+    });
     let by_title = matches!(sort, Some((0, _)));
     let ranks: HashMap<u64, usize> = match sort {
-        Some((p, _)) if p != 0 => db.prop(p).map(|pp| pp.opts.iter().enumerate().map(|(i, o)| (o.id, i)).collect()).unwrap_or_default(),
+        Some((p, _)) if p != 0 => db
+            .prop(p)
+            .map(|pp| pp.opts.iter().enumerate().map(|(i, o)| (o.id, i)).collect())
+            .unwrap_or_default(),
         _ => HashMap::new(),
     };
-    let (mut plain, mut nums, mut strs): (Vec<u64>, Vec<(f64, u64)>, Vec<(String, u64)>) = (vec![], vec![], vec![]);
+    let (mut plain, mut nums, mut strs): (Vec<u64>, Vec<(f64, u64)>, Vec<(String, u64)>) =
+        (vec![], vec![], vec![]);
     shared_scan(st, |b| {
         let ids = chunk_ids(b)?;
-        let titles = if !q.is_empty() || by_title { Some(chunk_titles(b)?) } else { None };
+        let titles = if !q.is_empty() || by_title {
+            Some(chunk_titles(b)?)
+        } else {
+            None
+        };
         let mut keep = vec![true; ids.len()];
         if !q.is_empty() {
             let t = titles.as_ref().expect("titles");
@@ -581,7 +905,10 @@ pub fn build_view(st: &Mutex<Store>, db: &Database, sort: Option<(u64, bool)>, q
                     let t = titles.as_ref().expect("titles");
                     for i in 0..ids.len() {
                         if keep[i] {
-                            strs.push((t[i].chars().take(32).collect::<String>().to_lowercase(), ids[i]));
+                            strs.push((
+                                t[i].chars().take(32).collect::<String>().to_lowercase(),
+                                ids[i],
+                            ));
                         }
                     }
                 } else {
@@ -598,7 +925,11 @@ pub fn build_view(st: &Mutex<Store>, db: &Database, sort: Option<(u64, bool)>, q
                             let c = col_sel(b, p as u32)?;
                             for i in 0..ids.len() {
                                 if keep[i] {
-                                    nums.push((c[i].and_then(|o| ranks.get(&o)).map_or(f64::NAN, |r| *r as f64), ids[i]));
+                                    nums.push((
+                                        c[i].and_then(|o| ranks.get(&o))
+                                            .map_or(f64::NAN, |r| *r as f64),
+                                        ids[i],
+                                    ));
                                 }
                             }
                         }
@@ -615,7 +946,15 @@ pub fn build_view(st: &Mutex<Store>, db: &Database, sort: Option<(u64, bool)>, q
                             for i in 0..ids.len() {
                                 if keep[i] {
                                     strs.push((
-                                        codes[i].map(|c| dict[c as usize].chars().take(32).collect::<String>().to_lowercase()).unwrap_or_default(),
+                                        codes[i]
+                                            .map(|c| {
+                                                dict[c as usize]
+                                                    .chars()
+                                                    .take(32)
+                                                    .collect::<String>()
+                                                    .to_lowercase()
+                                            })
+                                            .unwrap_or_default(),
                                         ids[i],
                                     ));
                                 }
@@ -629,7 +968,13 @@ pub fn build_view(st: &Mutex<Store>, db: &Database, sort: Option<(u64, bool)>, q
         Ok(())
     })?;
     let mut out: Vec<u64> = if let Some((_, asc)) = sort {
-        if !strs.is_empty() || (nums.is_empty() && skind.map_or(false, |k| !matches!(k, PropKind::Number | PropKind::Select | PropKind::Checkbox) || by_title)) {
+        if !strs.is_empty()
+            || (nums.is_empty()
+                && skind.map_or(false, |k| {
+                    !matches!(k, PropKind::Number | PropKind::Select | PropKind::Checkbox)
+                        || by_title
+                }))
+        {
             strs.sort_by(|a, b| match (a.0.is_empty(), b.0.is_empty()) {
                 (true, false) => std::cmp::Ordering::Greater,
                 (false, true) => std::cmp::Ordering::Less,
@@ -666,7 +1011,13 @@ struct Acc {
 
 impl Acc {
     fn new() -> Acc {
-        Acc { count: 0.0, sum: 0.0, min: f64::INFINITY, max: f64::NEG_INFINITY, nvals: 0.0 }
+        Acc {
+            count: 0.0,
+            sum: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            nvals: 0.0,
+        }
     }
     fn row(&mut self, v: Option<f64>) {
         self.count += 1.0;
@@ -715,7 +1066,11 @@ impl Acc {
 }
 
 fn needs_values(cfg: &Cfg) -> bool {
-    cfg.value != 0 && matches!(cfg.agg, Agg::Sum | Agg::Avg | Agg::Min | Agg::Max | Agg::Filled)
+    cfg.value != 0
+        && matches!(
+            cfg.agg,
+            Agg::Sum | Agg::Avg | Agg::Min | Agg::Max | Agg::Filled
+        )
 }
 
 /// One number (count / sum / avg / min / max). Straight from the zone maps: no chunk is read.
@@ -736,7 +1091,11 @@ pub fn big_number(st: &Mutex<Store>, cfg: &Cfg) -> Num {
     } else {
         len
     };
-    Num { value, prev: None, rows: vec![] }
+    Num {
+        value,
+        prev: None,
+        rows: vec![],
+    }
 }
 
 fn bucket_key(iso: &str, b: Bucket) -> String {
@@ -756,14 +1115,22 @@ fn bucket_key(iso: &str, b: Bucket) -> String {
 /// Group-by chart data over the whole table, exact: select / checkbox / date (bucketed by ISO prefix) / text groups; one series.
 pub fn big_grouped(st: &Mutex<Store>, db: &Database, cfg: &Cfg) -> Dataset {
     let g = cfg.group as u32;
-    let kind = if cfg.group == 0 { PropKind::Text } else { db.kind_of(cfg.group) };
+    let kind = if cfg.group == 0 {
+        PropKind::Text
+    } else {
+        db.kind_of(cfg.group)
+    };
     let vals = needs_values(cfg);
     let mut sel: HashMap<Option<u64>, Acc> = HashMap::new();
     let mut chk: [Acc; 3] = [Acc::new(); 3];
     let mut txt: HashMap<String, Acc> = HashMap::new();
     let mut all = Acc::new();
     let r = shared_scan(st, |b| {
-        let v: Vec<Option<f64>> = if vals { col_num(b, cfg.value as u32)? } else { vec![] };
+        let v: Vec<Option<f64>> = if vals {
+            col_num(b, cfg.value as u32)?
+        } else {
+            vec![]
+        };
         let val = |i: usize| if vals { v[i] } else { None };
         if cfg.group == 0 {
             let n = chunk_ids(b)?.len();
@@ -790,7 +1157,16 @@ pub fn big_grouped(st: &Mutex<Store>, db: &Database, cfg: &Cfg) -> Dataset {
             }
             _ => {
                 let (dict, codes) = col_text(b, g)?;
-                let keys: Vec<String> = dict.iter().map(|s| if kind == PropKind::Date { bucket_key(s, cfg.bucket) } else { s.clone() }).collect();
+                let keys: Vec<String> = dict
+                    .iter()
+                    .map(|s| {
+                        if kind == PropKind::Date {
+                            bucket_key(s, cfg.bucket)
+                        } else {
+                            s.clone()
+                        }
+                    })
+                    .collect();
                 let mut local: HashMap<u32, Acc> = HashMap::new();
                 let mut none = Acc::new();
                 for (i, c) in codes.into_iter().enumerate() {
@@ -800,17 +1176,22 @@ pub fn big_grouped(st: &Mutex<Store>, db: &Database, cfg: &Cfg) -> Dataset {
                     }
                 }
                 for (c, a) in local {
-                    txt.entry(keys[c as usize].clone()).or_insert_with(Acc::new).merge(&a);
+                    txt.entry(keys[c as usize].clone())
+                        .or_insert_with(Acc::new)
+                        .merge(&a);
                 }
                 if none.count > 0.0 {
-                    txt.entry(String::new()).or_insert_with(Acc::new).merge(&none);
+                    txt.entry(String::new())
+                        .or_insert_with(Acc::new)
+                        .merge(&none);
                 }
             }
         }
         Ok(())
     });
     let _ = r;
-    let (mut cats, mut colors, mut accs): (Vec<String>, Vec<Option<egui::Color32>>, Vec<Acc>) = (vec![], vec![], vec![]);
+    let (mut cats, mut colors, mut accs): (Vec<String>, Vec<Option<egui::Color32>>, Vec<Acc>) =
+        (vec![], vec![], vec![]);
     let mut dated = false;
     if cfg.group == 0 {
         cats.push("All".into());
@@ -834,7 +1215,14 @@ pub fn big_grouped(st: &Mutex<Store>, db: &Database, cfg: &Cfg) -> Dataset {
                 }
             }
             PropKind::Checkbox => {
-                for (i, (n, c)) in [("Yes", Some(tag_color(2))), ("No", Some(tag_color(0))), ("No value", None)].into_iter().enumerate() {
+                for (i, (n, c)) in [
+                    ("Yes", Some(tag_color(2))),
+                    ("No", Some(tag_color(0))),
+                    ("No value", None),
+                ]
+                .into_iter()
+                .enumerate()
+                {
                     if i < 2 || chk[2].count > 0.0 {
                         cats.push(n.into());
                         colors.push(c);
@@ -849,8 +1237,17 @@ pub fn big_grouped(st: &Mutex<Store>, db: &Database, cfg: &Cfg) -> Dataset {
                     v.retain(|(k, _)| !k.is_empty());
                     v.sort_by(|a, b| a.0.cmp(&b.0));
                 } else {
-                    v.sort_by(|a, b| b.1.count.partial_cmp(&a.1.count).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
-                    let limit = if cfg.limit == 0 { 300 } else { cfg.limit as usize };
+                    v.sort_by(|a, b| {
+                        b.1.count
+                            .partial_cmp(&a.1.count)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(a.0.cmp(&b.0))
+                    });
+                    let limit = if cfg.limit == 0 {
+                        300
+                    } else {
+                        cfg.limit as usize
+                    };
                     if v.len() > limit {
                         let mut other = Acc::new();
                         for (_, a) in v.drain(limit..) {
@@ -881,12 +1278,27 @@ pub fn big_grouped(st: &Mutex<Store>, db: &Database, cfg: &Cfg) -> Dataset {
         _ => "Count",
     };
     let n = cats.len();
-    Dataset { cats, colors, series: vec![Ser { name: name.into(), color: None, vals: accs.iter().map(|a| a.value(cfg.agg)).collect(), rows: vec![vec![]; n] }], dated, percent: false }
+    Dataset {
+        cats,
+        colors,
+        series: vec![Ser {
+            name: name.into(),
+            color: None,
+            vals: accs.iter().map(|a| a.value(cfg.agg)).collect(),
+            rows: vec![vec![]; n],
+        }],
+        dated,
+        percent: false,
+    }
 }
 
 /// Scatter points (x, y numeric columns), thinned to ~`max_points` while scanning.
 pub fn big_scatter(st: &Mutex<Store>, cfg: &Cfg, max_points: usize) -> Scatter {
-    let total = st.lock().unwrap_or_else(|e| e.into_inner()).len().unwrap_or(0) as usize;
+    let total = st
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
+        .unwrap_or(0) as usize;
     let every = (total / (max_points * 2).max(1)).max(1);
     let mut pts: Vec<(f64, f64, u64, usize)> = vec![];
     let mut k = 0usize;
@@ -908,7 +1320,10 @@ pub fn big_scatter(st: &Mutex<Store>, cfg: &Cfg, max_points: usize) -> Scatter {
         let s = pts.len().div_ceil(max_points);
         pts = pts.into_iter().step_by(s).collect();
     }
-    Scatter { pts, cats: vec![("All".into(), None)] }
+    Scatter {
+        pts,
+        cats: vec![("All".into(), None)],
+    }
 }
 
 #[cfg(test)]
@@ -949,7 +1364,13 @@ mod tests {
         assert_eq!(status.kind, PropKind::Select);
         let amount = db.props.iter().find(|p| p.name == "Amount").unwrap();
         // group by status, sum of amount
-        let cfg = Cfg { db: id, group: status.id, value: amount.id, agg: Agg::Sum, ..Default::default() };
+        let cfg = Cfg {
+            db: id,
+            group: status.id,
+            value: amount.id,
+            agg: Agg::Sum,
+            ..Default::default()
+        };
         let ds = big_grouped(&st, &db, &cfg);
         assert_eq!(ds.cats.len(), 3);
         let expect: f64 = (0..30_000usize).map(|i| (i % 100) as f64).sum();
@@ -959,16 +1380,39 @@ mod tests {
         let ds = big_grouped(
             &st,
             &db,
-            &Cfg { db: id, group: due.id, agg: Agg::Count, bucket: Bucket::Month, ..Default::default() },
+            &Cfg {
+                db: id,
+                group: due.id,
+                agg: Agg::Count,
+                bucket: Bucket::Month,
+                ..Default::default()
+            },
         );
-        assert!(ds.dated && ds.cats.len() == 12 && ds.series[0].vals.iter().sum::<f64>() == 30_000.0);
+        assert!(
+            ds.dated && ds.cats.len() == 12 && ds.series[0].vals.iter().sum::<f64>() == 30_000.0
+        );
         // number card from zone maps
-        let n = big_number(&st, &Cfg { db: id, value: amount.id, agg: Agg::Max, ..Default::default() });
+        let n = big_number(
+            &st,
+            &Cfg {
+                db: id,
+                value: amount.id,
+                agg: Agg::Max,
+                ..Default::default()
+            },
+        );
         assert_eq!(n.value, 99.0);
         // sorted + searched view
         let ids = build_view(&st, &db, Some((amount.id, false)), "", 100).unwrap();
         assert_eq!(ids.len(), 100);
-        assert_eq!(lock(&st).get(ids[0]).unwrap().unwrap().get(amount.id as u32), Some(&Value::Num(99.0)));
+        assert_eq!(
+            lock(&st)
+                .get(ids[0])
+                .unwrap()
+                .unwrap()
+                .get(amount.id as u32),
+            Some(&Value::Num(99.0))
+        );
         let found = build_view(&st, &db, None, "task 2999", 1000).unwrap();
         assert_eq!(found.len(), 11); // Task 2999, Task 29990..29999
         let by_title = build_view(&st, &db, Some((0, true)), "", 3).unwrap();
@@ -1005,7 +1449,8 @@ mod tests {
 
     #[test]
     fn csv_reader_handles_quotes_and_newlines() {
-        let rows: Vec<Vec<String>> = Csv::new("a,b\n\"x,1\",\"he said \"\"hi\"\"\nsecond line\"\n\n,\nlast,1").collect();
+        let rows: Vec<Vec<String>> =
+            Csv::new("a,b\n\"x,1\",\"he said \"\"hi\"\"\nsecond line\"\n\n,\nlast,1").collect();
         assert_eq!(rows[0], vec!["a", "b"]);
         assert_eq!(rows[1], vec!["x,1", "he said \"hi\"\nsecond line"]);
         assert_eq!(rows[2], vec!["last", "1"]);

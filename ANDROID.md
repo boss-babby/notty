@@ -27,6 +27,19 @@ the Java activity, which cargo-apk cannot compile.
 
 Vendored patches: `vendor/eframe` (storage dir), `vendor/egui-winit` (no winit soft-keyboard calls on Android, Back key capture).
 
+## Bluetooth pairing transport and push (pass 10)
+* `android/java/com/lumen/app/BlePair.java` is the Java half of `src/collab/pair.rs`: the host advertises the 16-byte session tag
+  (manufacturer data `0x4C55`, service `4c756d65-6e00-4000-8000-00805f9b34fb`), runs a GATT server (`RX` write, `TX` notify) and hands whole
+  fragments to Rust; the guest scans for the service, connects, negotiates the MTU, enables notifications and writes fragments one at a time.
+  Keys, the six-digit code, sealing and the CRC reassembler stay in Rust.
+* Manifest permissions: `BLUETOOTH_SCAN` (`neverForLocation`), `BLUETOOTH_ADVERTISE`, `BLUETOOTH_CONNECT`, the legacy pair with
+  `maxSdkVersion="30"`, `uses-feature bluetooth_le` **not required**.
+* `FcmKit.java` loads Firebase Messaging **by reflection**: the APK builds and runs without the SDK (push unavailable, the foreground
+  service keeps the session alive); drop the SDK on the class path and the registration token is handed to Rust for `/api/collab/push`.
+* `tools/phone-rig.sh [--dry-run] HOST_SERIAL GUEST_SERIAL [apk]` drives two real devices over `adb` + UI Automator (install, permissions,
+  Share on the host, Nearby on the guest, foreground service, "host found", screen kept awake). `--dry-run` checks the tooling and the APK
+  signature — that is what CI can do.
+
 ## Signing
 `android/lumen-release.jks` (password `lumen-release`, override with `LUMEN_KEYSTORE` / `LUMEN_KEYSTORE_PASS`) is generated on first build.
 Keep it: an update must be signed with the same key. For Play Store publishing create your own upload key.

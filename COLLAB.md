@@ -735,3 +735,200 @@ See `RELEASE-14.8.md` for commands, artefacts and sizes. `cargo test --lib`: 318
 5. **Quorum for the election** (three or more editors) to avoid split brain in partitions; sign the `Standby` plan with the host's long-term key.
 6. **Per-document access:** share a page with a link that expires and can be revoked, with the roles kept in the encrypted plan.
 7. **Large-scale polish:** memory-mapped chunk reads for tables over 10 M rows, background compaction after a big sync, delta-compressed `BigChunk`s.
+
+## 16. Pass 10 — the §15.10 list: text CRDT, persisted tombstones, DHT/IPv6, signed plans, grants, phone glue (14.8 · this delivery)
+
+Input: the seven ranked items of §15.10. `PROTO` is now **8**: `Welcome.spk`, `Standby.{spk,sig,seq,grants}`, `BigGet.have`, `BigChunk.cells`
+(all `serde(default)`, but a 14.7 peer is still refused with the usual "incompatible version" message). Every item below says what was
+built, how it was checked, and — just as important — what is **not** finished.
+
+| # | §15.10 item | State |
+|---|---|---|
+| 1 | Phones in the loop (BLE glue, FCM SDK, two-device rig) | **done in the code, compiled into the APK, not run on radios**: `BlePair.java`, `FcmKit.java`, `tools/phone-rig.sh` (§16.6) |
+| 2 | A real text CRDT (15.7) with the editor adapter | **done**: `collab/textcrdt.rs` (RGA) + adapter + `merge3` through the CRDT (§16.2). The live per-keystroke `TextOp` broadcast is the one piece still to wire |
+| 3 | Persist tombstones, per-table index checkpoint, cell merge | **done**: `graves.log`, `bidx.lst`, `merge_cells`, delta `BigGet`, mmap reads, background compaction (§16.3) |
+| 4 | IPv6 + DHT discovery | **done**: dual-stack listener, IPv6 beacons, `dht:CODE` through the BitTorrent DHT (§16.4) |
+| 5 | Quorum + signed `Standby` plan | **done**: Ed25519 host key, pinned, signed plan, provisional host + step-down (§16.5) |
+| 6 | Per-document access (expiring, revocable links with roles) | **core done and tested**: grants with role / expiry / uses, enforcement, revocation, carried in the signed plan (§16.5). **No UI card yet** |
+| 7 | Large-scale polish (mmap, compaction, delta, compressed chunks) | **3 of 4**: mmap reads, compaction after a big sync, delta `BigChunk`s. Payload compression (deflate) not done (§16.3, §16.8) |
+
+### 16.1 What changed in the tree
+
+```
+src/collab/textcrdt.rs  new   RGA text CRDT, editor adapter, anchors, Hub, merge3
+src/collab/access.rs    new   Ed25519 host key, signed plan bytes, quorum rule, grants
+src/collab/dht.rs       new   bencode + BEP-5 get_peers / announce_peer + announcer thread
+src/collab/bigsync.rs   edit  persisted tombstones, index checkpoint, cell merge, delta, compaction
+src/collab/mod.rs       edit  PROTO 8, signing, pinning, quorum, grants, DHT hooks, IPv6 hints
+src/collab/textmerge.rs edit  merge3 now delegates to the CRDT (field merge unchanged)
+src/collab/net.rs       edit  dual-stack listener, IPv6 multicast beacons + discovery
+src/bigtable.rs         edit  graves.log replay/append, cell map, smaller memory floor
+src/bigui.rs            edit  a cell edit is announced as a cell ((id, prop)), not as a whole row
+lumen-store/src/lib.rs  edit  memory-mapped reads for data files ≥ 256 MB (`FileSource::with_mmap_min`)
+android/…/BlePair.java  new   BLE advertiser + GATT server / scanner + GATT client for pair.rs
+android/…/FcmKit.java   new   FCM token by reflection (APK builds without the Firebase SDK)
+android/AndroidManifest edit  BLUETOOTH_SCAN (neverForLocation) / ADVERTISE / CONNECT + legacy pair
+tools/phone-rig.sh      new   two-device adb + UI Automator rig (dry-run mode for CI)
+```
+
+### 16.2 A real text CRDT (`collab/textcrdt.rs`, 650 lines, 9 tests)
+
+* **Model.** RGA: every character has an id `(counter, replica)`; an insertion names the character it was typed after (`origin`). The
+  integration rule (skip concurrent siblings with a bigger id, then descend) gives the same string for the same operation set in **any**
+  delivery order, duplicates are no-ops, and an operation whose origin has not arrived waits in a bounded `pending` list (causal delivery).
+  Deletions are tombstones; `compact()` drops the ones no live character refers to.
+* **Editor adapter.** `Doc::set_text(&str)` is the whole adapter: prefix/suffix trim, then a `u16` LCS over the changed middle, emitting
+  *minimal, separate* runs (`…two separate edits → ≤ 4 operations`). It is what an egui `TextEdit` needs (the editor still owns a plain
+  `String`); `Hub::local` / `Hub::remote` hold one document per open block.
+* **Carets.** `anchor(index) -> Id` / `index_of(Id) -> index`: a caret is an id, so it moves with remote insertions and collapses sensibly
+  when the character it followed is deleted (test `carets_follow_remote_edits`).
+* **`merge3` through the CRDT.** Both sides derive their replica id from the content they produced (FNV of the string, collision-nudged),
+  build a document from the common base, apply the other side's operations and return the text — deterministic, order-independent
+  (`merge3(x, y) == merge3(y, x)`), and *both* overlapping edits survive instead of "smaller first" concatenation. `textmerge::merge3`
+  now delegates to it, so **every** concurrent block edit in the session (`merge_block`) is resolved by the CRDT; the field-wise JSON merge
+  around it is unchanged.
+* **Tests.** convergence while typing at the same place (runs are not interleaved), reversed delivery + duplicates, insert into a range
+  another device deleted, operations waiting for their origin, multi-hunk adapter diff + Unicode, carets, merge3 symmetry and
+  30 000-operation randomised three-replica convergence.
+* **Not wired (the remaining half of §15.7).** There is no `Msg::Text` frame yet: the editor keeps sending the block entity, and the CRDT
+  is what merges it. That is already a strict improvement (overlapping edits are no longer lost), but per-keystroke operations would cut
+  the round-trip size from a whole block to a few characters. The adapter and the document store are ready for it —
+  §16.8 has the exact next step.
+
+### 16.3 Big tables: tombstones that survive a restart, cell merge, checkpoints, delta, mmap, compaction
+
+* **Persistent tombstones (`bigtable.rs`).** `graves.log` next to the store: 16-byte records `(row id, ms)`, ms = 0 undoes one. It is
+  replayed once per process (lazily, before the first tombstone use), appended on every delete, and rewritten when ≥ 4/5 of it is dead
+  records. `note_delete` now always records a tombstone (previously only during a session), so *deleting a row while alone* also survives
+  a restart and cannot be resurrected by a peer that still has it. In-memory floor raised to 2 M tombstones per table.
+* **Index checkpoint (`bidx.lst`).** Magic `BIX1`, a 64-bit *stamp* (data length, chunk count, WAL length, highest id, tombstone
+  fingerprint) and the `(bucket, rows, signature)` table with an FNV checksum. The stamp is taken **before** the scan, so a write during
+  the first index makes the next start rebuild instead of trusting a stale file; a corrupt or truncated file is ignored.
+  A million-row table skips the full scan on every reconnect.
+* **Cell-level merge.** `bigtable::note_cell(dir, id, prop)` records which properties (0 = title) this device changed per row (bounded,
+  100 k rows). Live `BigChunk`s carry `cells`; the receiver merges row by row with `merge_cells(local, remote, remote_cells, local_cells)`:
+  a cell only one side touched comes from that side, a cell both touched goes to the newer stamp (ties: the larger value, so both devices
+  decide alike); the merged row is stamped `max + 1` so every *other* device adopts it by the plain newer-wins rule. Two people editing
+  two columns of one row no longer overwrite each other.
+* **Delta requests.** `BigGet.have` lists `(row id, signature)` of the rows the requester already holds for a bucket; the answer only packs
+  the rows that are missing or different (test: 1 edited row out of 500 → a single row on the wire).
+* **Memory-mapped reads (`lumen-store`).** Data files ≥ 256 MB (`FileSource::with_mmap_min`, lazy) are read through a read-only
+  `memmap2` map instead of one `pread` per chunk; the map is dropped and re-created when reads pass its end and **before** `compact`
+  replaces the file (a stale map after compaction returned old bytes — caught by the new test, fixed, and covered by
+  `big_files_are_read_through_a_memory_map`).
+* **Compaction after a big sync.** When one sync accepted ≥ 20 000 rows, `compact_in_background` rewrites the data files on a worker
+  thread (native only; the browser store is a `Vec`).
+* **Not done.** `BigChunk` payloads are still base64 of the raw chunk (no deflate) — the delta already removes most of the bytes, but a
+  compressed frame would help the first sync of a million rows. Columnar cross-device merge of a *new* column is whole-row (the cells are
+  merged only when the row exists on both sides).
+
+### 16.4 Anywhere without our site: IPv6 + the BitTorrent DHT (`collab/dht.rs`, 4 tests)
+
+* **Dual-stack listening.** `Net::listen_pref` binds `[::]` first (on Linux/Android that is dual-stack) and `0.0.0.0` on the same port when
+  the platform keeps the families apart (Windows). IPv4-mapped peers are canonicalised to `a.b.c.d` so a device that dials both ways is
+  one device.
+* **IPv6 discovery.** Beacons also go to the link-local group `ff02::4c75:6d65` („lume“) on the same port and a second receiver listens
+  for them; `local_addrs6()` adds global / unique-local addresses to the hints (link-local addresses are not advertised: they need a zone).
+  Two IPv6 devices therefore meet with no NAT and no UPnP.
+* **DHT.** A small BEP-5 client: bencode encode/decode (bounded depth and lengths), `get_peers` iterations towards
+  `SHA-256("lumen-dht-v1" ‖ CODE)[..20]`, `announce_peer` with the write tokens, and a background `Announcer` that re-announces every
+  9 minutes (5 minutes when it failed). The host announces when "Internet" is switched on; `dht:CODE` in the join field looks the code up
+  and dials what it finds. The DHT learns an infohash and a public address — never the code, the session or a document; the Noise handshake
+  and the token/`cap` proof still decide who gets in.
+* **Tests.** bencode round-trip + hostile inputs, infohash normalisation, and a fake DHT node: announce → lookup returns the host's
+  `ip:port`, another code finds nothing, and the background announcer reports "Announced to N DHT nodes".
+* **Not done.** No IPv6 hole punching (global IPv6 makes it unnecessary), no DHT for the *browser* build (no UDP), no magnet-style
+  multi-address records (the DHT returns one TCP port per announce).
+
+### 16.5 Signed fail-over plans, a quorum, and revocable per-document links (`collab/access.rs`, 4 tests)
+
+* **Host key.** `HostKey::from_device(private)` = Ed25519 from `SHA-256("lumen/host-signing-key/v1" ‖ X25519 private key)` — nothing new to
+  store. The host sends its public key in `Welcome.spk`; a joiner **pins** it for the session (a different key later is refused) and clears
+  the pin only when it follows a successor.
+* **Signed plan.** Every field of `Standby` (host, order, addresses, secret, cap, relay, grants, `seq`) is length-prefixed into
+  `plan_bytes` and signed. `on_standby` ignores unsigned plans, plans signed by an unpinned key, bad signatures and replayed sequences.
+  A device that only knows the share code can no longer name itself (or a friend) as the successor.
+* **Quorum.** With **three or more editors** the promoted device is a *provisional* host: it accepts the followers that prove their `cap`,
+  and once a majority of the plan's editors (itself included) is connected it becomes authoritative (toast + fresh plan). Connect a
+  majority within 14 s — otherwise it steps down, closes its listeners, pushes the failed candidate onto the election's "tried" list and
+  follows (or promotes) the next editor. While provisional it refuses approvals, role changes, kicks and new links ("Waiting for the other
+  editors…"). Split brain now needs *two* majorities, which a partition cannot produce. Two editors keep the old behaviour (a majority of
+  two would block on any single failure).
+* **Grants** (`Grants`): role (edit / suggest / view), optional expiry, optional use count, label, `revoked`, creation time; ≤ 32 per
+  document; proofs are `secure::proof("c", token, channel hash)`, so a grant token is bound to the encrypted channel like the share code.
+  `Hello` matching a live grant is accepted with *that* role and no request card (a used-up, expired or revoked grant matches nothing);
+  `enforce_grants` closes connections whose link ended in the meantime; `revoke` drops them immediately. The **live grants travel inside
+  the signed plan to the editors**, so a successor keeps honouring and revoking the same links; the editor set is also what makes the
+  plan's promise checkable.
+* **Tests.** plan signature verifies, another key does not, five tampered plans fail, the key is derived (not random); grants expire, run
+  out, are revoked, are bound to the channel, the JSON survives a round-trip, at most 32; the quorum is a strict majority and only applies
+  from three editors on.
+* **Not done.** No UI yet for creating / revoking a link (the API is `create_grant`, `revoke_grant`, `grant_link`, `grant_lan_text`, and
+  `Grants::describe` for a row) — §16.8 item 1.
+
+### 16.6 Phones in the loop
+
+* **`BlePair.java`** — the Java half §15.4 asked for: the host advertises `SERVICE` **plus the 16-byte session tag** as manufacturer data
+  `0x4C55`, runs a GATT server (`RX` write, `TX` notify with a CCCD) and forwards whole fragments to Rust; the guest scans filtered by the
+  service UUID, reports `(tag, address)`, connects, negotiates MTU, enables notifications and writes fragments one at a time (GATT allows a
+  single outstanding write). Keys, codes, sealing and the reassembler stay in `pair.rs` — this class only moves bytes.
+* **`FcmKit.java`** — the Firebase SDK is *not* bundled (it needs `google-services.json` and a Gradle build). The class loads
+  `FirebaseMessaging` by reflection: without the SDK `available()` is false and the app keeps using the foreground service; with the SDK on
+  the class path `token(ctx, cb)` hands the registration token to Rust, which registers it with `/api/collab/push` (site side done in
+  §15.5). The APK builds and installs either way.
+* **Manifest** — `BLUETOOTH_SCAN` (`neverForLocation`), `BLUETOOTH_ADVERTISE`, `BLUETOOTH_CONNECT`, the legacy pair with
+  `maxSdkVersion=30`, and `uses-feature bluetooth_le` as *not required*.
+* **`tools/phone-rig.sh`** — two devices over `adb` + UI Automator: install, grant the runtime permissions, launch, open Share on the host
+  and Nearby on the guest, then assert that (a) `CollabService` is running, (b) the guest logs that it found the host (NSD / beacon),
+  (c) the guest screen stays awake during the sync. `--dry-run` checks the tooling and the APK signature only, which is what CI can do.
+* **Honest status.** Compiled into the delivered APK (verified: `BlePair`, `FcmKit`, `CollabService` are in `classes.dex`), but **no radio
+  and no second phone exist in this sandbox**, so the pairing screen, the GATT exchange and the push call are unverified. The Rust side they
+  talk to (§15.4, sealed fragments with CRC) is tested; the rig is the thing that closes the gap on real hardware.
+
+### 16.7 Verification log (this machine, Linux x86-64)
+
+| What | Result |
+|---|---|
+| `cargo check --lib --tests` (host) | clean (warnings only, all pre-existing) |
+| `cargo test --lib` | see `VERIFY.md` in this delivery for the exact tail; the new modules add 17 tests (§16.2–16.5) and the big-table tests were rewritten for the new `merge_with` / `BigGet.have` signatures |
+| `cargo fmt` | applied to the whole tree |
+| Web build (`build-web.sh`) | `public/webapp`: `lumen_bg.wasm` 26.3 MB, `lumen.js` 93 KB, served at `/webapp` and `/app` |
+| Windows build (`build-windows.sh`) | `Lumen-windows-x64.exe` 39.2 MB (+ zip 19.7 MB) |
+| Android build (`build-android.sh`) | signed `Lumen-android-arm64.apk` 17.3 MB (arm64-v8a, `liblumen.so` 33.3 MB uncompressed, v1+v2+v3 signature) |
+| Two devices over loopback | `two_devices_sync_over_a_real_socket`, `a_big_table_is_shared_edited_and_deleted_live`, `the_editors_elect_a_new_host_when_the_host_vanishes` |
+| Two phones / two radios | **not possible here** (no devices, no Bluetooth) — rig shipped |
+| DHT against the public network | **not possible here** (no unrestricted UDP) — fake-node test shipped |
+
+### 16.8 What is left (exact next steps)
+
+1. **The grants UI** (~1 file, `collab/ui.rs`): a card in the Share tab listing `Grants::describe`, a `+ Link` row (role, 1 h / 24 h / 7 d /
+   never, uses), a copy button using `grant_link` / `grant_lan_text`, and revoke. Everything it calls exists and is tested.
+2. **Live `TextOp` frames** (`Msg::Text { block, ops }`, `EditorHub`): the editor calls `Hub::local` after a `TextEdit` change and sends the
+   returned operations (drop the whole-block `Ops` for text fields); `Hub::remote` applies them and reports the new string + caret offset via
+   `Doc::anchor`. The fallback (entity merge) stays for peers that do not send text frames.
+3. **Real-device pass:** run `tools/phone-rig.sh` with two phones; then the BLE pairing panel on top of `BlePair` + `pair.rs`
+   (permissions → advertise → show the six-digit code → accept), and an FCM project (`google-services.json` + `FCM_SERVICE_ACCOUNT`).
+4. **Compressed `BigChunk`s:** deflate the chunk before base64 (the crate is already linked for the collab payloads) and raise the row cap
+   per frame; measure the first sync of 1 M rows before / after.
+5. **Cell merge for new columns / deletions of a cell** (today a column that does not exist locally is taken from the remote row as a whole)
+   and an explicit "cell deleted" marker instead of the missing-property convention.
+6. **IPv6 first-class:** publish an AAAA in the relay link, prefer IPv6 addresses in hints, and use the DHT record's source address for the
+   `wan_address` when UPnP is unavailable.
+7. **`Arc<Page>` copy-on-write / per-page store** (§15.7, unchanged): the remaining memory win for workspaces with many huge pages; a model
+   refactor across ~60 files.
+
+### 16.9 Review — what more can be done now (ranked)
+
+1. **Docs and editor polish around the CRDT** (undo of remote merges, "kept both versions" marker, per-block history) — the CRDT made
+   concurrent typing correct; the UI still does not *show* that it happened.
+2. **Server-assisted rendezvous without a document server**: the relay already exists; a signed *introduction* (room → addresses) would make
+   "share by link" connect directly whenever the network allows, and fall back to relaying otherwise, without a new trust anchor.
+3. **Play Store / F-Droid packaging** (`aab`, reproducible builds, `fastlane` metadata) and an update check against `version.json`.
+4. **Encrypted-at-rest tables** (the store is plaintext today; the device key already exists and could wrap a per-table file key).
+5. **Mesh topologies** (the star is still the only one): a joiner-to-joiner data channel would cut host upload by half for three people.
+6. **A real test rig in CI** (two emulators + `adb`); the emulator can drive NSD and the foreground service, everything except the radio.
+
+### 16.10 The delivery itself
+
+`DELIVERY.md` in the repository root lists the three artefacts with their sizes and SHA-256, the exact build commands, how the website
+serves them (`/downloads`, `/app`, `/webapp`), and the limitations of this machine. `VERIFY.md` records the commands and their output.
