@@ -310,6 +310,9 @@ impl Sink for SecureSink {
             i.send(m);
         }
     }
+    fn path_kind(&self) -> super::iroh_transport::PathKind {
+        self.inner.lock().map(|i| i.path_kind()).unwrap_or_default()
+    }
     fn flush_pending(&self) {
         #[cfg(not(target_arch = "wasm32"))]
         {

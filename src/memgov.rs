@@ -68,6 +68,19 @@ pub fn tick(ctx: &Context) {
 pub fn rss_mb() -> Option<f64> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    if let Some(kb) = rest
+                        .split_whitespace()
+                        .next()
+                        .and_then(|v| v.parse::<f64>().ok())
+                    {
+                        return Some(kb / 1024.0);
+                    }
+                }
+            }
+        }
         let s = std::fs::read_to_string("/proc/self/statm").ok()?;
         let pages: f64 = s.split_whitespace().nth(1)?.parse().ok()?;
         Some(pages * 4096.0 / 1048576.0)

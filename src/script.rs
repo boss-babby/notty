@@ -144,37 +144,51 @@ fn fmt_num(n: f64) -> String {
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Null, Value::Null) => true,
-        (Value::Bool(x), Value::Bool(y)) => x == y,
-        (Value::Num(x), Value::Num(y)) => x == y,
-        (Value::Str(x), Value::Str(y)) => x == y,
-        (Value::Host(x), Value::Host(y)) => x == y,
-        (Value::List(x), Value::List(y)) => {
-            if Rc::ptr_eq(x, y) {
-                return true;
-            }
-            let (x, y) = (x.borrow(), y.borrow());
-            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| values_equal(p, q))
+    fn eq_inner(a: &Value, b: &Value, depth: u8) -> bool {
+        if depth > 32 {
+            return false;
         }
-        (Value::Map(x), Value::Map(y)) => {
-            if Rc::ptr_eq(x, y) {
-                return true;
+        match (a, b) {
+            (Value::Null, Value::Null) => true,
+            (Value::Bool(x), Value::Bool(y)) => x == y,
+            (Value::Num(x), Value::Num(y)) => x == y,
+            (Value::Str(x), Value::Str(y)) => x == y,
+            (Value::Host(x), Value::Host(y)) => x == y,
+            (Value::List(x), Value::List(y)) => {
+                if Rc::ptr_eq(x, y) {
+                    return true;
+                }
+                let (x, y) = (x.borrow(), y.borrow());
+                x.len() == y.len()
+                    && x.iter()
+                        .zip(y.iter())
+                        .all(|(p, q)| eq_inner(p, q, depth + 1))
             }
-            let (x, y) = (x.borrow(), y.borrow());
-            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).map_or(false, |w| values_equal(v, w)))
+            (Value::Map(x), Value::Map(y)) => {
+                if Rc::ptr_eq(x, y) {
+                    return true;
+                }
+                let (x, y) = (x.borrow(), y.borrow());
+                x.len() == y.len()
+                    && x.iter()
+                        .all(|(k, v)| y.get(k).map_or(false, |w| eq_inner(v, w, depth + 1)))
+            }
+            (Value::Func(x), Value::Func(y)) => Rc::ptr_eq(x, y),
+            (Value::Native(x), Value::Native(y)) => x == y,
+            _ => false,
         }
-        (Value::Func(x), Value::Func(y)) => Rc::ptr_eq(x, y),
-        (Value::Native(x), Value::Native(y)) => x == y,
-        _ => false,
     }
+    eq_inner(a, b, 0)
 }
 
 fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
     match (a, b) {
-        (Value::Num(x), Value::Num(y)) => x.partial_cmp(y).unwrap_or(Equal),
-        (Value::Str(x), Value::Str(y)) => x.to_lowercase().cmp(&y.to_lowercase()).then_with(|| x.cmp(y)),
+        (Value::Num(x), Value::Num(y)) => x.total_cmp(y),
+        (Value::Str(x), Value::Str(y)) => x
+            .to_lowercase()
+            .cmp(&y.to_lowercase())
+            .then_with(|| x.cmp(y)),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Null, Value::Null) => Equal,
         (Value::Null, _) => Greater, // empty values sort last

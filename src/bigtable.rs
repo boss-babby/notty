@@ -51,8 +51,21 @@ fn root() -> Option<std::path::PathBuf> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn safe_table_dir(dir: &str) -> Option<std::path::PathBuf> {
+    if dir.is_empty()
+        || dir.len() > 128
+        || !dir
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    Some(root()?.join(dir))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn open_new(dir: &str, budget: usize, _create: bool) -> Option<Store> {
-    Store::open_dir(root()?.join(dir), budget).ok()
+    Store::open_dir(safe_table_dir(dir)?, budget).ok()
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -241,7 +254,7 @@ mod grave_file {
     static LOADED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
 
     pub fn path(dir: &str) -> Option<PathBuf> {
-        Some(super::root()?.join(dir).join("graves.log"))
+        Some(super::safe_table_dir(dir)?.join("graves.log"))
     }
 
     pub fn replay(bytes: &[u8]) -> BTreeMap<u64, u64> {
@@ -260,15 +273,21 @@ mod grave_file {
 
     /// Reads the log of `dir` once per process (before the first use of the in-memory map).
     pub fn ensure(dir: &str) {
-        let first = LOADED.lock().ok().map_or(false, |mut l| {
-            l.get_or_insert_with(Default::default)
-                .insert(dir.to_owned())
-        });
-        if !first {
+        let Ok(mut loaded) = LOADED.lock() else {
+            return;
+        };
+        let set = loaded.get_or_insert_with(Default::default);
+        if set.contains(dir) {
             return;
         }
-        let Some(p) = path(dir) else { return };
-        let Ok(bytes) = std::fs::read(&p) else { return };
+        let Some(p) = path(dir) else {
+            set.insert(dir.to_owned());
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&p) else {
+            set.insert(dir.to_owned());
+            return;
+        };
         let m = replay(&bytes);
         let live = m.len();
         if let Ok(mut g) = GRAVE.lock() {
@@ -280,6 +299,7 @@ mod grave_file {
                 e.entry(k).or_insert(v);
             }
         }
+        set.insert(dir.to_owned());
         // the log only grows: rewrite it when most of it is dead records
         if bytes.len() / 16 > live * 4 + 4096 {
             rewrite(dir);
@@ -364,7 +384,7 @@ pub fn grave_stamp(dir: &str) -> u64 {
 /// The directory of a table (native only).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn table_path(dir: &str) -> Option<std::path::PathBuf> {
-    Some(root()?.join(dir))
+    safe_table_dir(dir)
 }
 
 pub fn grave_put(dir: &str, id: u64, ms: u64) {

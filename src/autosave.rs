@@ -15,12 +15,14 @@ pub struct SaveJob {
     pub skipped: bool,
     /// Fingerprint of what is already stored: an equal fingerprint means "nothing to write".
     pub known_fp: Option<u64>,
+    pub gen: u64,
 }
 
 /// `text == None`: unchanged (or not serialisable — the caller then saves synchronously next time).
 pub struct SaveDone {
     pub fp: Option<u64>,
     pub text: Option<String>,
+    pub gen: u64,
 }
 
 pub type Runner = fn(SaveJob) -> SaveDone;
@@ -30,6 +32,7 @@ pub struct Autosave {
     tx: std::sync::mpsc::Sender<SaveJob>,
     rx: std::sync::mpsc::Receiver<SaveDone>,
     busy: bool,
+    gen: u64,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -38,36 +41,56 @@ impl Autosave {
         let (tx, jobs) = std::sync::mpsc::channel::<SaveJob>();
         let (done_tx, rx) = std::sync::mpsc::channel::<SaveDone>();
         let ctx = ctx.clone();
-        let _ = std::thread::Builder::new().name("lumen-autosave".into()).spawn(move || {
-            while let Ok(job) = jobs.recv() {
-                let done = run(job);
-                if done_tx.send(done).is_err() {
-                    return;
+        let _ = std::thread::Builder::new()
+            .name("lumen-autosave".into())
+            .spawn(move || {
+                while let Ok(job) = jobs.recv() {
+                    let gen = job.gen;
+                    let mut done = run(job);
+                    done.gen = gen;
+                    if done_tx.send(done).is_err() {
+                        return;
+                    }
+                    ctx.request_repaint(); // a repaint is the moment the UI thread stores the result
                 }
-                ctx.request_repaint(); // a repaint is the moment the UI thread stores the result
-            }
-        });
-        Autosave { tx, rx, busy: false }
+            });
+        Autosave {
+            tx,
+            rx,
+            busy: false,
+            gen: 1,
+        }
     }
 
     pub fn busy(&self) -> bool {
         self.busy
     }
 
+    /// Invalidates any in-flight job (e.g. after switching or resetting the workspace) so stale completions are discarded.
+    pub fn invalidate(&mut self) {
+        self.gen = self.gen.wrapping_add(1).max(1);
+        while self.rx.try_recv().is_ok() {}
+    }
+
     /// Queues a snapshot. `false` when the worker is still busy with the previous one (the caller just tries again next time).
-    pub fn submit(&mut self, job: SaveJob) -> bool {
+    pub fn submit(&mut self, mut job: SaveJob) -> bool {
         if self.busy {
             return false;
         }
+        job.gen = self.gen;
         self.busy = self.tx.send(job).is_ok();
         self.busy
     }
 
-    /// A finished job, if there is one (never blocks).
+    /// A finished job, if there is one (never blocks). Discards completions from older generations.
     pub fn poll(&mut self) -> Option<SaveDone> {
-        let d = self.rx.try_recv().ok()?;
-        self.busy = false;
-        Some(d)
+        loop {
+            let d = self.rx.try_recv().ok()?;
+            self.busy = false;
+            if d.gen == self.gen {
+                return Some(d);
+            }
+        }
     }
 
     /// Waits for the job in flight (the synchronous save paths call this first so an older result can never overwrite a newer one).
@@ -75,9 +98,16 @@ impl Autosave {
         if !self.busy {
             return None;
         }
-        let d = self.rx.recv_timeout(std::time::Duration::from_secs(20)).ok();
+        let d = self
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .ok();
+        if d.is_none() {
+            // Timed out while worker is still running: invalidate its generation so its late result is ignored.
+            self.gen = self.gen.wrapping_add(1).max(1);
+        }
         self.busy = false;
-        d
+        d.filter(|r| r.gen == self.gen)
     }
 }
 
@@ -95,6 +125,9 @@ impl Autosave {
     }
     pub fn busy(&self) -> bool {
         false
+    }
+    pub fn invalidate(&mut self) {
+        self.done = None;
     }
     pub fn submit(&mut self, job: SaveJob) -> bool {
         self.done = Some((self.run)(job));
@@ -116,9 +149,17 @@ mod tests {
         let text = serde_json::to_string(&job.ws).ok();
         let fp = text.as_ref().map(|t| crate::media::fnv(t.as_bytes()));
         if fp.is_some() && fp == job.known_fp {
-            return SaveDone { fp, text: None };
+            return SaveDone {
+                fp,
+                text: None,
+                gen: job.gen,
+            };
         }
-        SaveDone { fp, text }
+        SaveDone {
+            fp,
+            text,
+            gen: job.gen,
+        }
     }
 
     #[test]
@@ -126,12 +167,33 @@ mod tests {
         let ctx = egui::Context::default();
         let mut a = Autosave::new(&ctx, run);
         let ws = Workspace::seed();
-        assert!(a.submit(SaveJob { ws: ws.clone(), cred: None, skipped: false, known_fp: None }));
-        assert!(!a.submit(SaveJob { ws: ws.clone(), cred: None, skipped: false, known_fp: None }), "one job at a time");
+        assert!(a.submit(SaveJob {
+            ws: ws.clone(),
+            cred: None,
+            skipped: false,
+            known_fp: None,
+            gen: 0,
+        }));
+        assert!(
+            !a.submit(SaveJob {
+                ws: ws.clone(),
+                cred: None,
+                skipped: false,
+                known_fp: None,
+                gen: 0,
+            }),
+            "one job at a time"
+        );
         let first = a.wait().expect("result");
         assert!(first.text.is_some() && first.fp.is_some());
         assert!(!a.busy());
-        assert!(a.submit(SaveJob { ws, cred: None, skipped: false, known_fp: first.fp }));
+        assert!(a.submit(SaveJob {
+            ws,
+            cred: None,
+            skipped: false,
+            known_fp: first.fp,
+            gen: 0,
+        }));
         let second = a.wait().expect("result");
         assert!(second.text.is_none(), "same state ⇒ nothing to write");
         assert_eq!(second.fp, first.fp);

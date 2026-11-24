@@ -65,7 +65,10 @@ impl Spring {
         let now = ctx.input(|i| i.time);
         let dt = ctx.input(|i| i.unstable_dt).clamp(0.002, 0.05);
         let max = self.max.max(0.0);
-        let pad = wheel != 0.0 && ctx.data(|d| d.get_temp::<bool>(Id::new("wheel_is_pad"))).unwrap_or(false);
+        let pad = wheel != 0.0
+            && ctx
+                .data(|d| d.get_temp::<bool>(Id::new("wheel_is_pad")))
+                .unwrap_or(false);
         let mut gliding = false;
         if wheel != 0.0 {
             if direct {
@@ -79,17 +82,29 @@ impl Spring {
                 self.target = self.pos;
                 self.vel = 0.0;
                 let inst = (-wheel / dt).clamp(-MAX_FLING, MAX_FLING);
-                if now - self.last_in > 0.12 || (self.fling != 0.0 && self.fling.signum() != inst.signum()) {
+                if now - self.last_in > 0.12
+                    || (self.fling != 0.0 && self.fling.signum() != inst.signum())
+                {
                     self.n_in = 0;
                     self.fling = 0.0;
                 }
                 self.n_in += 1;
-                self.fling = if self.fling != 0.0 { self.fling * 0.55 + inst * 0.45 } else { inst };
+                self.fling = if self.fling != 0.0 {
+                    self.fling * 0.55 + inst * 0.45
+                } else {
+                    inst
+                };
                 self.last_in = now;
                 self.pad_mode = true;
             } else {
                 // Mouse wheel notch: critically damped spring towards the new target.
-                self.target = (self.target - wheel.clamp(-MAX_NOTCH, MAX_NOTCH)).clamp(0.0, max);
+                // Re-anchor target to current pos on direction reversal so reverse scrolling feels immediate.
+                let step = wheel.clamp(-MAX_NOTCH, MAX_NOTCH);
+                let rem = self.target - self.pos;
+                if rem != 0.0 && rem.signum() == step.signum() {
+                    self.target = self.pos;
+                }
+                self.target = (self.target - step).clamp(0.0, max);
                 self.pad_mode = false;
                 self.fling = 0.0;
                 self.n_in = 0;
@@ -116,7 +131,9 @@ impl Spring {
                 self.fling = 0.0;
             }
         }
-        let moving = !direct && !self.pad_mode && ((self.target - self.pos).abs() > 0.25 || self.vel.abs() > 2.0);
+        let moving = !direct
+            && !self.pad_mode
+            && ((self.target - self.pos).abs() > 0.25 || self.vel.abs() > 2.0);
         if moving {
             let (p, v) = damp(self.pos, self.vel, self.target, dt);
             self.pos = p;

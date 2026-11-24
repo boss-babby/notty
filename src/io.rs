@@ -126,7 +126,7 @@ pub fn file_safe(name: &str) -> String {
 }
 
 pub(crate) fn csv_escape(s: &str) -> String {
-    if s.contains([',', '"', '\n']) {
+    if s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s.to_owned()

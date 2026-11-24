@@ -617,13 +617,21 @@ fn weekday_mask(list: &[&Json]) -> u8 {
 fn parse_trigger(ws: &mut Workspace, db: u64, t: &Json) -> Result<Trigger, String> {
     let ty = match t {
         Json::String(s) => s.to_lowercase(),
-        o => str_of(o, "type").ok_or("trigger needs a type")?.to_lowercase(),
+        o => str_of(o, "type")
+            .ok_or("trigger needs a type")?
+            .to_lowercase(),
     };
     let prop = |ws: &Workspace| -> Result<u64, String> {
         let v = t.get("prop").ok_or("this trigger needs a prop")?;
-        resolve_prop(ws, db, v).filter(|p| *p != 0).ok_or_else(|| format!("Unknown property {v}."))
+        resolve_prop(ws, db, v)
+            .filter(|p| *p != 0)
+            .ok_or_else(|| format!("Unknown property {v}."))
     };
-    let time = |t: &Json| -> u16 { str_of(t, "time").and_then(dates::parse_hhmm).unwrap_or(9 * 60) };
+    let time = |t: &Json| -> u16 {
+        str_of(t, "time")
+            .and_then(dates::parse_hhmm)
+            .unwrap_or(9 * 60)
+    };
     Ok(match ty.as_str() {
         "row_added" => Trigger::RowAdded,
         "manual" => Trigger::Manual,
@@ -633,18 +641,28 @@ fn parse_trigger(ws: &mut Workspace, db: u64, t: &Json) -> Result<Trigger, Strin
             let to = match t.get("to") {
                 None | Some(Json::Null) => ChangeTo::Any,
                 Some(v) => {
-                    let text = v.as_str().map(|s| s.to_owned()).unwrap_or_else(|| v.to_string());
+                    let text = v
+                        .as_str()
+                        .map(|s| s.to_owned())
+                        .unwrap_or_else(|| v.to_string());
                     match kind {
                         PropKind::Select => ChangeTo::Sel(ensure_opt(ws, db, p, &text)),
                         PropKind::MultiSelect => ChangeTo::Has(ensure_opt(ws, db, p, &text)),
-                        PropKind::Checkbox => ChangeTo::Check(matches!(text.to_lowercase().as_str(), "true" | "yes" | "1" | "checked")),
+                        PropKind::Checkbox => ChangeTo::Check(matches!(
+                            text.to_lowercase().as_str(),
+                            "true" | "yes" | "1" | "checked"
+                        )),
                         _ => ChangeTo::Any,
                     }
                 }
             };
             Trigger::PropChanged { prop: p, to }
         }
-        "date_reached" => Trigger::DateReached { prop: prop(ws)?, offset_days: t.get("offset_days").and_then(|v| v.as_i64()).unwrap_or(0) as i32, minute: time(t) },
+        "date_reached" => Trigger::DateReached {
+            prop: prop(ws)?,
+            offset_days: t.get("offset_days").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            minute: time(t),
+        },
         "schedule" => {
             let every = str_of(t, "every").unwrap_or("daily").to_lowercase();
             let freq = match every.as_str() {
@@ -652,13 +670,37 @@ fn parse_trigger(ws: &mut Workspace, db: u64, t: &Json) -> Result<Trigger, Strin
                 "weekly" | "week" => Freq::Weekly,
                 "monthly" | "month" => Freq::Monthly,
                 "yearly" | "year" => Freq::Yearly,
-                o => return Err(format!("Unknown schedule “{o}” (daily, weekly, monthly, yearly).")),
+                o => {
+                    return Err(format!(
+                        "Unknown schedule “{o}” (daily, weekly, monthly, yearly)."
+                    ))
+                }
             };
-            let repeat = Repeat { freq, every: t.get("interval").and_then(|v| v.as_u64()).unwrap_or(1).clamp(1, 365) as u32, weekdays: weekday_mask(&arr_of(t, "weekdays")), ..Repeat::default() };
-            let start_day = str_of(t, "start").and_then(dates::parse_one).map(dates::day_of).unwrap_or_else(dates::today_day);
-            Trigger::Schedule { repeat, start_day, minute: time(t) }
+            let repeat = Repeat {
+                freq,
+                every: t
+                    .get("interval")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1)
+                    .clamp(1, 365) as u32,
+                weekdays: weekday_mask(&arr_of(t, "weekdays")),
+                ..Repeat::default()
+            };
+            let start_day = str_of(t, "start")
+                .and_then(dates::parse_one)
+                .map(dates::day_of)
+                .unwrap_or_else(dates::today_day);
+            Trigger::Schedule {
+                repeat,
+                start_day,
+                minute: time(t),
+            }
         }
-        other => return Err(format!("Unknown trigger “{other}” (row_added, manual, prop_changed, date_reached, schedule).")),
+        other => {
+            return Err(format!(
+            "Unknown trigger “{other}” (row_added, manual, prop_changed, date_reached, schedule)."
+        ))
+        }
     })
 }
 

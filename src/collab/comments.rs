@@ -103,7 +103,13 @@ fn mention_spans(ui: &mut egui::Ui, pal: &Palette, text: &str, size: f32) {
     ui.label(job);
 }
 
-pub fn window(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &mut Workspace, current: Option<u64>) {
+pub fn window(
+    ctx: &Context,
+    pal: &Palette,
+    c: &mut Collab,
+    ws: &mut Workspace,
+    current: Option<u64>,
+) {
     let Some(pid) = current else { return };
     let screen = ctx.screen_rect();
     let w = 340.0_f32.min(screen.width() - 16.0);
@@ -111,15 +117,44 @@ pub fn window(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &mut Workspace, 
     let me = c.me.clone();
     let can_moderate = c.mode != Mode::Joined || c.role == Role::Editor;
     let viewer = c.mode != Mode::Off && c.role == Role::Viewer;
-    let editing_block = c.local.block.filter(|b| ws.page(pid).map_or(false, |p| p.blocks.iter().any(|x| x.id == *b)));
+    let editing_block = c.local.block.filter(|b| {
+        ws.page(pid)
+            .map_or(false, |p| p.blocks.iter().any(|x| x.id == *b))
+    });
     // read receipt: this device is looking at the thread list of `pid` right now, up to the newest comment it contains
     if c.mode != Mode::Off {
-        let newest = list.iter().map(|x| (x.ts * 1000.0) as u64).max().unwrap_or(0);
+        let newest = list
+            .iter()
+            .map(|x| (x.ts * 1000.0) as u64)
+            .max()
+            .unwrap_or(0);
         if newest > 0 && c.local.seen != Some((pid, newest)) {
             c.local.seen = Some((pid, newest));
         }
     }
-    let names: Vec<String> = c.roster.iter().filter(|(p, _)| p.id != me.id).filter_map(|(p, _)| p.name.split_whitespace().next().map(|s| s.to_owned())).collect();
+    let peers: Vec<(PeerInfo, String)> = c
+        .roster
+        .iter()
+        .filter(|(p, _)| p.id != me.id)
+        .filter_map(|(p, _)| {
+            p.name
+                .split_whitespace()
+                .next()
+                .map(|first| (p.clone(), first.to_owned()))
+        })
+        .collect();
+
+    let phone = screen.width() < 560.0;
+    let win_w = if phone {
+        (screen.width() - 20.0).max(260.0)
+    } else {
+        356.0_f32.min(screen.width() - 16.0)
+    };
+    let anchor = if phone {
+        (Align2::CENTER_TOP, vec2(0.0, 50.0))
+    } else {
+        (Align2::RIGHT_TOP, vec2(-10.0, 52.0))
+    };
 
     let mut close = false;
     let mut resolve: Option<(u64, bool)> = None;
@@ -130,64 +165,182 @@ pub fn window(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &mut Workspace, 
         .title_bar(false)
         .collapsible(false)
         .resizable(false)
-        .anchor(Align2::RIGHT_TOP, vec2(-8.0, 52.0))
-        .frame(crate::widgets::popup_frame(pal).corner_radius(egui::CornerRadius::same(14)).inner_margin(egui::Margin::same(12)))
+        .anchor(anchor.0, anchor.1)
+        .frame(
+            crate::widgets::popup_frame(pal)
+                .corner_radius(egui::CornerRadius::same(12))
+                .inner_margin(egui::Margin::same(14)),
+        )
         .show(ctx, |ui| {
-            ui.set_width(w - 24.0);
+            let inner_w = (win_w - 28.0).max(220.0);
+            ui.set_width(inner_w);
+            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+            // Clean Notion header
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(l::MESSAGE_SQUARE).font(body(15.0)).color(pal.accent));
-                ui.label(egui::RichText::new("Comments").font(bold(15.0)).color(pal.text));
+                crate::icons::glyph(
+                    ui.painter(),
+                    ui.cursor().left_center() + vec2(8.0, 0.0),
+                    15.0,
+                    l::MESSAGE_SQUARE,
+                    pal.muted,
+                );
+                ui.add_space(20.0);
+                ui.label(
+                    egui::RichText::new("Comments")
+                        .font(bold(14.5))
+                        .color(pal.text),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if glyph_button(ui, pal, l::X, "Close", None).clicked() {
                         close = true;
                     }
                     let resolved_n = list.iter().filter(|x| x.resolved).count();
                     if resolved_n > 0 {
-                        let lbl = if c.ui.comment_resolved { "Hide resolved" } else { "Resolved" };
-                        if button(ui, pal, &format!("{lbl} ({resolved_n})"), 3, 112.0).clicked() {
+                        let lbl = if c.ui.comment_resolved {
+                            "Hide resolved"
+                        } else {
+                            "Resolved"
+                        };
+                        if button(ui, pal, &format!("{lbl} ({resolved_n})"), 3, 108.0).clicked() {
                             c.ui.comment_resolved = !c.ui.comment_resolved;
                         }
                     }
                 });
             });
-            ui.add_space(6.0);
-            let shown: Vec<&Comment> = list.iter().filter(|x| x.reply_to == 0 && (c.ui.comment_resolved || !x.resolved)).collect();
+            let (hr, _) = ui.allocate_exact_size(vec2(inner_w, 1.0), Sense::hover());
+            ui.painter().line_segment(
+                [
+                    pos2(hr.left(), hr.center().y),
+                    pos2(hr.right(), hr.center().y),
+                ],
+                egui::Stroke::new(1.0_f32, pal.border),
+            );
+
+            let shown: Vec<&Comment> = list
+                .iter()
+                .filter(|x| x.reply_to == 0 && (c.ui.comment_resolved || !x.resolved))
+                .collect();
             if shown.is_empty() {
-                ui.label(egui::RichText::new("No comments yet. Start the conversation — @mention a teammate to notify them.").font(body(12.5)).color(pal.muted));
+                egui::Frame::new()
+                    .fill(pal.callout)
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                    .inner_margin(egui::Margin::symmetric(12, 14))
+                    .show(ui, |ui| {
+                        ui.set_width((inner_w - 24.0).max(160.0));
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new("No comments yet")
+                                    .font(bold(12.5))
+                                    .color(pal.text),
+                            );
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(if peers.is_empty() {
+                                    "Leave a note on this page, or share to @mention teammates."
+                                } else {
+                                    "Start a thread — type @ to mention a teammate."
+                                })
+                                .font(body(11.5))
+                                .color(pal.muted),
+                            );
+                        });
+                    });
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height((screen.height() - if phone { 320.0 } else { 340.0 }).max(120.0))
+                    .auto_shrink([true, true])
+                    .show(ui, |ui| {
+                        for top in shown {
+                            thread(
+                                ui,
+                                pal,
+                                c,
+                                ws,
+                                pid,
+                                top,
+                                &list,
+                                &me,
+                                can_moderate && !viewer,
+                                &mut resolve,
+                                &mut delete,
+                            );
+                            ui.add_space(6.0);
+                        }
+                    });
             }
-            egui::ScrollArea::vertical().max_height((screen.height() - 330.0).max(120.0)).auto_shrink([true, true]).show(ui, |ui| {
-                for top in shown {
-                    thread(ui, pal, c, ws, pid, top, &list, &me, can_moderate && !viewer, &mut resolve, &mut delete);
-                    ui.add_space(6.0);
-                }
-            });
             if viewer {
-                ui.label(egui::RichText::new("View only — you cannot comment.").font(body(12.0)).color(pal.muted));
+                ui.label(
+                    egui::RichText::new("View only — you cannot comment.")
+                        .font(body(12.0))
+                        .color(pal.muted),
+                );
                 return;
             }
-            ui.add_space(4.0);
             if c.ui.comment_reply != 0 {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Replying").font(body(12.0)).color(pal.accent));
-                    if button(ui, pal, "Cancel", 3, 60.0).clicked() {
-                        c.ui.comment_reply = 0;
-                    }
+                    ui.label(
+                        egui::RichText::new("Replying to thread")
+                            .font(body(12.0))
+                            .color(pal.accent),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if button(ui, pal, "Cancel", 3, 56.0).clicked() {
+                            c.ui.comment_reply = 0;
+                        }
+                    });
                 });
             } else if let Some(b) = editing_block {
-                let txt = ws.page(pid).and_then(|p| p.blocks.iter().find(|x| x.id == b)).map(|x| snippet(&x.text, 28)).unwrap_or_default();
+                let txt = ws
+                    .page(pid)
+                    .and_then(|p| p.blocks.iter().find(|x| x.id == b))
+                    .map(|x| snippet(&x.text, 26))
+                    .unwrap_or_default();
                 ui.horizontal(|ui| {
                     let on = c.ui.comment_on_block;
                     if super::ui::switch_public(ui, pal, on).clicked() {
                         c.ui.comment_on_block = !on;
                     }
-                    ui.label(egui::RichText::new(format!("On the block I'm editing: “{txt}”")).font(body(12.0)).color(pal.muted));
+                    ui.label(
+                        egui::RichText::new(format!("Attach to block: “{txt}”"))
+                            .font(body(11.5))
+                            .color(pal.muted),
+                    );
                 });
             }
+
+            // Notion-style padded composer box with subtle muted placeholder
             let edit_id = Id::new("comment_draft_edit");
-            let out = egui::TextEdit::multiline(&mut c.ui.comment_draft).id(edit_id).desired_rows(2).hint_text("Add a comment — @name mentions").desired_width(w - 24.0).font(body(13.5)).show(ui);
-            // @name picker: follows the caret (not only the end of the text), matches the start of any word of a name, keyboard + tap
+            let mut out_opt = None;
+            egui::Frame::new()
+                .fill(pal.code_bg)
+                .corner_radius(egui::CornerRadius::same(8))
+                .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.set_width((inner_w - 20.0).max(160.0));
+                    let out = egui::TextEdit::multiline(&mut c.ui.comment_draft)
+                        .id(edit_id)
+                        .desired_rows(2)
+                        .frame(false)
+                        .hint_text(
+                            egui::RichText::new("Add a comment… type @ to mention")
+                                .color(pal.muted),
+                        )
+                        .desired_width(f32::INFINITY)
+                        .font(body(13.0))
+                        .show(ui);
+                    out_opt = Some(out);
+                });
+            let out = out_opt.unwrap();
+
+            // @mention picker: follows the caret, shows connected teammate avatars + names + @handle
             let chars: Vec<char> = c.ui.comment_draft.chars().collect();
-            let caret = out.cursor_range.map(|r| r.primary.ccursor.index).unwrap_or(chars.len()).min(chars.len());
+            let caret = out
+                .cursor_range
+                .map(|r| r.primary.ccursor.index)
+                .unwrap_or(chars.len())
+                .min(chars.len());
             let mut at = None;
             let mut i = caret;
             while i > 0 {
@@ -205,58 +358,158 @@ pub fn window(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &mut Workspace, 
             }
             let focused = out.response.has_focus();
             if let (Some(at), true) = (at, focused || c.ui.comment_pick != usize::MAX) {
-                let frag: String = chars[at + 1..caret].iter().collect::<String>().to_lowercase();
-                let mut hits: Vec<&String> = names.iter().filter(|n| frag.is_empty() || n.to_lowercase().split_whitespace().any(|w| w.starts_with(&frag))).collect();
-                hits.dedup();
+                let frag: String = chars[at + 1..caret]
+                    .iter()
+                    .collect::<String>()
+                    .to_lowercase();
+                let mut hits: Vec<&(PeerInfo, String)> = peers
+                    .iter()
+                    .filter(|(p, first)| {
+                        frag.is_empty()
+                            || first.to_lowercase().starts_with(&frag)
+                            || p.name
+                                .to_lowercase()
+                                .split_whitespace()
+                                .any(|w| w.starts_with(&frag))
+                    })
+                    .collect();
                 hits.truncate(6);
-                if hits.is_empty() {
-                    ui.label(egui::RichText::new(if names.is_empty() { "Nobody else is in this session yet — share the workspace to mention people." } else { "No one by that name." }).font(body(11.5)).color(pal.muted));
-                } else {
-                    if c.ui.comment_pick >= hits.len() {
-                        c.ui.comment_pick = 0;
-                    }
-                    let (down, up, accept) = ui.input_mut(|i| (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown), i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp), i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) || i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)));
-                    if down {
-                        c.ui.comment_pick = (c.ui.comment_pick + 1) % hits.len();
-                    }
-                    if up {
-                        c.ui.comment_pick = (c.ui.comment_pick + hits.len() - 1) % hits.len();
-                    }
-                    let mut chosen: Option<String> = if accept { Some(hits[c.ui.comment_pick].clone()) } else { None };
-                    egui::Frame::new().fill(with_alpha(pal.hover, 0.6)).corner_radius(egui::CornerRadius::same(8)).inner_margin(egui::Margin::same(3)).show(ui, |ui| {
-                        for (ix, n) in hits.iter().enumerate() {
-                            let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
-                            if ix == c.ui.comment_pick || resp.hovered() {
-                                ui.painter().rect_filled(r, 6.0, pal.accent_soft);
+                egui::Frame::new()
+                    .fill(pal.callout)
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                    .inner_margin(egui::Margin::same(4))
+                    .show(ui, |ui| {
+                        ui.set_width((inner_w - 8.0).max(160.0));
+                        if hits.is_empty() {
+                            ui.label(
+                                egui::RichText::new(if peers.is_empty() {
+                                    "Share this workspace to mention connected teammates."
+                                } else {
+                                    "No matching teammate."
+                                })
+                                .font(body(11.5))
+                                .color(pal.muted),
+                            );
+                        } else {
+                            if c.ui.comment_pick >= hits.len() {
+                                c.ui.comment_pick = 0;
                             }
-                            ui.painter().text(pos2(r.left() + 8.0, r.center().y), Align2::LEFT_CENTER, format!("@{n}"), body(13.0), pal.text);
-                            if resp.clicked() {
-                                chosen = Some((*n).clone());
+                            let (down, up, accept) = ui.input_mut(|i| {
+                                (
+                                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                                    i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                                        || i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                                )
+                            });
+                            if down {
+                                c.ui.comment_pick = (c.ui.comment_pick + 1) % hits.len();
+                            }
+                            if up {
+                                c.ui.comment_pick =
+                                    (c.ui.comment_pick + hits.len() - 1) % hits.len();
+                            }
+                            let mut chosen: Option<String> = if accept {
+                                Some(hits[c.ui.comment_pick].1.clone())
+                            } else {
+                                None
+                            };
+                            for (ix, (peer, handle)) in hits.iter().enumerate() {
+                                let (r, resp) = ui.allocate_exact_size(
+                                    vec2(ui.available_width(), 30.0),
+                                    Sense::click(),
+                                );
+                                let sel = ix == c.ui.comment_pick || resp.hovered();
+                                if sel {
+                                    ui.painter().rect_filled(r, 6.0, pal.hover);
+                                }
+                                avatar(
+                                    ui.painter(),
+                                    pos2(r.left() + 14.0, r.center().y),
+                                    9.5,
+                                    peer,
+                                    if sel { pal.hover } else { pal.callout },
+                                );
+                                ui.painter().text(
+                                    pos2(r.left() + 30.0, r.center().y),
+                                    Align2::LEFT_CENTER,
+                                    &peer.name,
+                                    bold(12.5),
+                                    pal.text,
+                                );
+                                ui.painter().text(
+                                    pos2(r.right() - 8.0, r.center().y),
+                                    Align2::RIGHT_CENTER,
+                                    format!("@{handle}"),
+                                    body(11.5),
+                                    pal.muted,
+                                );
+                                if resp
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .clicked()
+                                {
+                                    chosen = Some(handle.clone());
+                                }
+                            }
+                            if let Some(n) = chosen {
+                                let mut s: String = chars[..at + 1].iter().collect();
+                                s.push_str(&n);
+                                s.push(' ');
+                                let new_caret = s.chars().count();
+                                s.extend(chars[caret..].iter());
+                                c.ui.comment_draft = s;
+                                c.ui.comment_pick = 0;
+                                let mut st = egui::TextEdit::load_state(ui.ctx(), edit_id)
+                                    .unwrap_or_default();
+                                st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                                    egui::text::CCursor::new(new_caret),
+                                )));
+                                st.store(ui.ctx(), edit_id);
+                                ui.ctx().memory_mut(|m| m.request_focus(edit_id));
                             }
                         }
                     });
-                    if let Some(n) = chosen {
-                        let mut s: String = chars[..at + 1].iter().collect();
-                        s.push_str(&n);
-                        s.push(' ');
-                        let new_caret = s.chars().count();
-                        s.extend(chars[caret..].iter());
-                        c.ui.comment_draft = s;
-                        c.ui.comment_pick = 0;
-                        let mut st = egui::TextEdit::load_state(ui.ctx(), edit_id).unwrap_or_default();
-                        st.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(new_caret))));
-                        st.store(ui.ctx(), edit_id);
-                        ui.ctx().memory_mut(|m| m.request_focus(edit_id));
-                    }
-                }
             } else {
                 c.ui.comment_pick = 0;
             }
+
+            // Clean composer footer: quick `@ Mention` trigger on left, crisp `Comment` button on right (no `0 chars` clutter)
             let empty = c.ui.comment_draft.trim().is_empty();
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("{} chars", c.ui.comment_draft.chars().count())).font(body(11.5)).color(pal.muted));
+                let mention_lbl = if peers.is_empty() {
+                    "@ Mention".to_owned()
+                } else {
+                    format!("@ Mention ({})", peers.len())
+                };
+                if button(
+                    ui,
+                    pal,
+                    &mention_lbl,
+                    0,
+                    if peers.is_empty() { 82.0 } else { 102.0 },
+                )
+                .on_hover_text("Insert @ to mention a teammate in this session")
+                .clicked()
+                {
+                    if !c.ui.comment_draft.is_empty() && !c.ui.comment_draft.ends_with(' ') {
+                        c.ui.comment_draft.push(' ');
+                    }
+                    c.ui.comment_draft.push('@');
+                    let new_caret = c.ui.comment_draft.chars().count();
+                    let mut st = egui::TextEdit::load_state(ui.ctx(), edit_id).unwrap_or_default();
+                    st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                        egui::text::CCursor::new(new_caret),
+                    )));
+                    st.store(ui.ctx(), edit_id);
+                    ui.ctx().memory_mut(|m| m.request_focus(edit_id));
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add_enabled_ui(!empty, |ui| button(ui, pal, "Comment", 1, 86.0)).inner.clicked() {
+                    if ui
+                        .add_enabled_ui(!empty, |ui| button(ui, pal, "Comment", 1, 86.0))
+                        .inner
+                        .clicked()
+                    {
                         submit = true;
                     }
                 });
@@ -268,8 +521,21 @@ pub fn window(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &mut Workspace, 
         if !text.is_empty() {
             let id = ws.id();
             let reply_to = c.ui.comment_reply;
-            let block = if reply_to == 0 && c.ui.comment_on_block { editing_block.unwrap_or(0) } else { 0 };
-            let cm = Comment { id, block, reply_to, author: me.name.clone(), author_id: me.id, text, ts: now_ms() as f64 / 1000.0, resolved: false };
+            let block = if reply_to == 0 && c.ui.comment_on_block {
+                editing_block.unwrap_or(0)
+            } else {
+                0
+            };
+            let cm = Comment {
+                id,
+                block,
+                reply_to,
+                author: me.name.clone(),
+                author_id: me.id,
+                text,
+                ts: now_ms() as f64 / 1000.0,
+                resolved: false,
+            };
             ws.comments.entry(pid).or_default().push(cm);
             c.ui.comment_known.insert(id);
             c.ui.comment_draft.clear();
@@ -278,7 +544,11 @@ pub fn window(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &mut Workspace, 
         }
     }
     if let Some((id, v)) = resolve {
-        if let Some(cm) = ws.comments.get_mut(&pid).and_then(|l| l.iter_mut().find(|x| x.id == id)) {
+        if let Some(cm) = ws
+            .comments
+            .get_mut(&pid)
+            .and_then(|l| l.iter_mut().find(|x| x.id == id))
+        {
             cm.resolved = v;
         }
         c.poke();
@@ -298,67 +568,139 @@ pub fn window(ctx: &Context, pal: &Palette, c: &mut Collab, ws: &mut Workspace, 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn thread(ui: &mut egui::Ui, pal: &Palette, c: &mut Collab, ws: &Workspace, pid: u64, top: &Comment, all: &[Comment], me: &PeerInfo, can_edit: bool, resolve: &mut Option<(u64, bool)>, delete: &mut Option<u64>) {
-    crate::widgets::popup_frame(pal).fill(with_alpha(pal.hover, if top.resolved { 0.25 } else { 0.55 })).corner_radius(egui::CornerRadius::same(10)).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        if top.block != 0 {
-            if let Some(b) = ws.page(pid).and_then(|p| p.blocks.iter().find(|x| x.id == top.block)) {
-                ui.label(egui::RichText::new(format!("▎{}", snippet(&b.text, 48))).font(body(11.5)).color(pal.muted));
-            }
-        }
-        let mut one = |ui: &mut egui::Ui, cm: &Comment, is_top: bool| {
-            ui.horizontal(|ui| {
-                let (r, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
-                let who = PeerInfo { id: cm.author_id, name: cm.author.clone(), device: String::new(), platform: String::new(), color: (cm.author_id % 8) as u8 };
-                avatar(ui.painter(), r.center(), 11.0, &who, pal.popup);
-                ui.label(egui::RichText::new(&cm.author).font(bold(12.5)).color(pal.text));
-                ui.label(egui::RichText::new(ago(cm.ts)).font(body(11.5)).color(pal.muted));
-                if cm.resolved && is_top {
-                    ui.label(egui::RichText::new("resolved").font(body(11.5)).color(Color32::from_rgb(52, 168, 83)));
+fn thread(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    c: &mut Collab,
+    ws: &Workspace,
+    pid: u64,
+    top: &Comment,
+    all: &[Comment],
+    me: &PeerInfo,
+    can_edit: bool,
+    resolve: &mut Option<(u64, bool)>,
+    delete: &mut Option<u64>,
+) {
+    crate::widgets::popup_frame(pal)
+        .fill(with_alpha(
+            pal.hover,
+            if top.resolved { 0.25 } else { 0.55 },
+        ))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if top.block != 0 {
+                if let Some(b) = ws
+                    .page(pid)
+                    .and_then(|p| p.blocks.iter().find(|x| x.id == top.block))
+                {
+                    ui.label(
+                        egui::RichText::new(format!("▎{}", snippet(&b.text, 48)))
+                            .font(body(11.5))
+                            .color(pal.muted),
+                    );
                 }
-            });
-            mention_spans(ui, pal, &cm.text, 13.0);
-            // read receipt on my own comments: who has had this page's comments open since it was written
-            if cm.author_id == me.id && c.mode != Mode::Off {
-                let at = (cm.ts * 1000.0) as u64;
-                let seen: Vec<&str> = c.roster.iter().filter(|(p, _)| p.id != me.id && c.presence_of(p.id).and_then(|pr| pr.seen).map_or(false, |(pg, t)| pg == pid && t >= at)).map(|(p, _)| ui_first(&p.name)).collect();
-                if !seen.is_empty() {
-                    ui.label(egui::RichText::new(format!("{} Seen by {}", l::CHECK, seen.join(", "))).font(body(10.5)).color(pal.muted));
-                }
             }
-        };
-        one(ui, top, true);
-        for r in all.iter().filter(|x| x.reply_to == top.id) {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.add_space(14.0);
-                ui.vertical(|ui| one(ui, r, false));
-            });
-            if can_edit && (r.author_id == me.id || c.mode != Mode::Joined) {
+            let one = |ui: &mut egui::Ui, cm: &Comment, is_top: bool| {
                 ui.horizontal(|ui| {
-                    ui.add_space(14.0);
-                    if button(ui, pal, "Delete", 3, 56.0).clicked() {
-                        *delete = Some(r.id);
+                    let (r, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
+                    let who = PeerInfo {
+                        id: cm.author_id,
+                        name: cm.author.clone(),
+                        device: String::new(),
+                        platform: String::new(),
+                        color: (cm.author_id % 8) as u8,
+                    };
+                    avatar(ui.painter(), r.center(), 11.0, &who, pal.popup);
+                    ui.label(
+                        egui::RichText::new(&cm.author)
+                            .font(bold(12.5))
+                            .color(pal.text),
+                    );
+                    ui.label(
+                        egui::RichText::new(ago(cm.ts))
+                            .font(body(11.5))
+                            .color(pal.muted),
+                    );
+                    if cm.resolved && is_top {
+                        ui.label(
+                            egui::RichText::new("resolved")
+                                .font(body(11.5))
+                                .color(Color32::from_rgb(52, 168, 83)),
+                        );
                     }
                 });
+                mention_spans(ui, pal, &cm.text, 13.0);
+                // read receipt on my own comments: who has had this page's comments open since it was written
+                if cm.author_id == me.id && c.mode != Mode::Off {
+                    let at = (cm.ts * 1000.0) as u64;
+                    let seen: Vec<&str> = c
+                        .roster
+                        .iter()
+                        .filter(|(p, _)| {
+                            p.id != me.id
+                                && c.presence_of(p.id)
+                                    .and_then(|pr| pr.seen)
+                                    .map_or(false, |(pg, t)| pg == pid && t >= at)
+                        })
+                        .map(|(p, _)| ui_first(&p.name))
+                        .collect();
+                    if !seen.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} Seen by {}",
+                                l::CHECK,
+                                seen.join(", ")
+                            ))
+                            .font(body(10.5))
+                            .color(pal.muted),
+                        );
+                    }
+                }
+            };
+            one(ui, top, true);
+            for r in all.iter().filter(|x| x.reply_to == top.id) {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.vertical(|ui| one(ui, r, false));
+                });
+                if can_edit && (r.author_id == me.id || c.mode != Mode::Joined) {
+                    ui.horizontal(|ui| {
+                        ui.add_space(14.0);
+                        if button(ui, pal, "Delete", 3, 56.0).clicked() {
+                            *delete = Some(r.id);
+                        }
+                    });
+                }
             }
-        }
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            if can_edit {
-                if button(ui, pal, "Reply", 3, 52.0).clicked() {
-                    c.ui.comment_reply = top.id;
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                if can_edit {
+                    if button(ui, pal, "Reply", 3, 52.0).clicked() {
+                        c.ui.comment_reply = top.id;
+                    }
+                    if button(
+                        ui,
+                        pal,
+                        if top.resolved { "Reopen" } else { "Resolve" },
+                        3,
+                        64.0,
+                    )
+                    .clicked()
+                    {
+                        *resolve = Some((top.id, !top.resolved));
+                    }
+                    if (top.author_id == me.id || c.mode != Mode::Joined)
+                        && button(ui, pal, "Delete", 3, 56.0).clicked()
+                    {
+                        *delete = Some(top.id);
+                    }
                 }
-                if button(ui, pal, if top.resolved { "Reopen" } else { "Resolve" }, 3, 64.0).clicked() {
-                    *resolve = Some((top.id, !top.resolved));
-                }
-                if (top.author_id == me.id || c.mode != Mode::Joined) && button(ui, pal, "Delete", 3, 56.0).clicked() {
-                    *delete = Some(top.id);
-                }
-            }
+            });
+            let _ = pos2(0.0, 0.0);
         });
-        let _ = pos2(0.0, 0.0);
-    });
 }
 
 #[cfg(test)]

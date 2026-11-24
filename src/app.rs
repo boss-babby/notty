@@ -1,7 +1,7 @@
 //! Application shell: sidebar, top bar, command palette, dialogs, toasts and persistence.
 
-use crate::widgets::LayerRaise;
 use crate::lucide as l;
+use crate::widgets::LayerRaise;
 use std::f32::consts::FRAC_PI_2;
 use std::time::Duration;
 
@@ -13,12 +13,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, now_ms, Credential};
 use crate::editor::{self, EditorState, Req};
-use crate::io as nio;
-use crate::platform;
 use crate::icons::{self, Icon};
+use crate::io as nio;
 use crate::lock::{LockEvent, LockScreen};
 use crate::media::{self, MediaStore};
 use crate::model::{Block, BlockKind, Page, PageKind, Workspace, TEMPLATES};
+use crate::platform;
 use crate::platform::{PickTarget};
 use crate::theme::{self, bold, body, lerp_color, Palette, ACCENTS};
 use crate::widgets::{
@@ -130,6 +130,8 @@ struct PaletteState {
 struct ImportDialog {
     name: String,
     text: String,
+    /// 0 = Markdown page, 1 = CSV database, 2 = Workspace backup JSON.
+    mode: u8,
 }
 
 #[derive(Default)]
@@ -758,9 +760,27 @@ impl LumenApp {
         let touch = crate::touch::touchy();
         let (_, t) = row_bg(ui, pal, key, rect, open);
         let col = lerp_color(pal.muted, pal.text, 0.35 + 0.65 * t);
-        icons::paint(ui.painter(), pos2(rect.left() + 20.0, rect.center().y), 15.0, Icon::Plus, col);
-        ui.painter().text(pos2(rect.left() + 38.0, rect.center().y), Align2::LEFT_CENTER, "New", body(14.5), col);
-        ui.painter().text(pos2(rect.right() - 12.0, rect.center().y), Align2::RIGHT_CENTER, "›", bold(17.0), col);
+        icons::paint(
+            ui.painter(),
+            pos2(rect.left() + 20.0, rect.center().y),
+            15.0,
+            Icon::Plus,
+            col,
+        );
+        ui.painter().text(
+            pos2(rect.left() + 38.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            "New",
+            body(14.5),
+            col,
+        );
+        ui.painter().text(
+            pos2(rect.right() - 12.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            "›",
+            bold(17.0),
+            col,
+        );
         let hov = resp.hovered();
         if resp.clicked() {
             open = !open;
@@ -772,40 +792,168 @@ impl LumenApp {
         }
         if open {
             let a = ctx.animate_bool_with_time(Id::new("new_fly_t"), true, 0.12);
+            let screen = ctx.screen_rect();
+            let mobile_sheet = screen.width() < 600.0;
             let pos = pos2(rect.right() + 6.0, rect.top() - 6.0);
             let mut pick: Option<u8> = None;
-            let area = Area::new(Id::new("new_fly")).order(Order::Foreground).fixed_pos(pos + vec2((1.0 - a) * -6.0, 0.0)).show(&ctx, |ui| {
+            if mobile_sheet {
+                Area::new(Id::new("new_fly_scrim"))
+                    .order(Order::Foreground)
+                    .fixed_pos(screen.min)
+                    .show(&ctx, |ui| {
+                        let (r, sr) = ui.allocate_exact_size(screen.size(), Sense::click());
+                        ui.painter().rect_filled(
+                            r,
+                            0.0,
+                            Color32::from_black_alpha((92.0 * a) as u8),
+                        );
+                        if sr.clicked() {
+                            open = false;
+                        }
+                    });
+            }
+            let fly_area = if mobile_sheet {
+                Area::new(Id::new("new_fly"))
+                    .order(Order::Foreground)
+                    .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -6.0 + (1.0 - a) * 28.0))
+            } else {
+                Area::new(Id::new("new_fly"))
+                    .order(Order::Foreground)
+                    .fixed_pos(pos + vec2((1.0 - a) * -6.0, 0.0))
+            };
+            let area = fly_area.show(&ctx, |ui| {
                 ui.set_opacity(a);
-                crate::widgets::popup_frame(pal).show(ui, |ui| {
-                    ui.set_width(236.0);
+                let frame = if mobile_sheet {
+                    Frame::NONE
+                        .fill(pal.popup)
+                        .stroke(Stroke::new(1.0_f32, pal.border))
+                        .corner_radius(CornerRadius {
+                            nw: 16,
+                            ne: 16,
+                            sw: 10,
+                            se: 10,
+                        })
+                        .inner_margin(Margin {
+                            left: 12,
+                            right: 12,
+                            top: 8,
+                            bottom: 14,
+                        })
+                } else {
+                    crate::widgets::popup_frame(pal)
+                };
+                frame.show(ui, |ui| {
+                    let fw = if mobile_sheet {
+                        (screen.width() - 36.0).max(200.0)
+                    } else {
+                        236.0
+                    };
+                    ui.set_width(fw);
+                    if mobile_sheet {
+                        let (hr, _) = ui.allocate_exact_size(vec2(fw, 12.0), Sense::hover());
+                        ui.painter().rect_filled(
+                            Rect::from_center_size(hr.center(), vec2(36.0, 4.0)),
+                            2.0,
+                            with_alpha(pal.muted, 0.45),
+                        );
+                        ui.add_space(4.0);
+                    }
                     section_label(ui, pal, "CREATE");
-                    if menu_item(ui, pal, l::FILE_PLUS, "Page", Some("Notes, docs, wikis — Markdown, tables, blocks"), false, false).clicked() {
+                    if menu_item(
+                        ui,
+                        pal,
+                        l::FILE_PLUS,
+                        "Page",
+                        Some("Notes, docs, wikis — Markdown, tables, blocks"),
+                        false,
+                        false,
+                    )
+                    .clicked()
+                    {
                         pick = Some(0);
                     }
-                    if menu_item(ui, pal, l::KANBAN, "Database", Some("Table, board, list, gallery, calendar, timeline"), false, false).clicked() {
+                    if menu_item(
+                        ui,
+                        pal,
+                        l::KANBAN,
+                        "Database",
+                        Some("Table, board, list, gallery, calendar, timeline"),
+                        false,
+                        false,
+                    )
+                    .clicked()
+                    {
                         pick = Some(1);
                     }
-                    if menu_item(ui, pal, l::NETWORK, "Canvas", Some("Infinite whiteboard with connectors"), false, false).clicked() {
+                    if menu_item(
+                        ui,
+                        pal,
+                        l::NETWORK,
+                        "Canvas",
+                        Some("Infinite whiteboard with connectors"),
+                        false,
+                        false,
+                    )
+                    .clicked()
+                    {
                         pick = Some(2);
                     }
-                    if menu_item(ui, pal, l::ZAP, "Flow", Some("Node-based automation and data pipelines"), false, false).clicked() {
+                    if menu_item(
+                        ui,
+                        pal,
+                        l::ZAP,
+                        "Flow",
+                        Some("Node-based automation and data pipelines"),
+                        false,
+                        false,
+                    )
+                    .clicked()
+                    {
                         pick = Some(3);
                     }
-                    ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top() + 2.0, Stroke::new(1.0_f32, pal.border));
+                    ui.painter().hline(
+                        ui.max_rect().x_range(),
+                        ui.cursor().top() + 2.0,
+                        Stroke::new(1.0_f32, pal.border),
+                    );
                     ui.add_space(5.0);
-                    if menu_item(ui, pal, l::LAYOUT_TEMPLATE, "From template…", None, false, false).clicked() {
+                    if menu_item(
+                        ui,
+                        pal,
+                        l::LAYOUT_TEMPLATE,
+                        "From template…",
+                        None,
+                        false,
+                        false,
+                    )
+                    .clicked()
+                    {
                         pick = Some(4);
                     }
-                    if menu_item(ui, pal, l::FILE_DOWN, "Import Markdown / CSV…", None, false, false).clicked() {
+                    if menu_item(
+                        ui,
+                        pal,
+                        l::FILE_DOWN,
+                        "Import Markdown / CSV…",
+                        None,
+                        false,
+                        false,
+                    )
+                    .clicked()
+                    {
                         pick = Some(5);
                     }
                 });
             });
-            let over = ctx.pointer_hover_pos().map_or(false, |p| area.response.rect.expand(8.0).contains(p));
+            let over = ctx
+                .pointer_hover_pos()
+                .map_or(false, |p| area.response.rect.expand(8.0).contains(p));
             if over || hov {
                 last = now;
             }
-            if (!touch && now - last > 0.28) || (ctx.input(|i| i.pointer.any_pressed()) && !over && !hov) {
+            if (!touch && now - last > 0.28)
+                || (ctx.input(|i| i.pointer.any_pressed()) && !over && !hov)
+            {
                 open = false;
             }
             if let Some(k) = pick {
@@ -876,13 +1024,31 @@ impl LumenApp {
         // workspace header
         let (_, hr) = ui.allocate_space(vec2(w, 36.0));
         let hresp = ui.interact(hr, Id::new("ws_header"), Sense::click());
-        let ht = ui.ctx().animate_bool_with_time(hresp.id, ui.rect_contains_pointer(hr), 0.1);
+        let ht = ui
+            .ctx()
+            .animate_bool_with_time(hresp.id, ui.rect_contains_pointer(hr), 0.1);
         ui.painter().rect_filled(hr, 7.0, with_alpha(pal.hover, ht));
         let av = Rect::from_center_size(pos2(hr.left() + 20.0, hr.center().y), vec2(24.0, 24.0));
         ui.painter().rect_filled(av, 7.0, pal.accent);
-        let letter = self.ws.name.chars().next().unwrap_or('L').to_uppercase().to_string();
-        ui.painter().text(av.center(), Align2::CENTER_CENTER, letter, bold(13.0), Color32::WHITE);
-        let name_clip = Rect::from_min_max(pos2(hr.left() + 40.0, hr.top()), pos2(hr.right() - 40.0, hr.bottom()));
+        let letter = self
+            .ws
+            .name
+            .chars()
+            .next()
+            .unwrap_or('L')
+            .to_uppercase()
+            .to_string();
+        ui.painter().text(
+            av.center(),
+            Align2::CENTER_CENTER,
+            letter,
+            bold(13.0),
+            Color32::WHITE,
+        );
+        let name_clip = Rect::from_min_max(
+            pos2(hr.left() + 40.0, hr.top()),
+            pos2(hr.right() - 40.0, hr.bottom()),
+        );
         ui.painter().with_clip_rect(name_clip).text(
             pos2(hr.left() + 40.0, hr.center().y),
             Align2::LEFT_CENTER,
@@ -893,9 +1059,19 @@ impl LumenApp {
         let cr = Rect::from_center_size(pos2(hr.right() - 18.0, hr.center().y), vec2(26.0, 26.0));
         let cresp = ui.interact(cr, Id::new("sb_collapse"), Sense::click());
         if crate::touch::reveal(ui.rect_contains_pointer(hr)) {
-            let h = ui.ctx().animate_bool_with_time(cresp.id, cresp.hovered() || cresp.is_pointer_button_down_on(), 0.1);
+            let h = ui.ctx().animate_bool_with_time(
+                cresp.id,
+                cresp.hovered() || cresp.is_pointer_button_down_on(),
+                0.1,
+            );
             ui.painter().rect_filled(cr, 6.0, with_alpha(pal.active, h));
-            icons::paint(ui.painter(), cr.center(), 15.0, Icon::ChevronLeft, pal.muted);
+            icons::paint(
+                ui.painter(),
+                cr.center(),
+                15.0,
+                Icon::ChevronLeft,
+                pal.muted,
+            );
         }
         if cresp.on_hover_text("Close sidebar  (Ctrl+\\)").clicked() {
             self.ws.sidebar_open = false;
@@ -906,28 +1082,95 @@ impl LumenApp {
         ui.add_space(8.0);
 
         // quick actions
-        if simple_row(ui, pal, "sr_search", w, Icon::Search, "Search", Some("Ctrl K")) {
-            self.palette = Some(PaletteState { query: String::new(), sel: 0, focused: false, pick: None });
+        if simple_row(
+            ui,
+            pal,
+            "sr_search",
+            w,
+            Icon::Search,
+            "Search",
+            Some("Ctrl K"),
+        ) {
+            self.palette = Some(PaletteState {
+                query: String::new(),
+                sel: 0,
+                focused: false,
+                pick: None,
+            });
+            if ui.ctx().screen_rect().width() < 720.0 {
+                self.ws.sidebar_open = false;
+            }
         }
         self.new_flyout(ui, pal, w);
-        if simple_row(ui, pal, "sr_journal", w, Icon::Page, "Today's journal", Some("Ctrl J")) {
+        if simple_row(
+            ui,
+            pal,
+            "sr_journal",
+            w,
+            Icon::Page,
+            "Today's journal",
+            Some("Ctrl J"),
+        ) {
             self.run(PalAct::Journal);
         }
         if simple_row(ui, pal, "sr_tpl", w, Icon::Duplicate, "Templates", None) {
             self.templates_open = true;
+            if ui.ctx().screen_rect().width() < 720.0 {
+                self.ws.sidebar_open = false;
+            }
         }
-        if simple_row(ui, pal, "sr_home", w, Icon::Board, "Dashboard", Some("Ctrl D")) {
+        if simple_row(
+            ui,
+            pal,
+            "sr_home",
+            w,
+            Icon::Board,
+            "Dashboard",
+            Some("Ctrl D"),
+        ) {
             self.run(PalAct::Dashboard);
         }
-        if simple_row(ui, pal, "sr_graph", w, Icon::Link, "Graph view", Some("Ctrl G")) {
+        if simple_row(
+            ui,
+            pal,
+            "sr_graph",
+            w,
+            Icon::Link,
+            "Graph view",
+            Some("Ctrl G"),
+        ) {
             self.run(PalAct::Graph);
         }
         let unread = self.ws.auto.unread();
-        let badge = if unread > 0 { format!("{unread} new") } else { String::new() };
-        if simple_row(ui, pal, "sr_auto", w, Icon::Zap, "Automations", if unread > 0 { Some(badge.as_str()) } else { Some("Ctrl ⇧ A") }) {
+        let badge = if unread > 0 {
+            format!("{unread} new")
+        } else {
+            String::new()
+        };
+        if simple_row(
+            ui,
+            pal,
+            "sr_auto",
+            w,
+            Icon::Zap,
+            "Automations",
+            if unread > 0 {
+                Some(badge.as_str())
+            } else {
+                Some("Ctrl ⇧ A")
+            },
+        ) {
             self.run(PalAct::Automations);
         }
-        if simple_row(ui, pal, "sr_ai", w, Icon::Sparkles, "Ask Lumen AI", Some("Ctrl ⇧ J")) {
+        if simple_row(
+            ui,
+            pal,
+            "sr_ai",
+            w,
+            Icon::Sparkles,
+            "Ask Lumen AI",
+            Some("Ctrl ⇧ J"),
+        ) {
             self.run(PalAct::Ai);
             if ui.ctx().screen_rect().width() < 720.0 {
                 self.ws.sidebar_open = false;
@@ -938,71 +1181,127 @@ impl LumenApp {
         let rows = self.side_rows();
         let footer_h = 78.0;
         let h = (ui.available_height() - footer_h).max(80.0);
-        ScrollArea::vertical().id_salt("side_scroll").max_height(h).auto_shrink([false, false]).show(ui, |ui| {
-            ui.set_width(w);
-            let favs: Vec<u64> = self.ws.pages.iter().filter(|p| p.favorite && !p.trashed).map(|p| p.id).collect();
-            if !favs.is_empty() {
-                section_label(ui, pal, "Favorites");
-                for id in favs {
+        ScrollArea::vertical()
+            .id_salt("side_scroll")
+            .max_height(h)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_width(w);
+                let favs: Vec<u64> = self
+                    .ws
+                    .pages
+                    .iter()
+                    .filter(|p| p.favorite && !p.trashed)
+                    .map(|p| p.id)
+                    .collect();
+                if !favs.is_empty() {
+                    section_label(ui, pal, "Favorites");
+                    for id in favs {
+                        let Some(p) = self.ws.page(id) else { continue };
+                        let out = page_row(
+                            ui,
+                            pal,
+                            Id::new(("fav", id)),
+                            w,
+                            0,
+                            p,
+                            self.ws.current == Some(id),
+                            false,
+                        );
+                        if out.click {
+                            ev.push(Ev::Open(id));
+                        }
+                        if let Some(pos) = out.more.or(out.rclick) {
+                            ev.push(Ev::Menu(id, pos));
+                        }
+                        if out.plus {
+                            ev.push(Ev::AddChild(id));
+                        }
+                    }
+                    ui.add_space(6.0);
+                }
+                section_label(ui, pal, "Pages");
+                // Only the rows on screen are laid out (28 px + 1 px spacing each): a workspace with 100 000 pages costs the same per frame
+                // as one with 30. The flattened list is cached and rebuilt only when the page tree changed.
+                let pitch = 29.0_f32;
+                let n = rows.len();
+                let top = ui.cursor().top();
+                let clip = ui.clip_rect();
+                let first = (((clip.top() - top) / pitch).floor() as isize - 2).clamp(0, n as isize)
+                    as usize;
+                let last = (((clip.bottom() - top) / pitch).ceil() as isize + 2)
+                    .clamp(0, n as isize) as usize;
+                if first > 0 {
+                    ui.allocate_space(vec2(w, first as f32 * pitch - 1.0));
+                }
+                for &(id, depth, has) in &rows[first..last.max(first)] {
                     let Some(p) = self.ws.page(id) else { continue };
-                    let out = page_row(ui, pal, Id::new(("fav", id)), w, 0, p, self.ws.current == Some(id), false);
+                    let out = page_row(
+                        ui,
+                        pal,
+                        Id::new(("srow", id)),
+                        w,
+                        depth as usize,
+                        p,
+                        self.ws.current == Some(id),
+                        has,
+                    );
                     if out.click {
                         ev.push(Ev::Open(id));
                     }
-                    if let Some(pos) = out.more.or(out.rclick) {
-                        ev.push(Ev::Menu(id, pos));
+                    if out.arrow {
+                        ev.push(Ev::Toggle(id));
                     }
                     if out.plus {
                         ev.push(Ev::AddChild(id));
                     }
+                    if let Some(pos) = out.more.or(out.rclick) {
+                        ev.push(Ev::Menu(id, pos));
+                    }
                 }
-                ui.add_space(6.0);
-            }
-            section_label(ui, pal, "Pages");
-            // Only the rows on screen are laid out (28 px + 1 px spacing each): a workspace with 100 000 pages costs the same per frame
-            // as one with 30. The flattened list is cached and rebuilt only when the page tree changed.
-            let pitch = 29.0_f32;
-            let n = rows.len();
-            let top = ui.cursor().top();
-            let clip = ui.clip_rect();
-            let first = (((clip.top() - top) / pitch).floor() as isize - 2).clamp(0, n as isize) as usize;
-            let last = (((clip.bottom() - top) / pitch).ceil() as isize + 2).clamp(0, n as isize) as usize;
-            if first > 0 {
-                ui.allocate_space(vec2(w, first as f32 * pitch - 1.0));
-            }
-            for &(id, depth, has) in &rows[first..last.max(first)] {
-                let Some(p) = self.ws.page(id) else { continue };
-                let out = page_row(ui, pal, Id::new(("srow", id)), w, depth as usize, p, self.ws.current == Some(id), has);
-                if out.click {
-                    ev.push(Ev::Open(id));
+                if last < n {
+                    ui.allocate_space(vec2(w, (n - last) as f32 * pitch - 1.0));
                 }
-                if out.arrow {
-                    ev.push(Ev::Toggle(id));
+                if n == 0 {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("  No pages yet")
+                            .color(pal.muted)
+                            .font(body(13.0)),
+                    );
                 }
-                if out.plus {
-                    ev.push(Ev::AddChild(id));
-                }
-                if let Some(pos) = out.more.or(out.rclick) {
-                    ev.push(Ev::Menu(id, pos));
-                }
-            }
-            if last < n {
-                ui.allocate_space(vec2(w, (n - last) as f32 * pitch - 1.0));
-            }
-            if n == 0 {
-                ui.add_space(6.0);
-                ui.label(RichText::new("  No pages yet").color(pal.muted).font(body(13.0)));
-            }
-        });
+            });
 
         // footer
         ui.add_space(4.0);
         if simple_row(ui, pal, "sr_trash", w, Icon::Trash, "Trash", None) {
             self.trash_open = true;
+            if ui.ctx().screen_rect().width() < 720.0 {
+                self.ws.sidebar_open = false;
+            }
         }
-        let (lbl, ic) = if self.cred.is_some() { ("Lock workspace", Icon::Lock) } else { ("Set a password", Icon::Shield) };
-        if simple_row(ui, pal, "sr_lock", w, ic, lbl, if self.cred.is_some() { Some("Ctrl L") } else { None }) {
+        let (lbl, ic) = if self.cred.is_some() {
+            ("Lock workspace", Icon::Lock)
+        } else {
+            ("Set a password", Icon::Shield)
+        };
+        if simple_row(
+            ui,
+            pal,
+            "sr_lock",
+            w,
+            ic,
+            lbl,
+            if self.cred.is_some() {
+                Some("Ctrl L")
+            } else {
+                None
+            },
+        ) {
             self.run(PalAct::Lock);
+            if ui.ctx().screen_rect().width() < 720.0 {
+                self.ws.sidebar_open = false;
+            }
         }
 
         if !ev.iter().any(|e| matches!(e, Ev::Menu(..))) {
@@ -1224,13 +1523,34 @@ impl LumenApp {
     fn palette_items(&self, q: &str) -> Vec<(PalAct, String, String, Option<String>)> {
         let q = q.trim().to_lowercase();
         let mut out = vec![];
-        let title_of = |p: &Page| if p.title.is_empty() { "Untitled".to_owned() } else { p.title.clone() };
-        let icon_of = |p: &Page| if p.icon.is_empty() { l::FILE_TEXT.to_owned() } else { icons::icon_text(&p.icon).to_owned() };
+        let title_of = |p: &Page| {
+            if p.title.is_empty() {
+                "Untitled".to_owned()
+            } else {
+                p.title.clone()
+            }
+        };
+        let icon_of = |p: &Page| {
+            if p.icon.is_empty() {
+                l::FILE_TEXT.to_owned()
+            } else {
+                icons::icon_text(&p.icon).to_owned()
+            }
+        };
         if q.is_empty() {
             let mut pages: Vec<&Page> = self.ws.pages.iter().filter(|p| !p.trashed).collect();
-            pages.sort_by(|a, b| b.updated.partial_cmp(&a.updated).unwrap_or(std::cmp::Ordering::Equal));
+            pages.sort_by(|a, b| {
+                b.updated
+                    .partial_cmp(&a.updated)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             for p in pages.into_iter().take(6) {
-                out.push((PalAct::Open(p.id), icon_of(p), title_of(p), Some(format!("Edited {}", ago(p.updated)))));
+                out.push((
+                    PalAct::Open(p.id),
+                    icon_of(p),
+                    title_of(p),
+                    Some(format!("Edited {}", ago(p.updated))),
+                ));
             }
         } else {
             let mut scored: Vec<(i32, PalAct, String, String, Option<String>)> = vec![];
@@ -1244,9 +1564,11 @@ impl LumenApp {
                 } else {
                     let mut snippet = None;
                     for b in &p.blocks {
-                        if let Some(pos) = b.text.to_lowercase().find(&q) {
-                            let start = b.text[..pos].char_indices().rev().nth(20).map(|(i, _)| i).unwrap_or(0);
-                            let s: String = b.text[start..].chars().take(70).collect();
+                        let bl = b.text.to_lowercase();
+                        if let Some(pos) = bl.find(&q) {
+                            let char_pos = bl[..pos].chars().count();
+                            let start_char = char_pos.saturating_sub(20);
+                            let s: String = b.text.chars().skip(start_char).take(70).collect();
                             snippet = Some(format!("…{s}"));
                             break;
                         }
@@ -1267,7 +1589,12 @@ impl LumenApp {
                 }
             }
             scored.sort_by_key(|s| s.0);
-            out.extend(scored.into_iter().take(8).map(|(_, a, i, t, s)| (a, i, t, s)));
+            out.extend(
+                scored
+                    .into_iter()
+                    .take(8)
+                    .map(|(_, a, i, t, s)| (a, i, t, s)),
+            );
         }
         let actions: [(PalAct, &str, &str, &str); 28] = [
             (PalAct::Ai, l::SPARKLES, "Ask Lumen AI", "Chat with the agent that can build pages, databases, dashboards and automations  (Ctrl+Shift+J)"),
@@ -1482,8 +1809,14 @@ impl LumenApp {
             }
         }
         if next.current.map_or(true, |c| next.page(c).is_none()) {
-            next.current = next.pages.iter().find(|p| !p.trashed && !p.row).map(|p| p.id);
+            next.current = next
+                .pages
+                .iter()
+                .find(|p| !p.trashed && !p.row)
+                .map(|p| p.id);
         }
+        self.autosave.invalidate();
+        self.saved_fp = None;
         self.ws = next;
         self.auto_rt.resync(&self.ws);
         let sizes = std::mem::take(&mut self.ed.media_sizes);
@@ -1941,14 +2274,43 @@ impl LumenApp {
     fn topbar_narrow(&mut self, ui: &mut Ui, pal: &Palette, cur: u64) {
         let sw = ui.ctx().screen_rect().width();
         let sp = ui.spacing().item_spacing.x;
-        let btn = 38.0;
-        let title_w = (sw - 8.0 - btn * 7.0 - sp * 9.0 - 28.0).clamp(60.0, 520.0);
+        let btn = if crate::touch::touchy() { 38.0 } else { 32.0 };
+        let compact = sw < 540.0;
+        let has_changes = self.collab.active()
+            || !self.collab.changes.is_empty()
+            || !self.collab.suggestions.is_empty()
+            || !self.collab.away.is_empty();
+        // Reserve exact width for: sidebar button (1) + right-side icons (3..4 on phone, 7..8 on tablet)
+        let right_btns = if compact {
+            if has_changes {
+                4.0
+            } else {
+                3.0
+            }
+        } else if has_changes {
+            8.0
+        } else {
+            7.0
+        };
+        let chip_extra = if self.collab.active() { 36.0 } else { 0.0 };
+        let title_w = (sw - btn * (right_btns + 1.0) - sp * (right_btns + 3.0) - chip_extra - 32.0)
+            .clamp(72.0, 520.0);
         if let Some(p) = self.ws.page(cur) {
-            let title = if p.title.is_empty() { "Untitled".to_owned() } else { p.title.clone() };
+            let title = if p.title.is_empty() {
+                "Untitled".to_owned()
+            } else {
+                p.title.clone()
+            };
             let icon = p.icon.clone();
-            let cr = crumb(ui, pal, &icon, &title, true, title_w - 24.0);
-            let (cr2, ch) = ui.allocate_exact_size(vec2(24.0, 36.0), Sense::click());
-            ui.painter().text(cr2.center(), Align2::CENTER_CENTER, l::CHEVRON_DOWN, body(14.0), pal.muted);
+            let cr = crumb(ui, pal, &icon, &title, true, (title_w - 22.0).max(48.0));
+            let (cr2, ch) = ui.allocate_exact_size(vec2(20.0, 36.0), Sense::click());
+            ui.painter().text(
+                cr2.center(),
+                Align2::CENTER_CENTER,
+                l::CHEVRON_DOWN,
+                body(13.0),
+                pal.muted,
+            );
             if cr.clicked() || ch.clicked() {
                 self.hier = true;
                 self.hier_init = false;
@@ -1964,32 +2326,60 @@ impl LumenApp {
             ui.add_space(4.0);
             let r = icon_button(ui, pal, Icon::Dots, 18.0, "Page options");
             crate::collab::ui::chip(ui, pal, &mut self.collab);
-            let open_comments = self.ws.current.and_then(|p| self.ws.comments.get(&p)).map_or(0, |v| v.iter().filter(|x| !x.resolved).count());
+            let open_comments = self
+                .ws
+                .current
+                .and_then(|p| self.ws.comments.get(&p))
+                .map_or(0, |v| v.iter().filter(|x| !x.resolved).count());
             crate::collab::ui::comments_button(ui, pal, &mut self.collab, open_comments);
             crate::collab::ui::changes_button(ui, pal, &mut self.collab);
             if r.clicked() {
                 self.page_menu = Some(r.rect.left_bottom() + vec2(-230.0, 6.0));
                 self.fresh = true;
             }
-            if icon_button(ui, pal, Icon::Sparkles, 18.0, "Ask Lumen AI").clicked() {
-                self.run(PalAct::Ai);
-            }
-            let unread = self.ws.auto.unread();
-            let br = icon_button(ui, pal, Icon::Bell, 18.0, "Notifications & automations");
-            if unread > 0 {
-                let c = br.rect.right_top() + vec2(-7.0, 8.0);
-                ui.painter().circle_filled(c, 7.5, pal.danger);
-                ui.painter().text(c, Align2::CENTER_CENTER, if unread > 9 { "9+".to_owned() } else { unread.to_string() }, bold(9.5), Color32::WHITE);
-            }
-            if br.clicked() {
-                crate::autoui::open_tab(if unread > 0 { crate::autoui::TAB_INBOX } else { crate::autoui::TAB_RULES });
-                crate::views::toggle(crate::views::Mode::Automations, self.ws.current);
-            }
-            if ui.add_enabled_ui(can_r, |ui| icon_button(ui, pal, Icon::Redo, 18.0, "Redo")).inner.clicked() {
-                self.run(PalAct::Redo);
-            }
-            if ui.add_enabled_ui(can_u, |ui| icon_button(ui, pal, Icon::Undo, 18.0, "Undo")).inner.clicked() {
-                self.run(PalAct::Undo);
+            if !compact {
+                if icon_button(ui, pal, Icon::Sparkles, 18.0, "Ask Lumen AI").clicked() {
+                    self.run(PalAct::Ai);
+                }
+                let unread = self.ws.auto.unread();
+                let br = icon_button(ui, pal, Icon::Bell, 18.0, "Notifications & automations");
+                if unread > 0 {
+                    let c = br.rect.right_top() + vec2(-7.0, 8.0);
+                    ui.painter().circle_filled(c, 7.5, pal.danger);
+                    ui.painter().text(
+                        c,
+                        Align2::CENTER_CENTER,
+                        if unread > 9 {
+                            "9+".to_owned()
+                        } else {
+                            unread.to_string()
+                        },
+                        bold(9.5),
+                        Color32::WHITE,
+                    );
+                }
+                if br.clicked() {
+                    crate::autoui::open_tab(if unread > 0 {
+                        crate::autoui::TAB_INBOX
+                    } else {
+                        crate::autoui::TAB_RULES
+                    });
+                    crate::views::toggle(crate::views::Mode::Automations, self.ws.current);
+                }
+                if ui
+                    .add_enabled_ui(can_r, |ui| icon_button(ui, pal, Icon::Redo, 18.0, "Redo"))
+                    .inner
+                    .clicked()
+                {
+                    self.run(PalAct::Redo);
+                }
+                if ui
+                    .add_enabled_ui(can_u, |ui| icon_button(ui, pal, Icon::Undo, 18.0, "Undo"))
+                    .inner
+                    .clicked()
+                {
+                    self.run(PalAct::Undo);
+                }
             }
         });
     }
@@ -2092,83 +2482,275 @@ impl LumenApp {
         let mut act: Option<u8> = None;
         let (fav, dark, has_pw) = (page.favorite, self.ws.dark, self.cred.is_some());
         let phone = ctx.screen_rect().width() < 720.0;
-        let open = popup_area(ctx, Id::new("page_menu"), pos, pal, &mut self.fresh, 262.0, |ui| {
-            if phone {
-                // the top bar of a phone only has room for undo / redo / this menu: everything else lives here
-                section_label(ui, pal, "QUICK ACTIONS");
-                if menu_item(ui, pal, l::SEARCH, "Search & commands", None, false, false).clicked() {
-                    act = Some(10);
+        let open = popup_area(
+            ctx,
+            Id::new("page_menu"),
+            pos,
+            pal,
+            &mut self.fresh,
+            262.0,
+            |ui| {
+                if phone {
+                    // the top bar of a phone only has room for undo / redo / this menu: everything else lives here
+                    section_label(ui, pal, "QUICK ACTIONS");
+                    if menu_item(ui, pal, l::SEARCH, "Search & commands", None, false, false)
+                        .clicked()
+                    {
+                        act = Some(10);
+                    }
+                    if menu_item(ui, pal, l::SPARKLES, "Ask Lumen AI", None, false, false).clicked()
+                    {
+                        act = Some(16);
+                    }
+                    if menu_item(
+                        ui,
+                        pal,
+                        l::BELL,
+                        "Notifications & automations",
+                        None,
+                        false,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        act = Some(17);
+                    }
+                    if menu_item(ui, pal, l::UNDO_2, "Undo", None, false, false).clicked() {
+                        act = Some(14);
+                    }
+                    if menu_item(ui, pal, l::REDO_2, "Redo", None, false, false).clicked() {
+                        act = Some(15);
+                    }
+                    if menu_item(
+                        ui,
+                        pal,
+                        l::STAR,
+                        if fav {
+                            "Remove from favorites"
+                        } else {
+                            "Add to favorites"
+                        },
+                        None,
+                        fav,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        act = Some(11);
+                    }
+                    if menu_item(
+                        ui,
+                        pal,
+                        if dark { l::SUN } else { l::MOON },
+                        if dark {
+                            "Switch to light mode"
+                        } else {
+                            "Switch to dark mode"
+                        },
+                        None,
+                        false,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        act = Some(12);
+                    }
+                    if menu_item(
+                        ui,
+                        pal,
+                        l::LOCK,
+                        if has_pw {
+                            "Lock workspace"
+                        } else {
+                            "Set a password"
+                        },
+                        None,
+                        false,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        act = Some(13);
+                    }
+                    ui.add_space(3.0);
+                    ui.painter().hline(
+                        ui.max_rect().x_range(),
+                        ui.cursor().top(),
+                        Stroke::new(1.0_f32, pal.border),
+                    );
+                    ui.add_space(4.0);
                 }
-                if menu_item(ui, pal, l::STAR, if fav { "Remove from favorites" } else { "Add to favorites" }, None, fav, false).clicked() {
-                    act = Some(11);
-                }
-                if menu_item(ui, pal, if dark { l::SUN } else { l::MOON }, if dark { "Switch to light mode" } else { "Switch to dark mode" }, None, false, false).clicked() {
-                    act = Some(12);
-                }
-                if menu_item(ui, pal, l::LOCK, if has_pw { "Lock workspace" } else { "Set a password" }, None, false, false).clicked() {
-                    act = Some(13);
-                }
-                ui.add_space(3.0);
-                ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
-                ui.add_space(4.0);
-            }
-            section_label(ui, pal, "CONTENT SIZE");
-            crate::widgets::size_control(ui, pal, &mut zoom);
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.label(RichText::new("Resizes the page content only — menus, the sidebar and pop-ups keep their size.").font(body(11.5)).color(pal.muted));
-            });
-            ui.add_space(3.0);
-            ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
-            ui.add_space(4.0);
-            section_label(ui, pal, "PAGE STYLE");
-
-            if menu_item(ui, pal, l::TYPE, if small { "Normal text size" } else { "Small text" }, None, false, false).clicked() {
-                act = Some(0);
-            }
-            if menu_item(ui, pal, l::MAXIMIZE, if full { "Standard page width" } else { "Full width" }, None, false, false).clicked() {
-                act = Some(1);
-            }
-            if !is_db && menu_item(ui, pal, l::LAYOUT_DASHBOARD, if has_dash { "Remove dashboard" } else { "Make this page a dashboard" }, Some(if has_dash { "Keeps the page text" } else { "Adds a grid of widgets and charts" }), has_dash, false).clicked() {
-                act = Some(9);
-            }
-            ui.add_space(3.0);
-            ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
-            ui.add_space(4.0);
-            if menu_item(ui, pal, l::COPY_PLUS, "Duplicate", None, false, false).clicked() {
-                act = Some(2);
-            }
-            if menu_item(ui, pal, l::FILE_UP, "Export as Markdown", Some("Downloads a .md file"), false, false).clicked() {
-                act = Some(3);
-            }
-            if menu_item(ui, pal, l::COPY, "Copy as Markdown", None, false, false).clicked() {
-                act = Some(4);
-            }
-            if is_db && menu_item(ui, pal, l::FILE_SPREADSHEET, "Export as CSV", Some("Downloads a .csv file"), false, false).clicked() {
-                act = Some(5);
-            }
-            if menu_item(ui, pal, l::PRINTER, "Print / Save as PDF", Some("Images and databases included"), false, false).clicked() {
-                act = Some(7);
-            }
-            if menu_item(ui, pal, l::HISTORY, "Page history", Some("Versions & restore"), false, false).clicked() {
-                act = Some(8);
-            }
-            ui.add_space(3.0);
-            ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
-            ui.add_space(4.0);
-            if !is_db {
-                let mins = ((words as f32) / 220.0).ceil().max(1.0) as usize;
+                section_label(ui, pal, "CONTENT SIZE");
+                crate::widgets::size_control(ui, pal, &mut zoom);
+                ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
-                    ui.label(RichText::new(format!("{words} words · {chars} characters · ~{mins} min read")).font(body(12.0)).color(pal.muted));
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new("Resizes the page content only — menus, the sidebar and pop-ups keep their size.")
+                                .font(body(11.5))
+                                .color(pal.muted),
+                        )
+                        .wrap(),
+                    );
                 });
+                ui.add_space(3.0);
+                ui.painter().hline(
+                    ui.max_rect().x_range(),
+                    ui.cursor().top(),
+                    Stroke::new(1.0_f32, pal.border),
+                );
                 ui.add_space(4.0);
-            }
-            if menu_item(ui, pal, l::TRASH_2, "Move to trash", None, false, true).clicked() {
-                act = Some(6);
-            }
-        });
+                section_label(ui, pal, "PAGE STYLE");
+
+                if menu_item(
+                    ui,
+                    pal,
+                    l::TYPE,
+                    if small {
+                        "Normal text size"
+                    } else {
+                        "Small text"
+                    },
+                    None,
+                    false,
+                    false,
+                )
+                .clicked()
+                {
+                    act = Some(0);
+                }
+                if menu_item(
+                    ui,
+                    pal,
+                    l::MAXIMIZE,
+                    if full {
+                        "Standard page width"
+                    } else {
+                        "Full width"
+                    },
+                    None,
+                    false,
+                    false,
+                )
+                .clicked()
+                {
+                    act = Some(1);
+                }
+                if !is_db
+                    && menu_item(
+                        ui,
+                        pal,
+                        l::LAYOUT_DASHBOARD,
+                        if has_dash {
+                            "Remove dashboard"
+                        } else {
+                            "Make this page a dashboard"
+                        },
+                        Some(if has_dash {
+                            "Keeps the page text"
+                        } else {
+                            "Adds a grid of widgets and charts"
+                        }),
+                        has_dash,
+                        false,
+                    )
+                    .clicked()
+                {
+                    act = Some(9);
+                }
+                ui.add_space(3.0);
+                ui.painter().hline(
+                    ui.max_rect().x_range(),
+                    ui.cursor().top(),
+                    Stroke::new(1.0_f32, pal.border),
+                );
+                ui.add_space(4.0);
+                if menu_item(ui, pal, l::COPY_PLUS, "Duplicate", None, false, false).clicked() {
+                    act = Some(2);
+                }
+                if menu_item(
+                    ui,
+                    pal,
+                    l::FILE_UP,
+                    "Export as Markdown",
+                    Some("Downloads a .md file"),
+                    false,
+                    false,
+                )
+                .clicked()
+                {
+                    act = Some(3);
+                }
+                if menu_item(ui, pal, l::COPY, "Copy as Markdown", None, false, false).clicked() {
+                    act = Some(4);
+                }
+                if is_db
+                    && menu_item(
+                        ui,
+                        pal,
+                        l::FILE_SPREADSHEET,
+                        "Export as CSV",
+                        Some("Downloads a .csv file"),
+                        false,
+                        false,
+                    )
+                    .clicked()
+                {
+                    act = Some(5);
+                }
+                if menu_item(
+                    ui,
+                    pal,
+                    l::PRINTER,
+                    "Print / Save as PDF",
+                    Some("Images and databases included"),
+                    false,
+                    false,
+                )
+                .clicked()
+                {
+                    act = Some(7);
+                }
+                if menu_item(
+                    ui,
+                    pal,
+                    l::HISTORY,
+                    "Page history",
+                    Some("Versions & restore"),
+                    false,
+                    false,
+                )
+                .clicked()
+                {
+                    act = Some(8);
+                }
+                ui.add_space(3.0);
+                ui.painter().hline(
+                    ui.max_rect().x_range(),
+                    ui.cursor().top(),
+                    Stroke::new(1.0_f32, pal.border),
+                );
+                ui.add_space(4.0);
+                if !is_db {
+                    let mins = ((words as f32) / 220.0).ceil().max(1.0) as usize;
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "{words} words · {chars} characters · ~{mins} min read"
+                            ))
+                            .font(body(12.0))
+                            .color(pal.muted),
+                        );
+                    });
+                    ui.add_space(4.0);
+                }
+                if menu_item(ui, pal, l::TRASH_2, "Move to trash", None, false, true).clicked() {
+                    act = Some(6);
+                }
+            },
+        );
         if !open || act.is_some() {
             self.page_menu = None;
         }
@@ -2200,10 +2782,20 @@ impl LumenApp {
                     if let Some(p) = self.ws.page_mut(cur) {
                         p.full_width = true;
                     }
-                    self.toast("This page is now a dashboard — add widgets from the toolbar", None);
+                    self.toast(
+                        "This page is now a dashboard — add widgets from the toolbar",
+                        None,
+                    );
                 }
             }
-            Some(10) => self.palette = Some(PaletteState { query: String::new(), sel: 0, focused: false, pick: None }),
+            Some(10) => {
+                self.palette = Some(PaletteState {
+                    query: String::new(),
+                    sel: 0,
+                    focused: false,
+                    pick: None,
+                })
+            }
             Some(11) => {
                 if let Some(p) = self.ws.page_mut(cur) {
                     p.favorite = !p.favorite;
@@ -2211,6 +2803,18 @@ impl LumenApp {
             }
             Some(12) => self.ws.dark = !self.ws.dark,
             Some(13) => self.run(PalAct::Lock),
+            Some(14) => self.run(PalAct::Undo),
+            Some(15) => self.run(PalAct::Redo),
+            Some(16) => self.run(PalAct::Ai),
+            Some(17) => {
+                let unread = self.ws.auto.unread();
+                crate::autoui::open_tab(if unread > 0 {
+                    crate::autoui::TAB_INBOX
+                } else {
+                    crate::autoui::TAB_RULES
+                });
+                crate::views::toggle(crate::views::Mode::Automations, self.ws.current);
+            }
             Some(3) => self.export_md(),
             Some(4) => {
                 ctx.copy_text(nio::page_markdown(&self.ws, cur));
@@ -2291,67 +2895,255 @@ impl LumenApp {
     }
 
     fn import_ui(&mut self, ctx: &Context, pal: &Palette) {
-        let Some(mut dlg) = self.import.take() else { return };
+        let Some(mut dlg) = self.import.take() else {
+            return;
+        };
         let mut action: Option<u8> = None;
-        let open = modal(ctx, Id::new("import"), pal, 620.0, 80.0, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.add_space(10.0);
-                ui.label(RichText::new("Import").font(bold(20.0)));
-            });
-            ui.horizontal(|ui| {
-                ui.add_space(10.0);
-                ui.label(RichText::new("Paste Markdown, CSV or a Lumen backup, choose a file from your device — or drop a file onto the window.").font(body(13.5)).color(pal.muted));
-            });
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                field(ui, pal, pal.bg, &mut dlg.name, "Name of the new page or database", false, 580.0, Id::new("imp_name"));
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                Frame::new().fill(pal.bg).stroke(Stroke::new(1.0_f32, pal.border)).corner_radius(CornerRadius::same(9)).inner_margin(Margin::same(10)).show(ui, |ui| {
-                    ScrollArea::vertical().max_height(230.0).show(ui, |ui| {
-                        ui.add(TextEdit::multiline(&mut dlg.text).desired_width(556.0).desired_rows(11).frame(false).font(egui::FontId::monospace(13.0)).hint_text("# My notes\n\n- paste your content here"));
+        let mut close_clicked = false;
+        let screen = ctx.screen_rect();
+        let phone = screen.width() < 600.0;
+        let modal_w = 560.0_f32.min(screen.width() - 20.0);
+        let open = modal(
+            ctx,
+            Id::new("import"),
+            pal,
+            modal_w,
+            if phone { 16.0 } else { 72.0 },
+            |ui| {
+                ui.spacing_mut().item_spacing = vec2(8.0, 10.0);
+                // Clean Notion header: title + close button + hairline
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Import").font(bold(16.0)).color(pal.text));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button(ui, pal, Icon::Close, 16.0, "Close").clicked() {
+                            close_clicked = true;
+                        }
                     });
                 });
-            });
-            ui.add_space(10.0);
-            if platform::can_pick_files() {
-                // choose a file from the device instead of pasting
-                ui.horizontal_wrapped(|ui| {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("Or choose a file:").font(body(13.5)).color(pal.muted));
-                    if crate::widgets::ghost_button(ui, pal, "Markdown / text file…").clicked() {
-                        platform::pick_file(ui.ctx(), PickTarget::ImportFile { mode: 0 }, false);
+                let hw = ui.available_width();
+                let (hr, _) = ui.allocate_exact_size(vec2(hw, 1.0), Sense::hover());
+                ui.painter().line_segment(
+                    [
+                        pos2(hr.left(), hr.center().y),
+                        pos2(hr.right(), hr.center().y),
+                    ],
+                    Stroke::new(1.0_f32, pal.border),
+                );
+
+                // Clean 3-mode segmented switcher (no competing bright accent buttons)
+                Frame::new()
+                    .fill(pal.code_bg)
+                    .corner_radius(CornerRadius::same(8))
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .inner_margin(Margin::same(3))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 3.0;
+                            let tw = (ui.available_width() - 6.0).max(60.0) / 3.0;
+                            for (i, (g, lbl)) in [
+                                (l::FILE_TEXT, "Markdown"),
+                                (l::TABLE, "CSV / TSV"),
+                                (l::DATABASE, "Backup"),
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            {
+                                let sel = dlg.mode == i as u8;
+                                let (r, rs) =
+                                    ui.allocate_exact_size(vec2(tw, 30.0), Sense::click());
+                                if sel {
+                                    ui.painter().rect_filled(r, 6.0, pal.active);
+                                    ui.painter().rect_stroke(
+                                        r,
+                                        6.0,
+                                        Stroke::new(1.0_f32, pal.border),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                } else if rs.hovered() {
+                                    ui.painter().rect_filled(r, 6.0, with_alpha(pal.hover, 0.7));
+                                }
+                                crate::icons::glyph(
+                                    ui.painter(),
+                                    pos2(r.left() + 14.0, r.center().y),
+                                    13.5,
+                                    g,
+                                    if sel { pal.text } else { pal.muted },
+                                );
+                                ui.painter().text(
+                                    pos2(r.left() + 28.0, r.center().y),
+                                    Align2::LEFT_CENTER,
+                                    lbl,
+                                    if sel { bold(12.0) } else { body(12.0) },
+                                    if sel { pal.text } else { pal.muted },
+                                );
+                                if rs.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                    dlg.mode = i as u8;
+                                }
+                            }
+                        });
+                    });
+
+                // File picker row (clean subtle pills that wrap nicely on phones)
+                if platform::can_pick_files() {
+                    ui.horizontal_wrapped(|ui| {
+                        let pick_lbl = match dlg.mode {
+                            0 => "Choose Markdown / text file…",
+                            1 => "Choose CSV / TSV file…",
+                            _ => "Choose Lumen backup (.json)…",
+                        };
+                        let (r, rs) = ui.allocate_exact_size(
+                            vec2(ui.available_width(), if phone { 38.0 } else { 32.0 }),
+                            Sense::click(),
+                        );
+                        ui.painter().rect_filled(
+                            r,
+                            7.0,
+                            if rs.hovered() { pal.hover } else { pal.callout },
+                        );
+                        ui.painter().rect_stroke(
+                            r,
+                            7.0,
+                            Stroke::new(1.0_f32, pal.border),
+                            egui::StrokeKind::Inside,
+                        );
+                        crate::icons::glyph(
+                            ui.painter(),
+                            pos2(r.left() + 16.0, r.center().y),
+                            14.5,
+                            l::UPLOAD,
+                            pal.muted,
+                        );
+                        ui.painter().text(
+                            pos2(r.left() + 32.0, r.center().y),
+                            Align2::LEFT_CENTER,
+                            pick_lbl,
+                            body(12.5),
+                            pal.text,
+                        );
+                        ui.painter().text(
+                            pos2(r.right() - 12.0, r.center().y),
+                            Align2::RIGHT_CENTER,
+                            "or drop file",
+                            body(11.5),
+                            pal.muted,
+                        );
+                        if rs.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                            platform::pick_file(
+                                ui.ctx(),
+                                PickTarget::ImportFile { mode: dlg.mode },
+                                false,
+                            );
+                        }
+                    });
+                }
+
+                // Name field (only for Markdown page or CSV database)
+                if dlg.mode != 2 {
+                    let fw = ui.available_width();
+                    Frame::new()
+                        .fill(pal.code_bg)
+                        .stroke(Stroke::new(1.0_f32, pal.border))
+                        .corner_radius(CornerRadius::same(7))
+                        .inner_margin(Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            ui.set_width((fw - 20.0).max(80.0));
+                            ui.add(
+                                TextEdit::singleline(&mut dlg.name)
+                                    .id(Id::new("imp_name"))
+                                    .desired_width(f32::INFINITY)
+                                    .frame(false)
+                                    .font(body(13.0))
+                                    .hint_text(
+                                        RichText::new(if dlg.mode == 0 {
+                                            "Page title (optional)"
+                                        } else {
+                                            "Database name (optional)"
+                                        })
+                                        .color(pal.muted),
+                                    ),
+                            );
+                        });
+                }
+
+                // Responsive padded paste area
+                let fw = ui.available_width();
+                let hint = match dlg.mode {
+                    0 => {
+                        "# My notes
+
+- Paste Markdown content here"
                     }
-                    if crate::widgets::ghost_button(ui, pal, "CSV / TSV file…").clicked() {
-                        platform::pick_file(ui.ctx(), PickTarget::ImportFile { mode: 1 }, false);
+                    1 => {
+                        "Name, Status, Priority
+Launch v2, In progress, High"
                     }
-                    if crate::widgets::ghost_button(ui, pal, "Backup (.json)…").clicked() {
-                        platform::pick_file(ui.ctx(), PickTarget::ImportFile { mode: 2 }, false);
+                    _ => "Paste Lumen workspace backup JSON here…",
+                };
+                Frame::new()
+                    .fill(pal.code_bg)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width((fw - 20.0).max(80.0));
+                        ScrollArea::vertical()
+                            .max_height(if phone { 170.0 } else { 210.0 })
+                            .show(ui, |ui| {
+                                ui.add(
+                                    TextEdit::multiline(&mut dlg.text)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(if phone { 7 } else { 9 })
+                                        .frame(false)
+                                        .font(egui::FontId::monospace(12.5))
+                                        .hint_text(RichText::new(hint).color(pal.muted)),
+                                );
+                            });
+                    });
+
+                // Single clean footer action row
+                ui.horizontal(|ui| {
+                    if dlg.mode == 2 {
+                        ui.label(
+                            RichText::new("Replaces current workspace")
+                                .font(body(11.5))
+                                .color(pal.danger),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(if dlg.mode == 0 {
+                                "Creates a new page"
+                            } else {
+                                "Creates a new database"
+                            })
+                            .font(body(11.5))
+                            .color(pal.muted),
+                        );
                     }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let btn_lbl = match dlg.mode {
+                            0 => "Import page",
+                            1 => "Import database",
+                            _ => "Restore backup",
+                        };
+                        let empty = dlg.text.trim().is_empty();
+                        if ui
+                            .add_enabled_ui(!empty, |ui| {
+                                primary_button(ui, pal, btn_lbl, if phone { 132.0 } else { 148.0 })
+                            })
+                            .inner
+                            .clicked()
+                        {
+                            action = Some(dlg.mode);
+                        }
+                    });
                 });
-                ui.add_space(8.0);
-            }
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                if primary_button(ui, pal, "Markdown → page", 190.0).clicked() {
-                    action = Some(0);
-                }
-                if primary_button(ui, pal, "CSV → database", 170.0).clicked() {
-                    action = Some(1);
-                }
-                if crate::widgets::ghost_button(ui, pal, "Restore backup (replaces all)").clicked() {
-                    action = Some(2);
-                }
-            });
-            ui.add_space(8.0);
-        });
+            },
+        ) && !close_clicked;
         let mut keep = open;
         match action {
-            Some(0) | Some(1) if dlg.text.trim().is_empty() => self.toast("Paste some content first", None),
+            Some(0) | Some(1) if dlg.text.trim().is_empty() => {
+                self.toast("Paste some content first", None)
+            }
             Some(0) => {
                 self.import_text(&dlg.name, &dlg.text, false);
                 keep = false;
@@ -2627,15 +3419,26 @@ fn fingerprint<T: serde::Serialize>(v: &T) -> Option<u64> {
     Some(h.0)
 }
 
-
 /// Runs on the autosave worker: fingerprint + serialise a snapshot.
 fn run_save(job: crate::autosave::SaveJob) -> crate::autosave::SaveDone {
-    let saved = SavedRef { ws: &job.ws, cred: &job.cred, skipped: job.skipped };
+    let saved = SavedRef {
+        ws: &job.ws,
+        cred: &job.cred,
+        skipped: job.skipped,
+    };
     let fp = fingerprint(&saved);
     if fp.is_some() && fp == job.known_fp {
-        return crate::autosave::SaveDone { fp, text: None };
+        return crate::autosave::SaveDone {
+            fp,
+            text: None,
+            gen: job.gen,
+        };
     }
-    crate::autosave::SaveDone { fp, text: eframe::encode_value(&saved) }
+    crate::autosave::SaveDone {
+        fp,
+        text: eframe::encode_value(&saved),
+        gen: job.gen,
+    }
 }
 
 impl LumenApp {
@@ -2705,8 +3508,18 @@ impl eframe::App for LumenApp {
         }
         // While the user is working (frames are being drawn, window focused, not closing) the snapshot is serialised on the worker
         // thread: this call costs one clone. Every other situation (closing, background, idle, browser) saves synchronously below.
-        let working = !self.closing && !cfg!(target_arch = "wasm32") && now_ms() - self.last_frame_ms < 2500.0;
-        if working && self.autosave.submit(crate::autosave::SaveJob { ws: self.ws.clone(), cred: self.cred.clone(), skipped: self.skipped_setup, known_fp: self.saved_fp }) {
+        let working = !self.closing
+            && !cfg!(target_arch = "wasm32")
+            && now_ms() - self.last_frame_ms < 2500.0;
+        if working
+            && self.autosave.submit(crate::autosave::SaveJob {
+                ws: self.ws.clone(),
+                cred: self.cred.clone(),
+                skipped: self.skipped_setup,
+                known_fp: self.saved_fp,
+                gen: 0,
+            })
+        {
             // the worker's answer is stored by `collect_autosave` in the next frame
         } else {
             if let Some(done) = self.autosave.wait() {
@@ -2718,7 +3531,11 @@ impl eframe::App for LumenApp {
             }
             // Dirty tracking: the state is streamed through a hasher (no allocation, no I/O). Nothing changed since the last save ⇒ the
             // workspace is neither re-serialised nor written (large workspaces, localStorage on the web, flash wear on phones).
-            let saved = SavedRef { ws: &self.ws, cred: &self.cred, skipped: self.skipped_setup };
+            let saved = SavedRef {
+                ws: &self.ws,
+                cred: &self.cred,
+                skipped: self.skipped_setup,
+            };
             let fp = fingerprint(&saved);
             if !(fp.is_some() && fp == self.saved_fp) {
                 match eframe::encode_value(&saved) {
@@ -2864,13 +3681,23 @@ impl LumenApp {
             return;
         }
         self.last_auto = t;
-        let o = crate::automation::tick(&mut self.ws, &mut self.auto_rt, t, crate::dates::now_local_min());
+        let o = crate::automation::tick(
+            &mut self.ws,
+            &mut self.auto_rt,
+            t,
+            crate::dates::now_local_min(),
+        );
         self.after_auto(ctx, o);
         // web: hand the reminders of the next 14 days to the page (own timers, even in a background tab); Android: to AlarmManager (fires while the app is closed)
         if t - self.last_push > 5000.0 {
             self.last_push = t;
             if self.ws.auto.settings.os_notify {
-                if let Some(json) = crate::automation::push_schedule(&self.ws, &mut self.auto_rt, crate::dates::now_local_min(), 24 * 14) {
+                if let Some(json) = crate::automation::push_schedule(
+                    &self.ws,
+                    &mut self.auto_rt,
+                    crate::dates::now_local_min(),
+                    24 * 14,
+                ) {
                     platform::schedule_push(&json);
                 }
             }
@@ -2887,11 +3714,22 @@ impl LumenApp {
         let quiet = self.ws.auto.settings.is_quiet(minute);
         for n in o.notices {
             if !self.locked {
-                self.toast(if n.body.is_empty() { n.title.clone() } else { format!("{} — {}", n.title, n.body) }, None);
+                self.toast(
+                    if n.body.is_empty() {
+                        n.title.clone()
+                    } else {
+                        format!("{} — {}", n.title, n.body)
+                    },
+                    None,
+                );
             }
             if self.ws.auto.settings.os_notify && !quiet {
                 if self.locked {
-                    platform::notify_os("Lumen", "You have a new notification", &format!("lumen-n-{}", n.id));
+                    platform::notify_os(
+                        "Lumen",
+                        "You have a new notification",
+                        &format!("lumen-n-{}", n.id),
+                    );
                 } else {
                     platform::notify_os(&n.title, &n.body, &format!("lumen-n-{}", n.id));
                 }
@@ -2931,7 +3769,11 @@ impl LumenApp {
         // repeating flows / scripts keep running whatever page is open
         {
             let t = now_ms();
-            let shown_flow = self.ws.current.filter(|c| !self.locked && crate::views::mode() == crate::views::Mode::Page && self.ws.page(*c).map_or(false, |p| p.kind == PageKind::Flow));
+            let shown_flow = self.ws.current.filter(|c| {
+                !self.locked
+                    && crate::views::mode() == crate::views::Mode::Page
+                    && self.ws.page(*c).map_or(false, |p| p.kind == PageKind::Flow)
+            });
             let o = self.bg.tick(&mut self.ws, ctx, t, shown_flow);
             if o.output.changed || !o.output.notices.is_empty() {
                 self.after_auto(ctx, o.output);
@@ -2943,12 +3785,20 @@ impl LumenApp {
         self.run_ai(ctx);
         self.run_collab(ctx);
         // theme (animated)
-        let target = if self.locked || self.ws.dark { 1.0 } else { 0.0 };
+        let target = if self.locked || self.ws.dark {
+            1.0
+        } else {
+            0.0
+        };
         let t = ctx.animate_value_with_time(Id::new("theme_t"), target, 0.35);
         let pal = theme::with_accent(Palette::mix(t), self.ws.accent, t);
         let touchy = crate::touch::touchy();
         crate::touch::set_narrow(ctx.screen_rect().width() < 720.0);
-        if !self.theme_applied || (t - self.last_theme_t).abs() > 1e-4 || self.last_accent != self.ws.accent || self.last_touch != touchy {
+        if !self.theme_applied
+            || (t - self.last_theme_t).abs() > 1e-4
+            || self.last_accent != self.ws.accent
+            || self.last_touch != touchy
+        {
             self.last_touch = touchy;
             theme::apply(ctx, &pal, t > 0.5);
             self.last_theme_t = t;
@@ -2966,7 +3816,13 @@ impl LumenApp {
         }
         // Idle wake-ups: only the auto-lock timer needs one, and only when a password is set.
         let busy = !self.ws.auto.rules.is_empty() || self.ws.auto.reminders.iter().any(|r| !r.done);
-        ctx.request_repaint_after(Duration::from_secs(if busy { 4 } else if self.cred.is_some() { 10 } else { 30 }));
+        ctx.request_repaint_after(Duration::from_secs(if busy {
+            4
+        } else if self.cred.is_some() {
+            10
+        } else {
+            30
+        }));
 
         if self.locked {
             match self.lock.show(ctx, self.cred.as_ref()) {
@@ -2987,8 +3843,15 @@ impl LumenApp {
                     self.locked = false;
                 }
                 LockEvent::Reset => {
+                    self.autosave.invalidate();
+                    self.saved_fp = None;
                     self.ws = Workspace::seed();
                     self.auto_rt.resync(&self.ws);
+                    self.ed = EditorState::default();
+                    self.wsother.clear();
+                    self.wsdirty.clear();
+                    self.wsreg = crate::workspaces::Registry::default();
+                    self.media = MediaStore::default();
                     self.cred = None;
                     self.skipped_setup = false;
                     self.lock = LockScreen::new();
@@ -3004,48 +3867,64 @@ impl LumenApp {
 
         // global shortcuts (suspended while the PDF reader is open — it has its own keys)
         if self.ed.pdf_req.is_none() {
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::L)) {
-            self.ws.dark = !self.ws.dark;
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::J)) {
-            self.run(PalAct::Ai);
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
-            self.palette = if self.palette.is_some() { None } else { Some(PaletteState { query: String::new(), sel: 0, focused: false, pick: None }) };
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::N)) {
-            self.new_page(None, PageKind::Doc);
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Backslash)) {
-            self.ws.sidebar_open = !self.ws.sidebar_open;
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::L)) {
-            self.run(PalAct::Lock);
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::J)) {
-            self.run(PalAct::Journal);
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Slash)) {
-            self.help_open = !self.help_open;
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Period)) {
-            self.run(PalAct::Focus);
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::G)) {
-            self.run(PalAct::Graph);
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::D)) && self.ed.sel.is_empty() {
-            self.run(PalAct::Dashboard);
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::A)) {
-            self.run(PalAct::Automations);
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::E)) {
-            self.export_md();
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::P)) {
-            self.palette = Some(PaletteState { query: String::new(), sel: 0, focused: false, pick: None });
-        }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::L)) {
+                self.ws.dark = !self.ws.dark;
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::J)) {
+                self.run(PalAct::Ai);
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
+                self.palette = if self.palette.is_some() {
+                    None
+                } else {
+                    Some(PaletteState {
+                        query: String::new(),
+                        sel: 0,
+                        focused: false,
+                        pick: None,
+                    })
+                };
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::N)) {
+                self.new_page(None, PageKind::Doc);
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Backslash)) {
+                self.ws.sidebar_open = !self.ws.sidebar_open;
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::L)) {
+                self.run(PalAct::Lock);
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::J)) {
+                self.run(PalAct::Journal);
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Slash)) {
+                self.help_open = !self.help_open;
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Period)) {
+                self.run(PalAct::Focus);
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::G)) {
+                self.run(PalAct::Graph);
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::D))
+                && self.ed.sel.is_empty()
+            {
+                self.run(PalAct::Dashboard);
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::A)) {
+                self.run(PalAct::Automations);
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::E)) {
+                self.export_md();
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::P)) {
+                self.palette = Some(PaletteState {
+                    query: String::new(),
+                    sel: 0,
+                    focused: false,
+                    pick: None,
+                });
+            }
         }
 
         // The PDF reader is exclusive: while it is open nothing of the workspace behind it is built or hit-tested — no outline rail, no
@@ -3063,8 +3942,13 @@ impl LumenApp {
         for f in dropped {
             let name = platform::file_name(&f);
             let lower = name.to_lowercase();
-            let Some(bytes) = platform::dropped_bytes(&f) else { continue };
-            let stem = name.rsplit_once('.').map(|x| x.0.to_owned()).unwrap_or(name.clone());
+            let Some(bytes) = platform::dropped_bytes(&f) else {
+                continue;
+            };
+            let stem = name
+                .rsplit_once('.')
+                .map(|x| x.0.to_owned())
+                .unwrap_or(name.clone());
             if media::is_image_name(&lower) {
                 if let (Some(cur), true) = (self.ws.current, self.ed.cover_picker.is_some()) {
                     self.set_media(ctx, PickTarget::Cover { page: cur }, &name, bytes);
@@ -3079,8 +3963,15 @@ impl LumenApp {
             if lower.ends_with(".csv") || lower.ends_with(".tsv") {
                 self.import_text(&stem, &text, true);
             } else if lower.ends_with(".json") {
-                self.import = Some(ImportDialog { name: stem, text });
-            } else if lower.ends_with(".md") || lower.ends_with(".markdown") || lower.ends_with(".txt") {
+                self.import = Some(ImportDialog {
+                    name: stem,
+                    text,
+                    mode: 0,
+                });
+            } else if lower.ends_with(".md")
+                || lower.ends_with(".markdown")
+                || lower.ends_with(".txt")
+            {
                 self.import_text(&stem, &text, false);
             } else {
                 self.add_media_block(ctx, BlockKind::File, &name, bytes);
@@ -3102,26 +3993,53 @@ impl LumenApp {
         self.prev_sidebar_page = self.ws.current;
         // swipe from the left edge opens the drawer, swipe left closes it
         match crate::touch::take_swipe() {
-            Some(crate::touch::Swipe::EdgeRight) if narrow && !self.ws.sidebar_open => self.ws.sidebar_open = true,
-            Some(crate::touch::Swipe::Left) if narrow && self.ws.sidebar_open => self.ws.sidebar_open = false,
+            Some(crate::touch::Swipe::EdgeRight) if narrow && !self.ws.sidebar_open => {
+                self.ws.sidebar_open = true
+            }
+            Some(crate::touch::Swipe::Left) if narrow && self.ws.sidebar_open => {
+                self.ws.sidebar_open = false
+            }
             _ => {}
         }
-        let st = ctx.animate_bool_with_time_and_easing(Id::new("sidebar_t"), self.ws.sidebar_open && !self.focus_mode, 0.34, egui::emath::easing::cubic_in_out);
+        let st = ctx.animate_bool_with_time_and_easing(
+            Id::new("sidebar_t"),
+            self.ws.sidebar_open && !self.focus_mode,
+            0.34,
+            egui::emath::easing::cubic_in_out,
+        );
         // The page is laid out ONCE at the width it will have when the sidebar has finished moving and then simply slides along with the
         // sidebar edge (no text re-wrapping on every frame = no stutter). `None` = not animating: lay out at the real panel width.
         let frozen_w: Option<f32> = if narrow {
             (st > 0.003).then_some(screen_w)
         } else if st > 0.003 && st < 0.997 {
-            Some(if self.ws.sidebar_open && !self.focus_mode { screen_w - SIDEBAR_W } else { screen_w })
+            Some(if self.ws.sidebar_open && !self.focus_mode {
+                screen_w - SIDEBAR_W
+            } else {
+                screen_w
+            })
         } else {
             None
         };
+        // Keep the topbar width independent of the desktop AI panel (topbar spans above the AI panel and must never shift).
+        let topbar_frozen_w = frozen_w;
         let ai_target = self.ai.rt.open && !self.locked && ctx.screen_rect().width() >= 720.0;
-        let ai_t = ctx.animate_bool_with_time_and_easing(Id::new("ai_slide_t"), ai_target, 0.32, egui::emath::easing::cubic_in_out);
-        let ai_w: f32 = ctx.data(|d| d.get_temp::<f32>(Id::new("ai_panel_w"))).unwrap_or(400.0).clamp(320.0, 680.0);
+        let ai_t = ctx.animate_bool_with_time_and_easing(
+            Id::new("ai_slide_t"),
+            ai_target,
+            0.26,
+            egui::emath::easing::cubic_out,
+        );
+        let ai_w: f32 = ctx
+            .data(|d| d.get_temp::<f32>(Id::new("ai_panel_w")))
+            .unwrap_or(400.0)
+            .clamp(320.0, 680.0);
         // the page is laid out once at the width it will have when the AI panel has finished sliding
         let frozen_w: Option<f32> = if frozen_w.is_none() && ai_t > 0.003 && ai_t < 0.997 {
-            let side = if !narrow && self.ws.sidebar_open && !self.focus_mode { SIDEBAR_W } else { 0.0 };
+            let side = if !narrow && self.ws.sidebar_open && !self.focus_mode {
+                SIDEBAR_W
+            } else {
+                0.0
+            };
             Some(screen_w - side - if ai_target { ai_w } else { 0.0 })
         } else {
             frozen_w
@@ -3131,50 +4049,110 @@ impl LumenApp {
                 let sw = SIDEBAR_W.min(screen_w * 0.88);
                 let screen = ctx.screen_rect();
                 // the drawer pushes the page (and the top bar) to the right in step with its own edge
-                egui::SidePanel::left("drawer_push").resizable(false).show_separator_line(false).exact_width(sw * st).frame(Frame::NONE).show(ctx, |_| {});
-                let bd = Area::new(Id::new("drawer_backdrop")).order(Order::Middle).fixed_pos(screen.min).show(ctx, |ui| {
-                    let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
-                    ui.painter().rect_filled(r, 0.0, Color32::from_black_alpha((110.0 * st) as u8));
-                    if resp.clicked() {
-                        self.ws.sidebar_open = false;
-                    }
-                });
-                ctx.raise_layer(bd.response.layer_id);
-                let dr = Area::new(Id::new("drawer")).order(Order::Middle).fixed_pos(pos2(screen.min.x - (1.0 - st) * sw, screen.min.y)).show(ctx, |ui| {
-                    Frame::new().fill(pal.sidebar).inner_margin(Margin::symmetric(8, 0)).shadow(egui::epaint::Shadow { offset: [3, 0], blur: 20, spread: 0, color: Color32::from_black_alpha((70.0 * st) as u8) }).show(ui, |ui| {
-                        ui.set_min_size(vec2(sw - 16.0, screen.height()));
-                        ui.set_max_width(sw - 16.0);
-                        self.sidebar(ui, &pal);
+                egui::SidePanel::left("drawer_push")
+                    .resizable(false)
+                    .show_separator_line(false)
+                    .exact_width(sw * st)
+                    .frame(Frame::NONE)
+                    .show(ctx, |_| {});
+                let bd = Area::new(Id::new("drawer_backdrop"))
+                    .order(Order::Middle)
+                    .fixed_pos(screen.min)
+                    .show(ctx, |ui| {
+                        let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                        ui.painter().rect_filled(
+                            r,
+                            0.0,
+                            Color32::from_black_alpha((110.0 * st) as u8),
+                        );
+                        if resp.clicked() {
+                            self.ws.sidebar_open = false;
+                        }
                     });
-                });
-                ctx.raise_layer(dr.response.layer_id);
+                let any_overlay = self.ws_menu.is_some()
+                    || self.row_menu.is_some()
+                    || self.side_menu.is_some()
+                    || self.page_menu.is_some()
+                    || self.templates_open
+                    || self.hier
+                    || self.import.is_some()
+                    || self.help_open
+                    || self.palette.is_some()
+                    || self.trash_open
+                    || self.security.is_some()
+                    || self.history.is_some()
+                    || self.ai.rt.open
+                    || self.ai.rt.settings.is_some()
+                    || self.collab.ui.menu
+                    || self.collab.ui.dialog
+                    || self.collab.ui.comments;
+                if !any_overlay {
+                    ctx.raise_layer(bd.response.layer_id);
+                }
+                let dr = Area::new(Id::new("drawer"))
+                    .order(Order::Middle)
+                    .fixed_pos(pos2(screen.min.x - (1.0 - st) * sw, screen.min.y))
+                    .show(ctx, |ui| {
+                        Frame::new()
+                            .fill(pal.sidebar)
+                            .inner_margin(Margin::symmetric(8, 0))
+                            .shadow(egui::epaint::Shadow {
+                                offset: [3, 0],
+                                blur: 20,
+                                spread: 0,
+                                color: Color32::from_black_alpha((70.0 * st) as u8),
+                            })
+                            .show(ui, |ui| {
+                                ui.set_min_size(vec2(sw - 16.0, screen.height()));
+                                ui.set_max_width(sw - 16.0);
+                                self.sidebar(ui, &pal);
+                            });
+                    });
+                if !any_overlay {
+                    ctx.raise_layer(dr.response.layer_id);
+                }
             }
         } else if st > 0.003 {
             egui::SidePanel::left("sidebar")
                 .resizable(false)
                 .exact_width(SIDEBAR_W * st)
-                .frame(Frame::new().fill(pal.sidebar).inner_margin(Margin::symmetric(8, 0)))
+                .frame(
+                    Frame::new()
+                        .fill(pal.sidebar)
+                        .inner_margin(Margin::symmetric(8, 0)),
+                )
                 .show(ctx, |ui| {
-                    ui.set_clip_rect(ui.max_rect().expand2(vec2(8.0, 0.0)).intersect(ui.clip_rect()));
+                    ui.set_clip_rect(
+                        ui.max_rect()
+                            .expand2(vec2(8.0, 0.0))
+                            .intersect(ui.clip_rect()),
+                    );
                     ui.set_opacity(st.powf(1.5));
                     ui.set_min_width(SIDEBAR_W - 16.0);
                     self.sidebar(ui, &pal);
                     let r = ui.clip_rect();
-                    ui.painter().vline(r.right(), r.y_range(), Stroke::new(1.0_f32, pal.border));
+                    ui.painter()
+                        .vline(r.right(), r.y_range(), Stroke::new(1.0_f32, pal.border));
                 });
         }
 
         if !self.focus_mode {
             // Short screens (a phone in landscape, or a portrait phone with the keyboard up) get a slimmer bar so the page keeps its room.
-            let bar_h = if crate::touch::touchy() && ctx.screen_rect().height() < 440.0 { 40.0 } else { 46.0 };
+            let bar_h = if crate::touch::touchy() && ctx.screen_rect().height() < 440.0 {
+                40.0
+            } else {
+                46.0
+            };
             // Seamless like Notion: same surface as the page, no separator line (egui draws one by default)
             egui::TopBottomPanel::top("topbar")
                 .exact_height(bar_h)
                 .show_separator_line(false)
                 .frame(Frame::new().fill(pal.bg).stroke(Stroke::NONE))
                 .show(ctx, |ui| {
-                    frozen_layout(ui, frozen_w, |ui| {
-                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| self.topbar(ui, &pal));
+                    frozen_layout(ui, topbar_frozen_w, |ui| {
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            self.topbar(ui, &pal)
+                        });
                     });
                 });
         }
@@ -3183,17 +4161,48 @@ impl LumenApp {
         if ai_t > 0.003 {
             let animating = ai_t < 0.997;
             let mut out = crate::aiui::PanelOut::default();
-            let mut panel = egui::SidePanel::right("ai_panel").frame(Frame::new().fill(crate::aiui::panel_bg(&pal)).shadow(egui::epaint::Shadow { offset: [-4, 0], blur: 24, spread: 0, color: Color32::from_black_alpha((38.0 * (1.0 - ai_t * 0.6)) as u8) }));
-            panel = if animating { panel.resizable(false).exact_width(ai_w * ai_t) } else { panel.resizable(true).default_width(ai_w).width_range(320.0..=680.0) };
+            let mut panel = egui::SidePanel::right("ai_panel").frame(
+                Frame::new()
+                    .fill(crate::aiui::panel_bg(&pal))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [-4, 0],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha((38.0 * (1.0 - ai_t * 0.6)) as u8),
+                    }),
+            );
+            panel = if animating {
+                panel.resizable(false).exact_width(ai_w * ai_t)
+            } else {
+                panel
+                    .resizable(true)
+                    .default_width(ai_w)
+                    .width_range(320.0..=680.0)
+            };
             let shown = panel.show(ctx, |ui| {
                 let r = ui.max_rect();
                 let lw = if animating { ai_w } else { r.width() };
-                let lr = Rect::from_min_size(pos2(r.right() - lw, r.top()), vec2(lw, r.height()));
+                // Anchor to r.min so the panel glides smoothly in/out from the right edge without re-wrapping
+                let lr = Rect::from_min_size(r.min, vec2(lw, r.height()));
                 let clip = ui.clip_rect().intersect(r);
-                ui.scope_builder(egui::UiBuilder::new().id_salt("ai_content").max_rect(lr), |ui| {
-                    ui.set_clip_rect(clip);
-                    out = crate::aiui::panel(ui, ctx, &mut self.ai, &mut self.ws, &pal);
-                });
+                ui.scope_builder(
+                    egui::UiBuilder::new().id_salt("ai_content").max_rect(lr),
+                    |ui| {
+                        ui.set_clip_rect(clip);
+                        ui.set_opacity((ai_t * 1.4).min(1.0));
+                        out = crate::aiui::panel(ui, ctx, &mut self.ai, &mut self.ws, &pal);
+                    },
+                );
+                ui.painter().vline(
+                    r.left(),
+                    r.y_range(),
+                    Stroke::new(1.0_f32, with_alpha(pal.border, ai_t)),
+                );
+                ui.painter().hline(
+                    r.x_range(),
+                    r.top(),
+                    Stroke::new(1.0_f32, with_alpha(pal.border, ai_t * 0.7)),
+                );
             });
             if !animating {
                 ctx.data_mut(|d| d.insert_temp(Id::new("ai_panel_w"), shown.response.rect.width()));
@@ -3210,137 +4219,193 @@ impl LumenApp {
         if let Some(t) = crate::dashcfg::take_toast() {
             self.toast(t, None);
         }
-        egui::CentralPanel::default().frame(Frame::new().fill(pal.bg)).show(ctx, |ui| frozen_layout(ui, frozen_w, |ui| {
-            match crate::views::mode() {
-                crate::views::Mode::Dashboard => {
-                    let nav = crate::dashboard::show(ui, &mut self.ws, &pal);
-                    if let Some(t) = nav.toast.clone() {
-                        self.toast(t, None);
-                    }
-                    if nav.new_page {
-                        crate::views::set(crate::views::Mode::Page, None);
-                        self.new_page(None, PageKind::Doc);
-                    } else if nav.new_db {
-                        crate::views::set(crate::views::Mode::Page, None);
-                        self.new_page(None, PageKind::Database);
-                    } else if nav.journal {
-                        crate::views::set(crate::views::Mode::Page, None);
-                        self.ws.open_today();
-                    } else if nav.graph {
-                        crate::views::set(crate::views::Mode::Graph, self.ws.current);
-                    }
-                    if let Some(id) = nav.out.open {
-                        crate::views::set(crate::views::Mode::Page, None);
-                        self.ws.current = Some(id);
-                    }
-                    return;
-                }
-                crate::views::Mode::Graph => {
-                    let out = crate::graph::show(ui, &self.ws, &pal);
-                    if out.close {
-                        crate::views::set(crate::views::Mode::Page, None);
-                    }
-                    if let Some(id) = out.open {
-                        crate::views::set(crate::views::Mode::Page, None);
-                        self.ws.current = Some(id);
-                    }
-                    return;
-                }
-                crate::views::Mode::Automations => {
-                    let out = crate::autoui::show(ui, &mut self.ws, &mut self.auto_rt, &pal);
-                    if out.close {
-                        crate::views::set(crate::views::Mode::Page, None);
-                    }
-                    if let Some(id) = out.open {
-                        crate::views::set(crate::views::Mode::Page, None);
-                        self.ws.current = Some(id);
-                    }
-                    if let Some(t) = out.toast {
-                        self.toast(t, None);
-                    }
-                    return;
-                }
-                crate::views::Mode::Page => {}
-            }
-            let Some(cur) = self.ws.current.filter(|id| self.ws.page(*id).map_or(false, |p| !p.trashed)) else {
-                ui.add_space(ui.available_height() * 0.3);
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new(l::FILE_TEXT).font(body(46.0)).color(pal.muted));
-                    ui.label(RichText::new("No page selected").font(bold(18.0)));
-                    ui.add_space(6.0);
-                    if primary_button(ui, &pal, "Create a page", 160.0).clicked() {
-                        self.new_page(None, PageKind::Doc);
-                    }
-                });
-                return;
-            };
-
-            if self.shown_page != Some(cur) {
-                reset_appear(ctx, Id::new(("page_in", cur)));
-                self.shown_page = Some(cur);
-                self.ed.block_menu = None;
-                self.ed.icon_picker = None;
-                self.ed.cover_picker = None;
-            }
-            let a = appear(ctx, Id::new(("page_in", cur)), 0.28);
-            if self.focus_title == Some(cur) {
-                ctx.memory_mut(|m| m.request_focus(Id::new(("title", cur))));
-                self.focus_title = None;
-            }
-            // canvas pages are a full-bleed whiteboard, not a scrolling document
-            if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Canvas) {
-                crate::canvasui::fix_once(&mut self.ws);
-                let out = crate::canvasui::show(ui, &mut self.ws, cur, &pal);
-                if let Some(id) = out.open {
-                    if self.ws.page(id).map_or(false, |p| !p.trashed) {
-                        self.ws.current = Some(id);
-                    }
-                }
-                if let Some(t) = out.toast {
-                    self.toast(t, None);
-                }
-                if let Some(ask) = out.pdf_ask {
-                    self.ed.pdf_ask = Some(ask);
-                }
-                if let Some((media_id, name)) = out.file_ask {
-                    match self.media.bytes(media_id) {
-                        Some(b) => {
-                            let msg = platform::save_download(&name, &b, "application/octet-stream");
-                            self.toast(msg, None);
+        egui::CentralPanel::default()
+            .frame(Frame::new().fill(pal.bg))
+            .show(ctx, |ui| {
+                frozen_layout(ui, frozen_w, |ui| {
+                    match crate::views::mode() {
+                        crate::views::Mode::Dashboard => {
+                            let nav = crate::dashboard::show(ui, &mut self.ws, &pal);
+                            if let Some(t) = nav.toast.clone() {
+                                self.toast(t, None);
+                            }
+                            if nav.new_page {
+                                crate::views::set(crate::views::Mode::Page, None);
+                                self.new_page(None, PageKind::Doc);
+                            } else if nav.new_db {
+                                crate::views::set(crate::views::Mode::Page, None);
+                                self.new_page(None, PageKind::Database);
+                            } else if nav.journal {
+                                crate::views::set(crate::views::Mode::Page, None);
+                                self.ws.open_today();
+                            } else if nav.graph {
+                                crate::views::set(crate::views::Mode::Graph, self.ws.current);
+                            }
+                            if let Some(id) = nav.out.open {
+                                crate::views::set(crate::views::Mode::Page, None);
+                                self.ws.current = Some(id);
+                            }
+                            return;
                         }
-                        None => self.toast("The attached file could not be read", None),
+                        crate::views::Mode::Graph => {
+                            let out = crate::graph::show(ui, &self.ws, &pal);
+                            if out.close {
+                                crate::views::set(crate::views::Mode::Page, None);
+                            }
+                            if let Some(id) = out.open {
+                                crate::views::set(crate::views::Mode::Page, None);
+                                self.ws.current = Some(id);
+                            }
+                            return;
+                        }
+                        crate::views::Mode::Automations => {
+                            let out =
+                                crate::autoui::show(ui, &mut self.ws, &mut self.auto_rt, &pal);
+                            if out.close {
+                                crate::views::set(crate::views::Mode::Page, None);
+                            }
+                            if let Some(id) = out.open {
+                                crate::views::set(crate::views::Mode::Page, None);
+                                self.ws.current = Some(id);
+                            }
+                            if let Some(t) = out.toast {
+                                self.toast(t, None);
+                            }
+                            return;
+                        }
+                        crate::views::Mode::Page => {}
                     }
-                }
-                crate::canvasx::service(ui.ctx(), &self.media);
-                return;
-            }
-            if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Flow) {
-                crate::flowui::fix_once(&mut self.ws);
-                let out = crate::flowui::show(ui, &mut self.ws, cur, &pal);
-                if let Some(o) = out.output {
-                    self.after_auto(ctx, o);
-                }
-                if let Some(t) = out.toast {
-                    self.toast(t, None);
-                }
-                return;
-            }
-            ui.add_space((1.0 - a) * 14.0);
-            ui.set_opacity(a);
+                    let Some(cur) = self
+                        .ws
+                        .current
+                        .filter(|id| self.ws.page(*id).map_or(false, |p| !p.trashed))
+                    else {
+                        ui.add_space(ui.available_height() * 0.3);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new(l::FILE_TEXT)
+                                    .font(body(46.0))
+                                    .color(pal.muted),
+                            );
+                            ui.label(RichText::new("No page selected").font(bold(18.0)));
+                            ui.add_space(6.0);
+                            if primary_button(ui, &pal, "Create a page", 160.0).clicked() {
+                                self.new_page(None, PageKind::Doc);
+                            }
+                        });
+                        return;
+                    };
 
-            let ws = &mut self.ws;
-            let ed = &mut self.ed;
-            let mut changed = false;
-            // Physics scrolling (critically damped spring for wheel / touchpad, 1:1 + fling for fingers) — see smooth.rs / touch.rs.
-            let over = ui.rect_contains_pointer(ui.max_rect()) && ed.menu.is_none() && ed.block_menu.is_none() && ed.link_edit.is_none();
-            let sa = ScrollArea::vertical().id_salt(("page_scroll", cur)).drag_to_scroll(false).auto_shrink([false, false]);
-            crate::smooth::scroll_area(ui, Id::new(("smooth_scroll", cur)), sa, over, |ui| {
-                changed = editor::show_page(ui, ws, cur, ed, &pal);
+                    if self.shown_page != Some(cur) {
+                        reset_appear(ctx, Id::new(("page_in", cur)));
+                        self.shown_page = Some(cur);
+                        self.ed.block_menu = None;
+                        self.ed.icon_picker = None;
+                        self.ed.cover_picker = None;
+                    }
+                    let a = appear(ctx, Id::new(("page_in", cur)), 0.28);
+                    if self.focus_title == Some(cur) {
+                        ctx.memory_mut(|m| m.request_focus(Id::new(("title", cur))));
+                        self.focus_title = None;
+                    }
+                    // canvas pages are a full-bleed whiteboard, not a scrolling document
+                    if self
+                        .ws
+                        .page(cur)
+                        .map_or(false, |p| p.kind == PageKind::Canvas)
+                    {
+                        crate::canvasui::fix_once(&mut self.ws);
+                        let out = crate::canvasui::show(ui, &mut self.ws, cur, &pal);
+                        if let Some(id) = out.open {
+                            if self.ws.page(id).map_or(false, |p| !p.trashed) {
+                                self.ws.current = Some(id);
+                            }
+                        }
+                        if let Some(t) = out.toast {
+                            self.toast(t, None);
+                        }
+                        if let Some(ask) = out.pdf_ask {
+                            self.ed.pdf_ask = Some(ask);
+                        }
+                        if let Some((media_id, name)) = out.file_ask {
+                            match self.media.bytes(media_id) {
+                                Some(b) => {
+                                    let msg = platform::save_download(
+                                        &name,
+                                        &b,
+                                        "application/octet-stream",
+                                    );
+                                    self.toast(msg, None);
+                                }
+                                None => self.toast("The attached file could not be read", None),
+                            }
+                        }
+                        crate::canvasx::service(ui.ctx(), &self.media);
+                        return;
+                    }
+                    if self
+                        .ws
+                        .page(cur)
+                        .map_or(false, |p| p.kind == PageKind::Flow)
+                    {
+                        crate::flowui::fix_once(&mut self.ws);
+                        let out = crate::flowui::show(ui, &mut self.ws, cur, &pal);
+                        if let Some(o) = out.output {
+                            self.after_auto(ctx, o);
+                        }
+                        if let Some(t) = out.toast {
+                            self.toast(t, None);
+                        }
+                        return;
+                    }
+                    ui.add_space((1.0 - a) * 14.0);
+                    ui.set_opacity(a);
+
+                    let ws = &mut self.ws;
+                    let ed = &mut self.ed;
+                    let mut changed = false;
+                    // Physics scrolling (critically damped spring for wheel / touchpad, 1:1 + fling for fingers) — see smooth.rs / touch.rs.
+                    let over = ui.rect_contains_pointer(ui.max_rect())
+                        && ed.menu.is_none()
+                        && ed.block_menu.is_none()
+                        && ed.link_edit.is_none()
+                        && ed.icon_picker.is_none()
+                        && ed.cover_picker.is_none()
+                        && ed.edit_button.is_none()
+                        && self.ws_menu.is_none()
+                        && self.row_menu.is_none()
+                        && self.side_menu.is_none()
+                        && self.page_menu.is_none()
+                        && self.palette.is_none()
+                        && !self.trash_open
+                        && !self.templates_open
+                        && !self.hier
+                        && !self.help_open
+                        && self.import.is_none()
+                        && self.security.is_none()
+                        && self.history.is_none()
+                        && !self.collab.ui.menu
+                        && !self.collab.ui.dialog
+                        && !self.collab.ui.comments
+                        && self.ai.rt.settings.is_none();
+                    let sa = ScrollArea::vertical()
+                        .id_salt(("page_scroll", cur))
+                        .drag_to_scroll(false)
+                        .auto_shrink([false, false]);
+                    crate::smooth::scroll_area(
+                        ui,
+                        Id::new(("smooth_scroll", cur)),
+                        sa,
+                        over,
+                        |ui| {
+                            changed = editor::show_page(ui, ws, cur, ed, &pal);
+                        },
+                    );
+                    if changed {
+                        ws.touch(cur);
+                    }
+                })
             });
-            if changed {
-                ws.touch(cur);
-            }
-        }));
 
         // computed properties (formulas / rollups), undo stack and page versions
         let tnow = now_ms() / 1000.0;
@@ -3364,7 +4429,14 @@ impl LumenApp {
         }
         if let Some(title) = self.ed.wiki.take() {
             let key = title.trim().to_lowercase();
-            let hit = self.ws.pages.iter().filter(|p| !p.trashed && p.title.trim().to_lowercase() == key).map(|p| (p.row, p.id)).min().map(|(_, id)| id);
+            let hit = self
+                .ws
+                .pages
+                .iter()
+                .filter(|p| !p.trashed && p.title.trim().to_lowercase() == key)
+                .map(|p| (p.row, p.id))
+                .min()
+                .map(|(_, id)| id);
             let id = hit.unwrap_or_else(|| {
                 let id = self.ws.add_page(None, crate::model::PageKind::Doc);
                 if let Some(p) = self.ws.page_mut(id) {
@@ -3381,12 +4453,25 @@ impl LumenApp {
 
         // one-click buttons, the button editor and the repeat / remind popover of date properties
         if let (Some(bid), Some(cur)) = (self.ed.press_button.take(), self.ws.current) {
-            let o = crate::automation::press_button(&mut self.ws, &mut self.auto_rt, cur, bid, now_ms());
+            let o = crate::automation::press_button(
+                &mut self.ws,
+                &mut self.auto_rt,
+                cur,
+                bid,
+                now_ms(),
+            );
             self.after_auto(ctx, o);
         }
         if let Some(bid) = self.ed.edit_button {
             let keep = match self.ws.current {
-                Some(cur) => crate::autoui::button_editor(ctx, &mut self.ws, &mut self.auto_rt, cur, bid, &pal),
+                Some(cur) => crate::autoui::button_editor(
+                    ctx,
+                    &mut self.ws,
+                    &mut self.auto_rt,
+                    cur,
+                    bid,
+                    &pal,
+                ),
                 None => false,
             };
             if !keep {
@@ -3405,17 +4490,22 @@ impl LumenApp {
         self.import_ui(ctx, &pal);
         self.help_ui(ctx, &pal);
         self.ws_menu_ui(ctx, &pal);
-        if self.ai.rt.open && !self.locked && ctx.screen_rect().width() < 720.0 {
-            let out = crate::aiui::fullscreen(ctx, &mut self.ai, &mut self.ws, &pal);
+        let ai_mob_target = self.ai.rt.open && !self.locked && ctx.screen_rect().width() < 720.0;
+        let ai_mob_t = ctx.animate_bool_with_time_and_easing(
+            Id::new("ai_mob_t"),
+            ai_mob_target,
+            0.28,
+            egui::emath::easing::cubic_in_out,
+        );
+        if ai_mob_t > 0.003 && ctx.screen_rect().width() < 720.0 {
+            let out = crate::aiui::fullscreen(ctx, &mut self.ai, &mut self.ws, &pal, ai_mob_t);
             if out.close {
                 self.ai.rt.open = false;
-                crate::widgets::reset_appear(ctx, Id::new("ai_sheet_a"));
             }
             if let Some(id) = out.open_page {
                 crate::views::set(crate::views::Mode::Page, None);
                 self.ws.current = Some(id);
                 self.ai.rt.open = false;
-                crate::widgets::reset_appear(ctx, Id::new("ai_sheet_a"));
             }
         }
         if !self.locked {
@@ -3427,7 +4517,7 @@ impl LumenApp {
         self.history_ui(ctx, &pal);
         crate::pdf::reader_ui(ctx, &mut self.ed.pdf_req, &mut self.ws.pdf_annots, &pal);
         self.toasts_ui(ctx, &pal);
-            self.collab_overlays(ctx, &pal);
+        self.collab_overlays(ctx, &pal);
     }
 
     fn history_ui(&mut self, ctx: &Context, pal: &Palette) {
@@ -3577,16 +4667,43 @@ fn row_bg(ui: &Ui, pal: &Palette, key: Id, rect: Rect, selected: bool) -> (bool,
     (hovered, t)
 }
 
-fn simple_row(ui: &mut Ui, pal: &Palette, key: &str, w: f32, icon: Icon, label: &str, hint: Option<&str>) -> bool {
+fn simple_row(
+    ui: &mut Ui,
+    pal: &Palette,
+    key: &str,
+    w: f32,
+    icon: Icon,
+    label: &str,
+    hint: Option<&str>,
+) -> bool {
     let key = Id::new(key);
     let (_, rect) = ui.allocate_space(vec2(w, 28.0));
     let resp = ui.interact(rect, key, Sense::click());
     let (_, t) = row_bg(ui, pal, key, rect, false);
     let col = lerp_color(pal.muted, pal.text, 0.35 + 0.65 * t);
-    icons::paint(ui.painter(), pos2(rect.left() + 20.0, rect.center().y), 15.0, icon, col);
-    ui.painter().text(pos2(rect.left() + 38.0, rect.center().y), Align2::LEFT_CENTER, label, body(14.5), col);
-    if let Some(h) = hint {
-        ui.painter().text(pos2(rect.right() - 10.0, rect.center().y), Align2::RIGHT_CENTER, h, body(11.5), with_alpha(pal.muted, 0.8));
+    icons::paint(
+        ui.painter(),
+        pos2(rect.left() + 20.0, rect.center().y),
+        15.0,
+        icon,
+        col,
+    );
+    ui.painter().text(
+        pos2(rect.left() + 38.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        body(14.5),
+        col,
+    );
+    let hide_hint = ui.ctx().screen_rect().width() < 600.0 || crate::touch::touchy();
+    if let Some(h) = hint.filter(|_| !hide_hint) {
+        ui.painter().text(
+            pos2(rect.right() - 10.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            h,
+            body(11.5),
+            with_alpha(pal.muted, 0.8),
+        );
     }
     resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
 }
@@ -3600,7 +4717,16 @@ struct RowOut {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn page_row(ui: &mut Ui, pal: &Palette, key: Id, w: f32, depth: usize, page: &Page, selected: bool, has_children: bool) -> RowOut {
+fn page_row(
+    ui: &mut Ui,
+    pal: &Palette,
+    key: Id,
+    w: f32,
+    depth: usize,
+    page: &Page,
+    selected: bool,
+    has_children: bool,
+) -> RowOut {
     let (_, rect) = ui.allocate_space(vec2(w, 28.0));
     let resp = ui.interact(rect, key, Sense::click());
     let (hovered, t) = row_bg(ui, pal, key, rect, selected);
@@ -3610,17 +4736,38 @@ fn page_row(ui: &mut Ui, pal: &Palette, key: Id, w: f32, depth: usize, page: &Pa
     // disclosure arrow
     let arrow_rect = Rect::from_min_size(pos2(x0, rect.top() + 4.0), vec2(20.0, 20.0));
     let aresp = ui.interact(arrow_rect, key.with("arrow"), Sense::click());
-    let et = ui.ctx().animate_bool_with_time(key.with("exp"), page.expanded, 0.18);
+    let et = ui
+        .ctx()
+        .animate_bool_with_time(key.with("exp"), page.expanded, 0.18);
     if has_children {
-        let ah = ui.ctx().animate_bool_with_time(key.with("ah"), aresp.hovered(), 0.1);
+        let ah = ui
+            .ctx()
+            .animate_bool_with_time(key.with("ah"), aresp.hovered(), 0.1);
         p.rect_filled(arrow_rect, 4.0, with_alpha(pal.active, ah));
-        icons::chevron(p, arrow_rect.center(), 13.0, et * FRAC_PI_2, lerp_color(pal.muted, pal.text, ah));
+        icons::chevron(
+            p,
+            arrow_rect.center(),
+            13.0,
+            et * FRAC_PI_2,
+            lerp_color(pal.muted, pal.text, ah),
+        );
     }
 
     // icon & title
     let ic = pos2(x0 + 32.0, rect.center().y);
     if page.icon.is_empty() {
-        icons::paint(p, ic, 15.0, match page.kind { PageKind::Database => Icon::Board, PageKind::Canvas => Icon::Canvas, PageKind::Flow => Icon::Flow, _ => Icon::Page }, pal.muted);
+        icons::paint(
+            p,
+            ic,
+            15.0,
+            match page.kind {
+                PageKind::Database => Icon::Board,
+                PageKind::Canvas => Icon::Canvas,
+                PageKind::Flow => Icon::Flow,
+                _ => Icon::Page,
+            },
+            pal.muted,
+        );
     } else {
         icons::paint_page_icon(ui, ic, &page.icon, 17.0, pal.text);
     }
@@ -3628,29 +4775,59 @@ fn page_row(ui: &mut Ui, pal: &Palette, key: Id, w: f32, depth: usize, page: &Pa
     let hovered = crate::touch::reveal(hovered);
     let t = if crate::touch::touchy() { 1.0 } else { t };
     let label_right = rect.right() - 6.0 - 48.0 * t;
-    let clip = Rect::from_min_max(pos2(x0 + 46.0, rect.top()), pos2(label_right.max(x0 + 60.0), rect.bottom()));
-    let title = if page.title.is_empty() { "Untitled" } else { &page.title };
+    let clip = Rect::from_min_max(
+        pos2(x0 + 46.0, rect.top()),
+        pos2(label_right.max(x0 + 60.0), rect.bottom()),
+    );
+    let title = if page.title.is_empty() {
+        "Untitled"
+    } else {
+        &page.title
+    };
     let col = if page.title.is_empty() {
         pal.muted
     } else {
-        lerp_color(pal.muted, pal.text, 0.55 + 0.45 * t.max(if selected { 1.0 } else { 0.0 }))
+        lerp_color(
+            pal.muted,
+            pal.text,
+            0.55 + 0.45 * t.max(if selected { 1.0 } else { 0.0 }),
+        )
     };
-    p.with_clip_rect(clip).text(pos2(x0 + 46.0, rect.center().y), Align2::LEFT_CENTER, title, body(14.5), col);
+    p.with_clip_rect(clip).text(
+        pos2(x0 + 46.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        title,
+        body(14.5),
+        col,
+    );
 
     // hover actions
-    let mut out = RowOut { click: false, arrow: false, plus: false, more: None, rclick: crate::widgets::right_clicked(ui, rect) };
+    let mut out = RowOut {
+        click: false,
+        arrow: false,
+        plus: false,
+        more: None,
+        rclick: crate::widgets::right_clicked(ui, rect),
+    };
     if t > 0.02 && hovered {
-        let more = Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), vec2(22.0, 22.0));
-        let plus = Rect::from_center_size(pos2(rect.right() - 40.0, rect.center().y), vec2(22.0, 22.0));
+        let phone = ui.ctx().screen_rect().width() < 600.0;
+        let more =
+            Rect::from_center_size(pos2(rect.right() - 16.0, rect.center().y), vec2(22.0, 22.0));
         let mr = ui.interact(more, key.with("more"), Sense::click());
-        let pr = ui.interact(plus, key.with("plus"), Sense::click());
         crate::widgets::paint_icon_button(ui, pal, more, &mr, Icon::Dots, 15.0);
-        crate::widgets::paint_icon_button(ui, pal, plus, &pr, Icon::Plus, 14.0);
         if mr.clicked() {
             out.more = Some(pos2(more.left(), more.bottom() + 4.0));
         }
-        if pr.clicked() {
-            out.plus = true;
+        if !phone {
+            let plus = Rect::from_center_size(
+                pos2(rect.right() - 40.0, rect.center().y),
+                vec2(22.0, 22.0),
+            );
+            let pr = ui.interact(plus, key.with("plus"), Sense::click());
+            crate::widgets::paint_icon_button(ui, pal, plus, &pr, Icon::Plus, 14.0);
+            if pr.clicked() {
+                out.plus = true;
+            }
         }
     }
     out.click = resp.on_hover_cursor(CursorIcon::PointingHand).clicked();

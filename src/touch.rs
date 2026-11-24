@@ -423,7 +423,7 @@ pub fn hook(g: &mut Gestures, ctx: &Context, raw: &mut RawInput) {
         set_touchy(true);
     }
     let events = std::mem::take(&mut raw.events);
-    let pass = PASS.with(|p| p.get());
+    let pass = PASS.with(|p| p.replace(false));
     let (events, outcome) = g.process(now, pass, events);
     raw.events = events;
     if let Some(p) = outcome.long_press {
@@ -452,8 +452,10 @@ pub fn hook(g: &mut Gestures, ctx: &Context, raw: &mut RawInput) {
     ctx.data_mut(|d| d.insert_temp(Id::new(DIRECT_ID), outcome.direct));
     match g.mode {
         Mode::Pending if now - g.t0 > RING_AFTER => ctx.request_repaint(),
-        Mode::Pending => ctx.request_repaint_after(Duration::from_millis((RING_AFTER * 1000.0) as u64 + 5)),
-        Mode::Held => ctx.request_repaint(),
+        Mode::Pending => {
+            ctx.request_repaint_after(Duration::from_millis((RING_AFTER * 1000.0) as u64 + 5))
+        }
+        Mode::Held if ring.map_or(false, |(_, t)| t < 1.0) => ctx.request_repaint(),
         Mode::Fling | Mode::Scroll => ctx.request_repaint(),
         _ => {}
     }

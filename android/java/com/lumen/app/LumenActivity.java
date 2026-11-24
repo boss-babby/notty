@@ -235,7 +235,7 @@ public class LumenActivity extends NativeActivity {
             Uri u = intent.getData();
             if (u == null || !"lumen".equals(u.getScheme()) || !"join".equals(u.getHost())) return;
             String raw = u.toString();
-            if (raw.length() > 512) return; // nothing legitimate is longer
+            if (raw.length() > 2048) return; // nothing legitimate is longer
             nativeLink(raw);
         } catch (Throwable ignored) {
         }
@@ -435,7 +435,13 @@ public class LumenActivity extends NativeActivity {
             @Override
             public void run() {
                 try {
-                    Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                    Uri u = Uri.parse(url);
+                    String sch = u.getScheme() == null ? "" : u.getScheme().toLowerCase(java.util.Locale.ROOT);
+                    if (!sch.equals("https") && !sch.equals("http") && !sch.equals("mailto")) {
+                        Toast.makeText(LumenActivity.this, "Blocked unsafe link scheme", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    Intent i = new Intent(Intent.ACTION_VIEW, u);
                     i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                     startActivity(i);
                 } catch (Exception e) {
@@ -693,7 +699,14 @@ public class LumenActivity extends NativeActivity {
             @Override
             public void run() {
                 try {
+                    if (printView != null) {
+                        printView.destroy();
+                        printView = null;
+                    }
                     printView = new WebView(LumenActivity.this);
+                    printView.getSettings().setJavaScriptEnabled(false);
+                    printView.getSettings().setAllowFileAccess(false);
+                    printView.getSettings().setAllowContentAccess(false);
                     printView.setWebViewClient(new WebViewClient() {
                         @Override
                         public void onPageFinished(WebView view, String url) {

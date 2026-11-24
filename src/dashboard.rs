@@ -287,17 +287,39 @@ fn toolbar(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, sco
     }
 }
 
-fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: &mut Nav, scope: Scope) {
+fn inner(
+    ui: &mut Ui,
+    ws: &mut Workspace,
+    pal: &Palette,
+    st: &mut UiState,
+    nav: &mut Nav,
+    scope: Scope,
+) {
     let ctx = ui.ctx().clone();
     let w = ui.available_width();
     let home = scope == Scope::Home;
-    let pad = if !home { 0.0 } else if w < 520.0 { 12.0 } else { 28.0 };
-    let screen_rect = if home { ui.max_rect() } else { ctx.available_rect() };
+    let pad = if !home {
+        0.0
+    } else if w < 520.0 {
+        12.0
+    } else {
+        28.0
+    };
+    let screen_rect = if home {
+        ui.max_rect()
+    } else {
+        ctx.available_rect()
+    };
     let key = Id::new("dash_scroll");
-    let sa = ScrollArea::vertical().id_salt("dash_scroll_area").auto_shrink([false, false]);
+    let sa = ScrollArea::vertical()
+        .id_salt("dash_scroll_area")
+        .auto_shrink([false, false]);
     let over = ui.rect_contains_pointer(ui.max_rect()) && st.drag.is_none() && st.resize.is_none();
     let mut acts: Vec<Act> = vec![];
-    let global = ws.dash.scope_range(match scope { Scope::Home => 0, Scope::Page(b) => b });
+    let global = ws.dash.scope_range(match scope {
+        Scope::Home => 0,
+        Scope::Page(b) => b,
+    });
     st.rects.clear();
     // the board that is drawn
     let bidx: Option<usize> = match scope {
@@ -335,24 +357,69 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                     ("journal", l::SUN, "Today's journal", "Your daily page"),
                     ("graph", l::NETWORK, "Graph view", "See how pages connect"),
                 ];
-                let n = if gw0 >= 980.0 { 5 } else if gw0 >= 640.0 { 3 } else { 2 };
-                let gap = 10.0;
-                let cw_ = (gw0 - gap * (n as f32 - 1.0)) / n as f32;
-                for chunk in cards.chunks(n) {
-                    let (rr, _) = ui.allocate_exact_size(vec2(gw0, 56.0), Sense::hover());
-                    for (i, (id, g, t, h)) in chunk.iter().enumerate() {
-                        let r = Rect::from_min_size(rr.min + vec2((cw_ + gap) * i as f32, 0.0), vec2(cw_, 56.0));
-                        if quick_card(ui, pal, r, id, g, t, h) {
-                            match *id {
-                                "page" => nav.new_page = true,
-                                "db" => nav.new_db = true,
-                                "dash" => nav.out.open = Some(cfg::new_dashboard_page(ws, None, "starter")),
-                                "journal" => nav.journal = true,
-                                _ => nav.graph = true,
+                if gw0 < 640.0 {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("dash_quick_pills")
+                        .max_width(gw0)
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                for (id, g, t, _h) in &cards {
+                                    let pw = (t.chars().count() as f32 * 7.4 + 44.0).max(96.0);
+                                    let (r, rs) = ui.allocate_exact_size(vec2(pw, 36.0), Sense::click());
+                                    ui.painter().rect_filled(
+                                        r,
+                                        8.0,
+                                        if rs.hovered() { pal.hover } else { pal.code_bg },
+                                    );
+                                    ui.painter().rect_stroke(
+                                        r,
+                                        8.0,
+                                        Stroke::new(1.0_f32, pal.border),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    crate::icons::glyph(ui.painter(), pos2(r.left() + 18.0, r.center().y), 14.5, g, pal.accent);
+                                    ui.painter().text(
+                                        pos2(r.left() + 34.0, r.center().y),
+                                        Align2::LEFT_CENTER,
+                                        *t,
+                                        bold(12.5),
+                                        pal.text,
+                                    );
+                                    if rs.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                        match *id {
+                                            "page" => nav.new_page = true,
+                                            "db" => nav.new_db = true,
+                                            "dash" => nav.out.open = Some(cfg::new_dashboard_page(ws, None, "starter")),
+                                            "journal" => nav.journal = true,
+                                            _ => nav.graph = true,
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                    ui.add_space(6.0);
+                } else {
+                    let n = if gw0 >= 980.0 { 5 } else { 3 };
+                    let gap = 10.0;
+                    let cw_ = (gw0 - gap * (n as f32 - 1.0)) / n as f32;
+                    for chunk in cards.chunks(n) {
+                        let (rr, _) = ui.allocate_exact_size(vec2(gw0, 56.0), Sense::hover());
+                        for (i, (id, g, t, h)) in chunk.iter().enumerate() {
+                            let r = Rect::from_min_size(rr.min + vec2((cw_ + gap) * i as f32, 0.0), vec2(cw_, 56.0));
+                            if quick_card(ui, pal, r, id, g, t, h) {
+                                match *id {
+                                    "page" => nav.new_page = true,
+                                    "db" => nav.new_db = true,
+                                    "dash" => nav.out.open = Some(cfg::new_dashboard_page(ws, None, "starter")),
+                                    "journal" => nav.journal = true,
+                                    _ => nav.graph = true,
+                                }
                             }
                         }
+                        ui.add_space(gap);
                     }
-                    ui.add_space(gap);
                 }
                 ui.add_space(6.0);
 
@@ -506,6 +573,7 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                     let mut tx = hr.left();
                     if st.edit {
                         let gr = Rect::from_min_size(pos2(hr.left() - 4.0, hr.top()), vec2(24.0, hr.height()));
+                        crate::touch::claim(gr);
                         let resp = ui.interact(gr, Id::new(("dash_grip", wd.id)), Sense::drag());
                         ui.painter().text(gr.center(), Align2::CENTER_CENTER, l::GRIP_VERTICAL, body(15.0), if resp.hovered() || st.drag == Some(wd.id) { pal.text } else { pal.muted });
                         if resp.hovered() {
@@ -586,6 +654,7 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                     // resize handle
                     if st.edit {
                         let hr2 = Rect::from_min_size(r.right_bottom() - vec2(22.0, 22.0), vec2(22.0, 22.0));
+                        crate::touch::claim(hr2);
                         let resp = ui.interact(hr2, Id::new(("dash_resize", wd.id)), Sense::drag());
                         let hot = resp.hovered() || st.resize.map_or(false, |x| x.0 == wd.id);
                         for k in 0..3 {
@@ -683,7 +752,11 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
             Menu::Widget(id) => {
                 let wid = *id;
                 let def = ws.dash.widget(wid).and_then(dw::def_for);
-                let (db, span, rows) = ws.dash.widget(wid).map(|w| (w.cfg.db, w.span, w.rows)).unwrap_or((0, 4, 3));
+                let (db, span, rows) = ws
+                    .dash
+                    .widget(wid)
+                    .map(|w| (w.cfg.db, w.span, w.rows))
+                    .unwrap_or((0, 4, 3));
                 let plot = ws.dash.widget(wid).and_then(cfg::plot_of);
                 keep = popup_area(&ctx, pid, pos, pal, &mut st.fresh, 230.0, |ui| {
                     if menu_item(ui, pal, l::SETTINGS, "Settings", None, false, false).clicked() {
@@ -694,13 +767,31 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                         acts.push(Act::Duplicate(wid));
                         close = true;
                     }
-                    if db != 0 && ws.page(db).is_some() && menu_item(ui, pal, l::DATABASE, "Open source database", None, false, false).clicked() {
+                    if db != 0
+                        && ws.page(db).is_some()
+                        && menu_item(
+                            ui,
+                            pal,
+                            l::DATABASE,
+                            "Open source database",
+                            None,
+                            false,
+                            false,
+                        )
+                        .clicked()
+                    {
                         acts.push(Act::OpenDb(db));
                         close = true;
                     }
                     section_label(ui, pal, "WIDTH");
                     ui.horizontal_wrapped(|ui| {
-                        for (n, s) in [("1/4", 3u8), ("1/3", 4), ("1/2", 6), ("2/3", 8), ("Full", 12)] {
+                        for (n, s) in [
+                            ("1/4", 3u8),
+                            ("1/3", 4),
+                            ("1/2", 6),
+                            ("2/3", 8),
+                            ("Full", 12),
+                        ] {
                             if chip(ui, pal, n, span == s).clicked() {
                                 acts.push(Act::Size(wid, s, rows));
                             }
@@ -708,7 +799,14 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                     });
                     section_label(ui, pal, "HEIGHT");
                     ui.horizontal_wrapped(|ui| {
-                        for (n, r) in [("XS", 1u8), ("S", 2), ("M", 3), ("L", 4), ("XL", 6), ("XXL", 8)] {
+                        for (n, r) in [
+                            ("XS", 1u8),
+                            ("S", 2),
+                            ("M", 3),
+                            ("L", 4),
+                            ("XL", 6),
+                            ("XXL", 8),
+                        ] {
                             if chip(ui, pal, n, rows == r).clicked() {
                                 acts.push(Act::Size(wid, span, r));
                             }
@@ -719,7 +817,8 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                         ui.horizontal_wrapped(|ui| {
                             for k in dw::CHART_KINDS {
                                 if let Some(d) = dw::def(k) {
-                                    let resp = glyph_chip(ui, pal, d.glyph, plot == k).on_hover_text(dw::plot_label(k));
+                                    let resp = glyph_chip(ui, pal, d.glyph, plot == k)
+                                        .on_hover_text(dw::plot_label(k));
                                     if resp.clicked() {
                                         acts.push(Act::Plot(wid, k));
                                     }
@@ -729,7 +828,17 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                     }
                     let _ = &def;
                     ui.add_space(2.0);
-                    if menu_item(ui, pal, l::TRASH_2, "Remove from dashboard", None, false, true).clicked() {
+                    if menu_item(
+                        ui,
+                        pal,
+                        l::TRASH_2,
+                        "Remove from dashboard",
+                        None,
+                        false,
+                        true,
+                    )
+                    .clicked()
+                    {
                         acts.push(Act::Remove(wid));
                         close = true;
                     }
@@ -737,13 +846,31 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
             }
             Menu::Layouts(bid) => {
                 let bid = *bid;
-                let page = ws.dash.board_index(bid).map_or(0, |i| ws.dash.boards[i].page);
+                let page = ws
+                    .dash
+                    .board_index(bid)
+                    .map_or(0, |i| ws.dash.boards[i].page);
                 keep = popup_area(&ctx, pid, pos, pal, &mut st.fresh, 290.0, |ui| {
                     section_label(ui, pal, "ADD A LAYOUT");
                     for (key, glyph, name, hint) in [
-                        ("overview", l::LAYOUT_DASHBOARD, "Overview", "Stats, tasks, deadlines, charts"),
-                        ("analytics", l::CHART_PIE, "Analytics", "Numbers, charts and a table per database"),
-                        ("personal", l::SUN, "Personal", "Today, timer, quick add, checklist, notes"),
+                        (
+                            "overview",
+                            l::LAYOUT_DASHBOARD,
+                            "Overview",
+                            "Stats, tasks, deadlines, charts",
+                        ),
+                        (
+                            "analytics",
+                            l::CHART_PIE,
+                            "Analytics",
+                            "Numbers, charts and a table per database",
+                        ),
+                        (
+                            "personal",
+                            l::SUN,
+                            "Personal",
+                            "Today, timer, quick add, checklist, notes",
+                        ),
                     ] {
                         if menu_item(ui, pal, glyph, name, Some(hint), false, false).clicked() {
                             cfg::fill_board(ws, bid, key);
@@ -752,9 +879,23 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                     }
                     if page != 0 {
                         ui.add_space(3.0);
-                        ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
+                        ui.painter().hline(
+                            ui.max_rect().x_range(),
+                            ui.cursor().top(),
+                            Stroke::new(1.0_f32, pal.border),
+                        );
                         ui.add_space(4.0);
-                        if menu_item(ui, pal, l::TRASH_2, "Remove dashboard from this page", Some("The page and its text stay"), false, true).clicked() {
+                        if menu_item(
+                            ui,
+                            pal,
+                            l::TRASH_2,
+                            "Remove dashboard from this page",
+                            Some("The page and its text stay"),
+                            false,
+                            true,
+                        )
+                        .clicked()
+                        {
                             ws.dash.drop_page_board(page);
                             nav.dropped = true;
                             close = true;
@@ -767,9 +908,24 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                     section_label(ui, pal, "ADD A BOARD");
                     for (key, glyph, name, hint) in [
                         ("blank", l::PLUS, "Blank board", "Start from nothing"),
-                        ("overview", l::LAYOUT_DASHBOARD, "Overview", "Stats, tasks, deadlines, charts"),
-                        ("analytics", l::CHART_PIE, "Analytics", "Numbers, charts and a table per database"),
-                        ("personal", l::SUN, "Personal", "Today, timer, quick add, checklist, notes"),
+                        (
+                            "overview",
+                            l::LAYOUT_DASHBOARD,
+                            "Overview",
+                            "Stats, tasks, deadlines, charts",
+                        ),
+                        (
+                            "analytics",
+                            l::CHART_PIE,
+                            "Analytics",
+                            "Numbers, charts and a table per database",
+                        ),
+                        (
+                            "personal",
+                            l::SUN,
+                            "Personal",
+                            "Today, timer, quick add, checklist, notes",
+                        ),
                     ] {
                         if menu_item(ui, pal, glyph, name, Some(hint), false, false).clicked() {
                             cfg::add_preset(ws, key);
@@ -782,7 +938,11 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                 let i = *i;
                 keep = popup_area(&ctx, pid, pos, pal, &mut st.fresh, 250.0, |ui| {
                     section_label(ui, pal, "BOARD NAME");
-                    let resp = ui.add(egui::TextEdit::singleline(&mut st.rename).desired_width(238.0).font(body(14.0)));
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut st.rename)
+                            .desired_width(238.0)
+                            .font(body(14.0)),
+                    );
                     if resp.changed() {
                         if let Some(b) = ws.dash.boards.get_mut(i) {
                             b.name = st.rename.clone();
@@ -792,17 +952,25 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                         close = true;
                     }
                     ui.add_space(4.0);
-                    if menu_item(ui, pal, l::ARROW_LEFT, "Move left", None, false, false).clicked() && i > 0 {
+                    if menu_item(ui, pal, l::ARROW_LEFT, "Move left", None, false, false).clicked()
+                        && i > 0
+                    {
                         ws.dash.boards.swap(i, i - 1);
                         ws.dash.active = i - 1;
                         close = true;
                     }
-                    if menu_item(ui, pal, l::ARROW_RIGHT, "Move right", None, false, false).clicked() && i + 1 < ws.dash.boards.len() {
+                    if menu_item(ui, pal, l::ARROW_RIGHT, "Move right", None, false, false)
+                        .clicked()
+                        && i + 1 < ws.dash.boards.len()
+                    {
                         ws.dash.boards.swap(i, i + 1);
                         ws.dash.active = i + 1;
                         close = true;
                     }
-                    if ws.dash.boards.len() > 1 && menu_item(ui, pal, l::TRASH_2, "Delete board", None, false, true).clicked() {
+                    if ws.dash.boards.len() > 1
+                        && menu_item(ui, pal, l::TRASH_2, "Delete board", None, false, true)
+                            .clicked()
+                    {
                         ws.dash.remove_board(i);
                         close = true;
                     }
@@ -812,7 +980,21 @@ fn inner(ui: &mut Ui, ws: &mut Workspace, pal: &Palette, st: &mut UiState, nav: 
                 keep = popup_area(&ctx, pid, pos, pal, &mut st.fresh, 230.0, |ui| {
                     section_label(ui, pal, "DASHBOARD TIME WINDOW");
                     for r in Range::ALL {
-                        if menu_item(ui, pal, if r == Range::All { l::CLOCK } else { l::CALENDAR_DAYS }, r.label(), None, ws.dash.scope_range(*rb) == r, false).clicked() {
+                        if menu_item(
+                            ui,
+                            pal,
+                            if r == Range::All {
+                                l::CLOCK
+                            } else {
+                                l::CALENDAR_DAYS
+                            },
+                            r.label(),
+                            None,
+                            ws.dash.scope_range(*rb) == r,
+                            false,
+                        )
+                        .clicked()
+                        {
                             ws.dash.set_scope_range(*rb, r);
                             close = true;
                         }

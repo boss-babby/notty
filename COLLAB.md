@@ -1038,3 +1038,52 @@ landing page and the rewrites `/app`, `/webapp` → the WebAssembly build. `LUME
 
 ### 17.9 Verification log (this machine, Linux x86-64, Rust 1.100)
 See `VERIFY.md` for the exact command tails. New tests: 4 (`mdns`), 4 (`collab::tests`: spans, sticky caret, link fall-back, follow); all collab tests pass.
+
+## 18. Pass 12 — universal Nearby for browsers (`/api/collab/near`), UPnP-IGDv2 IPv6 pinholes, compressed BigChunks, cell-merge hardening, and full-stack server (14.8.1 · this delivery)
+
+Building on §17 (Pass 11, which shipped sticky carets, multi-line `selection_spans`, Follow-Cursor with top pill, desktop `mdns.rs` ⇄ Android NSD, direct-link relay fallback `&rr=&rb=`, and the Share-links UI card), Pass 12 closes four of the highest-ranked open items from §16.8 and §17.8 and ships a runnable full-stack web server.
+
+### 18.1 What was completed in Pass 12
+1. **Universal Nearby for WebAssembly browsers too (§17.8 item 1 — `/api/collab/near`):**
+   * `collab/relay.rs`: added `near_announce` (`POST /api/collab/near`) and `near_poll` (`GET /api/collab/near`). Hosting devices with a relay site announce their `Beacon` + `room` every 12 s under a SHA-256 hash of their public IP (no share token ever travels — joining still requires the host's approval card and 4-digit channel code).
+   * `collab/mod.rs` & `collab/ui.rs`: discovering clients (including **WebAssembly browsers**, Android, Windows, Linux, and macOS) poll `/api/collab/near` every 3 s while the Nearby tab is open. Direct LAN addresses always take priority over relay entries when both discover the same host; browser hosts (`port == 0`) are accepted over `relay:<room>`. The Nearby tab now actively discovers devices in the browser instead of showing a static error.
+   * Test: `collab::tests::universal_nearby_prefers_lan_over_relay_and_accepts_browser_hosts`.
+2. **UPnP-IGDv2 IPv6 firewall pinholes (§17.8 item 2 — `collab/upnp.rs`):**
+   * Added `V6Firewall`, `parse_v6_firewall`, `discover_v6_firewall`, `add_pinhole` (`WANIPv6FirewallControl:1` `AddPinhole`, TCP protocol 6), and `delete_pinhole` (`DeletePinhole`).
+   * Wired into `Collab::set_internet` and `Collab::release_wan`: when falling back to global IPv6 (no UPnP IPv4 or behind CGNAT), Lumen now automatically asks IGDv2 routers for an inbound IPv6 TCP pinhole and cleans it up when sharing stops.
+   * Test: `collab::upnp::tests::parses_v6_firewall_control_and_pinhole_soap`.
+3. **Compressed `BigChunk`s & cell-merge hardening (§16.8 items 4 & 5 — `collab/bigsync.rs`):**
+   * `pack` compresses chunks > 256 B with `miniz_oxide` zlib (prefixed with `0x5A` `'Z'`) whenever smaller; `unpack` inflates with a 24 MiB safety cap while remaining 100 % backwards-compatible with uncompressed `LCH` chunks (`PROTO` remains 8).
+   * `merge_cells` now preserves brand-new columns added remotely while still honoring explicit remote cell deletions in `cr`.
+   * Tests: `collab::bigsync::tests::compressed_big_chunks_shrink_and_reject_bombs`, `collab::bigsync::tests::cell_merge_preserves_deletions_and_new_columns`.
+4. **Full-stack web server (`../server.mjs`, `../public/index.html`):**
+   * Zero-dependency Node.js ES-module server serving `/` (landing & downloads portal), `/app` & `/webapp` (WebAssembly app with `application/wasm` MIME), `/downloads/*` + `/api/download/:file` (Range/HEAD streaming + counters), and the full collaboration API (`/api/collab`, `/api/collab/near`, `/api/collab/punch`, `/api/collab/rtc`, `/api/collab/ip`, `/api/collab/info`, `/api/health`).
+   * Verified end-to-end with the real Rust client against the live server (`LUMEN_RELAY_TEST=http://127.0.0.1:3000 cargo test --lib site_relay -- --ignored`).
+
+### 18.2 Remaining open items (for future passes)
+1. **Live per-keystroke `TextOp` frames** (§16.8 item 2) — requires physical device IME composition & undo soak testing.
+2. **Real-device radio verification** (§16.8 item 3) — BLE GATT pairing (`BlePair.java`) and FCM push (`FcmKit.java`) require two physical Android phones (`tools/phone-rig.sh`).
+3. **WebSocket / SSE relay transport** (§17.8 item 4) — dedicated `lumen-relay` binary for sub-100 ms relay latency beyond HTTP long-poll.
+4. **`Arc<Page>` copy-on-write / per-page store** (§16.8 item 7) — model refactor across ~60 files for ultra-large workspaces.
+5. **Remote carets inside table cells, code blocks, and database cells** (§17.8 item 7).
+
+---
+
+## 19. Unified Iroh 1.x QUIC Migration & Notion-Style Minimalist UI
+
+All six overlapping custom networking transports have been consolidated onto **`iroh` 1.5.0** + **`iroh-tickets` 1.0.0** behind Lumen's existing `Inbox` / `Box<dyn Sink>` boundary while keeping 100% of the CRDT, `bigsync`, `access.rs` (Ed25519 signed failover + revocable grants), `changes.rs`, `comments.rs`, sticky multi-line carets, Follow-Cursor pill, and Android `ScanActivity` / `CollabService` / `LocalOnlyHotspot` stack intact:
+
+- **Archived legacy files (not deleted):** `upnp.rs`, `punch.rs`, `turn.rs`, `dht.rs`, `relay.rs`, `net.rs`, `webnet.rs`, `rtc.rs`, and `lumen_turn.rs` are preserved in `src/collab/previous_legacy/` with a `README.md`.
+- **Unified transport (`src/collab/iroh_transport.rs`):**
+  - ALPN `b"lumen/collab/9"`, deterministic `iroh::SecretKey` derived from Lumen's persisted device key, length-prefixed frames capped at 4 MiB with automatic `miniz_oxide` deflate for payloads > 400 B, and 4,096-event `Inbox` back-pressure.
+  - Native & Android run a single background current-thread Tokio runtime only while active; WebAssembly (`default-features = false, features = ["tls-ring"]`) drives the same `iroh::Endpoint` via `wasm_bindgen_futures::spawn_local`, enabling browsers to both host and join.
+  - Default `RelayMode::Default` uses n0's free global public relays automatically (zero server setup); optional `Custom Iroh Relay URL` setting supports self-hosted `iroh-relay`.
+  - Clean QUIC writer flush-before-stop guarantees `Msg::Denied`, `Msg::Bye`, and `Msg::Moved` are delivered before connection teardown, and `keep_existing` preserves active host links during baton handover.
+- **Universal invite tickets & LAN Nearby (`src/collab/mod.rs`, `src/collab/mdns.rs`):**
+  - Single share link (`lumen://join?iroh=<ticket>&t=<token>` or `<site>/app?iroh=<ticket>&t=<token>`) works across LAN, Wi-Fi, 5G, CGNAT, and browsers.
+  - `Beacon.iroh` carries the host's `EndpointId` over desktop mDNS (`mdns.rs`) and Android `NsdManager` for zero-config offline LAN discovery.
+  - Failover plans (`Standby` / `StandbyAddr`) carry `iroh:<ticket_or_id>` so host handover and election work across NATs and offline LANs.
+- **Notion-style minimalist UI (`src/collab/ui.rs`):**
+  - Redesigned Share & Nearby dialog matching `src/theme.rs` (clean underline tabs, 1px hairlines, flat muted callout panels, zero UPnP/CGNAT error banners).
+  - Live per-peer path badges (`Direct LAN`, `Direct P2P`, `Relayed`) in the people menu.
+- **Verification:** All 85 `collab::` unit and live two-endpoint / three-device Iroh QUIC tests (sync, big tables, approval, grants, handover, failover election, sticky carets, Follow-Cursor, mDNS) pass.

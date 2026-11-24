@@ -36,7 +36,12 @@ static CTX: OnceLock<Context> = OnceLock::new();
 /// `DisplayMetrics.density` as f32 bits (0 = not reported yet).
 static DENSITY: AtomicU32 = AtomicU32::new(0);
 /// System insets in physical pixels: left, top, right, bottom (bottom already includes the keyboard).
-static INSETS: [AtomicI32; 4] = [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
+static INSETS: [AtomicI32; 4] = [
+    AtomicI32::new(0),
+    AtomicI32::new(0),
+    AtomicI32::new(0),
+    AtomicI32::new(0),
+];
 static IME_VISIBLE: AtomicBool = AtomicBool::new(false);
 static TZ_MIN: AtomicI64 = AtomicI64::new(0);
 static BACK: AtomicBool = AtomicBool::new(false);
@@ -277,8 +282,16 @@ pub fn vault_open(blob: &[u8]) -> Option<Vec<u8>> {
 
 /// A preview frame of the QR scanner (luma plane of an NV21 image). `true` = a join code was found and queued.
 #[no_mangle]
-pub extern "system" fn Java_com_lumen_app_CollabKit_nativeScanFrame(env: JNIEnv, _c: JClass, luma: JByteArray, w: jint, h: jint) -> jboolean {
-    let Ok(bytes) = env.convert_byte_array(&luma) else { return 0 };
+pub extern "system" fn Java_com_lumen_app_CollabKit_nativeScanFrame(
+    env: JNIEnv,
+    _c: JClass,
+    luma: JByteArray,
+    w: jint,
+    h: jint,
+) -> jboolean {
+    let Ok(bytes) = env.convert_byte_array(&luma) else {
+        return 0;
+    };
     let (w, h) = (w.max(0) as usize, h.max(0) as usize);
     if w == 0 || h == 0 || bytes.len() < w * h {
         return 0;
@@ -286,7 +299,11 @@ pub extern "system" fn Java_com_lumen_app_CollabKit_nativeScanFrame(env: JNIEnv,
     let mut img = rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| bytes[y * w + x]);
     for grid in img.detect_grids() {
         if let Ok((_, text)) = grid.decode() {
-            if text.len() <= 1024 && (text.starts_with("lumen://join") || text.contains("join=")) {
+            if text.len() <= 2048
+                && (text.starts_with("lumen://join")
+                    || text.contains("iroh=")
+                    || text.contains("join="))
+            {
                 crate::collab::push_launch_link(text);
                 wake();
                 return 1;
@@ -320,10 +337,14 @@ pub extern "system" fn Java_com_lumen_app_CollabKit_nativeNsdFound(mut env: JNIE
 
 /// `lumen://join?…` delivered by the activity (intent filter): handed to the collaboration dialog on the next frame.
 #[no_mangle]
-pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeLink(mut env: JNIEnv, _c: JClass, link: JString) {
+pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeLink(
+    mut env: JNIEnv,
+    _c: JClass,
+    link: JString,
+) {
     if let Ok(s) = env.get_string(&link) {
         let s: String = s.into();
-        if s.len() <= 512 && s.starts_with("lumen://join") {
+        if s.len() <= 2048 && s.starts_with("lumen://join") {
             crate::collab::push_launch_link(s);
             wake();
         }

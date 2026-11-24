@@ -6,26 +6,26 @@ use std::collections::HashMap;
 use egui::{
     pos2,
     text::{CCursor, CCursorRange, LayoutJob, TextFormat},
-    vec2, Align, Align2, Color32, Context, CornerRadius, CursorIcon, FontId, Frame, Id, Key, Margin, Modifiers, Order,
-    Rect, RichText, ScrollArea, Sense, Shape, Stroke, TextEdit, Ui,
+    vec2, Align, Align2, Color32, Context, CornerRadius, CursorIcon, FontId, Frame, Id, Key,
+    Margin, Modifiers, Order, Rect, RichText, ScrollArea, Sense, Shape, Stroke, TextEdit, Ui,
 };
 
+use crate::clip;
 use crate::database::{self, DbState};
 use crate::dates;
 use crate::icons::{self, Icon};
-use crate::model::{Block, BlockKind, Page, PageKind, PropKind, Val, ViewKind, Workspace, ICONS};
-use crate::theme::{bold, body, lerp_color, tag_color, Palette, COVERS, TAG_NAMES};
 use crate::lucide as l;
 use crate::media;
 use crate::mediablocks;
+use crate::model::{Block, BlockKind, Page, PageKind, PropKind, Val, ViewKind, Workspace, ICONS};
 use crate::multisel;
 use crate::pickers;
-use crate::rich::{self, Fmt, Rich};
-use crate::clip;
 use crate::platform;
+use crate::rich::{self, Fmt, Rich};
+use crate::theme::{body, bold, lerp_color, tag_color, Palette, COVERS, TAG_NAMES};
 use crate::widgets::{
-    self, appear, context_menu, gradient_rect, menu_item, popup_area, replace_chars, reset_appear, right_clicked, right_clicked_any, section_label,
-    slice_chars, with_alpha, CtxItem,
+    self, appear, context_menu, gradient_rect, menu_item, popup_area, replace_chars, reset_appear,
+    right_clicked, right_clicked_any, section_label, slice_chars, with_alpha, CtxItem,
 };
 
 /// Width of the left gutter that holds the "+" / drag handle of a block. Phones get a slimmer one so text keeps its width.
@@ -64,6 +64,8 @@ pub struct EditorState {
     pub active: Option<u64>,
     /// Phone toolbar: 0 = closed, 1 = "turn into", 2 = "insert".
     pub tool_menu: u8,
+    /// Phone toolbar sub-mode: true = inline text formatting bar (`B I U S <> Highlight`) with stateful typing toggles.
+    pub mobile_fmt_mode: bool,
     /// Time until which the phone toolbar stays up although the text field lost focus (a tap on a toolbar button does that).
     pub bar_grace: f64,
     pub slash_sel: usize,
@@ -148,8 +150,16 @@ pub struct LinkEdit {
 
 #[derive(Clone, Copy)]
 pub enum EdMenu {
-    Text { bid: u64, a: usize, b: usize, pos: egui::Pos2 },
-    Block { bid: u64, pos: egui::Pos2 },
+    Text {
+        bid: u64,
+        a: usize,
+        b: usize,
+        pos: egui::Pos2,
+    },
+    Block {
+        bid: u64,
+        pos: egui::Pos2,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -196,52 +206,225 @@ struct SlashItem {
 fn slash_all() -> Vec<SlashItem> {
     let mut v: Vec<SlashItem> = BlockKind::TEXTY
         .iter()
-        .map(|k| SlashItem { act: Slash::Block(*k), label: k.label(), hint: k.hint(), glyph: k.glyph(), kw: k.keywords(), sec: "BASIC BLOCKS" })
+        .map(|k| SlashItem {
+            act: Slash::Block(*k),
+            label: k.label(),
+            hint: k.hint(),
+            glyph: k.glyph(),
+            kw: k.keywords(),
+            sec: "BASIC BLOCKS",
+        })
         .collect();
-    v.push(SlashItem { act: Slash::Block(BlockKind::Table), label: "Table", hint: "Simple table — paste Markdown tables, convert to a database.", glyph: l::TABLE, kw: "table grid rows columns markdown spreadsheet cells", sec: "BASIC BLOCKS" });
-    v.push(SlashItem { act: Slash::Block(BlockKind::Equation), label: "Equation", hint: "LaTeX math — $$ … $$ (inline: $x^2$).", glyph: l::SIGMA, kw: "equation math latex formula tex katex sigma integral fraction", sec: "BASIC BLOCKS" });
-    v.push(SlashItem { act: Slash::Block(BlockKind::Divider), label: "Divider", hint: "Visually divide blocks.", glyph: l::MINUS, kw: "divider line hr separator", sec: "BASIC BLOCKS" });
+    v.push(SlashItem {
+        act: Slash::Block(BlockKind::Table),
+        label: "Table",
+        hint: "Simple table — paste Markdown tables, convert to a database.",
+        glyph: l::TABLE,
+        kw: "table grid rows columns markdown spreadsheet cells",
+        sec: "BASIC BLOCKS",
+    });
+    v.push(SlashItem {
+        act: Slash::Block(BlockKind::Equation),
+        label: "Equation",
+        hint: "LaTeX math — $$ … $$ (inline: $x^2$).",
+        glyph: l::SIGMA,
+        kw: "equation math latex formula tex katex sigma integral fraction",
+        sec: "BASIC BLOCKS",
+    });
+    v.push(SlashItem {
+        act: Slash::Block(BlockKind::Divider),
+        label: "Divider",
+        hint: "Visually divide blocks.",
+        glyph: l::MINUS,
+        kw: "divider line hr separator",
+        sec: "BASIC BLOCKS",
+    });
     let med = "MEDIA";
     for (k, label, hint, glyph, kw) in [
-        (BlockKind::Whiteboard, "Whiteboard", "An infinite board inside the page — shapes, sticky notes, ink, frames, connectors.", l::NETWORK, "whiteboard canvas edgeless draw sketch diagram miro board affine shapes frame mindmap"),
-        (BlockKind::Image, "Image", "Upload a picture or paste an image link.", l::IMAGE, "image picture photo upload png jpg gif"),
-        (BlockKind::Embed, "Video", "Embed a YouTube, Vimeo or Loom video.", l::VIDEO, "video youtube vimeo loom movie clip"),
-        (BlockKind::Embed, "Audio", "Embed Spotify or any audio player.", l::MUSIC, "audio spotify music podcast sound"),
-        (BlockKind::Embed, "Embed", "Embed any website, map, Figma file or document.", l::GLOBE, "embed website iframe map figma codepen docs"),
-        (BlockKind::Bookmark, "Web bookmark", "Save a link as a visual card.", l::BOOKMARK, "bookmark link url web card"),
-        (BlockKind::File, "PDF", "Upload a PDF and read it right inside the page.", l::FILE_TEXT, "pdf reader document read viewer paper"),
-        (BlockKind::File, "File", "Attach a file to this page.", l::PAPERCLIP, "file attachment upload document"),
+        (
+            BlockKind::Whiteboard,
+            "Whiteboard",
+            "An infinite board inside the page — shapes, sticky notes, ink, frames, connectors.",
+            l::NETWORK,
+            "whiteboard canvas edgeless draw sketch diagram miro board affine shapes frame mindmap",
+        ),
+        (
+            BlockKind::Image,
+            "Image",
+            "Upload a picture or paste an image link.",
+            l::IMAGE,
+            "image picture photo upload png jpg gif",
+        ),
+        (
+            BlockKind::Embed,
+            "Video",
+            "Embed a YouTube, Vimeo or Loom video.",
+            l::VIDEO,
+            "video youtube vimeo loom movie clip",
+        ),
+        (
+            BlockKind::Embed,
+            "Audio",
+            "Embed Spotify or any audio player.",
+            l::MUSIC,
+            "audio spotify music podcast sound",
+        ),
+        (
+            BlockKind::Embed,
+            "Embed",
+            "Embed any website, map, Figma file or document.",
+            l::GLOBE,
+            "embed website iframe map figma codepen docs",
+        ),
+        (
+            BlockKind::Bookmark,
+            "Web bookmark",
+            "Save a link as a visual card.",
+            l::BOOKMARK,
+            "bookmark link url web card",
+        ),
+        (
+            BlockKind::File,
+            "PDF",
+            "Upload a PDF and read it right inside the page.",
+            l::FILE_TEXT,
+            "pdf reader document read viewer paper",
+        ),
+        (
+            BlockKind::File,
+            "File",
+            "Attach a file to this page.",
+            l::PAPERCLIP,
+            "file attachment upload document",
+        ),
     ] {
-        v.push(SlashItem { act: Slash::Block(k), label, hint, glyph, kw, sec: med });
+        v.push(SlashItem {
+            act: Slash::Block(k),
+            label,
+            hint,
+            glyph,
+            kw,
+            sec: med,
+        });
     }
-    for (n, label, glyph) in [(2u8, "2 columns", l::COLUMNS_2), (3, "3 columns", l::COLUMNS_3), (4, "4 columns", l::LAYOUT_GRID), (5, "5 columns", l::LAYOUT_GRID)] {
-        v.push(SlashItem { act: Slash::Columns(n), label, hint: "Lay content out side by side.", glyph, kw: "column columns layout side by side split grid", sec: "LAYOUT" });
+    for (n, label, glyph) in [
+        (2u8, "2 columns", l::COLUMNS_2),
+        (3, "3 columns", l::COLUMNS_3),
+        (4, "4 columns", l::LAYOUT_GRID),
+        (5, "5 columns", l::LAYOUT_GRID),
+    ] {
+        v.push(SlashItem {
+            act: Slash::Columns(n),
+            label,
+            hint: "Lay content out side by side.",
+            glyph,
+            kw: "column columns layout side by side split grid",
+            sec: "LAYOUT",
+        });
     }
-    v.push(SlashItem { act: Slash::Block(BlockKind::Button), label: "Button", hint: "One click runs actions: set properties, create tasks, move rows, notify.", glyph: l::MOUSE_POINTER_2, kw: "button automation action click run rule trigger macro one-click", sec: "AUTOMATION" });
+    v.push(SlashItem {
+        act: Slash::Block(BlockKind::Button),
+        label: "Button",
+        hint: "One click runs actions: set properties, create tasks, move rows, notify.",
+        glyph: l::MOUSE_POINTER_2,
+        kw: "button automation action click run rule trigger macro one-click",
+        sec: "AUTOMATION",
+    });
     let adv = "ADVANCED";
-    v.push(SlashItem { act: Slash::Block(BlockKind::Toc), label: "Table of contents", hint: "Jump links to every heading.", glyph: l::TABLE_OF_CONTENTS, kw: "table of contents toc outline", sec: adv });
-    v.push(SlashItem { act: Slash::NewPage, label: "Page", hint: "Embed a new sub-page inside this page.", glyph: l::FILE_PLUS, kw: "page subpage new child", sec: adv });
-    v.push(SlashItem { act: Slash::Link, label: "Link to page", hint: "Link to an existing page.", glyph: l::LINK_2, kw: "link page mention reference", sec: adv });
-    v.push(SlashItem { act: Slash::Dashboard, label: "Dashboard", hint: "Turn this page into a dashboard of charts, tables and widgets.", glyph: l::LAYOUT_DASHBOARD, kw: "dashboard widgets chart charts kpi board analytics overview", sec: adv });
-    v.push(SlashItem { act: Slash::Widget, label: "Dashboard widget", hint: "Place a chart, number, task list or timer anywhere in the page.", glyph: l::CHART_PIE, kw: "widget chart kpi number gauge stats metric dashboard graph plot timer tasks", sec: adv });
-    v.push(SlashItem { act: Slash::Today, label: "Today's date", hint: "Insert the current date.", glyph: l::CALENDAR_DAYS, kw: "date today now time", sec: adv });
-    v.push(SlashItem { act: Slash::DbView, label: "Linked view of database", hint: "Show a filtered view of any database on this page.", glyph: l::TABLE_2, kw: "linked view database embed inline filter table board calendar today week", sec: "DATABASES" });
+    v.push(SlashItem {
+        act: Slash::Block(BlockKind::Toc),
+        label: "Table of contents",
+        hint: "Jump links to every heading.",
+        glyph: l::TABLE_OF_CONTENTS,
+        kw: "table of contents toc outline",
+        sec: adv,
+    });
+    v.push(SlashItem {
+        act: Slash::NewPage,
+        label: "Page",
+        hint: "Embed a new sub-page inside this page.",
+        glyph: l::FILE_PLUS,
+        kw: "page subpage new child",
+        sec: adv,
+    });
+    v.push(SlashItem {
+        act: Slash::Link,
+        label: "Link to page",
+        hint: "Link to an existing page.",
+        glyph: l::LINK_2,
+        kw: "link page mention reference",
+        sec: adv,
+    });
+    v.push(SlashItem {
+        act: Slash::Dashboard,
+        label: "Dashboard",
+        hint: "Turn this page into a dashboard of charts, tables and widgets.",
+        glyph: l::LAYOUT_DASHBOARD,
+        kw: "dashboard widgets chart charts kpi board analytics overview",
+        sec: adv,
+    });
+    v.push(SlashItem {
+        act: Slash::Widget,
+        label: "Dashboard widget",
+        hint: "Place a chart, number, task list or timer anywhere in the page.",
+        glyph: l::CHART_PIE,
+        kw: "widget chart kpi number gauge stats metric dashboard graph plot timer tasks",
+        sec: adv,
+    });
+    v.push(SlashItem {
+        act: Slash::Today,
+        label: "Today's date",
+        hint: "Insert the current date.",
+        glyph: l::CALENDAR_DAYS,
+        kw: "date today now time",
+        sec: adv,
+    });
+    v.push(SlashItem {
+        act: Slash::DbView,
+        label: "Linked view of database",
+        hint: "Show a filtered view of any database on this page.",
+        glyph: l::TABLE_2,
+        kw: "linked view database embed inline filter table board calendar today week",
+        sec: "DATABASES",
+    });
     let dbs = [
-        (ViewKind::Table, "Table database", "Spreadsheet-style database."),
-        (ViewKind::Board, "Board database", "Kanban board grouped by status."),
+        (
+            ViewKind::Table,
+            "Table database",
+            "Spreadsheet-style database.",
+        ),
+        (
+            ViewKind::Board,
+            "Board database",
+            "Kanban board grouped by status.",
+        ),
         (ViewKind::List, "List database", "A minimal list of pages."),
         (ViewKind::Gallery, "Gallery database", "Cards in a grid."),
-        (ViewKind::Calendar, "Calendar database", "Plan items on a calendar."),
+        (
+            ViewKind::Calendar,
+            "Calendar database",
+            "Plan items on a calendar.",
+        ),
     ];
     for (k, l, h) in dbs {
-        v.push(SlashItem { act: Slash::NewDb(k), label: l, hint: h, glyph: k.glyph(), kw: "database table board kanban list gallery calendar view", sec: "DATABASES" });
+        v.push(SlashItem {
+            act: Slash::NewDb(k),
+            label: l,
+            hint: h,
+            glyph: k.glyph(),
+            kw: "database table board kanban list gallery calendar view",
+            sec: "DATABASES",
+        });
     }
     v
 }
 
 fn slash_items(query: &str) -> Vec<SlashItem> {
     let q = query.trim().to_lowercase();
-    slash_all().into_iter().filter(|k| q.is_empty() || k.label.to_lowercase().contains(&q) || k.kw.contains(&q)).collect()
+    slash_all()
+        .into_iter()
+        .filter(|k| q.is_empty() || k.label.to_lowercase().contains(&q) || k.kw.contains(&q))
+        .collect()
 }
 
 enum Act {
@@ -285,7 +468,10 @@ fn slash_act(idx: usize, s: SlashItem) -> Act {
 }
 
 fn byte_at(s: &str, chars: usize) -> usize {
-    s.char_indices().nth(chars).map(|(i, _)| i).unwrap_or(s.len())
+    s.char_indices()
+        .nth(chars)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
 }
 
 fn md_shortcut(text: &str, cursor: usize) -> Option<(BlockKind, usize)> {
@@ -387,15 +573,28 @@ fn find_link(ch: &[char], i: usize) -> Option<(usize, usize)> {
 pub(crate) fn parse_spans(s: &str) -> Vec<Span> {
     let ch: Vec<char> = s.chars().collect();
     let n = ch.len();
-    let (mut bo, mut it, mut st, mut co, mut ul, mut hl) = (false, false, false, false, false, false);
+    let (mut bo, mut it, mut st, mut co, mut ul, mut hl) =
+        (false, false, false, false, false, false);
     let mut out: Vec<Span> = vec![];
     let mut cur = String::new();
     let mut i = 0;
-    let has_later = |from: usize, pat: &[char]| -> bool { (from..n.saturating_sub(pat.len() - 1)).any(|j| ch[j..j + pat.len()] == *pat) };
+    let has_later = |from: usize, pat: &[char]| -> bool {
+        (from..n.saturating_sub(pat.len() - 1)).any(|j| ch[j..j + pat.len()] == *pat)
+    };
     macro_rules! flush {
         ($marker:expr) => {
             if !cur.is_empty() {
-                out.push(Span { text: std::mem::take(&mut cur), bold: bo, italic: it, strike: st, code: co, ul, hl, link: None, marker: $marker });
+                out.push(Span {
+                    text: std::mem::take(&mut cur),
+                    bold: bo,
+                    italic: it,
+                    strike: st,
+                    code: co,
+                    ul,
+                    hl,
+                    link: None,
+                    marker: $marker,
+                });
             }
         };
     }
@@ -443,7 +642,17 @@ pub(crate) fn parse_spans(s: &str) -> Vec<Span> {
                 cur.push('[');
                 flush!(true);
                 let inner: String = unescape(&ch[i + 1..j].iter().collect::<String>());
-                out.push(Span { text: inner, bold: bo, italic: it, strike: st, code: false, ul, hl, link: Some(ch[j + 2..k].iter().collect()), marker: false });
+                out.push(Span {
+                    text: inner,
+                    bold: bo,
+                    italic: it,
+                    strike: st,
+                    code: false,
+                    ul,
+                    hl,
+                    link: Some(ch[j + 2..k].iter().collect()),
+                    marker: false,
+                });
                 cur = ch[j..=k].iter().collect();
                 flush!(true);
                 i = k + 1;
@@ -464,7 +673,10 @@ pub(crate) fn parse_spans(s: &str) -> Vec<Span> {
             toggle2!(ul, "__");
         } else if c == '=' && two && (hl || (open_ok(i + 2) && has_later(i + 2, &['=', '=']))) {
             toggle2!(hl, "==");
-        } else if c == '*' && !two && (it || (i + 1 < n && !ch[i + 1].is_whitespace() && has_later(i + 1, &['*']))) {
+        } else if c == '*'
+            && !two
+            && (it || (i + 1 < n && !ch[i + 1].is_whitespace() && has_later(i + 1, &['*'])))
+        {
             flush!(false);
             cur.push(c);
             if it {
@@ -488,7 +700,13 @@ fn has_marks(s: &str) -> bool {
     crate::rich::has_marks(s)
 }
 
-pub fn rich_job(text: &str, font: &FontId, color: Color32, pal: &Palette, strip: bool) -> LayoutJob {
+pub fn rich_job(
+    text: &str,
+    font: &FontId,
+    color: Color32,
+    pal: &Palette,
+    strip: bool,
+) -> LayoutJob {
     let mut job = LayoutJob::default();
     let math_text;
     let text = if strip && text.contains('$') {
@@ -527,7 +745,13 @@ pub fn rich_job(text: &str, font: &FontId, color: Color32, pal: &Palette, strip:
             color
         };
         let fmt = TextFormat {
-            font_id: if sp.code { FontId::monospace(font.size * 0.88) } else if sp.bold { bold(font.size) } else { font.clone() },
+            font_id: if sp.code {
+                FontId::monospace(font.size * 0.88)
+            } else if sp.bold {
+                bold(font.size)
+            } else {
+                font.clone()
+            },
             color: fg,
             background: if sp.hl && !sp.marker {
                 Color32::from_rgba_unmultiplied(255, 208, 0, 100)
@@ -537,8 +761,16 @@ pub fn rich_job(text: &str, font: &FontId, color: Color32, pal: &Palette, strip:
                 Color32::TRANSPARENT
             },
             italics: sp.italic,
-            strikethrough: if sp.strike && !sp.marker { Stroke::new(1.3_f32, color) } else { Stroke::NONE },
-            underline: if (sp.ul || is_link) && !sp.marker { Stroke::new(1.2_f32, fg) } else { Stroke::NONE },
+            strikethrough: if sp.strike && !sp.marker {
+                Stroke::new(1.3_f32, color)
+            } else {
+                Stroke::NONE
+            },
+            underline: if (sp.ul || is_link) && !sp.marker {
+                Stroke::new(1.2_f32, fg)
+            } else {
+                Stroke::NONE
+            },
             ..Default::default()
         };
         job.append(&sp.text, 0.0, fmt);
@@ -550,9 +782,11 @@ pub fn rich_job(text: &str, font: &FontId, color: Color32, pal: &Palette, strip:
 }
 
 const KEYWORDS: &[&str] = &[
-    "fn", "let", "mut", "pub", "use", "mod", "struct", "enum", "impl", "trait", "if", "else", "for", "while", "loop", "return", "match",
-    "const", "static", "class", "def", "function", "var", "import", "from", "export", "async", "await", "true", "false", "self",
-    "None", "null", "new", "in", "as", "where", "type", "int", "string", "void", "public", "private", "package", "break", "continue",
+    "fn", "let", "mut", "pub", "use", "mod", "struct", "enum", "impl", "trait", "if", "else",
+    "for", "while", "loop", "return", "match", "const", "static", "class", "def", "function",
+    "var", "import", "from", "export", "async", "await", "true", "false", "self", "None", "null",
+    "new", "in", "as", "where", "type", "int", "string", "void", "public", "private", "package",
+    "break", "continue",
 ];
 
 /// Tiny language-agnostic syntax highlighter for code blocks.
@@ -568,7 +802,11 @@ fn code_job(text: &str, font: &FontId, pal: &Palette) -> LayoutJob {
     let mut i = 0;
     while i < n {
         let c = ch[i];
-        let rest_starts = |p: &str| p.chars().enumerate().all(|(k, pc)| i + k < n && ch[i + k] == pc);
+        let rest_starts = |p: &str| {
+            p.chars()
+                .enumerate()
+                .all(|(k, pc)| i + k < n && ch[i + k] == pc)
+        };
         if rest_starts("//") || (c == '#' && i + 1 < n && ch[i + 1] == ' ') {
             let mut j = i;
             while j < n && ch[j] != '\n' {
@@ -659,15 +897,29 @@ fn subtree_end(bl: &[Block], i: usize) -> usize {
 // ───────────────────────────── page body ─────────────────────────────
 
 /// Renders a page (cover, header, body). Returns `true` if anything changed.
-pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState, pal: &Palette) -> bool {
-    let Some(idx) = ws.pages.iter().position(|p| p.id == id) else { return false };
+pub fn show_page(
+    ui: &mut Ui,
+    ws: &mut Workspace,
+    id: u64,
+    ed: &mut EditorState,
+    pal: &Palette,
+) -> bool {
+    let Some(idx) = ws.pages.iter().position(|p| p.id == id) else {
+        return false;
+    };
     let mut changed = false;
     ed.rc_frame = false;
     ed.embed_rects.clear();
     ed.cur_page = id;
     if std::mem::take(&mut ed.want_pages) {
-        ed.pages = ws.pages.iter().filter(|p| !p.trashed && !p.row && p.id != id).map(|p| (p.title.clone(), p.icon.clone())).collect();
-        ed.pages.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        ed.pages = ws
+            .pages
+            .iter()
+            .filter(|p| !p.trashed && !p.row && p.id != id)
+            .map(|p| (p.title.clone(), p.icon.clone()))
+            .collect();
+        ed.pages
+            .sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
     }
     let avail = ui.available_width();
     // two-finger pinch on the page = content size (the same value as the slider in the ⋯ menu)
@@ -685,16 +937,35 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
     ed.scale = zoom * if small { 0.9 } else { 1.0 };
     // Page-wide drag surface (registered first = lowest): blank space starts the selection rectangle.
     let top = ui.cursor().min;
-    let bg_rect = Rect::from_min_max(pos2(ui.max_rect().left(), top.y), pos2(ui.max_rect().right(), top.y + 30000.0));
+    let bg_rect = Rect::from_min_max(
+        pos2(ui.max_rect().left(), top.y),
+        pos2(ui.max_rect().right(), top.y + 30000.0),
+    );
     let bg = ui.interact(bg_rect, Id::new(("page_bg", id)), Sense::click_and_drag());
     changed |= pickers::cover(ui, &mut ws.pages[idx], ed, pal, avail);
 
-    let dash_board = if kind == PageKind::Doc && !is_row { ws.dash.page_board(id) } else { None };
+    let dash_board = if kind == PageKind::Doc && !is_row {
+        ws.dash.page_board(id)
+    } else {
+        None
+    };
     let wide = kind == PageKind::Database || full || dash_board.is_some();
     // phones: use (almost) the whole width, no 300 pt minimum that would push the page off-screen
     let compact = avail < 640.0;
-    let col_w = if compact { (avail - 16.0).max(200.0) } else if wide { (avail - 96.0).max(300.0) } else { (avail - 80.0).clamp(300.0, 900.0) };
-    let left = if compact { 8.0 } else if wide { 48.0 } else { ((avail - col_w) / 2.0).max(24.0) };
+    let col_w = if compact {
+        (avail - 16.0).max(200.0)
+    } else if wide {
+        (avail - 96.0).max(300.0)
+    } else {
+        (avail - 80.0).clamp(300.0, 900.0)
+    };
+    let left = if compact {
+        8.0
+    } else if wide {
+        48.0
+    } else {
+        ((avail - col_w) / 2.0).max(24.0)
+    };
     let content_w = (col_w - gutter()).max(if compact { 140.0 } else { 200.0 });
 
     ui.horizontal_top(|ui| {
@@ -720,22 +991,46 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
                 ui.add_space(16.0);
             }
             match kind {
-                PageKind::Database if ws.bigs.contains_key(&id) => changed |= crate::bigui::show(ui, ws, id, pal, col_w),
+                PageKind::Database if ws.bigs.contains_key(&id) => {
+                    changed |= crate::bigui::show(ui, ws, id, pal, col_w)
+                }
                 PageKind::Database => changed |= database::show(ui, ws, id, ed, pal, col_w),
                 _ => {
                     let mut links: Links = HashMap::new();
-                    for b in ws.pages[idx].blocks.iter().filter(|b| b.kind == BlockKind::PageLink) {
+                    for b in ws.pages[idx]
+                        .blocks
+                        .iter()
+                        .filter(|b| b.kind == BlockKind::PageLink)
+                    {
                         if let Some(t) = b.link.and_then(|l| ws.page(l)).filter(|t| !t.trashed) {
-                            links.insert(t.id, LinkInfo { icon: t.icon.clone(), title: if t.title.is_empty() { "Untitled".into() } else { t.title.clone() } });
+                            links.insert(
+                                t.id,
+                                LinkInfo {
+                                    icon: t.icon.clone(),
+                                    title: if t.title.is_empty() {
+                                        "Untitled".into()
+                                    } else {
+                                        t.title.clone()
+                                    },
+                                },
+                            );
                         }
                     }
                     {
                         // the page's own blocks are lent to the block renderer so that linked database views can use the whole workspace
-                        let dv_before = ws.pages[idx].blocks.iter().filter(|b| b.kind == BlockKind::DbView).count();
+                        let dv_before = ws.pages[idx]
+                            .blocks
+                            .iter()
+                            .filter(|b| b.kind == BlockKind::DbView)
+                            .count();
                         let shell = ws.pages[idx].shell();
                         let mut page = std::mem::replace(&mut ws.pages[idx], shell);
                         changed |= blocks(ui, &mut page, ws, ed, pal, content_w, &links, &bg);
-                        let dv_after = page.blocks.iter().filter(|b| b.kind == BlockKind::DbView).count();
+                        let dv_after = page
+                            .blocks
+                            .iter()
+                            .filter(|b| b.kind == BlockKind::DbView)
+                            .count();
                         ws.pages[idx] = page;
                         if dv_after < dv_before {
                             ws.prune_linked_views();
@@ -749,7 +1044,10 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
 
     if let Some(bid) = ed.table_to_db.take() {
         if let Some(db) = crate::mdtable::to_database(ws, id, bid) {
-            crate::dashcfg::set_toast(&format!("Table converted to the database “{}”", ws.display_title(db)));
+            crate::dashcfg::set_toast(&format!(
+                "Table converted to the database “{}”",
+                ws.display_title(db)
+            ));
             changed = true;
             ui.ctx().request_repaint();
         }
@@ -768,7 +1066,12 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
     }
     if let Some(bid) = ed.want_board.take() {
         let board = ws.add_canvas(Some(id));
-        if let Some(b) = ws.pages.iter_mut().find(|p| p.id == id).and_then(|p| p.blocks.iter_mut().find(|b| b.id == bid)) {
+        if let Some(b) = ws
+            .pages
+            .iter_mut()
+            .find(|p| p.id == id)
+            .and_then(|p| p.blocks.iter_mut().find(|b| b.id == bid))
+        {
             b.link = Some(board);
         }
         changed = true;
@@ -801,7 +1104,14 @@ pub fn show_page(ui: &mut Ui, ws: &mut Workspace, id: u64, ed: &mut EditorState,
 
 /// Reverse relations: everything (in any database) that points at this row through a Relation property, grouped by database + property.
 /// Open a person and see the tasks assigned to them — relations work in both directions without a second property.
-fn relation_links(ui: &mut Ui, ws: &Workspace, id: u64, ed: &mut EditorState, pal: &Palette, w: f32) {
+fn relation_links(
+    ui: &mut Ui,
+    ws: &Workspace,
+    id: u64,
+    ed: &mut EditorState,
+    pal: &Palette,
+    w: f32,
+) {
     let groups = ws.relation_backlinks(id);
     if groups.is_empty() {
         return;
@@ -809,26 +1119,71 @@ fn relation_links(ui: &mut Ui, ws: &Workspace, id: u64, ed: &mut EditorState, pa
     ui.add_space(10.0);
     for (db, prop, rows) in groups {
         let dbt = ws.display_title(db);
-        let pname = ws.db(db).and_then(|d| d.prop(prop)).map(|p| p.name.clone()).unwrap_or_default();
+        let pname = ws
+            .db(db)
+            .and_then(|d| d.prop(prop))
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
         ui.horizontal(|ui| {
             ui.add_space(gutter());
-            ui.label(RichText::new(format!("{}  ·  {}  ·  {}", dbt.to_uppercase(), pname.to_uppercase(), rows.len())).font(bold(11.5)).color(pal.muted));
+            ui.label(
+                RichText::new(format!(
+                    "{}  ·  {}  ·  {}",
+                    dbt.to_uppercase(),
+                    pname.to_uppercase(),
+                    rows.len()
+                ))
+                .font(bold(11.5))
+                .color(pal.muted),
+            );
         });
         for r in rows.into_iter().take(60) {
             let Some(p) = ws.page(r) else { continue };
             let (rect, resp) = ui.allocate_exact_size(vec2(w + gutter(), 28.0), Sense::click());
-            let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-            let rr = Rect::from_min_max(pos2(rect.left() + gutter() - 6.0, rect.top()), rect.right_bottom());
+            let t = ui
+                .ctx()
+                .animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+            let rr = Rect::from_min_max(
+                pos2(rect.left() + gutter() - 6.0, rect.top()),
+                rect.right_bottom(),
+            );
             ui.painter().rect_filled(rr, 6.0, with_alpha(pal.hover, t));
             let icon = if p.icon.is_empty() { l::TABLE } else { &p.icon };
-            icons::paint_page_icon(ui, pos2(rr.left() + 18.0, rr.center().y), icon, 16.0, pal.text);
-            let title = if p.title.is_empty() { "Untitled" } else { &p.title };
-            ui.painter().text(pos2(rr.left() + 38.0, rr.center().y), Align2::LEFT_CENTER, title, body(14.5), pal.text);
+            icons::paint_page_icon(
+                ui,
+                pos2(rr.left() + 18.0, rr.center().y),
+                icon,
+                16.0,
+                pal.text,
+            );
+            let title = if p.title.is_empty() {
+                "Untitled"
+            } else {
+                &p.title
+            };
+            ui.painter().text(
+                pos2(rr.left() + 38.0, rr.center().y),
+                Align2::LEFT_CENTER,
+                title,
+                body(14.5),
+                pal.text,
+            );
             // the row's status-like value (first select property) as a quiet hint on the right
             if let Some(d) = ws.db(db) {
-                if let Some((pr, Val::Sel(o))) = d.props.iter().find(|x| x.kind == PropKind::Select).and_then(|x| p.props.get(&x.id).map(|v| (x, v))) {
+                if let Some((pr, Val::Sel(o))) = d
+                    .props
+                    .iter()
+                    .find(|x| x.kind == PropKind::Select)
+                    .and_then(|x| p.props.get(&x.id).map(|v| (x, v)))
+                {
                     if let Some(op) = d.opt(pr.id, *o) {
-                        ui.painter().text(pos2(rr.right() - 10.0, rr.center().y), Align2::RIGHT_CENTER, &op.name, body(12.5), pal.muted);
+                        ui.painter().text(
+                            pos2(rr.right() - 10.0, rr.center().y),
+                            Align2::RIGHT_CENTER,
+                            &op.name,
+                            body(12.5),
+                            pal.muted,
+                        );
                     }
                 }
             }
@@ -848,40 +1203,89 @@ fn backlinks(ui: &mut Ui, ws: &Workspace, id: u64, ed: &mut EditorState, pal: &P
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.add_space(gutter());
-        ui.label(RichText::new(format!("LINKED FROM  ·  {}", links.len())).font(bold(11.5)).color(pal.muted));
+        ui.label(
+            RichText::new(format!("LINKED FROM  ·  {}", links.len()))
+                .font(bold(11.5))
+                .color(pal.muted),
+        );
     });
     for l in links {
         let Some(p) = ws.page(l) else { continue };
         let (rect, resp) = ui.allocate_exact_size(vec2(w + gutter(), 28.0), Sense::click());
-        let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-        let r = Rect::from_min_max(pos2(rect.left() + gutter() - 6.0, rect.top()), rect.right_bottom());
+        let t = ui
+            .ctx()
+            .animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+        let r = Rect::from_min_max(
+            pos2(rect.left() + gutter() - 6.0, rect.top()),
+            rect.right_bottom(),
+        );
         ui.painter().rect_filled(r, 6.0, with_alpha(pal.hover, t));
-        let icon = if p.icon.is_empty() { l::FILE_TEXT } else { &p.icon };
-        icons::paint_page_icon(ui, pos2(r.left() + 18.0, r.center().y), icon, 17.0, pal.text);
-        let title = if p.title.is_empty() { "Untitled" } else { &p.title };
-        ui.painter().text(pos2(r.left() + 38.0, r.center().y), Align2::LEFT_CENTER, title, body(14.5), pal.text);
+        let icon = if p.icon.is_empty() {
+            l::FILE_TEXT
+        } else {
+            &p.icon
+        };
+        icons::paint_page_icon(
+            ui,
+            pos2(r.left() + 18.0, r.center().y),
+            icon,
+            17.0,
+            pal.text,
+        );
+        let title = if p.title.is_empty() {
+            "Untitled"
+        } else {
+            &p.title
+        };
+        ui.painter().text(
+            pos2(r.left() + 38.0, r.center().y),
+            Align2::LEFT_CENTER,
+            title,
+            body(14.5),
+            pal.text,
+        );
         if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
             ed.nav = Some(l);
         }
     }
 }
 
-fn header(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, content_w: f32) -> bool {
+fn header(
+    ui: &mut Ui,
+    page: &mut Page,
+    ed: &mut EditorState,
+    pal: &Palette,
+    content_w: f32,
+) -> bool {
     let mut changed = false;
     let has_cover = page.has_cover();
     ui.add_space(if has_cover { 0.0 } else { 40.0 });
 
     let icon_h = 76.0;
-    let (rect, _) = ui.allocate_exact_size(vec2(content_w + gutter(), if has_cover { 44.0 } else { icon_h }), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(
+        vec2(content_w + gutter(), if has_cover { 44.0 } else { icon_h }),
+        Sense::hover(),
+    );
     let hdr_top = rect.top();
     if !page.icon.is_empty() {
         let size = 68.0;
         let top = if has_cover { hdr_top - 34.0 } else { hdr_top };
-        let ir = Rect::from_min_size(pos2(rect.left() + gutter() - 8.0, top), vec2(size + 16.0, size + 8.0));
+        let ir = Rect::from_min_size(
+            pos2(rect.left() + gutter() - 8.0, top),
+            vec2(size + 16.0, size + 8.0),
+        );
         let resp = ui.interact(ir, Id::new(("icon", page.id)), Sense::click());
-        let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+        let t = ui
+            .ctx()
+            .animate_bool_with_time(resp.id, resp.hovered(), 0.12);
         ui.painter().rect_filled(ir, 12.0, with_alpha(pal.hover, t));
-        icons::paint_page_icon(ui, pos2(ir.center().x, ir.center().y + 2.0), &page.icon, 60.0, pal.text);
+        icons::paint_page_icon(
+            ui,
+            pos2(ir.center().x, ir.center().y + 2.0),
+            &page.icon,
+            60.0,
+            pal.text,
+        );
         if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
             ed.icon_picker = Some(ir.left_bottom() + vec2(0.0, 6.0));
             ed.fresh = true;
@@ -890,8 +1294,13 @@ fn header(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, con
 
     let row_h = 30.0;
     let (row, _) = ui.allocate_exact_size(vec2(content_w + gutter(), row_h), Sense::hover());
-    let hov = crate::touch::reveal(ui.rect_contains_pointer(Rect::from_min_max(pos2(row.left(), hdr_top - 10.0), pos2(row.right(), row.bottom() + 56.0))));
-    let t = ui.ctx().animate_bool_with_time(Id::new(("hdr_h", page.id)), hov, 0.15);
+    let hov = crate::touch::reveal(ui.rect_contains_pointer(Rect::from_min_max(
+        pos2(row.left(), hdr_top - 10.0),
+        pos2(row.right(), row.bottom() + 56.0),
+    )));
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(Id::new(("hdr_h", page.id)), hov, 0.15);
     let mut x = row.left() + gutter();
     let mut buttons: Vec<(String, &str)> = vec![];
     if page.icon.is_empty() {
@@ -908,9 +1317,18 @@ fn header(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, con
             continue;
         }
         let resp = ui.interact(r, Id::new((key, page.id)), Sense::click());
-        let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-        ui.painter().rect_filled(r, 6.0, with_alpha(pal.hover, h * t));
-        ui.painter().text(r.center(), Align2::CENTER_CENTER, &label, body(13.0), with_alpha(lerp_color(pal.muted, pal.text, h), t));
+        let h = ui
+            .ctx()
+            .animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+        ui.painter()
+            .rect_filled(r, 6.0, with_alpha(pal.hover, h * t));
+        ui.painter().text(
+            r.center(),
+            Align2::CENTER_CENTER,
+            &label,
+            body(13.0),
+            with_alpha(lerp_color(pal.muted, pal.text, h), t),
+        );
         if resp.clicked() {
             if key == "ai" {
                 page.icon = l::FILE_TEXT.into();
@@ -931,17 +1349,35 @@ fn header(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette, con
         let phone = crate::touch::compact();
         let size = if phone {
             let n = page.title.chars().count();
-            (if n > 48 { 22.0 } else if n > 26 { 26.0 } else { 30.0 }) * ed.scale.max(0.5)
+            (if n > 48 {
+                22.0
+            } else if n > 26 {
+                26.0
+            } else {
+                30.0
+            }) * ed.scale.max(0.5)
         } else {
             40.0 * ed.scale.max(0.5)
         };
-        let w = if phone { (content_w - 4.0).max(80.0) } else { content_w };
-        let edit = if phone { TextEdit::multiline(&mut page.title).desired_rows(1) } else { TextEdit::singleline(&mut page.title) };
+        let w = if phone {
+            (content_w - 4.0).max(80.0)
+        } else {
+            content_w
+        };
+        let edit = if phone {
+            TextEdit::multiline(&mut page.title).desired_rows(1)
+        } else {
+            TextEdit::singleline(&mut page.title)
+        };
         let r = ui.add(
             edit.id(tid)
                 .frame(false)
                 .font(bold(size))
-                .hint_text(RichText::new("Untitled").font(bold(size)).color(with_alpha(pal.muted, 0.55)))
+                .hint_text(
+                    RichText::new("Untitled")
+                        .font(bold(size))
+                        .color(with_alpha(pal.muted, 0.55)),
+                )
                 .desired_width(w)
                 .margin(Margin::symmetric(0, 4)),
         );
@@ -1007,7 +1443,16 @@ fn col_depth(bl: &[Block]) -> Vec<u8> {
     out
 }
 
-fn blocks(ui: &mut Ui, page: &mut Page, ws: &mut Workspace, ed: &mut EditorState, pal: &Palette, w: f32, links: &Links, bg: &egui::Response) -> bool {
+fn blocks(
+    ui: &mut Ui,
+    page: &mut Page,
+    ws: &mut Workspace,
+    ed: &mut EditorState,
+    pal: &Palette,
+    w: f32,
+    links: &Links,
+    bg: &egui::Response,
+) -> bool {
     let origin = ui.cursor().min;
     let n = page.blocks.len();
     let pointer = ui.ctx().pointer_hover_pos();
@@ -1039,9 +1484,30 @@ fn blocks(ui: &mut Ui, page: &mut Page, ws: &mut Workspace, ed: &mut EditorState
         }
     }
 
-    let mut cx = Pass { ws, ed, pal, links, heads, visible, rects: Vec::with_capacity(n), col_rects: vec![], nums: [0; 8], act: None, changed: false, pointer };
+    let mut cx = Pass {
+        ws,
+        ed,
+        pal,
+        links,
+        heads,
+        visible,
+        rects: Vec::with_capacity(n),
+        col_rects: vec![],
+        nums: [0; 8],
+        act: None,
+        changed: false,
+        pointer,
+    };
     draw_range(ui, page, &mut cx, 0, n, 0, w);
-    let Pass { ws, ed, rects, col_rects, mut act, mut changed, .. } = cx;
+    let Pass {
+        ws,
+        ed,
+        rects,
+        col_rects,
+        mut act,
+        mut changed,
+        ..
+    } = cx;
     {
         // outline rail + "current heading" of the table-of-contents blocks
         let o = crate::outline::collect(&page.blocks, &rects, ui.clip_rect());
@@ -1060,9 +1526,15 @@ fn blocks(ui: &mut Ui, page: &mut Page, ws: &mut Workspace, ed: &mut EditorState
                 let clip = ui.clip_rect();
                 let edge = if crate::touch::touchy() { 80.0 } else { 44.0 };
                 if p.y < clip.top() + edge {
-                    ui.scroll_with_delta(vec2(0.0, 5.0 + 15.0 * ((clip.top() + edge - p.y) / edge).clamp(0.0, 1.0)));
+                    ui.scroll_with_delta(vec2(
+                        0.0,
+                        5.0 + 15.0 * ((clip.top() + edge - p.y) / edge).clamp(0.0, 1.0),
+                    ));
                 } else if p.y > clip.bottom() - edge {
-                    ui.scroll_with_delta(vec2(0.0, -5.0 - 15.0 * ((p.y - (clip.bottom() - edge)) / edge).clamp(0.0, 1.0)));
+                    ui.scroll_with_delta(vec2(
+                        0.0,
+                        -5.0 - 15.0 * ((p.y - (clip.bottom() - edge)) / edge).clamp(0.0, 1.0),
+                    ));
                 }
             }
             let bl = &page.blocks;
@@ -1070,29 +1542,58 @@ fn blocks(ui: &mut Ui, page: &mut Page, ws: &mut Workspace, ed: &mut EditorState
             let from_end = subtree_end(bl, from);
             // (target index, line y, line x, line width, indent to adopt)
             let mut drop: Option<(usize, f32, f32, f32, Option<u8>)> = None;
-            let into = col_rects.iter().find(|(c, r)| r.contains(p) && bl[from].kind != BlockKind::Columns && !(*c >= from && *c < from_end)).copied();
+            let into = col_rects
+                .iter()
+                .find(|(c, r)| {
+                    r.contains(p)
+                        && bl[from].kind != BlockKind::Columns
+                        && !(*c >= from && *c < from_end)
+                })
+                .copied();
             if let Some((c, cr)) = into {
                 let end = subtree_end(bl, c);
-                let inside: Vec<&(usize, Rect)> = rects.iter().filter(|(i, _)| *i > c && *i < end).collect();
+                let inside: Vec<&(usize, Rect)> =
+                    rects.iter().filter(|(i, _)| *i > c && *i < end).collect();
                 let slot = inside.iter().find(|(_, r)| p.y < r.center().y);
                 let (target, y, ind) = match slot {
                     Some((i, r)) => (*i, r.top() - 1.0, bl[*i].indent),
-                    None => (end, inside.last().map_or(cr.top(), |(_, r)| r.bottom()) + 1.0, bl[c].indent + 1),
+                    None => (
+                        end,
+                        inside.last().map_or(cr.top(), |(_, r)| r.bottom()) + 1.0,
+                        bl[c].indent + 1,
+                    ),
                 };
-                drop = Some((target, y, cr.left() + gutter(), (cr.width() - gutter()).max(40.0), Some(ind)));
+                drop = Some((
+                    target,
+                    y,
+                    cr.left() + gutter(),
+                    (cr.width() - gutter()).max(40.0),
+                    Some(ind),
+                ));
             } else {
-                let cands: Vec<&(usize, Rect)> = rects.iter().filter(|(i, _)| depth[*i] == 0).collect();
+                let cands: Vec<&(usize, Rect)> =
+                    rects.iter().filter(|(i, _)| depth[*i] == 0).collect();
                 if let (Some(first), Some(last)) = (cands.first(), cands.last()) {
                     let (target, y) = match cands.iter().find(|(_, r)| p.y < r.center().y) {
                         Some((i, r)) => (*i, r.top() - 1.0),
                         None => (n, last.1.bottom() + 1.0),
                     };
                     let ind = if target < n { bl[target].indent } else { 0 };
-                    drop = Some((target, y, first.1.left() + gutter(), w, if depth[from] > 0 { Some(ind) } else { None }));
+                    drop = Some((
+                        target,
+                        y,
+                        first.1.left() + gutter(),
+                        w,
+                        if depth[from] > 0 { Some(ind) } else { None },
+                    ));
                 }
             }
             if let Some((target, y, x0, lw, ind)) = drop {
-                ui.painter().rect_filled(Rect::from_min_size(pos2(x0, y - 1.5), vec2(lw, 3.0)), 2.0, pal.accent);
+                ui.painter().rect_filled(
+                    Rect::from_min_size(pos2(x0, y - 1.5), vec2(lw, 3.0)),
+                    2.0,
+                    pal.accent,
+                );
                 if !ui.input(|i| i.pointer.primary_down()) {
                     act = Some(match ind {
                         Some(ind) => Act::MoveAs(from, target, ind),
@@ -1114,8 +1615,16 @@ fn blocks(ui: &mut Ui, page: &mut Page, ws: &mut Workspace, ed: &mut EditorState
     // click below the last block to append
     let (rest, _) = ui.allocate_exact_size(vec2(w + gutter(), 150.0), Sense::hover());
     let tail_hover = ui.rect_contains_pointer(rest);
-    let t = ui.ctx().animate_bool_with_time(Id::new(("tail", page.id)), tail_hover, 0.15);
-    ui.painter().text(pos2(rest.left() + gutter(), rest.top() + 16.0), Align2::LEFT_CENTER, "Click to add a block", body(14.0), with_alpha(pal.muted, t * 0.8));
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(Id::new(("tail", page.id)), tail_hover, 0.15);
+    ui.painter().text(
+        pos2(rest.left() + gutter(), rest.top() + 16.0),
+        Align2::LEFT_CENTER,
+        "Click to add a block",
+        body(14.0),
+        with_alpha(pal.muted, t * 0.8),
+    );
     if bg.clicked() && tail_hover && n > 0 {
         let last = &page.blocks[n - 1];
         if last.kind == BlockKind::Text && last.text.is_empty() {
@@ -1160,7 +1669,15 @@ fn blocks(ui: &mut Ui, page: &mut Page, ws: &mut Workspace, ed: &mut EditorState
 
 /// Draws the blocks `from..to` of the page. `base` is the indent of the first nesting level (2 levels deeper inside every column).
 #[allow(clippy::too_many_arguments)]
-fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usize, base: u8, w: f32) {
+fn draw_range(
+    ui: &mut Ui,
+    page: &mut Page,
+    cx: &mut Pass,
+    from: usize,
+    to: usize,
+    base: u8,
+    w: f32,
+) {
     let pal = cx.pal;
     let n = page.blocks.len();
     let mut i = from;
@@ -1189,7 +1706,9 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
                 BlockKind::H1 => 18.0,
                 BlockKind::H2 => 12.0,
                 BlockKind::H3 => 8.0,
-                BlockKind::Callout | BlockKind::Code | BlockKind::Quote | BlockKind::Equation => 6.0,
+                BlockKind::Callout | BlockKind::Code | BlockKind::Quote | BlockKind::Equation => {
+                    6.0
+                }
                 BlockKind::Columns | BlockKind::DbView | BlockKind::Widget => 8.0,
                 _ => 1.0,
             });
@@ -1207,7 +1726,21 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
             use std::hash::{Hash, Hasher};
             let b = &page.blocks[cur];
             let mut h = std::collections::hash_map::DefaultHasher::new();
-            (b.kind as u8, &b.text, b.indent, b.collapsed, b.checked, w.to_bits(), cx.ed.scale.to_bits(), cx.heads.len(), b.bg, b.size, b.url.len(), b.media).hash(&mut h);
+            (
+                b.kind as u8,
+                &b.text,
+                b.indent,
+                b.collapsed,
+                b.checked,
+                w.to_bits(),
+                cx.ed.scale.to_bits(),
+                cx.heads.len(),
+                b.bg,
+                b.size,
+                b.url.len(),
+                b.media,
+            )
+                .hash(&mut h);
             h.finish()
         };
         if cx.ed.dragging.is_none()
@@ -1225,7 +1758,19 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
                     cx.rects.push((cur, r));
                     continue;
                 }
-            } else if n > 400 && top > clip.bottom() + 1600.0 && matches!(kind, BlockKind::Text | BlockKind::Bullet | BlockKind::Numbered | BlockKind::Todo | BlockKind::H1 | BlockKind::H2 | BlockKind::H3) {
+            } else if n > 400
+                && top > clip.bottom() + 1600.0
+                && matches!(
+                    kind,
+                    BlockKind::Text
+                        | BlockKind::Bullet
+                        | BlockKind::Numbered
+                        | BlockKind::Todo
+                        | BlockKind::H1
+                        | BlockKind::H2
+                        | BlockKind::H3
+                )
+            {
                 // Large page, block never laid out and far below the screen: reserve an estimate instead of laying out thousands of
                 // blocks in the first frames (the real height is measured when the block scrolls near the viewport).
                 let est = (cx.ed.scale.max(0.5) * 26.0).max(20.0);
@@ -1241,9 +1786,17 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
             ui.vertical(|ui| {
                 ui.set_width(w - ind_px);
                 if kind == BlockKind::DbView {
-                    cx.changed |= draw_dbview(ui, cx.ws, &mut page.blocks[cur], cx.ed, pal, w - ind_px);
+                    cx.changed |=
+                        draw_dbview(ui, cx.ws, &mut page.blocks[cur], cx.ed, pal, w - ind_px);
                 } else if kind == BlockKind::Whiteboard {
-                    let o = crate::whiteboard::block(ui, cx.ws, cx.ed.cur_page, &mut page.blocks[cur], pal, w - ind_px);
+                    let o = crate::whiteboard::block(
+                        ui,
+                        cx.ws,
+                        cx.ed.cur_page,
+                        &mut page.blocks[cur],
+                        pal,
+                        w - ind_px,
+                    );
                     cx.changed |= o.changed;
                     if o.create {
                         cx.ed.want_board = Some(bid);
@@ -1264,7 +1817,19 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
                         crate::dashcfg::set_toast(&t);
                     }
                 } else {
-                    cx.changed |= draw_block(ui, &mut page.blocks[cur], cur, n, num, cx.ed, pal, w - ind_px, &mut cx.act, &cx.heads, cx.links);
+                    cx.changed |= draw_block(
+                        ui,
+                        &mut page.blocks[cur],
+                        cur,
+                        n,
+                        num,
+                        cx.ed,
+                        pal,
+                        w - ind_px,
+                        &mut cx.act,
+                        &cx.heads,
+                        cx.links,
+                    );
                 }
             });
         });
@@ -1283,23 +1848,43 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
             }
         }
         let bgc = page.blocks[cur].bg;
-        if bgc > 0 && !matches!(kind, BlockKind::Divider | BlockKind::Callout | BlockKind::Code | BlockKind::Equation) {
-            let r = Rect::from_min_max(pos2(rect.left() + gutter() + ind_px - 6.0, rect.top()), pos2(rect.right() + 4.0, rect.bottom()));
-            ui.painter().set(bg_slot, Shape::rect_filled(r, 4.0, tag_color(bgc as usize - 1).gamma_multiply(0.16)));
+        if bgc > 0
+            && !matches!(
+                kind,
+                BlockKind::Divider | BlockKind::Callout | BlockKind::Code | BlockKind::Equation
+            )
+        {
+            let r = Rect::from_min_max(
+                pos2(rect.left() + gutter() + ind_px - 6.0, rect.top()),
+                pos2(rect.right() + 4.0, rect.bottom()),
+            );
+            ui.painter().set(
+                bg_slot,
+                Shape::rect_filled(r, 4.0, tag_color(bgc as usize - 1).gamma_multiply(0.16)),
+            );
         }
         if cx.ed.scroll_to == Some(bid) {
             // leave a little air above the heading (Notion lands a heading ~ 1 line below the top edge)
-            ui.scroll_to_rect(Rect::from_min_max(pos2(rect.left(), rect.top() - 20.0), rect.right_bottom()), Some(Align::TOP));
+            ui.scroll_to_rect(
+                Rect::from_min_max(pos2(rect.left(), rect.top() - 20.0), rect.right_bottom()),
+                Some(Align::TOP),
+            );
             cx.ed.scroll_to = None;
         }
 
         // gutter controls
-        let hover_zone = Rect::from_min_max(pos2(rect.left(), rect.top() - 1.0), pos2(rect.right(), rect.bottom() + 1.0));
-        let hovering = cx.pointer.map_or(false, |p| hover_zone.contains(p)) && cx.ed.dragging.is_none()
+        let hover_zone = Rect::from_min_max(
+            pos2(rect.left(), rect.top() - 1.0),
+            pos2(rect.right(), rect.bottom() + 1.0),
+        );
+        let hovering = cx.pointer.map_or(false, |p| hover_zone.contains(p))
+            && cx.ed.dragging.is_none()
             || cx.ed.dragging == Some(bid)
             || cx.ed.block_menu.map_or(false, |(b, _)| b == bid)
             || (crate::touch::touchy() && cx.ed.active == Some(bid) && cx.ed.sel.is_empty());
-        let t = ui.ctx().animate_bool_with_time(Id::new(("gutter", bid)), hovering, 0.12);
+        let t = ui
+            .ctx()
+            .animate_bool_with_time(Id::new(("gutter", bid)), hovering, 0.12);
         if t > 0.02 {
             let y = rect.top()
                 + match kind {
@@ -1313,11 +1898,20 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
             let tiny = crate::touch::compact();
             let (plus, grip) = if tiny {
                 // phones: one big handle (the "+" lives in the toolbar above the keyboard)
-                (Rect::from_min_size(pos2(rect.left() + 1.0, y - 5.0), vec2(0.0, 0.0)), Rect::from_min_size(pos2(rect.left() + 1.0, y - 5.0), vec2(34.0, 34.0)))
+                (
+                    Rect::from_min_size(pos2(rect.left() + 1.0, y - 5.0), vec2(0.0, 0.0)),
+                    Rect::from_min_size(pos2(rect.left() + 1.0, y - 5.0), vec2(34.0, 34.0)),
+                )
             } else if crate::touch::touchy() {
-                (Rect::from_min_size(pos2(rect.left() + 3.0, y - 4.0), vec2(26.0, 32.0)), Rect::from_min_size(pos2(rect.left() + 29.0, y - 4.0), vec2(26.0, 32.0)))
+                (
+                    Rect::from_min_size(pos2(rect.left() + 3.0, y - 4.0), vec2(26.0, 32.0)),
+                    Rect::from_min_size(pos2(rect.left() + 29.0, y - 4.0), vec2(26.0, 32.0)),
+                )
             } else {
-                (Rect::from_min_size(pos2(rect.left() + 6.0, y), vec2(22.0, 24.0)), Rect::from_min_size(pos2(rect.left() + 29.0, y), vec2(20.0, 24.0)))
+                (
+                    Rect::from_min_size(pos2(rect.left() + 6.0, y), vec2(22.0, 24.0)),
+                    Rect::from_min_size(pos2(rect.left() + 29.0, y), vec2(20.0, 24.0)),
+                )
             };
             let pr = ui.interact(plus, Id::new(("plus", bid)), Sense::click());
             let gr = ui.interact(grip, Id::new(("grip", bid)), Sense::click_and_drag());
@@ -1326,11 +1920,27 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
                 if tiny && icon == Icon::Plus {
                     continue;
                 }
-                let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || resp.is_pointer_button_down_on(), 0.1);
-                ui.painter().rect_filled(r, 5.0, with_alpha(pal.hover, h * t));
-                icons::paint(ui.painter(), r.center(), if tiny { 18.0 } else { 15.0 }, icon, with_alpha(lerp_color(pal.muted, pal.text, h), t));
+                let h = ui.ctx().animate_bool_with_time(
+                    resp.id,
+                    resp.hovered() || resp.is_pointer_button_down_on(),
+                    0.1,
+                );
+                ui.painter()
+                    .rect_filled(r, 5.0, with_alpha(pal.hover, h * t));
+                icons::paint(
+                    ui.painter(),
+                    r.center(),
+                    if tiny { 18.0 } else { 15.0 },
+                    icon,
+                    with_alpha(lerp_color(pal.muted, pal.text, h), t),
+                );
             }
-            if !tiny && pr.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Click to add a block below").clicked() {
+            if !tiny
+                && pr
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text("Click to add a block below")
+                    .clicked()
+            {
                 cx.act = Some(Act::InsertAfter(cur, BlockKind::Text, "/".into()));
             }
             if gr.drag_started() {
@@ -1350,7 +1960,11 @@ fn draw_range(ui: &mut Ui, page: &mut Page, cx: &mut Pass, from: usize, to: usiz
                 }
             }
             if gr.hovered() || gr.dragged() {
-                ui.ctx().set_cursor_icon(if gr.dragged() { CursorIcon::Grabbing } else { CursorIcon::Grab });
+                ui.ctx().set_cursor_icon(if gr.dragged() {
+                    CursorIcon::Grabbing
+                } else {
+                    CursorIcon::Grab
+                });
             }
         }
     }
@@ -1386,13 +2000,95 @@ fn sibling_target(bl: &[Block], i: usize, up: bool) -> Option<usize> {
 
 /// Phone / tablet editing toolbar: a strip above the keyboard (add, block type, indent, move, duplicate, undo, delete, hide keyboard)
 /// plus the block-type bottom sheet. It scrolls sideways, so it can never run off a narrow screen.
+/// Checks whether the caret in `text` is sitting right before a closing `mark` (active stateful typing mode).
+fn caret_inside_mark(text: &str, caret_char: usize, mark: &str) -> bool {
+    let mlen = mark.chars().count();
+    let chars: Vec<char> = text.chars().collect();
+    if caret_char + mlen > chars.len() {
+        return false;
+    }
+    let after: String = chars[caret_char..caret_char + mlen].iter().collect();
+    if after != mark {
+        return false;
+    }
+    // Also ensure there is a matching opening mark before the caret on the same line
+    let before: String = chars[..caret_char].iter().collect();
+    before.contains(mark)
+}
+
+/// Applies inline formatting from the mobile keyboard toolbar:
+/// - With a selection: wraps/unwraps the selected text with `mark`.
+/// - Without a selection (caret only): toggles stateful typing mode by inserting `mark..mark` and placing the
+///   caret inside (when turning ON), or jumping the caret past the closing `mark` (when turning OFF).
+fn apply_mobile_format(
+    ctx: &egui::Context,
+    page: &mut Page,
+    ed: &mut EditorState,
+    idx: usize,
+    mark: &str,
+) {
+    let Some(blk) = page.blocks.get_mut(idx) else {
+        return;
+    };
+    let bid = blk.id;
+    let edit_id = Id::new(("blk", bid));
+    let chars: Vec<char> = blk.text.chars().collect();
+    let (a, b) = egui::TextEdit::load_state(ctx, edit_id)
+        .and_then(|st| st.cursor.char_range())
+        .map(|r| {
+            let i0 = r.primary.index.min(r.secondary.index).min(chars.len());
+            let i1 = r.primary.index.max(r.secondary.index).min(chars.len());
+            (i0, i1)
+        })
+        .unwrap_or((chars.len(), chars.len()));
+
+    let mlen = mark.chars().count();
+    let new_caret = if a < b {
+        // Wrap or unwrap selection
+        let before: String = chars[..a].iter().collect();
+        let mid: String = chars[a..b].iter().collect();
+        let after: String = chars[b..].iter().collect();
+        if before.ends_with(mark) && after.starts_with(mark) {
+            let b_trim = &before[..before.len() - mark.len()];
+            let a_trim = &after[mark.len()..];
+            blk.text = format!("{b_trim}{mid}{a_trim}");
+            b.saturating_sub(mlen)
+        } else {
+            blk.text = format!("{before}{mark}{mid}{mark}{after}");
+            b + mlen
+        }
+    } else if caret_inside_mark(&blk.text, a, mark) {
+        // Turn OFF stateful formatting: step cursor past the closing marker
+        (a + mlen).min(chars.len())
+    } else {
+        // Turn ON stateful formatting: insert opening + closing markers and place caret in between
+        let before: String = chars[..a].iter().collect();
+        let after: String = chars[a..].iter().collect();
+        blk.text = format!("{before}{mark}{mark}{after}");
+        a + mlen
+    };
+    ed.focus = Some((bid, new_caret));
+    ed.restore_sel = Some((bid, new_caret, new_caret));
+    let mut st = egui::TextEdit::load_state(ctx, edit_id).unwrap_or_default();
+    st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+        egui::text::CCursor::new(new_caret),
+    )));
+    st.store(ctx, edit_id);
+    ctx.memory_mut(|m| m.request_focus(edit_id));
+}
+
 fn mobile_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) -> Option<Act> {
     if !crate::touch::touchy() {
         return None;
     }
     let ctx = ui.ctx().clone();
     let bid = ed.active?;
-    if !ed.sel.is_empty() || ed.marquee.is_some() || ed.dragging.is_some() || ed.menu.is_some() || ed.block_menu.is_some() {
+    if !ed.sel.is_empty()
+        || ed.marquee.is_some()
+        || ed.dragging.is_some()
+        || ed.menu.is_some()
+        || ed.block_menu.is_some()
+    {
         return None;
     }
     let idx = page.blocks.iter().position(|b| b.id == bid)?;
@@ -1411,57 +2107,229 @@ fn mobile_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette)
     let bar_h = 48.0;
     let mut out: Option<Act> = None;
     let mut dismiss = false;
-    let (can_up, can_down) = (sibling_target(&page.blocks, idx, true).is_some(), sibling_target(&page.blocks, idx, false).is_some());
+    let (can_up, can_down) = (
+        sibling_target(&page.blocks, idx, true).is_some(),
+        sibling_target(&page.blocks, idx, false).is_some(),
+    );
     let can_undo = ed.undo.iter().any(|(p, _)| *p == page.id);
     let mut menu = ed.tool_menu;
 
-    let bar = egui::Area::new(Id::new("mobile_bar")).order(Order::Foreground).fixed_pos(pos2(screen.left(), screen.bottom() - bar_h)).show(&ctx, |ui| {
-        Frame::new().fill(pal.popup).stroke(Stroke::new(1.0_f32, pal.border)).show(ui, |ui| {
-            ui.set_width(screen.width() - 2.0);
-            ui.set_height(bar_h - 2.0);
-            ScrollArea::horizontal().id_salt("mobile_bar_scroll").scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
-                    ui.add_space(4.0);
-                    if widgets::icon_button(ui, pal, Icon::Plus, 18.0, "Insert a block below").clicked() {
-                        menu = if menu == 2 { 0 } else { 2 };
-                    }
-                    if widgets::icon_button(ui, pal, Icon::Type, 18.0, "Turn into").clicked() {
-                        menu = if menu == 1 { 0 } else { 1 };
-                    }
-                    ui.add_space(6.0);
-                    if widgets::icon_button(ui, pal, Icon::Outdent, 18.0, "Outdent").clicked() {
-                        out = Some(Act::Indent(idx, -1));
-                    }
-                    if widgets::icon_button(ui, pal, Icon::Indent, 18.0, "Indent").clicked() {
-                        out = Some(Act::Indent(idx, 1));
-                    }
-                    ui.add_space(6.0);
-                    if ui.add_enabled_ui(can_up, |ui| widgets::icon_button(ui, pal, Icon::MoveUp, 18.0, "Move up")).inner.clicked() {
-                        out = sibling_target(&page.blocks, idx, true).map(|t| Act::MoveTo(idx, t));
-                    }
-                    if ui.add_enabled_ui(can_down, |ui| widgets::icon_button(ui, pal, Icon::MoveDown, 18.0, "Move down")).inner.clicked() {
-                        out = sibling_target(&page.blocks, idx, false).map(|t| Act::MoveTo(idx, t));
-                    }
-                    ui.add_space(6.0);
-                    if widgets::icon_button(ui, pal, Icon::Duplicate, 18.0, "Duplicate").clicked() {
-                        out = Some(Act::Dup(idx));
-                    }
-                    if ui.add_enabled_ui(can_undo, |ui| widgets::icon_button(ui, pal, Icon::Undo, 18.0, "Undo")).inner.clicked() {
-                        ed.want_undo = true;
-                    }
-                    if widgets::icon_button(ui, pal, Icon::Trash, 18.0, "Delete block").clicked() {
-                        out = Some(Act::Remove(idx));
-                    }
-                    ui.add_space(6.0);
-                    if widgets::icon_button(ui, pal, Icon::ChevronDown, 18.0, "Hide keyboard").clicked() {
-                        dismiss = true;
-                    }
-                    ui.add_space(4.0);
+    let bar = egui::Area::new(Id::new("mobile_bar"))
+        .order(Order::Foreground)
+        .fixed_pos(pos2(screen.left(), screen.bottom() - bar_h))
+        .show(&ctx, |ui| {
+            Frame::new()
+                .fill(pal.popup)
+                .stroke(Stroke::new(1.0_f32, pal.border))
+                .show(ui, |ui| {
+                    ui.set_width(screen.width() - 2.0);
+                    ui.set_height(bar_h - 2.0);
+                    ScrollArea::horizontal()
+                        .id_salt("mobile_bar_scroll")
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .show(ui, |ui| {
+                            ui.horizontal_centered(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
+                                ui.add_space(4.0);
+                                if ed.mobile_fmt_mode {
+                                    // Format sub-mode: [← Back] + stateful inline formatting toggles
+                                    if widgets::icon_button(
+                                        ui,
+                                        pal,
+                                        Icon::ChevronLeft,
+                                        18.0,
+                                        "Back to block toolbar",
+                                    )
+                                    .clicked()
+                                    {
+                                        ed.mobile_fmt_mode = false;
+                                    }
+                                    ui.add_space(4.0);
+                                    let edit_id = Id::new(("blk", bid));
+                                    let caret = egui::TextEdit::load_state(&ctx, edit_id)
+                                        .and_then(|st| st.cursor.char_range())
+                                        .map(|r| r.primary.index)
+                                        .unwrap_or_else(|| page.blocks[idx].text.chars().count());
+                                    let mut picked_mark: Option<&'static str> = None;
+                                    for (icon, mark, tip) in [
+                                        (Icon::Bold, "**", "Bold (toggle active typing)"),
+                                        (Icon::Italic, "*", "Italic (toggle active typing)"),
+                                        (Icon::Underline, "__", "Underline (toggle active typing)"),
+                                        (
+                                            Icon::Strike,
+                                            "~~",
+                                            "Strikethrough (toggle active typing)",
+                                        ),
+                                        (Icon::Code, "`", "Inline code (toggle active typing)"),
+                                        (Icon::Highlight, "==", "Highlight (toggle active typing)"),
+                                    ] {
+                                        let active =
+                                            caret_inside_mark(&page.blocks[idx].text, caret, mark);
+                                        let r = widgets::icon_button(ui, pal, icon, 18.0, tip);
+                                        if active {
+                                            ui.painter().rect_filled(
+                                                r.rect.shrink2(vec2(1.0, 3.0)),
+                                                6.0,
+                                                with_alpha(pal.accent, 0.22),
+                                            );
+                                            ui.painter().hline(
+                                                r.rect.x_range().shrink(7.0),
+                                                r.rect.bottom() - 4.0,
+                                                Stroke::new(2.0_f32, pal.accent),
+                                            );
+                                        }
+                                        if r.clicked() {
+                                            picked_mark = Some(mark);
+                                        }
+                                    }
+                                    if let Some(mark) = picked_mark {
+                                        apply_mobile_format(&ctx, page, ed, idx, mark);
+                                    }
+                                    ui.add_space(6.0);
+                                    if widgets::icon_button(
+                                        ui,
+                                        pal,
+                                        Icon::ChevronDown,
+                                        18.0,
+                                        "Hide keyboard",
+                                    )
+                                    .clicked()
+                                    {
+                                        dismiss = true;
+                                    }
+                                    ui.add_space(4.0);
+                                } else {
+                                    if widgets::icon_button(
+                                        ui,
+                                        pal,
+                                        Icon::Plus,
+                                        18.0,
+                                        "Insert a block below",
+                                    )
+                                    .clicked()
+                                    {
+                                        menu = if menu == 2 { 0 } else { 2 };
+                                    }
+                                    if widgets::icon_button(ui, pal, Icon::Type, 18.0, "Turn into")
+                                        .clicked()
+                                    {
+                                        menu = if menu == 1 { 0 } else { 1 };
+                                    }
+                                    // `Aa` Format sub-mode button
+                                    let (fr, frs) =
+                                        ui.allocate_exact_size(vec2(38.0, 36.0), Sense::click());
+                                    if frs.hovered() {
+                                        ui.painter().rect_filled(fr, 7.0, pal.hover);
+                                    }
+                                    ui.painter().text(
+                                        fr.center(),
+                                        Align2::CENTER_CENTER,
+                                        "Aa",
+                                        bold(14.5),
+                                        pal.text,
+                                    );
+                                    if frs
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .on_hover_text("Text formatting (Bold, Italic, Highlight…)")
+                                        .clicked()
+                                    {
+                                        menu = 0;
+                                        ed.mobile_fmt_mode = true;
+                                    }
+                                    ui.add_space(4.0);
+                                    if widgets::icon_button(ui, pal, Icon::Outdent, 18.0, "Outdent")
+                                        .clicked()
+                                    {
+                                        out = Some(Act::Indent(idx, -1));
+                                    }
+                                    if widgets::icon_button(ui, pal, Icon::Indent, 18.0, "Indent")
+                                        .clicked()
+                                    {
+                                        out = Some(Act::Indent(idx, 1));
+                                    }
+                                    ui.add_space(4.0);
+                                    if ui
+                                        .add_enabled_ui(can_up, |ui| {
+                                            widgets::icon_button(
+                                                ui,
+                                                pal,
+                                                Icon::MoveUp,
+                                                18.0,
+                                                "Move up",
+                                            )
+                                        })
+                                        .inner
+                                        .clicked()
+                                    {
+                                        out = sibling_target(&page.blocks, idx, true)
+                                            .map(|t| Act::MoveTo(idx, t));
+                                    }
+                                    if ui
+                                        .add_enabled_ui(can_down, |ui| {
+                                            widgets::icon_button(
+                                                ui,
+                                                pal,
+                                                Icon::MoveDown,
+                                                18.0,
+                                                "Move down",
+                                            )
+                                        })
+                                        .inner
+                                        .clicked()
+                                    {
+                                        out = sibling_target(&page.blocks, idx, false)
+                                            .map(|t| Act::MoveTo(idx, t));
+                                    }
+                                    ui.add_space(4.0);
+                                    if widgets::icon_button(
+                                        ui,
+                                        pal,
+                                        Icon::Duplicate,
+                                        18.0,
+                                        "Duplicate",
+                                    )
+                                    .clicked()
+                                    {
+                                        out = Some(Act::Dup(idx));
+                                    }
+                                    if ui
+                                        .add_enabled_ui(can_undo, |ui| {
+                                            widgets::icon_button(ui, pal, Icon::Undo, 18.0, "Undo")
+                                        })
+                                        .inner
+                                        .clicked()
+                                    {
+                                        ed.want_undo = true;
+                                    }
+                                    if widgets::icon_button(
+                                        ui,
+                                        pal,
+                                        Icon::Trash,
+                                        18.0,
+                                        "Delete block",
+                                    )
+                                    .clicked()
+                                    {
+                                        out = Some(Act::Remove(idx));
+                                    }
+                                    ui.add_space(4.0);
+                                    if widgets::icon_button(
+                                        ui,
+                                        pal,
+                                        Icon::ChevronDown,
+                                        18.0,
+                                        "Hide keyboard",
+                                    )
+                                    .clicked()
+                                    {
+                                        dismiss = true;
+                                    }
+                                    ui.add_space(4.0);
+                                }
+                            });
+                        });
                 });
-            });
         });
-    });
     ctx.raise_layer(bar.response.layer_id);
     let mut covered = bar.response.rect;
 
@@ -1469,45 +2337,83 @@ fn mobile_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette)
         let cur_kind = page.blocks[idx].kind;
         let w = (screen.width() - 16.0).min(520.0);
         let max_h = (screen.height() * 0.5).clamp(160.0, 380.0);
-        let sheet = egui::Area::new(Id::new("mobile_sheet")).order(Order::Foreground).anchor(Align2::CENTER_BOTTOM, vec2(0.0, -(bar_h + 6.0))).show(&ctx, |ui| {
-            widgets::popup_frame(pal).show(ui, |ui| {
-                ui.set_width(w - 12.0);
-                ui.horizontal(|ui| {
-                    for (m, label) in [(1u8, "Turn into"), (2u8, "Insert below")] {
-                        let on = menu == m;
-                        let (r, resp) = ui.allocate_exact_size(vec2((w - 16.0) / 2.0, 36.0), Sense::click());
-                        ui.painter().rect_filled(r, 8.0, if on { pal.active } else { pal.hover.gamma_multiply(0.0) });
-                        ui.painter().text(r.center(), Align2::CENTER_CENTER, label, bold(13.5), if on { pal.text } else { pal.muted });
-                        if resp.clicked() {
-                            menu = m;
-                        }
-                    }
-                });
-                ui.add_space(4.0);
-                ScrollArea::vertical().id_salt("mobile_sheet_scroll").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
-                    if menu == 1 {
-                        for k in BlockKind::TEXTY.iter().copied().chain(std::iter::once(BlockKind::Divider)) {
-                            if menu_item(ui, pal, k.glyph(), k.label(), None, k == cur_kind, false).clicked() {
-                                out = Some(Act::Convert(idx, k, false));
-                                menu = 0;
+        let sheet = egui::Area::new(Id::new("mobile_sheet"))
+            .order(Order::Foreground)
+            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -(bar_h + 6.0)))
+            .show(&ctx, |ui| {
+                widgets::popup_frame(pal).show(ui, |ui| {
+                    ui.set_width(w - 12.0);
+                    ui.horizontal(|ui| {
+                        for (m, label) in [(1u8, "Turn into"), (2u8, "Insert below")] {
+                            let on = menu == m;
+                            let (r, resp) = ui
+                                .allocate_exact_size(vec2((w - 16.0) / 2.0, 36.0), Sense::click());
+                            ui.painter().rect_filled(
+                                r,
+                                8.0,
+                                if on {
+                                    pal.active
+                                } else {
+                                    pal.hover.gamma_multiply(0.0)
+                                },
+                            );
+                            ui.painter().text(
+                                r.center(),
+                                Align2::CENTER_CENTER,
+                                label,
+                                bold(13.5),
+                                if on { pal.text } else { pal.muted },
+                            );
+                            if resp.clicked() {
+                                menu = m;
                             }
                         }
-                    } else {
-                        let mut sec = "";
-                        for it in slash_all() {
-                            if it.sec != sec {
-                                sec = it.sec;
-                                section_label(ui, pal, sec);
+                    });
+                    ui.add_space(4.0);
+                    ScrollArea::vertical()
+                        .id_salt("mobile_sheet_scroll")
+                        .max_height(max_h)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            if menu == 1 {
+                                for k in BlockKind::TEXTY
+                                    .iter()
+                                    .copied()
+                                    .chain(std::iter::once(BlockKind::Divider))
+                                {
+                                    if menu_item(
+                                        ui,
+                                        pal,
+                                        k.glyph(),
+                                        k.label(),
+                                        None,
+                                        k == cur_kind,
+                                        false,
+                                    )
+                                    .clicked()
+                                    {
+                                        out = Some(Act::Convert(idx, k, false));
+                                        menu = 0;
+                                    }
+                                }
+                            } else {
+                                let mut sec = "";
+                                for it in slash_all() {
+                                    if it.sec != sec {
+                                        sec = it.sec;
+                                        section_label(ui, pal, sec);
+                                    }
+                                    if menu_item(ui, pal, it.glyph, it.label, None, false, false)
+                                        .clicked()
+                                    {
+                                        out = Some(Act::InsertSlash(idx, it));
+                                        menu = 0;
+                                    }
+                                }
                             }
-                            if menu_item(ui, pal, it.glyph, it.label, None, false, false).clicked() {
-                                out = Some(Act::InsertSlash(idx, it));
-                                menu = 0;
-                            }
-                        }
-                    }
+                        });
                 });
             });
-        });
         ctx.raise_layer(sheet.response.layer_id);
         covered = covered.union(sheet.response.rect);
         // a tap outside the sheet and the toolbar closes it
@@ -1534,7 +2440,15 @@ fn mobile_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette)
 
 /// Draws one column layout (the `Columns` block `i` and its `Column` children up to `end`) side by side.
 /// Every column owns a gutter on its left, so each block keeps its "+" / drag handle; columns stack on narrow screens.
-fn draw_columns(ui: &mut Ui, page: &mut Page, cx: &mut Pass, i: usize, end: usize, base: u8, w: f32) {
+fn draw_columns(
+    ui: &mut Ui,
+    page: &mut Page,
+    cx: &mut Pass,
+    i: usize,
+    end: usize,
+    base: u8,
+    w: f32,
+) {
     let pal = cx.pal;
     let k = page.blocks[i].indent;
     let ind_px = k.saturating_sub(base) as f32 * INDENT;
@@ -1557,8 +2471,28 @@ fn draw_columns(ui: &mut Ui, page: &mut Page, cx: &mut Pass, i: usize, end: usiz
     let cw_all = total - gutter() * m as f32;
     let stacked = (cw_all / m as f32) < 150.0;
     // widths (permille weights; 0 = equal share)
-    let wsum: f32 = cols.iter().map(|(c, _)| if page.blocks[*c].start == 0 { 1000.0 / m as f32 } else { page.blocks[*c].start as f32 }).sum::<f32>().max(1.0);
-    let widths: Vec<f32> = cols.iter().map(|(c, _)| (if page.blocks[*c].start == 0 { 1000.0 / m as f32 } else { page.blocks[*c].start as f32 }) / wsum * cw_all).collect();
+    let wsum: f32 = cols
+        .iter()
+        .map(|(c, _)| {
+            if page.blocks[*c].start == 0 {
+                1000.0 / m as f32
+            } else {
+                page.blocks[*c].start as f32
+            }
+        })
+        .sum::<f32>()
+        .max(1.0);
+    let widths: Vec<f32> = cols
+        .iter()
+        .map(|(c, _)| {
+            (if page.blocks[*c].start == 0 {
+                1000.0 / m as f32
+            } else {
+                page.blocks[*c].start as f32
+            }) / wsum
+                * cw_all
+        })
+        .collect();
     let first_col_idx = cx.col_rects.len();
     let mut rights: Vec<f32> = vec![];
     let row = ui.horizontal_top(|ui| {
@@ -1594,16 +2528,32 @@ fn draw_columns(ui: &mut Ui, page: &mut Page, cx: &mut Pass, i: usize, end: usiz
         for idx in 1..m {
             let x = rights[idx - 1];
             let hr = Rect::from_min_max(pos2(x - 2.0, rect.top()), pos2(x + 8.0, rect.bottom()));
-            let resp = ui.interact(hr, Id::new(("colsz", page.blocks[cols[idx].0].id)), Sense::drag());
-            let hot = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || resp.dragged(), 0.1);
+            let resp = ui.interact(
+                hr,
+                Id::new(("colsz", page.blocks[cols[idx].0].id)),
+                Sense::drag(),
+            );
+            let hot =
+                ui.ctx()
+                    .animate_bool_with_time(resp.id, resp.hovered() || resp.dragged(), 0.1);
             if hot > 0.01 {
-                ui.painter().rect_filled(Rect::from_center_size(pos2(x + 3.0, rect.center().y), vec2(3.0, (rect.height() - 4.0).max(12.0))), 2.0, with_alpha(pal.accent, hot * 0.8));
+                ui.painter().rect_filled(
+                    Rect::from_center_size(
+                        pos2(x + 3.0, rect.center().y),
+                        vec2(3.0, (rect.height() - 4.0).max(12.0)),
+                    ),
+                    2.0,
+                    with_alpha(pal.accent, hot * 0.8),
+                );
             }
             if resp.hovered() || resp.dragged() {
                 ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
             }
             if resp.dragged() {
-                let dx = resp.drag_delta().x.clamp(-(widths[idx - 1] - 90.0).max(0.0), (widths[idx] - 90.0).max(0.0));
+                let dx = resp.drag_delta().x.clamp(
+                    -(widths[idx - 1] - 90.0).max(0.0),
+                    (widths[idx] - 90.0).max(0.0),
+                );
                 let mut nw = widths.clone();
                 nw[idx - 1] += dx;
                 nw[idx] -= dx;
@@ -1620,31 +2570,104 @@ fn draw_columns(ui: &mut Ui, page: &mut Page, cx: &mut Pass, i: usize, end: usiz
     }
 
     // hover toolbar: add / remove a column, equal widths, unwrap, delete layout
-    let zone = Rect::from_min_max(pos2(rect.left(), rect.top() - 26.0), pos2(rect.right(), rect.bottom()));
-    let hot = cx.pointer.map_or(false, |p| zone.contains(p)) && cx.ed.dragging.is_none() && cx.ed.marquee.is_none();
-    let t = ui.ctx().animate_bool_with_time(Id::new(("colbar", bid)), hot, 0.12);
+    let zone = Rect::from_min_max(
+        pos2(rect.left(), rect.top() - 26.0),
+        pos2(rect.right(), rect.bottom()),
+    );
+    let hot = cx.pointer.map_or(false, |p| zone.contains(p))
+        && cx.ed.dragging.is_none()
+        && cx.ed.marquee.is_none();
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(Id::new(("colbar", bid)), hot, 0.12);
     if t > 0.02 {
-        let hovered_col = cx.col_rects[first_col_idx..].iter().find(|(_, r)| cx.pointer.map_or(false, |p| r.x_range().contains(p.x))).map(|(c, _)| *c).unwrap_or(cols[m - 1].0);
+        let hovered_col = cx.col_rects[first_col_idx..]
+            .iter()
+            .find(|(_, r)| cx.pointer.map_or(false, |p| r.x_range().contains(p.x)))
+            .map(|(c, _)| *c)
+            .unwrap_or(cols[m - 1].0);
         let items: [(&str, &str, Option<Act>); 5] = [
-            (l::PLUS, if m < 6 { "Add a column after this one" } else { "Up to 6 columns" }, if m < 6 { Some(Act::ColAdd(hovered_col)) } else { None }),
-            (l::MINUS, "Remove this column and its content", Some(Act::ColDel(hovered_col))),
-            (l::BETWEEN_HORIZONTAL_START, "Equal column widths (or double-click a divider)", Some(Act::ColEqual(i))),
-            (l::LAYOUT_LIST, "Unwrap — stack the columns, keep the content", Some(Act::ColUnwrap(i))),
-            (l::TRASH_2, "Delete the whole layout", Some(Act::ColDelete(i))),
+            (
+                l::PLUS,
+                if m < 6 {
+                    "Add a column after this one"
+                } else {
+                    "Up to 6 columns"
+                },
+                if m < 6 {
+                    Some(Act::ColAdd(hovered_col))
+                } else {
+                    None
+                },
+            ),
+            (
+                l::MINUS,
+                "Remove this column and its content",
+                Some(Act::ColDel(hovered_col)),
+            ),
+            (
+                l::BETWEEN_HORIZONTAL_START,
+                "Equal column widths (or double-click a divider)",
+                Some(Act::ColEqual(i)),
+            ),
+            (
+                l::LAYOUT_LIST,
+                "Unwrap — stack the columns, keep the content",
+                Some(Act::ColUnwrap(i)),
+            ),
+            (
+                l::TRASH_2,
+                "Delete the whole layout",
+                Some(Act::ColDelete(i)),
+            ),
         ];
         let bw = 24.0;
         let x0 = rect.right() - bw * items.len() as f32 - 4.0;
         let y0 = rect.top() - 24.0;
-        ui.painter().rect_filled(Rect::from_min_size(pos2(x0 - 3.0, y0 - 1.0), vec2(bw * items.len() as f32 + 6.0, 26.0)), 8.0, with_alpha(pal.popup, t));
-        ui.painter().rect_stroke(Rect::from_min_size(pos2(x0 - 3.0, y0 - 1.0), vec2(bw * items.len() as f32 + 6.0, 26.0)), 8.0, Stroke::new(1.0, with_alpha(pal.border, t)), egui::StrokeKind::Inside);
+        ui.painter().rect_filled(
+            Rect::from_min_size(
+                pos2(x0 - 3.0, y0 - 1.0),
+                vec2(bw * items.len() as f32 + 6.0, 26.0),
+            ),
+            8.0,
+            with_alpha(pal.popup, t),
+        );
+        ui.painter().rect_stroke(
+            Rect::from_min_size(
+                pos2(x0 - 3.0, y0 - 1.0),
+                vec2(bw * items.len() as f32 + 6.0, 26.0),
+            ),
+            8.0,
+            Stroke::new(1.0, with_alpha(pal.border, t)),
+            egui::StrokeKind::Inside,
+        );
         for (q, (glyph, tip, a)) in items.into_iter().enumerate() {
             let r = Rect::from_min_size(pos2(x0 + bw * q as f32, y0), vec2(bw, 24.0));
             let resp = ui.interact(r, Id::new(("colbtn", bid, q)), Sense::click());
-            let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() && a.is_some(), 0.1);
-            ui.painter().rect_filled(r.shrink(1.0), 6.0, with_alpha(pal.hover, h * t));
-            let col = if q == 4 && h > 0.0 { pal.danger } else if a.is_some() { pal.text } else { pal.muted };
-            ui.painter().text(r.center(), Align2::CENTER_CENTER, glyph, body(14.0), with_alpha(col, t));
-            if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip).clicked() {
+            let h = ui
+                .ctx()
+                .animate_bool_with_time(resp.id, resp.hovered() && a.is_some(), 0.1);
+            ui.painter()
+                .rect_filled(r.shrink(1.0), 6.0, with_alpha(pal.hover, h * t));
+            let col = if q == 4 && h > 0.0 {
+                pal.danger
+            } else if a.is_some() {
+                pal.text
+            } else {
+                pal.muted
+            };
+            ui.painter().text(
+                r.center(),
+                Align2::CENTER_CENTER,
+                glyph,
+                body(14.0),
+                with_alpha(col, t),
+            );
+            if resp
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text(tip)
+                .clicked()
+            {
                 if let Some(a) = a {
                     cx.act = Some(a);
                 }
@@ -1654,9 +2677,18 @@ fn draw_columns(ui: &mut Ui, page: &mut Page, cx: &mut Pass, i: usize, end: usiz
 }
 
 /// A linked view of a database: the source stays unchanged, this block has its own layout, filters and sorts.
-fn draw_dbview(ui: &mut Ui, ws: &mut Workspace, b: &mut Block, ed: &mut EditorState, pal: &Palette, w: f32) -> bool {
+fn draw_dbview(
+    ui: &mut Ui,
+    ws: &mut Workspace,
+    b: &mut Block,
+    ed: &mut EditorState,
+    pal: &Palette,
+    w: f32,
+) -> bool {
     let mut changed = false;
-    let src = b.link.filter(|l| ws.page(*l).map_or(false, |p| p.db.is_some() && !p.trashed));
+    let src = b
+        .link
+        .filter(|l| ws.page(*l).map_or(false, |p| p.db.is_some() && !p.trashed));
     let Some(db_id) = src else {
         // pick the source database
         egui::Frame::new().fill(with_alpha(pal.hover, 0.5)).stroke(Stroke::new(1.0, pal.border)).corner_radius(8.0).inner_margin(Margin::same(12)).show(ui, |ui| {
@@ -1683,13 +2715,29 @@ fn draw_dbview(ui: &mut Ui, ws: &mut Workspace, b: &mut Block, ed: &mut EditorSt
     let title = ws.display_title(db_id);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = vec2(6.0, 0.0);
-        let r = ui.add(egui::Label::new(RichText::new(format!("{}  {}", l::DATABASE, title)).font(bold(15.0)).color(pal.text)).sense(Sense::click()));
-        if r.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Open the source database").clicked() {
+        let r = ui.add(
+            egui::Label::new(
+                RichText::new(format!("{}  {}", l::DATABASE, title))
+                    .font(bold(15.0))
+                    .color(pal.text),
+            )
+            .sense(Sense::click()),
+        );
+        if r.on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text("Open the source database")
+            .clicked()
+        {
             ed.nav = Some(db_id);
         }
-        ui.label(RichText::new("linked view").font(body(11.5)).color(pal.muted));
+        ui.label(
+            RichText::new("linked view")
+                .font(body(11.5))
+                .color(pal.muted),
+        );
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-            if crate::widgets::icon_button(ui, pal, Icon::Close, 11.0, "Choose another database").clicked() {
+            if crate::widgets::icon_button(ui, pal, Icon::Close, 11.0, "Choose another database")
+                .clicked()
+            {
                 b.link = None;
                 changed = true;
             }
@@ -1699,7 +2747,9 @@ fn draw_dbview(ui: &mut Ui, ws: &mut Workspace, b: &mut Block, ed: &mut EditorSt
     if b.link.is_none() {
         return changed;
     }
-    let Some(vi) = ws.ensure_linked_view(db_id, b.id, ViewKind::Table) else { return changed };
+    let Some(vi) = ws.ensure_linked_view(db_id, b.id, ViewKind::Table) else {
+        return changed;
+    };
     let mut st = ed.dbv.remove(&b.id).unwrap_or_default();
     std::mem::swap(&mut ed.db, &mut st);
     changed |= database::show_linked(ui, ws, db_id, vi, b.id, ed, pal, w);
@@ -1711,7 +2761,10 @@ fn draw_dbview(ui: &mut Ui, ws: &mut Workspace, b: &mut Block, ed: &mut EditorSt
 /// Repairs the column structure after any edit: a `Columns` block holds `Column` blocks (one level deeper), every column holds at
 /// least one block, a layout with fewer than two columns dissolves, and the page never ends inside a layout (so you can keep typing).
 fn normalize_layout(bl: &mut Vec<Block>, next_id: &mut u64) {
-    if !bl.iter().any(|b| matches!(b.kind, BlockKind::Columns | BlockKind::Column)) {
+    if !bl
+        .iter()
+        .any(|b| matches!(b.kind, BlockKind::Columns | BlockKind::Column))
+    {
         return;
     }
     let mut guard = 0;
@@ -1723,7 +2776,13 @@ fn normalize_layout(bl: &mut Vec<Block>, next_id: &mut u64) {
         for i in 0..bl.len() {
             match bl[i].kind {
                 BlockKind::Column => {
-                    let ok = bl[i].indent > 0 && (0..i).rev().find(|j| bl[*j].indent < bl[i].indent).map_or(false, |j| bl[j].kind == BlockKind::Columns && bl[j].indent + 1 == bl[i].indent);
+                    let ok = bl[i].indent > 0
+                        && (0..i)
+                            .rev()
+                            .find(|j| bl[*j].indent < bl[i].indent)
+                            .map_or(false, |j| {
+                                bl[j].kind == BlockKind::Columns && bl[j].indent + 1 == bl[i].indent
+                            });
                     if !ok {
                         bl[i].kind = BlockKind::Text;
                         bl[i].text.clear();
@@ -1746,7 +2805,10 @@ fn normalize_layout(bl: &mut Vec<Block>, next_id: &mut u64) {
                     }
                     for j in i + 1..end {
                         if bl[j].indent == k + 1 && bl[j].kind != BlockKind::Column {
-                            let prev_is_col = (i + 1..j).rev().find(|q| bl[*q].indent == k + 1).map_or(false, |q| bl[q].kind == BlockKind::Column);
+                            let prev_is_col = (i + 1..j)
+                                .rev()
+                                .find(|q| bl[*q].indent == k + 1)
+                                .map_or(false, |q| bl[q].kind == BlockKind::Column);
                             if prev_is_col {
                                 let e = subtree_end(bl, j);
                                 for b in bl[j..e].iter_mut() {
@@ -1759,7 +2821,9 @@ fn normalize_layout(bl: &mut Vec<Block>, next_id: &mut u64) {
                             continue 'again;
                         }
                     }
-                    let cols: Vec<usize> = (i + 1..end).filter(|q| bl[*q].indent == k + 1 && bl[*q].kind == BlockKind::Column).collect();
+                    let cols: Vec<usize> = (i + 1..end)
+                        .filter(|q| bl[*q].indent == k + 1 && bl[*q].kind == BlockKind::Column)
+                        .collect();
                     if cols.len() < 2 {
                         dissolve(bl, i);
                         continue 'again;
@@ -1776,7 +2840,10 @@ fn normalize_layout(bl: &mut Vec<Block>, next_id: &mut u64) {
             }
         }
         // the page must not end inside a layout
-        if let Some(r) = (0..bl.len()).rev().find(|i| bl[*i].kind == BlockKind::Columns && subtree_end(bl, *i) == bl.len()) {
+        if let Some(r) = (0..bl.len())
+            .rev()
+            .find(|i| bl[*i].kind == BlockKind::Columns && subtree_end(bl, *i) == bl.len())
+        {
             let t = new_block(next_id, BlockKind::Text, String::new(), bl[r].indent);
             bl.push(t);
         }
@@ -1829,17 +2896,43 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
             bl.insert(i + 1, nb);
         }
         Act::Merge(i) => {
-            if i == 0 {
+            if i == 0 || i >= bl.len() {
                 return;
             }
-            if matches!(bl[i - 1].kind, BlockKind::Column | BlockKind::Columns) || col_depth(bl)[i - 1] != col_depth(bl)[i] {
+            // Find the nearest visible preceding block (skipping hidden children of collapsed toggles)
+            let mut prev_idx = i - 1;
+            let mut hidden_ancestor = false;
+            for k in (0..i).rev() {
+                if bl[k].kind == BlockKind::Toggle
+                    && !bl[k].checked
+                    && bl[k].indent < bl[prev_idx].indent
+                {
+                    prev_idx = k;
+                    hidden_ancestor = true;
+                }
+            }
+            if hidden_ancestor {
+                // Don't swallow text into a collapsed toggle's hidden children; focus the toggle header instead
+                ed.focus = Some((bl[prev_idx].id, usize::MAX));
+                return;
+            }
+            if matches!(bl[i - 1].kind, BlockKind::Column | BlockKind::Columns)
+                || col_depth(bl)[i - 1] != col_depth(bl)[i]
+            {
                 // never merge across a column boundary
                 ed.focus = Some((bl[i].id, 0));
                 return;
             }
             if !bl[i - 1].kind.has_text() {
+                let has_children = i < bl.len() && bl[i].indent > bl[i - 1].indent;
+                if has_children {
+                    ed.focus = Some((bl[i].id, 0));
+                    return;
+                }
                 bl.remove(i - 1);
-                ed.focus = Some((bl[i - 1].id, 0));
+                if let Some(cur) = bl.get(i - 1) {
+                    ed.focus = Some((cur.id, 0));
+                }
             } else {
                 let b = bl.remove(i);
                 let prev = &mut bl[i - 1];
@@ -1879,7 +2972,10 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
                     bl[i].text = "New button".into();
                     ed.edit_button = Some(bl[i].id);
                 }
-                let media_kind = matches!(kind, BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File);
+                let media_kind = matches!(
+                    kind,
+                    BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File
+                );
                 if kind != BlockKind::PageLink && (!media_kind || i + 1 >= bl.len()) {
                     let ind = bl[i].indent;
                     let nb = new_block(next_id, BlockKind::Text, String::new(), ind);
@@ -1942,9 +3038,15 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
             ed.focus = Some((txt.id, 0));
             bl.insert(end, txt);
             bl.insert(end, col);
-            if let Some(p) = (0..c).rev().find(|j| bl[*j].kind == BlockKind::Columns && bl[*j].indent + 1 == k) {
+            if let Some(p) = (0..c)
+                .rev()
+                .find(|j| bl[*j].kind == BlockKind::Columns && bl[*j].indent + 1 == k)
+            {
                 let pe = subtree_end(bl, p);
-                for b in bl[p + 1..pe].iter_mut().filter(|b| b.kind == BlockKind::Column && b.indent == k) {
+                for b in bl[p + 1..pe]
+                    .iter_mut()
+                    .filter(|b| b.kind == BlockKind::Column && b.indent == k)
+                {
                     b.start = 0;
                 }
             }
@@ -1963,7 +3065,10 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
         Act::ColEqual(i) => {
             let end = subtree_end(bl, i);
             let k = bl[i].indent;
-            for b in bl[i + 1..end].iter_mut().filter(|b| b.kind == BlockKind::Column && b.indent == k + 1) {
+            for b in bl[i + 1..end]
+                .iter_mut()
+                .filter(|b| b.kind == BlockKind::Column && b.indent == k + 1)
+            {
                 b.start = 0;
             }
         }
@@ -2017,8 +3122,16 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
                 return;
             }
             let cur = bl[i].indent as i8;
-            let max_allowed = if i == 0 { 0 } else { (bl[i - 1].indent as i8 + 1).min(6) };
-            let new = if d > 0 { (cur + 1).min(max_allowed) } else { (cur - 1).max(0) };
+            let max_allowed = if i == 0 {
+                0
+            } else {
+                (bl[i - 1].indent as i8 + 1).min(6)
+            };
+            let new = if d > 0 {
+                (cur + 1).min(max_allowed)
+            } else {
+                (cur - 1).max(0)
+            };
             if new == cur {
                 return;
             }
@@ -2086,7 +3199,12 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
                 nb.id = *next_id;
                 nb.indent = (nb.indent + base).min(6);
                 // plain lines pasted into a list continue the list
-                if plain_lines && matches!(cur_kind, BlockKind::Todo | BlockKind::Bullet | BlockKind::Numbered) {
+                if plain_lines
+                    && matches!(
+                        cur_kind,
+                        BlockKind::Todo | BlockKind::Bullet | BlockKind::Numbered
+                    )
+                {
                     nb.kind = cur_kind;
                 }
             }
@@ -2100,7 +3218,9 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
             let at;
             if !editable || n == 0 || (head.is_empty() && tail.is_empty()) {
                 // an empty (or fully selected) text block is replaced, anything else gets the blocks after it
-                if editable && bl[i].text.is_empty() || editable && head.is_empty() && tail.is_empty() {
+                if editable && bl[i].text.is_empty()
+                    || editable && head.is_empty() && tail.is_empty()
+                {
                     bl.remove(i);
                     at = i;
                 } else {
@@ -2162,7 +3282,12 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
                 let mut first = 0;
                 let mut ins: Vec<Block> = vec![];
                 for q in 0..n.clamp(2, 6) {
-                    ins.push(new_block(next_id, BlockKind::Column, String::new(), ind + 1));
+                    ins.push(new_block(
+                        next_id,
+                        BlockKind::Column,
+                        String::new(),
+                        ind + 1,
+                    ));
                     let t = new_block(next_id, BlockKind::Text, String::new(), ind + 2);
                     if q == 0 {
                         first = t.id;
@@ -2227,7 +3352,11 @@ fn draw_block(
     let font = font_for(b.kind, ed.scale);
     // content size: every fixed dimension of a block (bullets, check boxes, icons) follows the text
     let s = ed.scale.max(0.5);
-    let base = if b.color > 0 { tag_color(b.color as usize - 1) } else { pal.text };
+    let base = if b.color > 0 {
+        tag_color(b.color as usize - 1)
+    } else {
+        pal.text
+    };
     match b.kind {
         BlockKind::Button => {
             changed |= crate::autoui::button_block(ui, b, ed, pal, w);
@@ -2247,17 +3376,42 @@ fn draw_block(
                 BlockKind::H3 => "Heading 3",
                 _ => "Type '/' for commands…",
             };
-            changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: base, hint, width: w }, act);
+            changed |= text_edit(
+                ui,
+                b,
+                idx,
+                n,
+                ed,
+                pal,
+                Tx {
+                    font,
+                    color: base,
+                    hint,
+                    width: w,
+                },
+                act,
+            );
         }
         BlockKind::Todo => {
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 let (r, resp) = ui.allocate_exact_size(vec2(28.0 * s, 26.0 * s), Sense::click());
                 let c = pos2(r.left() + 10.0 * s, r.top() + 13.5 * s);
-                let t = ui.ctx().animate_bool_with_time(Id::new(("chk", b.id)), b.checked, 0.18);
+                let t = ui
+                    .ctx()
+                    .animate_bool_with_time(Id::new(("chk", b.id)), b.checked, 0.18);
                 let box_r = Rect::from_center_size(c, vec2(17.0 * s, 17.0 * s));
-                ui.painter().rect_filled(box_r, 4.0 * s, with_alpha(pal.accent, t));
-                ui.painter().rect_stroke(box_r, 4.0 * s, Stroke::new(1.6_f32, lerp_color(pal.text.gamma_multiply(0.8), pal.accent, t)), egui::StrokeKind::Inside);
+                ui.painter()
+                    .rect_filled(box_r, 4.0 * s, with_alpha(pal.accent, t));
+                ui.painter().rect_stroke(
+                    box_r,
+                    4.0 * s,
+                    Stroke::new(
+                        1.6_f32,
+                        lerp_color(pal.text.gamma_multiply(0.8), pal.accent, t),
+                    ),
+                    egui::StrokeKind::Inside,
+                );
                 if t > 0.02 {
                     let s = t.min(1.0);
                     let p1 = pos2(c.x - 4.2 * s, c.y + 0.2 * s);
@@ -2268,14 +3422,29 @@ fn draw_block(
                     if s > 0.5 {
                         pts.push(p2 + (p3 - p2) * ((s - 0.5) * 2.0).min(1.0));
                     }
-                    ui.painter().add(Shape::line(pts, Stroke::new(2.0_f32, Color32::WHITE)));
+                    ui.painter()
+                        .add(Shape::line(pts, Stroke::new(2.0_f32, Color32::WHITE)));
                 }
                 if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                     b.checked = !b.checked;
                     changed = true;
                 }
                 let col = lerp_color(base, pal.muted, t);
-                changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: col, hint: "To-do", width: w - 28.0 * s }, act);
+                changed |= text_edit(
+                    ui,
+                    b,
+                    idx,
+                    n,
+                    ed,
+                    pal,
+                    Tx {
+                        font,
+                        color: col,
+                        hint: "To-do",
+                        width: w - 28.0 * s,
+                    },
+                    act,
+                );
             });
         }
         BlockKind::Bullet | BlockKind::Numbered => {
@@ -2286,8 +3455,14 @@ fn draw_block(
                     let c = pos2(r.left() + 10.0 * s, r.top() + 13.5 * s);
                     match b.indent % 3 {
                         0 => ui.painter().circle_filled(c, 3.0 * s, base),
-                        1 => ui.painter().circle_stroke(c, 3.0 * s, Stroke::new(1.3_f32, base)),
-                        _ => ui.painter().rect_filled(Rect::from_center_size(c, vec2(5.5 * s, 5.5 * s)), 1.0, base),
+                        1 => ui
+                            .painter()
+                            .circle_stroke(c, 3.0 * s, Stroke::new(1.3_f32, base)),
+                        _ => ui.painter().rect_filled(
+                            Rect::from_center_size(c, vec2(5.5 * s, 5.5 * s)),
+                            1.0,
+                            base,
+                        ),
                     };
                 } else {
                     let label = match b.indent % 3 {
@@ -2295,47 +3470,139 @@ fn draw_block(
                         1 => format!("{}.", (b'a' + ((num.max(1) - 1) % 26) as u8) as char),
                         _ => format!("{}.", roman(num)),
                     };
-                    ui.painter().text(pos2(r.left() + 17.0 * s, r.top() + 13.5 * s), Align2::RIGHT_CENTER, label, body(16.0 * ed.scale.max(0.5)), base);
+                    ui.painter().text(
+                        pos2(r.left() + 17.0 * s, r.top() + 13.5 * s),
+                        Align2::RIGHT_CENTER,
+                        label,
+                        body(16.0 * ed.scale.max(0.5)),
+                        base,
+                    );
                 }
-                let hint = if b.kind == BlockKind::Bullet { "List" } else { "List item" };
-                changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: base, hint, width: w - 26.0 * s }, act);
+                let hint = if b.kind == BlockKind::Bullet {
+                    "List"
+                } else {
+                    "List item"
+                };
+                changed |= text_edit(
+                    ui,
+                    b,
+                    idx,
+                    n,
+                    ed,
+                    pal,
+                    Tx {
+                        font,
+                        color: base,
+                        hint,
+                        width: w - 26.0 * s,
+                    },
+                    act,
+                );
             });
         }
         BlockKind::Toggle => {
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 let (r, resp) = ui.allocate_exact_size(vec2(26.0 * s, 26.0 * s), Sense::click());
-                let t = ui.ctx().animate_bool_with_time(Id::new(("tgl", b.id)), !b.collapsed, 0.14);
-                let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-                let rr = Rect::from_center_size(r.center() + vec2(-2.0, 0.0), vec2(22.0 * s, 22.0 * s));
+                let t = ui
+                    .ctx()
+                    .animate_bool_with_time(Id::new(("tgl", b.id)), !b.collapsed, 0.14);
+                let h = ui
+                    .ctx()
+                    .animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+                let rr =
+                    Rect::from_center_size(r.center() + vec2(-2.0, 0.0), vec2(22.0 * s, 22.0 * s));
                 ui.painter().rect_filled(rr, 5.0, with_alpha(pal.hover, h));
-                icons::chevron(ui.painter(), rr.center(), 13.0 * s, t * std::f32::consts::FRAC_PI_2, lerp_color(pal.muted, pal.text, h));
+                icons::chevron(
+                    ui.painter(),
+                    rr.center(),
+                    13.0 * s,
+                    t * std::f32::consts::FRAC_PI_2,
+                    lerp_color(pal.muted, pal.text, h),
+                );
                 if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                     b.collapsed = !b.collapsed;
                     changed = true;
                 }
-                changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: base, hint: "Toggle", width: w - 26.0 * s }, act);
+                changed |= text_edit(
+                    ui,
+                    b,
+                    idx,
+                    n,
+                    ed,
+                    pal,
+                    Tx {
+                        font,
+                        color: base,
+                        hint: "Toggle",
+                        width: w - 26.0 * s,
+                    },
+                    act,
+                );
             });
         }
         BlockKind::Quote => {
             let r = ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.add_space(14.0);
-                changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: base, hint: "Empty quote", width: w - 14.0 }, act);
+                changed |= text_edit(
+                    ui,
+                    b,
+                    idx,
+                    n,
+                    ed,
+                    pal,
+                    Tx {
+                        font,
+                        color: base,
+                        hint: "Empty quote",
+                        width: w - 14.0,
+                    },
+                    act,
+                );
             });
             let rr = r.response.rect;
-            ui.painter().rect_filled(Rect::from_min_size(rr.min + vec2(0.0, 3.0), vec2(3.0, rr.height() - 6.0)), 2.0, base);
+            ui.painter().rect_filled(
+                Rect::from_min_size(rr.min + vec2(0.0, 3.0), vec2(3.0, rr.height() - 6.0)),
+                2.0,
+                base,
+            );
         }
         BlockKind::Callout => {
-            Frame::new().fill(pal.callout).corner_radius(CornerRadius::same(6)).inner_margin(Margin::symmetric(14, 12)).show(ui, |ui| {
-                ui.set_width(w - 28.0);
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    let (r, _) = ui.allocate_exact_size(vec2(34.0 * s, 26.0 * s), Sense::hover());
-                    icons::glyph(ui.painter(), r.left_center() + vec2(12.0 * s, 0.0), 19.0 * s, l::LIGHTBULB, tag_color(3));
-                    changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: base, hint: "Type something…", width: w - 28.0 - 34.0 * s }, act);
+            Frame::new()
+                .fill(pal.callout)
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(14, 12))
+                .show(ui, |ui| {
+                    ui.set_width(w - 28.0);
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let (r, _) =
+                            ui.allocate_exact_size(vec2(34.0 * s, 26.0 * s), Sense::hover());
+                        icons::glyph(
+                            ui.painter(),
+                            r.left_center() + vec2(12.0 * s, 0.0),
+                            19.0 * s,
+                            l::LIGHTBULB,
+                            tag_color(3),
+                        );
+                        changed |= text_edit(
+                            ui,
+                            b,
+                            idx,
+                            n,
+                            ed,
+                            pal,
+                            Tx {
+                                font,
+                                color: base,
+                                hint: "Type something…",
+                                width: w - 28.0 - 34.0 * s,
+                            },
+                            act,
+                        );
+                    });
                 });
-            });
         }
         BlockKind::Code => {
             let fr = Frame::new()
@@ -2345,15 +3612,39 @@ fn draw_block(
                 .inner_margin(Margin::symmetric(16, 14))
                 .show(ui, |ui| {
                     ui.set_width(w - 32.0);
-                    changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: pal.text, hint: "Write some code…", width: w - 32.0 }, act);
+                    changed |= text_edit(
+                        ui,
+                        b,
+                        idx,
+                        n,
+                        ed,
+                        pal,
+                        Tx {
+                            font,
+                            color: pal.text,
+                            hint: "Write some code…",
+                            width: w - 32.0,
+                        },
+                        act,
+                    );
                 });
             let rr = fr.response.rect;
             if crate::touch::reveal(ui.rect_contains_pointer(rr)) {
-                let br = Rect::from_min_size(pos2(rr.right() - 58.0, rr.top() + 6.0), vec2(50.0, 22.0));
+                let br =
+                    Rect::from_min_size(pos2(rr.right() - 58.0, rr.top() + 6.0), vec2(50.0, 22.0));
                 let resp = ui.interact(br, Id::new(("copy", b.id)), Sense::click());
-                let h = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-                ui.painter().rect_filled(br, 5.0, with_alpha(pal.active, 0.5 + 0.5 * h));
-                ui.painter().text(br.center(), Align2::CENTER_CENTER, "Copy", body(12.0), pal.text);
+                let h = ui
+                    .ctx()
+                    .animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+                ui.painter()
+                    .rect_filled(br, 5.0, with_alpha(pal.active, 0.5 + 0.5 * h));
+                ui.painter().text(
+                    br.center(),
+                    Align2::CENTER_CENTER,
+                    "Copy",
+                    body(12.0),
+                    pal.text,
+                );
                 if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                     ui.ctx().copy_text(b.text.clone());
                 }
@@ -2362,69 +3653,156 @@ fn draw_block(
         BlockKind::Equation => {
             let ctx = ui.ctx().clone();
             let tid = Id::new(("blk", b.id));
-            let editing = ctx.memory(|m| m.has_focus(tid)) || ed.focus.map_or(false, |(f, _)| f == b.id) || ed.restore_sel.map_or(false, |r| r.0 == b.id) || b.text.trim().is_empty();
+            let editing = ctx.memory(|m| m.has_focus(tid))
+                || ed.focus.map_or(false, |(f, _)| f == b.id)
+                || ed.restore_sel.map_or(false, |r| r.0 == b.id)
+                || b.text.trim().is_empty();
             // Notion style: a typeset equation sits directly on the page (no box, no border); the shaded editing surface only exists while the source is being edited
-            let fr = Frame::new().fill(if editing { pal.code_bg } else { Color32::TRANSPARENT }).stroke(Stroke::NONE).corner_radius(CornerRadius::same(6)).inner_margin(Margin::symmetric(16, 12)).show(ui, |ui| {
-                let avail = w - 32.0;
-                ui.set_width(avail);
-                // typeset preview, scaled down when the formula is wider than the page
-                let mut size = 24.0 * s;
-                let mut mb = ui.fonts(|f| crate::math::typeset(f, &b.text, size, true));
-                if mb.w > avail && mb.w > 0.0 {
-                    size = (size * avail / mb.w).max(10.0);
-                    mb = ui.fonts(|f| crate::math::typeset(f, &b.text, size, true));
-                }
-                let (r, resp) = ui.allocate_exact_size(vec2(avail, mb.height().max(28.0 * s) + 4.0), Sense::click());
-                if b.text.trim().is_empty() {
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, "Write a TeX equation below, e.g. E = mc^2", body(14.0 * s), pal.muted);
+            let fr = Frame::new()
+                .fill(if editing {
+                    pal.code_bg
                 } else {
-                    let x = (r.center().x - mb.w / 2.0).max(r.left());
-                    crate::math::paint(&ui.painter().with_clip_rect(r.expand(2.0)), pos2(x, r.center().y - mb.height() / 2.0), &mb, pal.text);
-                }
-                if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                    ed.focus = Some((b.id, usize::MAX));
-                }
-                if editing {
-                    ui.add_space(6.0);
-                    changed |= text_edit(ui, b, idx, n, ed, pal, Tx { font, color: pal.muted, hint: "TeX, e.g. \\frac{a}{b} + \\sqrt{x}", width: avail }, act);
-                }
-            });
+                    Color32::TRANSPARENT
+                })
+                .stroke(Stroke::NONE)
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(Margin::symmetric(16, 12))
+                .show(ui, |ui| {
+                    let avail = w - 32.0;
+                    ui.set_width(avail);
+                    // typeset preview, scaled down when the formula is wider than the page
+                    let mut size = 24.0 * s;
+                    let mut mb = ui.fonts(|f| crate::math::typeset(f, &b.text, size, true));
+                    if mb.w > avail && mb.w > 0.0 {
+                        size = (size * avail / mb.w).max(10.0);
+                        mb = ui.fonts(|f| crate::math::typeset(f, &b.text, size, true));
+                    }
+                    let (r, resp) = ui.allocate_exact_size(
+                        vec2(avail, mb.height().max(28.0 * s) + 4.0),
+                        Sense::click(),
+                    );
+                    if b.text.trim().is_empty() {
+                        ui.painter().text(
+                            r.center(),
+                            Align2::CENTER_CENTER,
+                            "Write a TeX equation below, e.g. E = mc^2",
+                            body(14.0 * s),
+                            pal.muted,
+                        );
+                    } else {
+                        let x = (r.center().x - mb.w / 2.0).max(r.left());
+                        crate::math::paint(
+                            &ui.painter().with_clip_rect(r.expand(2.0)),
+                            pos2(x, r.center().y - mb.height() / 2.0),
+                            &mb,
+                            pal.text,
+                        );
+                    }
+                    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                        ed.focus = Some((b.id, usize::MAX));
+                    }
+                    if editing {
+                        ui.add_space(6.0);
+                        changed |= text_edit(
+                            ui,
+                            b,
+                            idx,
+                            n,
+                            ed,
+                            pal,
+                            Tx {
+                                font,
+                                color: pal.muted,
+                                hint: "TeX, e.g. \\frac{a}{b} + \\sqrt{x}",
+                                width: avail,
+                            },
+                            act,
+                        );
+                    }
+                });
             let _ = fr;
         }
         BlockKind::Divider => {
             let (r, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
-            ui.painter().line_segment([pos2(r.left(), r.center().y), pos2(r.right(), r.center().y)], Stroke::new(1.0_f32, pal.border.gamma_multiply(1.4)));
+            ui.painter().line_segment(
+                [pos2(r.left(), r.center().y), pos2(r.right(), r.center().y)],
+                Stroke::new(1.0_f32, pal.border.gamma_multiply(1.4)),
+            );
         }
         BlockKind::Toc => {
             // Collapsed headings are stored in the block text as "id,id,…" (saved with the page, undoable, per table-of-contents block).
-            let mut collapsed: Vec<u64> = b.text.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            let mut collapsed: Vec<u64> = b
+                .text
+                .split(',')
+                .filter_map(|x| x.trim().parse().ok())
+                .collect();
             let before = collapsed.clone();
-            let tint = if b.color > 0 { Some(tag_color(b.color as usize - 1)) } else { None };
+            let tint = if b.color > 0 {
+                Some(tag_color(b.color as usize - 1))
+            } else {
+                None
+            };
             let touchy = crate::touch::touchy();
             let row_h = if touchy { 32.0 } else { 26.0 } * s.max(0.8);
             let pick_id = Id::new(("toc_pick", b.id));
             let mut picking: bool = ui.ctx().data(|d| d.get_temp(pick_id)).unwrap_or(false);
-            let has_kids: Vec<bool> = (0..heads.len()).map(|i| heads.get(i + 1).map_or(false, |nx| nx.1 > heads[i].1)).collect();
+            let has_kids: Vec<bool> = (0..heads.len())
+                .map(|i| heads.get(i + 1).map_or(false, |nx| nx.1 > heads[i].1))
+                .collect();
             ui.add_space(2.0);
             // header: title + tools (collapse all / expand all / colour) — tools show on hover, always on touch screens
             let (hr, hresp) = ui.allocate_exact_size(vec2(w, 24.0 * s.max(0.8)), Sense::hover());
             let hov = ui.rect_contains_pointer(hr.expand2(vec2(0.0, 4.0)));
-            ui.painter().text(pos2(hr.left() + 2.0, hr.center().y), Align2::LEFT_CENTER, "Table of contents", bold(12.5 * s.max(0.8)), with_alpha(pal.muted, 0.9));
+            ui.painter().text(
+                pos2(hr.left() + 2.0, hr.center().y),
+                Align2::LEFT_CENTER,
+                "Table of contents",
+                bold(12.5 * s.max(0.8)),
+                with_alpha(pal.muted, 0.9),
+            );
             let _ = hresp;
             if !heads.is_empty() && (crate::touch::reveal(hov) || picking) {
                 let mut x = hr.right() - 4.0;
-                let tools: [(&str, &str); 3] = [(l::PALETTE, "Text colour"), (l::CHEVRONS_UP_DOWN, "Expand all"), (l::LIST_TREE, "Collapse all")];
+                let tools: [(&str, &str); 3] = [
+                    (l::PALETTE, "Text colour"),
+                    (l::CHEVRONS_UP_DOWN, "Expand all"),
+                    (l::LIST_TREE, "Collapse all"),
+                ];
                 for (gl, tip) in tools {
-                    let br = Rect::from_center_size(pos2(x - 13.0, hr.center().y), vec2(26.0, 24.0));
+                    let br =
+                        Rect::from_center_size(pos2(x - 13.0, hr.center().y), vec2(26.0, 24.0));
                     let resp = ui.interact(br, Id::new(("toc_tool", b.id, tip)), Sense::click());
-                    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+                    let t = ui
+                        .ctx()
+                        .animate_bool_with_time(resp.id, resp.hovered(), 0.1);
                     ui.painter().rect_filled(br, 5.0, with_alpha(pal.hover, t));
-                    icons::glyph(ui.painter(), br.center(), 14.0, gl, if resp.hovered() || (tip == "Text colour" && picking) { pal.text } else { pal.muted });
-                    if resp.on_hover_text(tip).on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                    icons::glyph(
+                        ui.painter(),
+                        br.center(),
+                        14.0,
+                        gl,
+                        if resp.hovered() || (tip == "Text colour" && picking) {
+                            pal.text
+                        } else {
+                            pal.muted
+                        },
+                    );
+                    if resp
+                        .on_hover_text(tip)
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
                         match tip {
                             "Text colour" => picking = !picking,
                             "Expand all" => collapsed.clear(),
-                            _ => collapsed = heads.iter().enumerate().filter(|(i, _)| has_kids[*i]).map(|(_, h)| h.0).collect(),
+                            _ => {
+                                collapsed = heads
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(i, _)| has_kids[*i])
+                                    .map(|(_, h)| h.0)
+                                    .collect()
+                            }
                         }
                     }
                     x -= 28.0;
@@ -2435,16 +3813,35 @@ fn draw_block(
                 let (pr, _) = ui.allocate_exact_size(vec2(w, 30.0), Sense::hover());
                 let mut x = pr.left() + 8.0;
                 for ci in 0..=9u8 {
-                    let c = if ci == 0 { pal.muted } else { tag_color(ci as usize - 1) };
-                    let cr = Rect::from_center_size(pos2(x + 10.0, pr.center().y), vec2(24.0, 24.0));
+                    let c = if ci == 0 {
+                        pal.muted
+                    } else {
+                        tag_color(ci as usize - 1)
+                    };
+                    let cr =
+                        Rect::from_center_size(pos2(x + 10.0, pr.center().y), vec2(24.0, 24.0));
                     let resp = ui.interact(cr, Id::new(("toc_col", b.id, ci)), Sense::click());
                     let sel = b.color == ci;
-                    let grow = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || sel, 0.1);
+                    let grow = ui
+                        .ctx()
+                        .animate_bool_with_time(resp.id, resp.hovered() || sel, 0.1);
                     ui.painter().circle_filled(cr.center(), 7.0 + 1.5 * grow, c);
                     if sel {
-                        ui.painter().circle_stroke(cr.center(), 10.5, Stroke::new(1.5_f32, pal.text));
+                        ui.painter().circle_stroke(
+                            cr.center(),
+                            10.5,
+                            Stroke::new(1.5_f32, pal.text),
+                        );
                     }
-                    if resp.on_hover_text(if ci == 0 { "Default" } else { TAG_NAMES[ci as usize - 1] }).on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                    if resp
+                        .on_hover_text(if ci == 0 {
+                            "Default"
+                        } else {
+                            TAG_NAMES[ci as usize - 1]
+                        })
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
                         b.color = ci;
                         changed = true;
                     }
@@ -2452,7 +3849,11 @@ fn draw_block(
                 }
             }
             if heads.is_empty() {
-                ui.label(RichText::new("Add headings to your page and they will appear here.").color(pal.muted).font(body(14.0 * s)));
+                ui.label(
+                    RichText::new("Add headings to your page and they will appear here.")
+                        .color(pal.muted)
+                        .font(body(14.0 * s)),
+                );
             }
             let min_lvl = heads.iter().map(|h| h.1).min().unwrap_or(1);
             let mut hide_below: Option<u8> = None;
@@ -2469,18 +3870,35 @@ fn draw_block(
                     hide_below = Some(*lvl);
                 }
                 let (r, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
-                let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+                let t = ui
+                    .ctx()
+                    .animate_bool_with_time(resp.id, resp.hovered(), 0.1);
                 let x = r.left() + (*lvl - min_lvl) as f32 * 20.0 * s.max(0.8);
                 // toggle (only for headings that have sub-headings): its own hit area, rotates smoothly
-                let tr = Rect::from_min_size(pos2(x - 2.0, r.top()), vec2(if touchy { 30.0 } else { 22.0 }, row_h));
+                let tr = Rect::from_min_size(
+                    pos2(x - 2.0, r.top()),
+                    vec2(if touchy { 30.0 } else { 22.0 }, row_h),
+                );
                 let mut toggled = false;
                 if kids {
                     let tresp = ui.interact(tr, Id::new(("toc_tog", b.id, *hid)), Sense::click());
-                    let th = ui.ctx().animate_bool_with_time(tresp.id.with("a"), !is_closed, 0.14);
+                    let th = ui
+                        .ctx()
+                        .animate_bool_with_time(tresp.id.with("a"), !is_closed, 0.14);
                     if tresp.hovered() {
-                        ui.painter().rect_filled(Rect::from_center_size(tr.center(), vec2(20.0, 20.0)), 5.0, pal.hover);
+                        ui.painter().rect_filled(
+                            Rect::from_center_size(tr.center(), vec2(20.0, 20.0)),
+                            5.0,
+                            pal.hover,
+                        );
                     }
-                    icons::chevron(ui.painter(), tr.center(), 11.0, th * std::f32::consts::FRAC_PI_2, if tresp.hovered() { pal.text } else { pal.muted });
+                    icons::chevron(
+                        ui.painter(),
+                        tr.center(),
+                        11.0,
+                        th * std::f32::consts::FRAC_PI_2,
+                        if tresp.hovered() { pal.text } else { pal.muted },
+                    );
                     if tresp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                         toggled = true;
                         if is_closed {
@@ -2491,24 +3909,59 @@ fn draw_block(
                     }
                 }
                 let tx = x + if touchy { 30.0 } else { 22.0 };
-                let label = if text.trim().is_empty() { "Untitled" } else { text.trim() };
+                let label = if text.trim().is_empty() {
+                    "Untitled"
+                } else {
+                    text.trim()
+                };
                 let current = ed.active_head == Some(*hid);
                 let rest = tint.unwrap_or(pal.muted);
                 let hot = tint.map_or(pal.text, |c| lerp_color(c, pal.text, 0.35));
-                let col = if current { tint.unwrap_or(pal.accent) } else { lerp_color(rest, hot, t) };
-                let font = if current { bold(14.5 * s) } else { body(14.5 * s) };
+                let col = if current {
+                    tint.unwrap_or(pal.accent)
+                } else {
+                    lerp_color(rest, hot, t)
+                };
+                let font = if current {
+                    bold(14.5 * s)
+                } else {
+                    body(14.5 * s)
+                };
                 let avail = (r.right() - tx - if is_closed { 34.0 } else { 4.0 }).max(40.0);
-                let wd = crate::widgets::text_fit(ui.painter(), pos2(tx, r.center().y), Align2::LEFT_CENTER, label, font, col, avail);
+                let wd = crate::widgets::text_fit(
+                    ui.painter(),
+                    pos2(tx, r.center().y),
+                    Align2::LEFT_CENTER,
+                    label,
+                    font,
+                    col,
+                    avail,
+                );
                 if t > 0.01 {
-                    ui.painter().line_segment([pos2(tx, r.center().y + 9.0 * s.max(0.8)), pos2(tx + wd, r.center().y + 9.0 * s.max(0.8))], Stroke::new(1.0_f32, with_alpha(col, t)));
+                    ui.painter().line_segment(
+                        [
+                            pos2(tx, r.center().y + 9.0 * s.max(0.8)),
+                            pos2(tx + wd, r.center().y + 9.0 * s.max(0.8)),
+                        ],
+                        Stroke::new(1.0_f32, with_alpha(col, t)),
+                    );
                 }
                 if is_closed {
                     let n_hidden = heads[i + 1..].iter().take_while(|h| h.1 > *lvl).count();
-                    ui.painter().text(pos2(tx + wd + 8.0, r.center().y), Align2::LEFT_CENTER, format!("+{n_hidden}"), body(11.5 * s.max(0.8)), with_alpha(pal.muted, 0.8));
+                    ui.painter().text(
+                        pos2(tx + wd + 8.0, r.center().y),
+                        Align2::LEFT_CENTER,
+                        format!("+{n_hidden}"),
+                        body(11.5 * s.max(0.8)),
+                        with_alpha(pal.muted, 0.8),
+                    );
                 }
                 if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() && !toggled {
                     // a click on the toggle never jumps
-                    if ui.input(|i| i.pointer.interact_pos()).map_or(true, |p| !(kids && tr.contains(p))) {
+                    if ui
+                        .input(|i| i.pointer.interact_pos())
+                        .map_or(true, |p| !(kids && tr.contains(p)))
+                    {
                         ed.scroll_to = Some(*hid);
                     }
                 }
@@ -2518,35 +3971,78 @@ fn draw_block(
                 collapsed.retain(|k| heads.iter().any(|h| h.0 == *k));
                 collapsed.sort_unstable();
                 collapsed.dedup();
-                b.text = collapsed.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(",");
+                b.text = collapsed
+                    .iter()
+                    .map(|k| k.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
                 changed = true;
             }
             ui.ctx().data_mut(|d| d.insert_temp(pick_id, picking));
             ui.add_space(4.0);
         }
         // laid out by `draw_range` / `draw_columns` / `draw_dbview`, never by this function
-        BlockKind::Columns | BlockKind::Column | BlockKind::DbView | BlockKind::Widget | BlockKind::Whiteboard => {}
+        BlockKind::Columns
+        | BlockKind::Column
+        | BlockKind::DbView
+        | BlockKind::Widget
+        | BlockKind::Whiteboard => {}
         BlockKind::PageLink => {
             let info = b.link.and_then(|l| links.get(&l));
             let (rect, resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::click());
-            let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-            ui.painter().rect_filled(rect, 6.0, with_alpha(pal.hover, t));
+            let t = ui
+                .ctx()
+                .animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+            ui.painter()
+                .rect_filled(rect, 6.0, with_alpha(pal.hover, t));
             match (info, b.link) {
                 (Some(i), _) => {
-                    let icon = if i.icon.is_empty() { l::FILE_TEXT } else { &i.icon };
-                    icons::paint_page_icon(ui, pos2(rect.left() + 16.0, rect.center().y), icon, 19.0, pal.text);
+                    let icon = if i.icon.is_empty() {
+                        l::FILE_TEXT
+                    } else {
+                        &i.icon
+                    };
+                    icons::paint_page_icon(
+                        ui,
+                        pos2(rect.left() + 16.0, rect.center().y),
+                        icon,
+                        19.0,
+                        pal.text,
+                    );
                     let col = pal.text;
-                    let g = ui.painter().layout_no_wrap(i.title.clone(), body(16.0 * ed.scale.max(0.5)), col);
+                    let g = ui.painter().layout_no_wrap(
+                        i.title.clone(),
+                        body(16.0 * ed.scale.max(0.5)),
+                        col,
+                    );
                     let (tx, ty) = (rect.left() + 34.0, rect.center().y - g.size().y / 2.0);
                     let gw = g.size().x;
                     ui.painter().galley(pos2(tx, ty), g, col);
-                    ui.painter().line_segment([pos2(tx, rect.center().y + 10.0), pos2(tx + gw, rect.center().y + 10.0)], Stroke::new(1.0_f32, with_alpha(col, 0.35)));
+                    ui.painter().line_segment(
+                        [
+                            pos2(tx, rect.center().y + 10.0),
+                            pos2(tx + gw, rect.center().y + 10.0),
+                        ],
+                        Stroke::new(1.0_f32, with_alpha(col, 0.35)),
+                    );
                 }
                 (None, None) => {
-                    ui.painter().text(pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, format!("{}  Choose a page to link…", l::LINK_2), body(15.0), pal.muted);
+                    ui.painter().text(
+                        pos2(rect.left() + 10.0, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        format!("{}  Choose a page to link…", l::LINK_2),
+                        body(15.0),
+                        pal.muted,
+                    );
                 }
                 (None, Some(_)) => {
-                    ui.painter().text(pos2(rect.left() + 10.0, rect.center().y), Align2::LEFT_CENTER, format!("{}  This page was deleted", l::TRIANGLE_ALERT), body(15.0), pal.danger);
+                    ui.painter().text(
+                        pos2(rect.left() + 10.0, rect.center().y),
+                        Align2::LEFT_CENTER,
+                        format!("{}  This page was deleted", l::TRIANGLE_ALERT),
+                        body(15.0),
+                        pal.danger,
+                    );
                 }
             }
             if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
@@ -2580,7 +4076,16 @@ struct Tx<'a> {
     width: f32,
 }
 
-fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorState, pal: &Palette, tx: Tx, act: &mut Option<Act>) -> bool {
+fn text_edit(
+    ui: &mut Ui,
+    b: &mut Block,
+    idx: usize,
+    n: usize,
+    ed: &mut EditorState,
+    pal: &Palette,
+    tx: Tx,
+    act: &mut Option<Act>,
+) -> bool {
     let ctx = ui.ctx().clone();
     let id = Id::new(("blk", b.id));
     let is_code = b.kind == BlockKind::Code || b.kind == BlockKind::Equation;
@@ -2588,13 +4093,27 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         // raw source field: no Markdown shortcuts inside (egui patch checks this flag)
         ctx.data_mut(|d| d.insert_temp(id.with("nomd"), true));
     }
-    let mut rt = if is_code { Rich::plain(&b.text) } else { Rich::parse(&b.text) };
+    let mut rt = if is_code {
+        Rich::plain(&b.text)
+    } else {
+        Rich::parse(&b.text)
+    };
     let nchars = rt.len();
-    let Tx { font, color, hint, width } = tx;
-    let focus_request = ed.focus.map_or(false, |(f, _)| f == b.id) || ed.restore_sel.map_or(false, |r| r.0 == b.id);
+    let Tx {
+        font,
+        color,
+        hint,
+        width,
+    } = tx;
+    let focus_request =
+        ed.focus.map_or(false, |(f, _)| f == b.id) || ed.restore_sel.map_or(false, |r| r.0 == b.id);
 
     // Unfocused blocks with inline formatting render the styled text without the markers.
-    if !focus_request && !b.kind.raw() && (has_marks(&b.text) || b.text.contains('$')) && !ctx.memory(|m| m.has_focus(id)) {
+    if !focus_request
+        && !b.kind.raw()
+        && (has_marks(&b.text) || b.text.contains('$'))
+        && !ctx.memory(|m| m.has_focus(id))
+    {
         // `$…$` formulas are shown typeset (Unicode); this display copy is self-consistent (links, chips) and never stored
         let rt = rt.with_math();
         let mut job = rt.job_ex(&font, color, pal, None);
@@ -2604,13 +4123,34 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         // Same geometry as the focused `TextEdit` below (3 px margin, at least one row of the body font) so that a block does not
         // move when it gains / loses focus or when text in it is marked up.
         let row_h = ui.fonts(|f| f.row_height(&font));
-        let (outer, resp) = ui.allocate_exact_size(vec2(width, galley.size().y.max(row_h) + 6.0), Sense::click());
-        let rect = Rect::from_min_size(outer.min + vec2(0.0, 3.0), vec2(width, outer.height() - 6.0));
+        let (outer, resp) = ui.allocate_exact_size(
+            vec2(width, galley.size().y.max(row_h) + 6.0),
+            Sense::click(),
+        );
+        let rect = Rect::from_min_size(
+            outer.min + vec2(0.0, 3.0),
+            vec2(width, outer.height() - 6.0),
+        );
         // `[[Page]]` links are hoverable chips (rounded pill + page icon), not blue hyperlinks
         let chips = rt.wiki_chips(None);
-        let chip_hit = if chips.is_empty() { None } else { resp.hover_pos().or_else(|| resp.interact_pointer_pos()).and_then(|p| rich::wiki_chip_at(&galley, rect.min, &chips, p)) };
+        let chip_hit = if chips.is_empty() {
+            None
+        } else {
+            resp.hover_pos()
+                .or_else(|| resp.interact_pointer_pos())
+                .and_then(|p| rich::wiki_chip_at(&galley, rect.min, &chips, p))
+        };
         if !chips.is_empty() {
-            let shapes = ui.fonts(|f| rich::wiki_chip_shapes(f, &galley, rect.min, &chips, pal, if resp.hovered() { chip_hit } else { None }));
+            let shapes = ui.fonts(|f| {
+                rich::wiki_chip_shapes(
+                    f,
+                    &galley,
+                    rect.min,
+                    &chips,
+                    pal,
+                    if resp.hovered() { chip_hit } else { None },
+                )
+            });
             for sh in shapes {
                 ui.painter().add(sh);
             }
@@ -2651,7 +4191,8 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         if fid == b.id {
             ctx.memory_mut(|m| m.request_focus(id));
             let mut st = TextEdit::load_state(&ctx, id).unwrap_or_default();
-            st.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(pos.min(nchars)))));
+            st.cursor
+                .set_char_range(Some(CCursorRange::one(CCursor::new(pos.min(nchars)))));
             st.store(&ctx, id);
             ed.focus = None;
             ed.slash_sel = 0;
@@ -2662,7 +4203,10 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         if rb == b.id {
             ctx.memory_mut(|m| m.request_focus(id));
             let mut st = TextEdit::load_state(&ctx, id).unwrap_or_default();
-            st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(a.min(nchars)), CCursor::new(c.min(nchars)))));
+            st.cursor.set_char_range(Some(CCursorRange::two(
+                CCursor::new(a.min(nchars)),
+                CCursor::new(c.min(nchars)),
+            )));
             st.store(&ctx, id);
             ed.restore_sel = None;
             ed.slash_sel = 0;
@@ -2670,7 +4214,15 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
     }
 
     let focused = ctx.memory(|m| m.has_focus(id));
-    let items = if focused && b.kind == BlockKind::Text && rt.plain.starts_with('/') && !rt.plain.contains('\n') { slash_items(&rt.plain[1..]) } else { vec![] };
+    let items = if focused
+        && b.kind == BlockKind::Text
+        && rt.plain.starts_with('/')
+        && !rt.plain.contains('\n')
+    {
+        slash_items(&rt.plain[1..])
+    } else {
+        vec![]
+    };
     let slash_active = !items.is_empty();
     if slash_active {
         ed.slash_sel = ed.slash_sel.min(items.len() - 1);
@@ -2699,7 +4251,10 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
             if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::M)) {
                 let (sa, sb) = widgets::selection(&ctx, id).unwrap_or((nchars, nchars));
                 let frag = rt.slice(sa, sb);
-                let surrounded = sa >= 1 && sb < nchars && rt.plain.chars().nth(sa - 1) == Some('$') && rt.plain.chars().nth(sb) == Some('$');
+                let surrounded = sa >= 1
+                    && sb < nchars
+                    && rt.plain.chars().nth(sa - 1) == Some('$')
+                    && rt.plain.chars().nth(sb) == Some('$');
                 if surrounded {
                     rt.replace(sa - 1, sb + 1, &frag);
                     ed.restore_sel = Some((b.id, sa - 1, sb - 1));
@@ -2714,7 +4269,11 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
                 ed.slash_sel = 0;
             }
             // Copy / Cut of a formatted fragment: remember the exact formatting for the next paste.
-            let copying = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy | egui::Event::Cut)));
+            let copying = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Copy | egui::Event::Cut))
+            });
             if copying {
                 if let Some((sa, sb)) = widgets::selection(&ctx, id) {
                     if sa != sb {
@@ -2723,7 +4282,15 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
                 }
             }
             // Pasting blocks that were copied in this app: insert the exact blocks, not their Markdown.
-            let pasted = ctx.input(|i| i.events.iter().find_map(|e| if let egui::Event::Paste(t) = e { Some(t.clone()) } else { None }));
+            let pasted = ctx.input(|i| {
+                i.events.iter().find_map(|e| {
+                    if let egui::Event::Paste(t) = e {
+                        Some(t.clone())
+                    } else {
+                        None
+                    }
+                })
+            });
             if let Some(t) = pasted {
                 if let Some(blocks) = clip::blocks_for(&t) {
                     ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Paste(_))));
@@ -2733,11 +4300,15 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
                     let (sa, sb) = widgets::selection(&ctx, id).unwrap_or((nchars, nchars));
                     match clip::classify(&t) {
                         clip::Pasted::Blocks(blocks) => {
-                            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Paste(_))));
+                            ctx.input_mut(|i| {
+                                i.events.retain(|e| !matches!(e, egui::Event::Paste(_)))
+                            });
                             *act = Some(Act::PasteMd(idx, blocks, sa, sb));
                         }
                         clip::Pasted::Inline(frag) => {
-                            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Paste(_))));
+                            ctx.input_mut(|i| {
+                                i.events.retain(|e| !matches!(e, egui::Event::Paste(_)))
+                            });
                             rt.replace(sa.min(sb), sa.max(sb), &frag);
                             b.text = rt.markup();
                             let at = sa.min(sb) + frag.len();
@@ -2749,8 +4320,14 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
             }
         }
         let range = TextEdit::load_state(&ctx, id).and_then(|s| s.cursor.char_range());
-        let (cursor, collapsed) = range.map_or((nchars, true), |r| (r.primary.index, r.primary.index == r.secondary.index));
-        let link_trig = if !b.kind.raw() && !slash_active && collapsed { wiki_trigger(&rt.plain, cursor) } else { None };
+        let (cursor, collapsed) = range.map_or((nchars, true), |r| {
+            (r.primary.index, r.primary.index == r.secondary.index)
+        });
+        let link_trig = if !b.kind.raw() && !slash_active && collapsed {
+            wiki_trigger(&rt.plain, cursor)
+        } else {
+            None
+        };
         if link_trig.is_none() && ed.link_dismiss.map_or(false, |d| d.0 == b.id) {
             ed.link_dismiss = None;
         }
@@ -2770,7 +4347,10 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
                 ed.slash_sel = (ed.slash_sel + len - 1) % len;
                 ed.slash_moved = true;
             }
-            if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::Tab)) {
+            if ui.input_mut(|i| {
+                i.consume_key(Modifiers::NONE, Key::Enter)
+                    || i.consume_key(Modifiers::NONE, Key::Tab)
+            }) {
                 *act = Some(slash_act(idx, items[ed.slash_sel]));
             }
         } else if link_active {
@@ -2788,7 +4368,10 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
             if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                 ed.link_dismiss = Some((b.id, start));
             }
-            if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::Tab)) {
+            if ui.input_mut(|i| {
+                i.consume_key(Modifiers::NONE, Key::Enter)
+                    || i.consume_key(Modifiers::NONE, Key::Tab)
+            }) {
                 let nc = insert_wiki(&mut rt, start, cursor, &link_sugs[ed.link_sel].title);
                 b.text = rt.markup();
                 ed.focus = Some((b.id, nc));
@@ -2799,9 +4382,21 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
             if !b.kind.raw() {
                 let shift = ui.input(|i| i.modifiers.shift);
                 if !shift && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
-                    let listy = matches!(b.kind, BlockKind::Todo | BlockKind::Bullet | BlockKind::Numbered | BlockKind::Quote | BlockKind::Callout | BlockKind::Toggle);
+                    let listy = matches!(
+                        b.kind,
+                        BlockKind::Todo
+                            | BlockKind::Bullet
+                            | BlockKind::Numbered
+                            | BlockKind::Quote
+                            | BlockKind::Callout
+                            | BlockKind::Toggle
+                    );
                     if rt.is_empty() && listy {
-                        *act = Some(if b.indent > 0 { Act::Indent(idx, -1) } else { Act::Convert(idx, BlockKind::Text, false) });
+                        *act = Some(if b.indent > 0 {
+                            Act::Indent(idx, -1)
+                        } else {
+                            Act::Convert(idx, BlockKind::Text, false)
+                        });
                     } else {
                         *act = Some(Act::Split(idx, cursor));
                     }
@@ -2826,23 +4421,39 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
                 }
             }
             if !b.kind.raw() {
-                let (row, rows) = ctx.data(|d| d.get_temp::<(usize, usize)>(id.with("rows"))).unwrap_or((1, 1));
-                if row == 0 && idx > 0 && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+                let (row, rows) = ctx
+                    .data(|d| d.get_temp::<(usize, usize)>(id.with("rows")))
+                    .unwrap_or((1, 1));
+                if row == 0
+                    && idx > 0
+                    && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp))
+                {
                     *act = Some(Act::FocusPrev(idx));
                 }
-                if row + 1 >= rows && idx + 1 < n && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+                if row + 1 >= rows
+                    && idx + 1 < n
+                    && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown))
+                {
                     *act = Some(Act::FocusNext(idx));
                 }
             }
         }
     }
 
-    let hint_txt = if b.kind == BlockKind::Text && !focused { String::new() } else { hint.to_owned() };
+    let hint_txt = if b.kind == BlockKind::Text && !focused {
+        String::new()
+    } else {
+        hint.to_owned()
+    };
     let (pal2, font2) = (*pal, font.clone());
     let pending_fmt = ed.pending.filter(|p| p.0 == b.id).map(|p| p.2);
     // caret of the previous frame: a `[[link]]` that contains it is shown as raw, editable text; the others are chips
     let caret_key = id.with("wl_caret");
-    let caret_prev: Option<usize> = if focused { ctx.data(|d| d.get_temp(caret_key)) } else { None };
+    let caret_prev: Option<usize> = if focused {
+        ctx.data(|d| d.get_temp(caret_key))
+    } else {
+        None
+    };
     let rt_old = rt.clone();
     let mut buf = rt.plain.clone();
     // The layouter shows the formatted text *without any markers*; while the text changes inside a frame it adapts the formats.
@@ -2875,12 +4486,21 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         .lock_focus(true)
         .margin(Margin::symmetric(0, 3))
         .layouter(&mut layouter)
-        .hint_text(RichText::new(hint_txt).font(font).color(with_alpha(pal.muted, 0.75)))
+        .hint_text(
+            RichText::new(hint_txt)
+                .font(font)
+                .color(with_alpha(pal.muted, 0.75)),
+        )
         .show(ui);
     // collaboration: report my caret, draw the other people's (thin coloured bar + name flag + selection tint)
     if focused {
         if let Some(cr) = out.cursor_range {
-            crate::collab::set_caret(b.id, cr.secondary.ccursor.index as u32, cr.primary.ccursor.index as u32, out.galley.text().chars().count() as u32);
+            crate::collab::set_caret(
+                b.id,
+                cr.secondary.ccursor.index as u32,
+                cr.primary.ccursor.index as u32,
+                out.galley.text().chars().count() as u32,
+            );
         }
     } else {
         crate::collab::clear_caret(b.id);
@@ -2892,7 +4512,15 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         if is_code {
             b.text = buf.clone();
         } else {
-            let paste = ctx.input(|i| i.events.iter().find_map(|e| if let egui::Event::Paste(t) = e { clip::rich_for(t) } else { None }));
+            let paste = ctx.input(|i| {
+                i.events.iter().find_map(|e| {
+                    if let egui::Event::Paste(t) = e {
+                        clip::rich_for(t)
+                    } else {
+                        None
+                    }
+                })
+            });
             rt.adjust(&buf, pending_fmt, paste.as_ref());
             b.text = rt.markup();
             ed.pending = None;
@@ -2909,8 +4537,12 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
     if !is_code && rt.plain.contains("[[") {
         let chips = rt.wiki_chips(caret_prev);
         if !chips.is_empty() {
-            let hover = ui.input(|i| i.pointer.hover_pos()).and_then(|p| rich::wiki_chip_at(&out.galley, out.galley_pos, &chips, p));
-            let shapes = ui.fonts(|f| rich::wiki_chip_shapes(f, &out.galley, out.galley_pos, &chips, pal, hover));
+            let hover = ui
+                .input(|i| i.pointer.hover_pos())
+                .and_then(|p| rich::wiki_chip_at(&out.galley, out.galley_pos, &chips, p));
+            let shapes = ui.fonts(|f| {
+                rich::wiki_chip_shapes(f, &out.galley, out.galley_pos, &chips, pal, hover)
+            });
             ui.painter().set(chip_bg, egui::Shape::Vec(shapes));
             if let Some(hi) = hover {
                 ctx.set_cursor_icon(CursorIcon::PointingHand);
@@ -2944,7 +4576,10 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
     // (The hidden text input follows the caret, see vendor/eframe text_agent.rs — it is clamped to the visible area.)
     if crate::touch::touchy() && focused && out.response.changed() {
         if let Some(cr) = out.cursor_range {
-            let r = out.galley.pos_from_cursor(&cr.primary).translate(out.galley_pos.to_vec2());
+            let r = out
+                .galley
+                .pos_from_cursor(&cr.primary)
+                .translate(out.galley_pos.to_vec2());
             ui.scroll_to_rect(r.expand2(vec2(0.0, 72.0)), None);
         }
     }
@@ -2958,7 +4593,10 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         if prev.map_or(true, |p| (p - h).abs() > 1.0) {
             ctx.data_mut(|d| d.insert_temp(key, h));
             if let Some(cr) = out.cursor_range {
-                let r = out.galley.pos_from_cursor(&cr.primary).translate(out.galley_pos.to_vec2());
+                let r = out
+                    .galley
+                    .pos_from_cursor(&cr.primary)
+                    .translate(out.galley_pos.to_vec2());
                 ui.scroll_to_rect(r.expand2(vec2(0.0, 72.0)), None);
             }
         }
@@ -2978,8 +4616,16 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
             Some(cr) if cr.primary.ccursor.index != cr.secondary.ccursor.index => {
                 let (pa, pb) = (cr.primary.ccursor.index, cr.secondary.ccursor.index);
                 let lo = if pa < pb { cr.primary } else { cr.secondary };
-                let r = out.galley.pos_from_cursor(&lo).translate(out.galley_pos.to_vec2());
-                ed.fmt_bar = Some(FmtBar { bid: b.id, pos: r.left_top(), a: pa.min(pb), b: pa.max(pb) });
+                let r = out
+                    .galley
+                    .pos_from_cursor(&lo)
+                    .translate(out.galley_pos.to_vec2());
+                ed.fmt_bar = Some(FmtBar {
+                    bid: b.id,
+                    pos: r.left_top(),
+                    a: pa.min(pb),
+                    b: pa.max(pb),
+                });
             }
             Some(_) => {
                 if ed.fmt_bar.map_or(false, |f| f.bid == b.id) {
@@ -3014,34 +4660,49 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
         let screen = ctx.screen_rect();
         let y = pos.y.min(screen.bottom() - 380.0).max(10.0);
         let pressed = ctx.input(|i| i.pointer.primary_pressed());
-        let area = egui::Area::new(Id::new("slash_menu")).order(Order::Foreground).fixed_pos(pos2(pos.x, y + (1.0 - t) * -5.0)).show(&ctx, |ui| {
-            ui.set_opacity(t);
-            crate::widgets::popup_frame(pal).show(ui, |ui| {
-                ui.set_width(310.0);
-                ScrollArea::vertical().max_height(340.0).auto_shrink([false, true]).show(ui, |ui| {
-                    let mut last_sec = "";
-                    for (i, k) in items.iter().enumerate() {
-                        if k.sec != last_sec {
-                            section_label(ui, pal, k.sec);
-                            last_sec = k.sec;
-                        }
-                        let r = menu_item(ui, pal, k.glyph, k.label, Some(k.hint), i == sel, false);
-                        if i == sel && moved {
-                            r.scroll_to_me(None);
-                        }
-                        // Hit-test by position (not by egui's hover flag): the text field loses focus on the very
-                        // press that clicks an item, and the flag is unreliable on that frame.
-                        let over = ui.rect_contains_pointer(r.rect) && ui.clip_rect().contains(r.rect.center());
-                        if over {
-                            ed.slash_sel = i;
-                        }
-                        if pressed && over {
-                            pick = Some(*k);
-                        }
-                    }
+        let area = egui::Area::new(Id::new("slash_menu"))
+            .order(Order::Foreground)
+            .fixed_pos(pos2(pos.x, y + (1.0 - t) * -5.0))
+            .show(&ctx, |ui| {
+                ui.set_opacity(t);
+                crate::widgets::popup_frame(pal).show(ui, |ui| {
+                    ui.set_width(310.0);
+                    ScrollArea::vertical()
+                        .max_height(340.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            let mut last_sec = "";
+                            for (i, k) in items.iter().enumerate() {
+                                if k.sec != last_sec {
+                                    section_label(ui, pal, k.sec);
+                                    last_sec = k.sec;
+                                }
+                                let r = menu_item(
+                                    ui,
+                                    pal,
+                                    k.glyph,
+                                    k.label,
+                                    Some(k.hint),
+                                    i == sel,
+                                    false,
+                                );
+                                if i == sel && moved {
+                                    r.scroll_to_me(None);
+                                }
+                                // Hit-test by position (not by egui's hover flag): the text field loses focus on the very
+                                // press that clicks an item, and the flag is unreliable on that frame.
+                                let over = ui.rect_contains_pointer(r.rect)
+                                    && ui.clip_rect().contains(r.rect.center());
+                                if over {
+                                    ed.slash_sel = i;
+                                }
+                                if pressed && over {
+                                    pick = Some(*k);
+                                }
+                            }
+                        });
                 });
             });
-        });
         ctx.raise_layer(area.response.layer_id);
         if let Some(k) = pick {
             *act = Some(slash_act(idx, k));
@@ -3052,18 +4713,35 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
 
     // `[[` page suggestions: a drop-down under the caret listing matching pages (and "Create …" for a new title)
     if focused && !slash_active && !b.kind.raw() {
-        let caret = out.cursor_range.filter(|c| c.primary.ccursor.index == c.secondary.ccursor.index);
+        let caret = out
+            .cursor_range
+            .filter(|c| c.primary.ccursor.index == c.secondary.ccursor.index);
         let trig = caret.and_then(|c| wiki_trigger(&rt.plain, c.primary.ccursor.index));
         if let (Some(cr), Some((st, q))) = (caret, trig) {
-            let sugs = if ed.link_dismiss == Some((b.id, st)) { vec![] } else { wiki_sugs(&ed.pages, &q) };
+            let sugs = if ed.link_dismiss == Some((b.id, st)) {
+                vec![]
+            } else {
+                wiki_sugs(&ed.pages, &q)
+            };
             ed.want_pages = true;
             if !sugs.is_empty() {
                 let screen = ctx.screen_rect();
-                let c_rect = out.galley.pos_from_cursor(&cr.primary).translate(out.galley_pos.to_vec2());
+                let c_rect = out
+                    .galley
+                    .pos_from_cursor(&cr.primary)
+                    .translate(out.galley_pos.to_vec2());
                 let w = 300.0_f32.min(screen.width() - 16.0);
-                let est_h = (sugs.len() as f32 * if crate::touch::touchy() { 40.0 } else { 30.0 } + 44.0).min(380.0);
+                let est_h = (sugs.len() as f32 * if crate::touch::touchy() { 40.0 } else { 30.0 }
+                    + 44.0)
+                    .min(380.0);
                 let below = c_rect.bottom() + 6.0;
-                let y = if below + est_h > screen.bottom() - 6.0 && c_rect.top() - est_h - 6.0 > screen.top() { c_rect.top() - est_h - 6.0 } else { below.min(screen.bottom() - est_h - 6.0).max(6.0) };
+                let y = if below + est_h > screen.bottom() - 6.0
+                    && c_rect.top() - est_h - 6.0 > screen.top()
+                {
+                    c_rect.top() - est_h - 6.0
+                } else {
+                    below.min(screen.bottom() - est_h - 6.0).max(6.0)
+                };
                 let x = c_rect.left().min(screen.right() - w - 8.0).max(8.0);
                 let t = appear(&ctx, Id::new("wiki_appear"), 0.12);
                 let moved = std::mem::take(&mut ed.slash_moved);
@@ -3071,29 +4749,49 @@ fn text_edit(ui: &mut Ui, b: &mut Block, idx: usize, n: usize, ed: &mut EditorSt
                 let sel = ed.link_sel;
                 let pressed = ctx.input(|i| i.pointer.primary_pressed());
                 let mut pick: Option<usize> = None;
-                let area = egui::Area::new(Id::new("wiki_menu")).order(Order::Foreground).fixed_pos(pos2(x, y + (1.0 - t) * -4.0)).show(&ctx, |ui| {
-                    ui.set_opacity(t);
-                    crate::widgets::popup_frame(pal).show(ui, |ui| {
-                        ui.set_width(w);
-                        section_label(ui, pal, "Link to page");
-                        ScrollArea::vertical().id_salt("wiki_scroll").max_height(300.0).auto_shrink([false, true]).show(ui, |ui| {
-                            for (i, sg) in sugs.iter().enumerate() {
-                                let (lead, label) = if sg.create { (l::PLUS, format!("Create “{}”", sg.title)) } else { (if sg.icon.is_empty() { l::FILE_TEXT } else { sg.icon.as_str() }, sg.title.clone()) };
-                                let r = menu_item(ui, pal, lead, &label, None, i == sel, false);
-                                if i == sel && moved {
-                                    r.scroll_to_me(None);
-                                }
-                                let over = ui.rect_contains_pointer(r.rect) && ui.clip_rect().contains(r.rect.center());
-                                if over {
-                                    ed.link_sel = i;
-                                }
-                                if pressed && over {
-                                    pick = Some(i);
-                                }
-                            }
+                let area = egui::Area::new(Id::new("wiki_menu"))
+                    .order(Order::Foreground)
+                    .fixed_pos(pos2(x, y + (1.0 - t) * -4.0))
+                    .show(&ctx, |ui| {
+                        ui.set_opacity(t);
+                        crate::widgets::popup_frame(pal).show(ui, |ui| {
+                            ui.set_width(w);
+                            section_label(ui, pal, "Link to page");
+                            ScrollArea::vertical()
+                                .id_salt("wiki_scroll")
+                                .max_height(300.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    for (i, sg) in sugs.iter().enumerate() {
+                                        let (lead, label) = if sg.create {
+                                            (l::PLUS, format!("Create “{}”", sg.title))
+                                        } else {
+                                            (
+                                                if sg.icon.is_empty() {
+                                                    l::FILE_TEXT
+                                                } else {
+                                                    sg.icon.as_str()
+                                                },
+                                                sg.title.clone(),
+                                            )
+                                        };
+                                        let r =
+                                            menu_item(ui, pal, lead, &label, None, i == sel, false);
+                                        if i == sel && moved {
+                                            r.scroll_to_me(None);
+                                        }
+                                        let over = ui.rect_contains_pointer(r.rect)
+                                            && ui.clip_rect().contains(r.rect.center());
+                                        if over {
+                                            ed.link_sel = i;
+                                        }
+                                        if pressed && over {
+                                            pick = Some(i);
+                                        }
+                                    }
+                                });
                         });
                     });
-                });
                 ctx.raise_layer(area.response.layer_id);
                 if let Some(i) = pick {
                     let nc = insert_wiki(&mut rt, st, cr.primary.ccursor.index, &sugs[i].title);
@@ -3121,7 +4819,11 @@ fn wiki_trigger(plain: &str, cursor: usize) -> Option<(usize, String)> {
     while i >= 2 && cur - i <= 60 {
         if chars[i - 1] == '[' && chars[i - 2] == '[' {
             let q: String = chars[i..cur].iter().collect();
-            return if q.contains(['[', ']', '\n']) { None } else { Some((i - 2, q)) };
+            return if q.contains(['[', ']', '\n']) {
+                None
+            } else {
+                Some((i - 2, q))
+            };
         }
         if chars[i - 1] == ']' || chars[i - 1] == '\n' {
             return None;
@@ -3140,11 +4842,26 @@ struct WikiSug {
 /// Pages matching what was typed after `[[` (prefix matches first), plus a "create" entry when the title does not exist yet.
 fn wiki_sugs(pages: &[(String, String)], q: &str) -> Vec<WikiSug> {
     let ql = q.trim().to_lowercase();
-    let mut hits: Vec<&(String, String)> = pages.iter().filter(|(t, _)| ql.is_empty() || t.to_lowercase().contains(&ql)).collect();
+    let mut hits: Vec<&(String, String)> = pages
+        .iter()
+        .filter(|(t, _)| ql.is_empty() || t.to_lowercase().contains(&ql))
+        .collect();
     hits.sort_by_key(|(t, _)| !t.to_lowercase().starts_with(&ql));
-    let mut v: Vec<WikiSug> = hits.into_iter().take(8).map(|(t, i)| WikiSug { title: t.clone(), icon: i.clone(), create: false }).collect();
+    let mut v: Vec<WikiSug> = hits
+        .into_iter()
+        .take(8)
+        .map(|(t, i)| WikiSug {
+            title: t.clone(),
+            icon: i.clone(),
+            create: false,
+        })
+        .collect();
     if !ql.is_empty() && !pages.iter().any(|(t, _)| t.trim().to_lowercase() == ql) {
-        v.push(WikiSug { title: q.trim().to_owned(), icon: String::new(), create: true });
+        v.push(WikiSug {
+            title: q.trim().to_owned(),
+            icon: String::new(),
+            create: true,
+        });
     }
     v
 }
@@ -3155,7 +4872,10 @@ fn insert_wiki(rt: &mut Rich, start: usize, cursor: usize, title: &str) -> usize
     if rt.plain.chars().skip(cursor).take(2).collect::<String>() == "]]" {
         end += 2;
     }
-    let clean: String = title.chars().filter(|c| !matches!(c, '|' | '[' | ']' | '\n')).collect();
+    let clean: String = title
+        .chars()
+        .filter(|c| !matches!(c, '|' | '[' | ']' | '\n'))
+        .collect();
     let t = format!("[[{}]]", clean.trim());
     let n = t.chars().count();
     rt.replace(start, end, &Rich::plain(&t));
@@ -3171,7 +4891,10 @@ fn toggle_format(rt: &mut Rich, ed: &mut EditorState, bid: u64, a: usize, b: usi
     } else {
         let mut f = match ed.pending {
             Some((pb, pc, f)) if pb == bid && pc == a => f,
-            _ => a.checked_sub(1).and_then(|i| rt.fmts.get(i).copied()).unwrap_or_default(),
+            _ => a
+                .checked_sub(1)
+                .and_then(|i| rt.fmts.get(i).copied())
+                .unwrap_or_default(),
         };
         f.link = 0;
         f.flags ^= flag;
@@ -3206,7 +4929,14 @@ fn word_range(text: &str, at: usize) -> (usize, usize) {
     (a, b)
 }
 
-fn open_text_menu(ed: &mut EditorState, ctx: &Context, id: Id, bid: u64, nchars: usize, p: egui::Pos2) {
+fn open_text_menu(
+    ed: &mut EditorState,
+    ctx: &Context,
+    id: Id,
+    bid: u64,
+    nchars: usize,
+    p: egui::Pos2,
+) {
     let (a, b) = widgets::selection(ctx, id).unwrap_or((nchars, nchars));
     let (a, b) = (a.min(nchars), b.min(nchars));
     ed.menu = Some(EdMenu::Text { bid, a, b, pos: p });
@@ -3235,7 +4965,14 @@ enum Cmd {
     CopyBlock,
 }
 
-fn ed_menu(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState, pal: &Palette, m: EdMenu) -> bool {
+fn ed_menu(
+    ui: &mut Ui,
+    page: &mut Page,
+    next_id: &mut u64,
+    ed: &mut EditorState,
+    pal: &Palette,
+    m: EdMenu,
+) -> bool {
     let ctx = ui.ctx().clone();
     let (bid, pos, sel) = match m {
         EdMenu::Text { bid, a, b, pos } => (bid, pos, Some((a, b))),
@@ -3255,35 +4992,126 @@ fn ed_menu(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState
     let mut list: Vec<(CtxItem, Cmd)> = vec![];
     if has_text {
         if sel.is_some() {
-            list.push((CtxItem::new(l::SCISSORS, "Cut").hint("Ctrl+X").enabled(has_sel), Cmd::Cut));
-            list.push((CtxItem::new(l::COPY, "Copy").hint("Ctrl+C").enabled(has_sel), Cmd::Copy));
-            list.push((CtxItem::new(l::CLIPBOARD_PASTE, "Paste").hint("Ctrl+V"), Cmd::Paste));
+            list.push((
+                CtxItem::new(l::SCISSORS, "Cut")
+                    .hint("Ctrl+X")
+                    .enabled(has_sel),
+                Cmd::Cut,
+            ));
+            list.push((
+                CtxItem::new(l::COPY, "Copy")
+                    .hint("Ctrl+C")
+                    .enabled(has_sel),
+                Cmd::Copy,
+            ));
+            list.push((
+                CtxItem::new(l::CLIPBOARD_PASTE, "Paste").hint("Ctrl+V"),
+                Cmd::Paste,
+            ));
             if !has_sel && crate::touch::touchy() {
                 list.push((CtxItem::new(l::TEXT_SELECT, "Select word"), Cmd::SelWord));
             }
-            list.push((CtxItem::new(l::TEXT_SELECT, "Select all").hint("Ctrl+A"), Cmd::SelAll));
+            list.push((
+                CtxItem::new(l::TEXT_SELECT, "Select all").hint("Ctrl+A"),
+                Cmd::SelAll,
+            ));
             if !kind.raw() {
-                list.push((CtxItem::new(l::BOLD, "Bold").hint("Ctrl+B").enabled(has_sel).sep(), Cmd::Fmt("**")));
-                list.push((CtxItem::new(l::ITALIC, "Italic").hint("Ctrl+I").enabled(has_sel), Cmd::Fmt("*")));
-                list.push((CtxItem::new(l::STRIKETHROUGH, "Strikethrough").hint("Ctrl+Shift+S").enabled(has_sel), Cmd::Fmt("~~")));
-                list.push((CtxItem::new(l::UNDERLINE, "Underline").hint("Ctrl+U").enabled(has_sel), Cmd::Fmt("__")));
-                list.push((CtxItem::new(l::CODE, "Inline code").hint("Ctrl+E").enabled(has_sel), Cmd::Fmt("`")));
-                list.push((CtxItem::new(l::HIGHLIGHTER, "Highlight").hint("Ctrl+Shift+H").enabled(has_sel), Cmd::Fmt("==")));
+                list.push((
+                    CtxItem::new(l::BOLD, "Bold")
+                        .hint("Ctrl+B")
+                        .enabled(has_sel)
+                        .sep(),
+                    Cmd::Fmt("**"),
+                ));
+                list.push((
+                    CtxItem::new(l::ITALIC, "Italic")
+                        .hint("Ctrl+I")
+                        .enabled(has_sel),
+                    Cmd::Fmt("*"),
+                ));
+                list.push((
+                    CtxItem::new(l::STRIKETHROUGH, "Strikethrough")
+                        .hint("Ctrl+Shift+S")
+                        .enabled(has_sel),
+                    Cmd::Fmt("~~"),
+                ));
+                list.push((
+                    CtxItem::new(l::UNDERLINE, "Underline")
+                        .hint("Ctrl+U")
+                        .enabled(has_sel),
+                    Cmd::Fmt("__"),
+                ));
+                list.push((
+                    CtxItem::new(l::CODE, "Inline code")
+                        .hint("Ctrl+E")
+                        .enabled(has_sel),
+                    Cmd::Fmt("`"),
+                ));
+                list.push((
+                    CtxItem::new(l::HIGHLIGHTER, "Highlight")
+                        .hint("Ctrl+Shift+H")
+                        .enabled(has_sel),
+                    Cmd::Fmt("=="),
+                ));
             }
         } else {
             list.push((CtxItem::new(l::COPY, "Copy text"), Cmd::CopyBlock));
         }
     }
-    list.push((CtxItem::new(l::REPLACE, if has_text { "Turn into & colour…" } else { "Style…" }).sep(), Cmd::Style));
+    list.push((
+        CtxItem::new(
+            l::REPLACE,
+            if has_text {
+                "Turn into & colour…"
+            } else {
+                "Style…"
+            },
+        )
+        .sep(),
+        Cmd::Style,
+    ));
     list.push((CtxItem::new(l::SQUARE_CHECK, "Select block"), Cmd::SelBlock));
-    list.push((CtxItem::new(l::COPY_PLUS, "Duplicate").hint("Ctrl+D"), Cmd::Dup));
-    list.push((CtxItem::new(l::ARROW_UP, "Move up").enabled(idx > 0), Cmd::Up));
-    list.push((CtxItem::new(l::ARROW_DOWN, "Move down").enabled(subtree_end(&page.blocks, idx) < page.blocks.len()), Cmd::Down));
-    list.push((CtxItem::new(l::INDENT_INCREASE, "Indent").hint("Tab").enabled(idx > 0), Cmd::Indent));
-    list.push((CtxItem::new(l::INDENT_DECREASE, "Outdent").hint("Shift+Tab").enabled(page.blocks[idx].indent > 0), Cmd::Outdent));
-    list.push((CtxItem::new(l::TRASH_2, "Delete").hint("Del").danger().sep(), Cmd::Del));
+    list.push((
+        CtxItem::new(l::COPY_PLUS, "Duplicate").hint("Ctrl+D"),
+        Cmd::Dup,
+    ));
+    list.push((
+        CtxItem::new(l::ARROW_UP, "Move up").enabled(idx > 0),
+        Cmd::Up,
+    ));
+    list.push((
+        CtxItem::new(l::ARROW_DOWN, "Move down")
+            .enabled(subtree_end(&page.blocks, idx) < page.blocks.len()),
+        Cmd::Down,
+    ));
+    list.push((
+        CtxItem::new(l::INDENT_INCREASE, "Indent")
+            .hint("Tab")
+            .enabled(idx > 0),
+        Cmd::Indent,
+    ));
+    list.push((
+        CtxItem::new(l::INDENT_DECREASE, "Outdent")
+            .hint("Shift+Tab")
+            .enabled(page.blocks[idx].indent > 0),
+        Cmd::Outdent,
+    ));
+    list.push((
+        CtxItem::new(l::TRASH_2, "Delete")
+            .hint("Del")
+            .danger()
+            .sep(),
+        Cmd::Del,
+    ));
     let items: Vec<CtxItem> = list.iter().map(|x| x.0).collect();
-    let (open, pick) = context_menu(&ctx, Id::new("ed_menu"), pos, pal, &mut ed.menu_fresh, &items);
+    let (open, pick) = context_menu(
+        &ctx,
+        Id::new("ed_menu"),
+        pos,
+        pal,
+        &mut ed.menu_fresh,
+        &items,
+    );
     let mut changed = false;
     if let Some(pi) = pick {
         let tid = Id::new(("blk", bid));
@@ -3382,10 +5210,16 @@ fn ed_menu(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState
 
 /// Applies clipboard text that arrived (asynchronously on the web) after "Paste" was chosen from a menu.
 fn finish_paste(page: &mut Page, next_id: &mut u64, ed: &mut EditorState) -> bool {
-    let Some((bid, a, b)) = ed.paste_wait else { return false };
-    let Some(clip) = platform::take_paste() else { return false };
+    let Some((bid, a, b)) = ed.paste_wait else {
+        return false;
+    };
+    let Some(clip) = platform::take_paste() else {
+        return false;
+    };
     ed.paste_wait = None;
-    let Some(idx) = page.blocks.iter().position(|x| x.id == bid) else { return false };
+    let Some(idx) = page.blocks.iter().position(|x| x.id == bid) else {
+        return false;
+    };
     let clip = clip.replace("\r\n", "\n");
     if clip.is_empty() {
         return false;
@@ -3406,7 +5240,15 @@ fn finish_paste(page: &mut Page, next_id: &mut u64, ed: &mut EditorState) -> boo
     }
     // 2. a formatted fragment copied inside the app keeps its formatting
     if !clip.trim_end_matches('\n').contains('\n') {
-        let frag = clip::rich_for(&clip).or_else(|| if let clip::Pasted::Inline(f) = clip::classify(&clip) { Some(f) } else { None }).unwrap_or_else(|| Rich::plain(&clip));
+        let frag = clip::rich_for(&clip)
+            .or_else(|| {
+                if let clip::Pasted::Inline(f) = clip::classify(&clip) {
+                    Some(f)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| Rich::plain(&clip));
         let mut rt = Rich::parse(&page.blocks[idx].text);
         rt.replace(a, b, &frag);
         page.blocks[idx].text = rt.markup();
@@ -3489,68 +5331,113 @@ fn fmt_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) ->
     let x = (bar.pos.x - 10.0).clamp(8.0, (screen.right() - w - 8.0).max(8.0));
     // on touch screens the finger / selection handles / keyboard hide the area under the selection: prefer the space above
     let above = bar.pos.y - h - 8.0 > screen.top() + 6.0;
-    let y = if above { bar.pos.y - h - 8.0 } else { bar.pos.y + 32.0 };
+    let y = if above {
+        bar.pos.y - h - 8.0
+    } else {
+        bar.pos.y + 32.0
+    };
     let mut clicked: Option<Cmd> = None;
     let mut link_clicked = false;
-    let area = egui::Area::new(Id::new("fmt_bar")).order(Order::Foreground).fixed_pos(pos2(x, y + (1.0 - t) * 5.0)).show(&ctx, |ui| {
-        ui.set_opacity(t);
-        crate::widgets::popup_frame(pal).inner_margin(Margin::same(4)).corner_radius(CornerRadius::same(9)).show(ui, |ui| {
-            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-            if wrap {
-                ui.set_width(w - 8.0);
-            }
-            let row = |ui: &mut Ui| {
-                let sep = |ui: &mut Ui| {
-                    let (r, _) = ui.allocate_exact_size(vec2(9.0, 26.0), Sense::hover());
-                    ui.painter().vline(r.center().x, r.y_range().shrink(4.0), Stroke::new(1.0_f32, pal.border));
-                };
-                if widgets::icon_button(ui, pal, Icon::Type, 15.0, "Turn into & colour").clicked() {
-                    clicked = Some(Cmd::Style);
-                }
-                sep(ui);
-                let state = Rich::parse(&page.blocks[idx].text);
-                for (icon, mark, tip) in [
-                    (Icon::Bold, "**", "Bold  Ctrl+B"),
-                    (Icon::Italic, "*", "Italic  Ctrl+I"),
-                    (Icon::Underline, "__", "Underline  Ctrl+U"),
-                    (Icon::Strike, "~~", "Strikethrough  Ctrl+Shift+S"),
-                    (Icon::Code, "`", "Inline code  Ctrl+E"),
-                    (Icon::Highlight, "==", "Highlight  Ctrl+Shift+H"),
-                ] {
-                    let r = widgets::icon_button(ui, pal, icon, 15.0, tip);
-                    if state.all_have(bar.a, bar.b, rich::flag_for(mark)) {
-                        ui.painter().rect_filled(r.rect.shrink2(vec2(0.0, 1.0)), 6.0, with_alpha(pal.accent, 0.22));
-                        ui.painter().hline(r.rect.x_range().shrink(7.0), r.rect.bottom() - 3.0, Stroke::new(2.0_f32, pal.accent));
+    let area = egui::Area::new(Id::new("fmt_bar"))
+        .order(Order::Foreground)
+        .fixed_pos(pos2(x, y + (1.0 - t) * 5.0))
+        .show(&ctx, |ui| {
+            ui.set_opacity(t);
+            crate::widgets::popup_frame(pal)
+                .inner_margin(Margin::same(4))
+                .corner_radius(CornerRadius::same(9))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                    let _ = wrap;
+                    let row = |ui: &mut Ui| {
+                        let sep = |ui: &mut Ui| {
+                            let (r, _) = ui.allocate_exact_size(vec2(9.0, 26.0), Sense::hover());
+                            ui.painter().vline(
+                                r.center().x,
+                                r.y_range().shrink(4.0),
+                                Stroke::new(1.0_f32, pal.border),
+                            );
+                        };
+                        if widgets::icon_button(ui, pal, Icon::Type, 15.0, "Turn into & colour")
+                            .clicked()
+                        {
+                            clicked = Some(Cmd::Style);
+                        }
+                        sep(ui);
+                        let state = Rich::parse(&page.blocks[idx].text);
+                        for (icon, mark, tip) in [
+                            (Icon::Bold, "**", "Bold  Ctrl+B"),
+                            (Icon::Italic, "*", "Italic  Ctrl+I"),
+                            (Icon::Underline, "__", "Underline  Ctrl+U"),
+                            (Icon::Strike, "~~", "Strikethrough  Ctrl+Shift+S"),
+                            (Icon::Code, "`", "Inline code  Ctrl+E"),
+                            (Icon::Highlight, "==", "Highlight  Ctrl+Shift+H"),
+                        ] {
+                            let r = widgets::icon_button(ui, pal, icon, 15.0, tip);
+                            if state.all_have(bar.a, bar.b, rich::flag_for(mark)) {
+                                ui.painter().rect_filled(
+                                    r.rect.shrink2(vec2(0.0, 1.0)),
+                                    6.0,
+                                    with_alpha(pal.accent, 0.22),
+                                );
+                                ui.painter().hline(
+                                    r.rect.x_range().shrink(7.0),
+                                    r.rect.bottom() - 3.0,
+                                    Stroke::new(2.0_f32, pal.accent),
+                                );
+                            }
+                            if r.clicked() {
+                                clicked = Some(Cmd::Fmt(mark));
+                            }
+                        }
+                        let lr = widgets::icon_button(ui, pal, Icon::Link, 15.0, "Link");
+                        if state.link_in(bar.a, bar.b).is_some() {
+                            ui.painter().rect_filled(
+                                lr.rect.shrink2(vec2(0.0, 1.0)),
+                                6.0,
+                                with_alpha(pal.accent, 0.22),
+                            );
+                        }
+                        if lr.clicked() {
+                            link_clicked = true;
+                        }
+                        sep(ui);
+                        if widgets::icon_button(ui, pal, Icon::Palette, 15.0, "Colour & background")
+                            .clicked()
+                        {
+                            clicked = Some(Cmd::Style);
+                        }
+                    };
+                    if wrap {
+                        ScrollArea::horizontal()
+                            .id_salt("fmt_bar_hscroll")
+                            .max_width((w - 8.0).max(160.0))
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            )
+                            .show(ui, |ui| {
+                                ui.horizontal(row);
+                            });
+                    } else {
+                        ui.horizontal(row);
                     }
-                    if r.clicked() {
-                        clicked = Some(Cmd::Fmt(mark));
-                    }
-                }
-                let lr = widgets::icon_button(ui, pal, Icon::Link, 15.0, "Link");
-                if state.link_in(bar.a, bar.b).is_some() {
-                    ui.painter().rect_filled(lr.rect.shrink2(vec2(0.0, 1.0)), 6.0, with_alpha(pal.accent, 0.22));
-                }
-                if lr.clicked() {
-                    link_clicked = true;
-                }
-                sep(ui);
-                if widgets::icon_button(ui, pal, Icon::Palette, 15.0, "Colour & background").clicked() {
-                    clicked = Some(Cmd::Style);
-                }
-            };
-            if wrap {
-                ui.horizontal_wrapped(row);
-            } else {
-                ui.horizontal(row);
-            }
+                });
         });
-    });
     ctx.raise_layer(area.response.layer_id);
     ctx.data_mut(|d| d.insert_temp(rect_id, area.response.rect));
     let mut changed = false;
     if link_clicked && clicked.is_none() {
-        let existing = Rich::parse(&page.blocks[idx].text).link_in(bar.a, bar.b).unwrap_or_else(|| "https://".to_owned());
-        ed.link_edit = Some(LinkEdit { bid: bar.bid, a: bar.a, b: bar.b, url: existing, pos: pos2(area.response.rect.left(), area.response.rect.bottom() + 6.0), fresh: true });
+        let existing = Rich::parse(&page.blocks[idx].text)
+            .link_in(bar.a, bar.b)
+            .unwrap_or_else(|| "https://".to_owned());
+        ed.link_edit = Some(LinkEdit {
+            bid: bar.bid,
+            a: bar.a,
+            b: bar.b,
+            url: existing,
+            pos: pos2(area.response.rect.left(), area.response.rect.bottom() + 6.0),
+            fresh: true,
+        });
         ed.fmt_bar = None;
         return false;
     }
@@ -3564,7 +5451,10 @@ fn fmt_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) ->
         }
         Some(_) => {
             ed.restore_sel = Some((bar.bid, bar.a, bar.b));
-            ed.block_menu = Some((bar.bid, pos2(area.response.rect.left(), area.response.rect.bottom() + 6.0)));
+            ed.block_menu = Some((
+                bar.bid,
+                pos2(area.response.rect.left(), area.response.rect.bottom() + 6.0),
+            ));
             ed.fresh = true;
             ed.fmt_bar = None;
         }
@@ -3574,40 +5464,68 @@ fn fmt_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) ->
 }
 
 pub fn link_popup(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) -> bool {
-    let Some(mut le) = ed.link_edit.take() else { return false };
+    let Some(mut le) = ed.link_edit.take() else {
+        return false;
+    };
     let ctx = ui.ctx().clone();
-    let Some(idx) = page.blocks.iter().position(|b| b.id == le.bid) else { return false };
+    let Some(idx) = page.blocks.iter().position(|b| b.id == le.bid) else {
+        return false;
+    };
     let (mut apply_it, mut remove, mut close) = (false, false, false);
     let id = Id::new("link_url");
     let screen = ctx.screen_rect();
-    let pos = pos2(le.pos.x.min(screen.right() - 340.0).max(8.0), le.pos.y.min(screen.bottom() - 90.0).max(8.0));
-    let area = egui::Area::new(Id::new("link_popup")).order(Order::Foreground).fixed_pos(pos).show(&ctx, |ui| {
-        crate::widgets::popup_frame(pal).inner_margin(Margin::same(8)).show(ui, |ui| {
-            ui.set_width(318.0);
-            ui.horizontal(|ui| {
-                icons::paint(ui.painter(), ui.cursor().min + vec2(10.0, 12.0), 14.0, Icon::Link, pal.muted);
-                ui.add_space(24.0);
-                let r = ui.add(TextEdit::singleline(&mut le.url).id(id).hint_text("Paste or type a link").desired_width(200.0));
-                if le.fresh {
-                    r.request_focus();
-                }
-                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    apply_it = true;
-                }
-                if ui.button("Apply").clicked() {
-                    apply_it = true;
-                }
-                if ui.button("✕").on_hover_text("Remove link").clicked() {
-                    remove = true;
-                }
-            });
+    let pos = pos2(
+        le.pos.x.min(screen.right() - 340.0).max(8.0),
+        le.pos.y.min(screen.bottom() - 90.0).max(8.0),
+    );
+    let area = egui::Area::new(Id::new("link_popup"))
+        .order(Order::Foreground)
+        .fixed_pos(pos)
+        .show(&ctx, |ui| {
+            crate::widgets::popup_frame(pal)
+                .inner_margin(Margin::same(8))
+                .show(ui, |ui| {
+                    ui.set_width(318.0);
+                    ui.horizontal(|ui| {
+                        icons::paint(
+                            ui.painter(),
+                            ui.cursor().min + vec2(10.0, 12.0),
+                            14.0,
+                            Icon::Link,
+                            pal.muted,
+                        );
+                        ui.add_space(24.0);
+                        let r = ui.add(
+                            TextEdit::singleline(&mut le.url)
+                                .id(id)
+                                .hint_text("Paste or type a link")
+                                .desired_width(200.0),
+                        );
+                        if le.fresh {
+                            r.request_focus();
+                        }
+                        if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            apply_it = true;
+                        }
+                        if ui.button("Apply").clicked() {
+                            apply_it = true;
+                        }
+                        if ui.button("✕").on_hover_text("Remove link").clicked() {
+                            remove = true;
+                        }
+                    });
+                });
         });
-    });
     ctx.raise_layer(area.response.layer_id);
     if ctx.input(|i| i.key_pressed(Key::Escape)) {
         close = true;
     }
-    if !le.fresh && ctx.input(|i| i.pointer.any_pressed()) && !ctx.pointer_interact_pos().map_or(false, |p| area.response.rect.contains(p)) {
+    if !le.fresh
+        && ctx.input(|i| i.pointer.any_pressed())
+        && !ctx
+            .pointer_interact_pos()
+            .map_or(false, |p| area.response.rect.contains(p))
+    {
         close = true;
     }
     le.fresh = false;
@@ -3618,7 +5536,11 @@ pub fn link_popup(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Pale
         if remove || url.is_empty() || url == "https://" {
             rt.set_link(le.a, le.b, None);
         } else {
-            let full = if url.contains("://") || url.starts_with("mailto:") { url.to_owned() } else { format!("https://{url}") };
+            let full = if url.contains("://") || url.starts_with("mailto:") {
+                url.to_owned()
+            } else {
+                format!("https://{url}")
+            };
             rt.set_link(le.a, le.b, Some(&full));
         }
         page.blocks[idx].text = rt.markup();
@@ -3641,27 +5563,63 @@ pub fn swatches(ui: &mut Ui, pal: &Palette, cur: u8, is_bg: bool, pick: &mut Opt
         ui.spacing_mut().item_spacing = vec2(3.0, 3.0);
         for c in 0..=9u8 {
             let (r, resp) = ui.allocate_exact_size(vec2(21.0, 21.0), Sense::click());
-            let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-            let col = if c == 0 { pal.muted } else { tag_color(c as usize - 1) };
+            let t = ui
+                .ctx()
+                .animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+            let col = if c == 0 {
+                pal.muted
+            } else {
+                tag_color(c as usize - 1)
+            };
             if is_bg {
-                let fill = if c == 0 { pal.hover } else { col.gamma_multiply(0.35) };
+                let fill = if c == 0 {
+                    pal.hover
+                } else {
+                    col.gamma_multiply(0.35)
+                };
                 ui.painter().rect_filled(r, 5.0, fill);
             } else {
-                ui.painter().rect_filled(r, 5.0, with_alpha(pal.hover, 0.4 + 0.6 * t));
-                ui.painter().text(r.center(), Align2::CENTER_CENTER, "A", bold(13.0), if c == 0 { pal.text } else { col });
+                ui.painter()
+                    .rect_filled(r, 5.0, with_alpha(pal.hover, 0.4 + 0.6 * t));
+                ui.painter().text(
+                    r.center(),
+                    Align2::CENTER_CENTER,
+                    "A",
+                    bold(13.0),
+                    if c == 0 { pal.text } else { col },
+                );
             }
             if cur == c {
-                ui.painter().rect_stroke(r, 5.0, Stroke::new(1.6_f32, pal.accent), egui::StrokeKind::Inside);
+                ui.painter().rect_stroke(
+                    r,
+                    5.0,
+                    Stroke::new(1.6_f32, pal.accent),
+                    egui::StrokeKind::Inside,
+                );
             }
-            let name = if c == 0 { "Default" } else { TAG_NAMES[c as usize - 1] };
-            if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(name).clicked() {
+            let name = if c == 0 {
+                "Default"
+            } else {
+                TAG_NAMES[c as usize - 1]
+            };
+            if resp
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text(name)
+                .clicked()
+            {
                 *pick = Some(c);
             }
         }
     });
 }
 
-fn popups(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState, pal: &Palette) -> bool {
+fn popups(
+    ui: &mut Ui,
+    page: &mut Page,
+    next_id: &mut u64,
+    ed: &mut EditorState,
+    pal: &Palette,
+) -> bool {
     let ctx = ui.ctx().clone();
     let mut changed = false;
 
@@ -3681,46 +5639,78 @@ fn popups(ui: &mut Ui, page: &mut Page, next_id: &mut u64, ed: &mut EditorState,
             let (cur_c, cur_bg) = (page.blocks[idx].color, page.blocks[idx].bg);
             let y = pos.y.min(ctx.screen_rect().bottom() - 480.0).max(10.0);
             let max_h = (ctx.screen_rect().bottom() - y - 20.0).clamp(240.0, 560.0);
-            let open = popup_area(&ctx, Id::new("block_menu"), pos2(pos.x, y), pal, &mut ed.fresh, 250.0, |ui| {
-                ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
-                    if cur_kind.has_text() {
-                        section_label(ui, pal, "TURN INTO");
-                        for k in BlockKind::TEXTY.iter() {
-                            if menu_item(ui, pal, k.glyph(), k.label(), None, *k == cur_kind, false).clicked() {
-                                action = Some(Act::Convert(idx, *k, false));
+            let open = popup_area(
+                &ctx,
+                Id::new("block_menu"),
+                pos2(pos.x, y),
+                pal,
+                &mut ed.fresh,
+                250.0,
+                |ui| {
+                    ScrollArea::vertical()
+                        .max_height(max_h)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            if cur_kind.has_text() {
+                                section_label(ui, pal, "TURN INTO");
+                                for k in BlockKind::TEXTY.iter() {
+                                    if menu_item(
+                                        ui,
+                                        pal,
+                                        k.glyph(),
+                                        k.label(),
+                                        None,
+                                        *k == cur_kind,
+                                        false,
+                                    )
+                                    .clicked()
+                                    {
+                                        action = Some(Act::Convert(idx, *k, false));
+                                    }
+                                }
+                                ui.add_space(4.0);
+                                section_label(ui, pal, "COLOR");
+                                let mut pick = None;
+                                swatches(ui, pal, cur_c, false, &mut pick);
+                                if let Some(c) = pick {
+                                    action = Some(Act::SetColor(idx, c, false));
+                                }
                             }
-                        }
-                        ui.add_space(4.0);
-                        section_label(ui, pal, "COLOR");
-                        let mut pick = None;
-                        swatches(ui, pal, cur_c, false, &mut pick);
-                        if let Some(c) = pick {
-                            action = Some(Act::SetColor(idx, c, false));
-                        }
-                    }
-                    section_label(ui, pal, "BACKGROUND");
-                    let mut pick = None;
-                    swatches(ui, pal, cur_bg, true, &mut pick);
-                    if let Some(c) = pick {
-                        action = Some(Act::SetColor(idx, c, true));
-                    }
-                    ui.add_space(4.0);
-                    ui.painter().hline(ui.available_rect_before_wrap().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
-                    ui.add_space(5.0);
-                    if menu_item(ui, pal, l::INDENT_INCREASE, "Indent", None, false, false).clicked() {
-                        action = Some(Act::Indent(idx, 1));
-                    }
-                    if menu_item(ui, pal, l::INDENT_DECREASE, "Outdent", None, false, false).clicked() {
-                        action = Some(Act::Indent(idx, -1));
-                    }
-                    if menu_item(ui, pal, l::COPY_PLUS, "Duplicate", None, false, false).clicked() {
-                        action = Some(Act::Dup(idx));
-                    }
-                    if menu_item(ui, pal, l::TRASH_2, "Delete", None, false, true).clicked() {
-                        action = Some(Act::Remove(idx));
-                    }
-                });
-            });
+                            section_label(ui, pal, "BACKGROUND");
+                            let mut pick = None;
+                            swatches(ui, pal, cur_bg, true, &mut pick);
+                            if let Some(c) = pick {
+                                action = Some(Act::SetColor(idx, c, true));
+                            }
+                            ui.add_space(4.0);
+                            ui.painter().hline(
+                                ui.available_rect_before_wrap().x_range(),
+                                ui.cursor().top(),
+                                Stroke::new(1.0_f32, pal.border),
+                            );
+                            ui.add_space(5.0);
+                            if menu_item(ui, pal, l::INDENT_INCREASE, "Indent", None, false, false)
+                                .clicked()
+                            {
+                                action = Some(Act::Indent(idx, 1));
+                            }
+                            if menu_item(ui, pal, l::INDENT_DECREASE, "Outdent", None, false, false)
+                                .clicked()
+                            {
+                                action = Some(Act::Indent(idx, -1));
+                            }
+                            if menu_item(ui, pal, l::COPY_PLUS, "Duplicate", None, false, false)
+                                .clicked()
+                            {
+                                action = Some(Act::Dup(idx));
+                            }
+                            if menu_item(ui, pal, l::TRASH_2, "Delete", None, false, true).clicked()
+                            {
+                                action = Some(Act::Remove(idx));
+                            }
+                        });
+                },
+            );
             let close = action.is_some() && !matches!(action, Some(Act::SetColor(..)));
             if let Some(a) = action {
                 apply(page, a, next_id, ed);
@@ -3759,14 +5749,20 @@ mod tests {
     #[test]
     fn inline_spans() {
         let s = parse_spans("a **b** *c* ~~d~~ `e` f");
-        let styled: Vec<(&str, bool, bool, bool, bool)> =
-            s.iter().filter(|x| !x.marker).map(|x| (x.text.as_str(), x.bold, x.italic, x.strike, x.code)).collect();
+        let styled: Vec<(&str, bool, bool, bool, bool)> = s
+            .iter()
+            .filter(|x| !x.marker)
+            .map(|x| (x.text.as_str(), x.bold, x.italic, x.strike, x.code))
+            .collect();
         assert!(styled.contains(&("b", true, false, false, false)));
         assert!(styled.contains(&("c", false, true, false, false)));
         assert!(styled.contains(&("d", false, false, true, false)));
         assert!(styled.contains(&("e", false, false, false, true)));
         // text is preserved byte-for-byte (needed for cursor mapping)
-        assert_eq!(s.iter().map(|x| x.text.as_str()).collect::<String>(), "a **b** *c* ~~d~~ `e` f");
+        assert_eq!(
+            s.iter().map(|x| x.text.as_str()).collect::<String>(),
+            "a **b** *c* ~~d~~ `e` f"
+        );
         // unmatched markers stay literal
         assert!(parse_spans("2 * 3 = 6").iter().all(|x| !x.marker));
         assert!(parse_spans("**open").iter().all(|x| !x.marker));
@@ -3797,7 +5793,10 @@ mod tests {
         apply(&mut p, Act::Indent(1, 1), &mut next, &mut ed);
         assert_eq!(p.blocks[1].indent, 1);
         apply(&mut p, Act::Indent(1, -1), &mut next, &mut ed);
-        assert_eq!(p.blocks.iter().map(|b| b.indent).collect::<Vec<_>>(), vec![0, 0, 1, 0]);
+        assert_eq!(
+            p.blocks.iter().map(|b| b.indent).collect::<Vec<_>>(),
+            vec![0, 0, 1, 0]
+        );
     }
 
     #[test]
@@ -3811,9 +5810,15 @@ mod tests {
         let mut next = 100;
         let mut ed = EditorState::default();
         apply(&mut p, Act::MoveTo(1, 4), &mut next, &mut ed);
-        assert_eq!(p.blocks.iter().map(|b| b.id).collect::<Vec<_>>(), vec![1, 4, 2, 3]);
+        assert_eq!(
+            p.blocks.iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![1, 4, 2, 3]
+        );
         apply(&mut p, Act::MoveTo(2, 3), &mut next, &mut ed); // into own subtree: ignored
-        assert_eq!(p.blocks.iter().map(|b| b.id).collect::<Vec<_>>(), vec![1, 4, 2, 3]);
+        assert_eq!(
+            p.blocks.iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![1, 4, 2, 3]
+        );
         apply(&mut p, Act::Split(3, 2), &mut next, &mut ed);
         assert_eq!(p.blocks[4].text, "ild");
         assert_eq!(p.blocks[4].indent, 1);
@@ -3823,7 +5828,11 @@ mod tests {
 
     #[test]
     fn collapsed_toggle_hides_children() {
-        let mut bl = vec![blk(1, BlockKind::Toggle, "t", 0), blk(2, BlockKind::Text, "c", 1), blk(3, BlockKind::Text, "d", 0)];
+        let mut bl = vec![
+            blk(1, BlockKind::Toggle, "t", 0),
+            blk(2, BlockKind::Text, "c", 1),
+            blk(3, BlockKind::Text, "d", 0),
+        ];
         bl[0].collapsed = true;
         assert!(hidden(&bl, 1));
         assert!(!hidden(&bl, 2));
@@ -3833,19 +5842,33 @@ mod tests {
     fn wiki_trigger_finds_the_open_brackets() {
         assert_eq!(wiki_trigger("see [[Pro", 9), Some((4, "Pro".to_owned())));
         assert_eq!(wiki_trigger("[[", 2), Some((0, String::new())));
-        assert_eq!(wiki_trigger("[[done]] and", 12), None, "a closed link is not a trigger");
+        assert_eq!(
+            wiki_trigger("[[done]] and", 12),
+            None,
+            "a closed link is not a trigger"
+        );
         assert_eq!(wiki_trigger("plain text", 5), None);
-        assert_eq!(wiki_trigger("[[a\nb", 6), None, "a trigger never spans lines");
+        assert_eq!(
+            wiki_trigger("[[a\nb", 6),
+            None,
+            "a trigger never spans lines"
+        );
     }
 
     #[test]
     fn wiki_suggestions_rank_and_offer_create() {
-        let pages: Vec<(String, String)> = ["Project plan", "Roadmap", "My project"].iter().map(|t| (t.to_string(), String::new())).collect();
+        let pages: Vec<(String, String)> = ["Project plan", "Roadmap", "My project"]
+            .iter()
+            .map(|t| (t.to_string(), String::new()))
+            .collect();
         let s = wiki_sugs(&pages, "proj");
         assert_eq!(s[0].title, "Project plan", "prefix matches first");
         assert!(s.iter().any(|x| x.title == "My project"));
         assert!(s.last().unwrap().create, "an unknown title offers Create");
-        assert!(!wiki_sugs(&pages, "roadmap").iter().any(|x| x.create), "an existing title does not");
+        assert!(
+            !wiki_sugs(&pages, "roadmap").iter().any(|x| x.create),
+            "an existing title does not"
+        );
         assert_eq!(wiki_sugs(&pages, "").len(), 3);
     }
 
@@ -3864,7 +5887,9 @@ mod tests {
     fn slash_menu_filters() {
         assert!(slash_items("").len() > 15);
         assert_eq!(slash_items("todo")[0].label, "To-do list");
-        assert!(slash_items("kanban").iter().any(|i| i.label == "Board database"));
+        assert!(slash_items("kanban")
+            .iter()
+            .any(|i| i.label == "Board database"));
         assert!(slash_items("zzzzzz").is_empty());
     }
 
@@ -3874,14 +5899,25 @@ mod tests {
 
     #[test]
     fn slash_columns_builds_a_valid_layout() {
-        let mut p = page(vec![blk(1, BlockKind::Text, "/columns", 0), blk(2, BlockKind::Text, "tail", 0)]);
+        let mut p = page(vec![
+            blk(1, BlockKind::Text, "/columns", 0),
+            blk(2, BlockKind::Text, "tail", 0),
+        ]);
         let mut next = 100;
         let mut ed = EditorState::default();
-        apply(&mut p, Act::Special(0, Slash::Columns(3)), &mut next, &mut ed);
+        apply(
+            &mut p,
+            Act::Special(0, Slash::Columns(3)),
+            &mut next,
+            &mut ed,
+        );
         normalize_layout(&mut p.blocks, &mut next);
         let k = kinds(&p);
         assert_eq!(k[0], (BlockKind::Columns, 0));
-        assert_eq!(k.iter().filter(|x| **x == (BlockKind::Column, 1)).count(), 3);
+        assert_eq!(
+            k.iter().filter(|x| **x == (BlockKind::Column, 1)).count(),
+            3
+        );
         assert_eq!(k.iter().filter(|x| **x == (BlockKind::Text, 2)).count(), 3);
         assert_eq!(*k.last().unwrap(), (BlockKind::Text, 0));
         let before = kinds(&p);
@@ -3893,21 +5929,47 @@ mod tests {
     fn normalize_repairs_broken_layouts() {
         let mut next = 500;
         // a single column dissolves, its content moves back to the page body
-        let mut p = page(vec![blk(1, BlockKind::Columns, "", 0), blk(2, BlockKind::Column, "", 1), blk(3, BlockKind::Text, "only", 2), blk(4, BlockKind::Text, "after", 0)]);
+        let mut p = page(vec![
+            blk(1, BlockKind::Columns, "", 0),
+            blk(2, BlockKind::Column, "", 1),
+            blk(3, BlockKind::Text, "only", 2),
+            blk(4, BlockKind::Text, "after", 0),
+        ]);
         normalize_layout(&mut p.blocks, &mut next);
         assert_eq!(kinds(&p), vec![(BlockKind::Text, 0), (BlockKind::Text, 0)]);
         // a stray block directly under Columns is pulled into the previous column
-        let mut p = page(vec![blk(1, BlockKind::Columns, "", 0), blk(2, BlockKind::Column, "", 1), blk(3, BlockKind::Text, "a", 2), blk(4, BlockKind::Column, "", 1), blk(5, BlockKind::Text, "b", 2), blk(6, BlockKind::Text, "stray", 1), blk(7, BlockKind::Text, "end", 0)]);
+        let mut p = page(vec![
+            blk(1, BlockKind::Columns, "", 0),
+            blk(2, BlockKind::Column, "", 1),
+            blk(3, BlockKind::Text, "a", 2),
+            blk(4, BlockKind::Column, "", 1),
+            blk(5, BlockKind::Text, "b", 2),
+            blk(6, BlockKind::Text, "stray", 1),
+            blk(7, BlockKind::Text, "end", 0),
+        ]);
         normalize_layout(&mut p.blocks, &mut next);
         assert_eq!(p.blocks[5].indent, 2);
         assert_eq!(p.blocks[5].text, "stray");
         // an empty column gets an empty block; an orphan Column becomes text; a page never ends inside a layout
-        let mut p = page(vec![blk(1, BlockKind::Column, "", 1), blk(2, BlockKind::Columns, "", 0), blk(3, BlockKind::Column, "", 1), blk(4, BlockKind::Column, "", 1), blk(5, BlockKind::Text, "x", 2)]);
+        let mut p = page(vec![
+            blk(1, BlockKind::Column, "", 1),
+            blk(2, BlockKind::Columns, "", 0),
+            blk(3, BlockKind::Column, "", 1),
+            blk(4, BlockKind::Column, "", 1),
+            blk(5, BlockKind::Text, "x", 2),
+        ]);
         normalize_layout(&mut p.blocks, &mut next);
         assert_eq!(p.blocks[0].kind, BlockKind::Text);
-        let cols = p.blocks.iter().filter(|b| b.kind == BlockKind::Column).count();
+        let cols = p
+            .blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::Column)
+            .count();
         assert_eq!(cols, 2);
-        assert!(p.blocks.iter().all(|b| b.kind != BlockKind::Column || b.indent == 1));
+        assert!(p
+            .blocks
+            .iter()
+            .all(|b| b.kind != BlockKind::Column || b.indent == 1));
         assert_eq!(p.blocks.last().unwrap().indent, 0);
         assert_eq!(p.blocks.last().unwrap().kind, BlockKind::Text);
     }
@@ -3917,18 +5979,42 @@ mod tests {
         let mut p = page(vec![blk(1, BlockKind::Text, "/c", 0)]);
         let mut next = 100;
         let mut ed = EditorState::default();
-        apply(&mut p, Act::Special(0, Slash::Columns(2)), &mut next, &mut ed);
+        apply(
+            &mut p,
+            Act::Special(0, Slash::Columns(2)),
+            &mut next,
+            &mut ed,
+        );
         normalize_layout(&mut p.blocks, &mut next);
-        let first_col = p.blocks.iter().position(|b| b.kind == BlockKind::Column).unwrap();
+        let first_col = p
+            .blocks
+            .iter()
+            .position(|b| b.kind == BlockKind::Column)
+            .unwrap();
         apply(&mut p, Act::ColAdd(first_col), &mut next, &mut ed);
         normalize_layout(&mut p.blocks, &mut next);
-        assert_eq!(p.blocks.iter().filter(|b| b.kind == BlockKind::Column).count(), 3);
+        assert_eq!(
+            p.blocks
+                .iter()
+                .filter(|b| b.kind == BlockKind::Column)
+                .count(),
+            3
+        );
         apply(&mut p, Act::ColDel(first_col), &mut next, &mut ed);
         normalize_layout(&mut p.blocks, &mut next);
-        assert_eq!(p.blocks.iter().filter(|b| b.kind == BlockKind::Column).count(), 2);
+        assert_eq!(
+            p.blocks
+                .iter()
+                .filter(|b| b.kind == BlockKind::Column)
+                .count(),
+            2
+        );
         apply(&mut p, Act::ColUnwrap(0), &mut next, &mut ed);
         normalize_layout(&mut p.blocks, &mut next);
-        assert!(p.blocks.iter().all(|b| !matches!(b.kind, BlockKind::Column | BlockKind::Columns)));
+        assert!(p
+            .blocks
+            .iter()
+            .all(|b| !matches!(b.kind, BlockKind::Column | BlockKind::Columns)));
         assert!(p.blocks.iter().all(|b| b.indent == 0));
     }
 
@@ -3955,7 +6041,15 @@ mod tests {
 
     #[test]
     fn backspace_never_merges_across_a_column_boundary() {
-        let mut p = page(vec![blk(1, BlockKind::Text, "before", 0), blk(2, BlockKind::Columns, "", 0), blk(3, BlockKind::Column, "", 1), blk(4, BlockKind::Text, "in column", 2), blk(5, BlockKind::Column, "", 1), blk(6, BlockKind::Text, "second", 2), blk(7, BlockKind::Text, "end", 0)]);
+        let mut p = page(vec![
+            blk(1, BlockKind::Text, "before", 0),
+            blk(2, BlockKind::Columns, "", 0),
+            blk(3, BlockKind::Column, "", 1),
+            blk(4, BlockKind::Text, "in column", 2),
+            blk(5, BlockKind::Column, "", 1),
+            blk(6, BlockKind::Text, "second", 2),
+            blk(7, BlockKind::Text, "end", 0),
+        ]);
         let mut next = 100;
         let mut ed = EditorState::default();
         let n = p.blocks.len();
@@ -3972,6 +6066,10 @@ mod tests {
         apply(&mut p, Act::Special(0, Slash::NewPage), &mut next, &mut ed);
         assert!(matches!(ed.req, Some(Req::NewPage(1))));
         assert_eq!(p.blocks[0].kind, BlockKind::PageLink);
-        assert_eq!(p.blocks.len(), 2, "a trailing text block is kept so the user can keep typing");
+        assert_eq!(
+            p.blocks.len(),
+            2,
+            "a trailing text block is kept so the user can keep typing"
+        );
     }
 }

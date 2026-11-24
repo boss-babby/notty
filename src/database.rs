@@ -1275,18 +1275,34 @@ fn filter_value(ui: &mut Ui, db: &Database, pal: &Palette, f: &Filter, kind: Pro
     }
 }
 
-fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st: &mut DbState, pal: &Palette, acts: &mut Vec<A>) {
+fn popups(
+    ui: &mut Ui,
+    ws: &Workspace,
+    db_id: u64,
+    db: &Database,
+    vi: usize,
+    st: &mut DbState,
+    pal: &Palette,
+    acts: &mut Vec<A>,
+) {
     let Some(pop) = st.popup.clone() else { return };
     let ctx = ui.ctx().clone();
     let pid = sid("db_popup");
     let mut next: Option<Option<Popup>> = None;
-    let view = &db.views[vi.min(db.views.len() - 1)];
+    if db.views.is_empty() {
+        return;
+    }
     let vi = vi.min(db.views.len() - 1);
+    let view = &db.views[vi];
     let open = match pop {
         Popup::Filter(pos) => popup_area(&ctx, pid, pos, pal, &mut st.fresh, 440.0, |ui| {
             section_label(ui, pal, "FILTER");
             if view.filters.is_empty() {
-                ui.label(RichText::new("   No filters yet — show only the pages that match.").font(body(13.0)).color(pal.muted));
+                ui.label(
+                    RichText::new("   No filters yet — show only the pages that match.")
+                        .font(body(13.0))
+                        .color(pal.muted),
+                );
             }
             let choices = prop_choices(db);
             for (fi, f) in view.filters.iter().enumerate() {
@@ -1294,21 +1310,48 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                 let avail = ui.available_width();
                 let wide = avail >= 430.0;
                 let half = ((avail - 30.0 - 8.0) * 0.5).max(70.0);
-                let (pw, ow, vw) = if wide { (120.0, 108.0, (avail - 120.0 - 108.0 - 16.0 - 30.0).max(90.0)) } else { (half, half, (avail - 4.0).max(90.0)) };
+                let (pw, ow, vw) = if wide {
+                    (
+                        120.0,
+                        108.0,
+                        (avail - 120.0 - 108.0 - 16.0 - 30.0).max(90.0),
+                    )
+                } else {
+                    (half, half, (avail - 4.0).max(90.0))
+                };
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
-                        let pname = choices.iter().find(|c| c.0 == f.prop).map(|c| c.1.clone()).unwrap_or_else(|| "Name".into());
+                        let pname = choices
+                            .iter()
+                            .find(|c| c.0 == f.prop)
+                            .map(|c| c.1.clone())
+                            .unwrap_or_else(|| "Name".into());
                         if field_btn(ui, pal, &pname, pw).clicked() {
                             let pos = choices.iter().position(|c| c.0 == f.prop).unwrap_or(0);
                             let nx = &choices[(pos + 1) % choices.len()];
                             let op = FilterOp::for_kind(nx.2)[0];
-                            acts.push(A::SetFilter(vi, fi, Filter { prop: nx.0, op, value: String::new() }));
+                            acts.push(A::SetFilter(
+                                vi,
+                                fi,
+                                Filter {
+                                    prop: nx.0,
+                                    op,
+                                    value: String::new(),
+                                },
+                            ));
                         }
                         if field_btn(ui, pal, f.op.label(kind), ow).clicked() {
                             let ops = FilterOp::for_kind(kind);
                             let pos = ops.iter().position(|o| *o == f.op).unwrap_or(0);
-                            acts.push(A::SetFilter(vi, fi, Filter { op: ops[(pos + 1) % ops.len()], ..f.clone() }));
+                            acts.push(A::SetFilter(
+                                vi,
+                                fi,
+                                Filter {
+                                    op: ops[(pos + 1) % ops.len()],
+                                    ..f.clone()
+                                },
+                            ));
                         }
                         if wide && f.op.needs_value() {
                             filter_value(ui, db, pal, f, kind, vi, fi, vw, acts);
@@ -1334,10 +1377,24 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                 section_label(ui, pal, "QUICK DATE FILTERS");
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-                    for (op, t) in [(FilterOp::Today, "Today"), (FilterOp::ThisWeek, "This week"), (FilterOp::ThisMonth, "This month"), (FilterOp::Next7, "Next 7 days"), (FilterOp::Past7, "Past 7 days"), (FilterOp::Overdue, "Overdue")] {
+                    for (op, t) in [
+                        (FilterOp::Today, "Today"),
+                        (FilterOp::ThisWeek, "This week"),
+                        (FilterOp::ThisMonth, "This month"),
+                        (FilterOp::Next7, "Next 7 days"),
+                        (FilterOp::Past7, "Past 7 days"),
+                        (FilterOp::Overdue, "Overdue"),
+                    ] {
                         let on = view.filters.iter().any(|f| f.prop == dp && f.op == op);
                         if pill(ui, pal, t, on, false).clicked() {
-                            acts.push(A::AddFilterWith(vi, Filter { prop: dp, op, value: String::new() }));
+                            acts.push(A::AddFilterWith(
+                                vi,
+                                Filter {
+                                    prop: dp,
+                                    op,
+                                    value: String::new(),
+                                },
+                            ));
                         }
                     }
                 });
@@ -1346,19 +1403,59 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
         Popup::Sort(pos) => popup_area(&ctx, pid, pos, pal, &mut st.fresh, 340.0, |ui| {
             section_label(ui, pal, "SORT");
             if view.sorts.is_empty() {
-                ui.label(RichText::new("   No sorts yet — order the pages any way you like.").font(body(13.0)).color(pal.muted));
+                ui.label(
+                    RichText::new("   No sorts yet — order the pages any way you like.")
+                        .font(body(13.0))
+                        .color(pal.muted),
+                );
             }
             let choices = prop_choices(db);
             for (si, s) in view.sorts.iter().enumerate() {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
-                    let pname = choices.iter().find(|c| c.0 == s.prop).map(|c| c.1.clone()).unwrap_or_else(|| "Name".into());
-                    if field_btn(ui, pal, &pname, ((ui.available_width() - 30.0 - 8.0) * 0.55).max(80.0)).clicked() {
+                    let pname = choices
+                        .iter()
+                        .find(|c| c.0 == s.prop)
+                        .map(|c| c.1.clone())
+                        .unwrap_or_else(|| "Name".into());
+                    if field_btn(
+                        ui,
+                        pal,
+                        &pname,
+                        ((ui.available_width() - 30.0 - 8.0) * 0.55).max(80.0),
+                    )
+                    .clicked()
+                    {
                         let pos = choices.iter().position(|c| c.0 == s.prop).unwrap_or(0);
-                        acts.push(A::SetSort(vi, si, Sort { prop: choices[(pos + 1) % choices.len()].0, asc: s.asc }));
+                        acts.push(A::SetSort(
+                            vi,
+                            si,
+                            Sort {
+                                prop: choices[(pos + 1) % choices.len()].0,
+                                asc: s.asc,
+                            },
+                        ));
                     }
-                    if field_btn(ui, pal, &format!("{} {}", if s.asc { l::ARROW_UP } else { l::ARROW_DOWN }, if s.asc { "Ascending" } else { "Descending" }), ((ui.available_width() - 30.0).max(80.0)).min(120.0)).clicked() {
-                        acts.push(A::SetSort(vi, si, Sort { prop: s.prop, asc: !s.asc }));
+                    if field_btn(
+                        ui,
+                        pal,
+                        &format!(
+                            "{} {}",
+                            if s.asc { l::ARROW_UP } else { l::ARROW_DOWN },
+                            if s.asc { "Ascending" } else { "Descending" }
+                        ),
+                        ((ui.available_width() - 30.0).max(80.0)).min(120.0),
+                    )
+                    .clicked()
+                    {
+                        acts.push(A::SetSort(
+                            vi,
+                            si,
+                            Sort {
+                                prop: s.prop,
+                                asc: !s.asc,
+                            },
+                        ));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if icon_button(ui, pal, Icon::Close, 11.0, "Remove sort").clicked() {
@@ -1394,22 +1491,66 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
             };
             popup_area(&ctx, pid, pos, pal, &mut st.fresh, 270.0, |ui| {
                 let mut name = p.name.clone();
-                let r = field(ui, pal, pal.bg, &mut name, "Property name", false, 250.0, sid(("pn", prop)));
+                let r = field(
+                    ui,
+                    pal,
+                    pal.bg,
+                    &mut name,
+                    "Property name",
+                    false,
+                    250.0,
+                    sid(("pn", prop)),
+                );
                 if r.changed() {
                     acts.push(A::RenameProp(prop, name));
                 }
                 ui.add_space(4.0);
-                if menu_item(ui, pal, l::CHART_PIE, "Pin chart to dashboard", Some("Breakdown by this property"), false, false).clicked() {
-                    acts.push(A::PinProp(prop, if matches!(p.kind, PropKind::Number | PropKind::Formula | PropKind::Rollup) { "bar" } else { "donut" }));
+                if menu_item(
+                    ui,
+                    pal,
+                    l::CHART_PIE,
+                    "Pin chart to dashboard",
+                    Some("Breakdown by this property"),
+                    false,
+                    false,
+                )
+                .clicked()
+                {
+                    acts.push(A::PinProp(
+                        prop,
+                        if matches!(
+                            p.kind,
+                            PropKind::Number | PropKind::Formula | PropKind::Rollup
+                        ) {
+                            "bar"
+                        } else {
+                            "donut"
+                        },
+                    ));
                     next = Some(None);
                 }
-                if matches!(p.kind, PropKind::Number | PropKind::Formula | PropKind::Rollup) && menu_item(ui, pal, l::HASH, "Pin total to dashboard", Some("Sum as a number card"), false, false).clicked() {
+                if matches!(
+                    p.kind,
+                    PropKind::Number | PropKind::Formula | PropKind::Rollup
+                ) && menu_item(
+                    ui,
+                    pal,
+                    l::HASH,
+                    "Pin total to dashboard",
+                    Some("Sum as a number card"),
+                    false,
+                    false,
+                )
+                .clicked()
+                {
                     acts.push(A::PinProp(prop, "number"));
                     next = Some(None);
                 }
                 section_label(ui, pal, "TYPE");
                 for k in PropKind::ALL {
-                    if menu_item(ui, pal, k.glyph(), k.label(), None, k == p.kind, false).clicked() && k != p.kind {
+                    if menu_item(ui, pal, k.glyph(), k.label(), None, k == p.kind, false).clicked()
+                        && k != p.kind
+                    {
                         acts.push(A::SetPropKind(prop, k));
                     }
                 }
@@ -1432,66 +1573,166 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                         let first = ws.rows(db_id).first().copied();
                         match first.map(|row| crate::formula::eval_str(ws, db_id, row, &f)) {
                             Some(Ok(v)) => {
-                                ui.label(RichText::new(format!("  = {}", v.text())).font(body(13.0)).color(pal.accent));
+                                ui.label(
+                                    RichText::new(format!("  = {}", v.text()))
+                                        .font(body(13.0))
+                                        .color(pal.accent),
+                                );
                             }
                             Some(Err(e)) => {
-                                ui.label(RichText::new(format!("  ⚠ {e}")).font(body(12.5)).color(pal.danger));
+                                ui.label(
+                                    RichText::new(format!("  ⚠ {e}"))
+                                        .font(body(12.5))
+                                        .color(pal.danger),
+                                );
                             }
                             None => {}
                         }
                         ui.add_space(2.0);
-                        egui::CollapsingHeader::new(RichText::new("Functions & operators").font(body(12.5)).color(pal.muted)).id_salt(("fxh", prop)).show(ui, |ui| {
-                            ui.add(egui::Label::new(RichText::new(crate::formula::HELP).font(body(12.0)).color(pal.muted)).wrap());
+                        egui::CollapsingHeader::new(
+                            RichText::new("Functions & operators")
+                                .font(body(12.5))
+                                .color(pal.muted),
+                        )
+                        .id_salt(("fxh", prop))
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(crate::formula::HELP)
+                                        .font(body(12.0))
+                                        .color(pal.muted),
+                                )
+                                .wrap(),
+                            );
                         });
                     }
                     PropKind::Relation => {
                         rule(ui, pal);
                         section_label(ui, pal, "RELATED DATABASE");
-                        let dbs: Vec<(u64, String)> = ws.pages.iter().filter(|x| x.db.is_some() && !x.trashed).map(|x| (x.id, ws.display_title(x.id))).collect();
-                        ScrollArea::vertical().max_height(150.0).id_salt(("reldbs", prop)).auto_shrink([false, true]).show(ui, |ui| {
-                            for (did, name) in dbs {
-                                let label = if did == db_id { format!("{name}  (this database)") } else { name };
-                                if menu_item(ui, pal, l::TABLE, &label, None, p.cfg.relation == did, false).clicked() {
-                                    acts.push(A::SetRelation(prop, did));
+                        let dbs: Vec<(u64, String)> = ws
+                            .pages
+                            .iter()
+                            .filter(|x| x.db.is_some() && !x.trashed)
+                            .map(|x| (x.id, ws.display_title(x.id)))
+                            .collect();
+                        ScrollArea::vertical()
+                            .max_height(150.0)
+                            .id_salt(("reldbs", prop))
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                for (did, name) in dbs {
+                                    let label = if did == db_id {
+                                        format!("{name}  (this database)")
+                                    } else {
+                                        name
+                                    };
+                                    if menu_item(
+                                        ui,
+                                        pal,
+                                        l::TABLE,
+                                        &label,
+                                        None,
+                                        p.cfg.relation == did,
+                                        false,
+                                    )
+                                    .clicked()
+                                    {
+                                        acts.push(A::SetRelation(prop, did));
+                                    }
                                 }
-                            }
-                        });
+                            });
                         if p.cfg.relation == db_id {
                             ui.label(RichText::new("  Relating a database to itself gives you task dependencies on the Timeline view.").font(body(12.0)).color(pal.muted));
                         }
                     }
                     PropKind::Rollup => {
                         rule(ui, pal);
-                        let rels: Vec<&Prop> = db.props.iter().filter(|x| x.kind == PropKind::Relation).collect();
+                        let rels: Vec<&Prop> = db
+                            .props
+                            .iter()
+                            .filter(|x| x.kind == PropKind::Relation)
+                            .collect();
                         if rels.is_empty() {
                             ui.label(RichText::new("   Add a Relation property first — a rollup summarises the linked rows.").font(body(12.5)).color(pal.muted));
                         } else {
                             section_label(ui, pal, "RELATION");
                             for rp in &rels {
-                                if menu_item(ui, pal, l::ARROW_UP_RIGHT, &rp.name, None, p.cfg.rollup_rel == rp.id, false).clicked() {
+                                if menu_item(
+                                    ui,
+                                    pal,
+                                    l::ARROW_UP_RIGHT,
+                                    &rp.name,
+                                    None,
+                                    p.cfg.rollup_rel == rp.id,
+                                    false,
+                                )
+                                .clicked()
+                                {
                                     acts.push(A::RollupRel(prop, rp.id));
                                 }
                             }
-                            if let Some(tdb) = rels.iter().find(|x| x.id == p.cfg.rollup_rel).and_then(|x| ws.db(x.cfg.relation)) {
+                            if let Some(tdb) = rels
+                                .iter()
+                                .find(|x| x.id == p.cfg.rollup_rel)
+                                .and_then(|x| ws.db(x.cfg.relation))
+                            {
                                 section_label(ui, pal, "PROPERTY");
-                                ScrollArea::vertical().max_height(120.0).id_salt(("rlp", prop)).auto_shrink([false, true]).show(ui, |ui| {
-                                    if menu_item(ui, pal, PropKind::Text.glyph(), "Name", None, p.cfg.rollup_prop == 0, false).clicked() {
-                                        acts.push(A::RollupProp(prop, 0));
-                                    }
-                                    for tp in &tdb.props {
-                                        if menu_item(ui, pal, tp.kind.glyph(), &tp.name, None, p.cfg.rollup_prop == tp.id, false).clicked() {
-                                            acts.push(A::RollupProp(prop, tp.id));
+                                ScrollArea::vertical()
+                                    .max_height(120.0)
+                                    .id_salt(("rlp", prop))
+                                    .auto_shrink([false, true])
+                                    .show(ui, |ui| {
+                                        if menu_item(
+                                            ui,
+                                            pal,
+                                            PropKind::Text.glyph(),
+                                            "Name",
+                                            None,
+                                            p.cfg.rollup_prop == 0,
+                                            false,
+                                        )
+                                        .clicked()
+                                        {
+                                            acts.push(A::RollupProp(prop, 0));
                                         }
-                                    }
-                                });
+                                        for tp in &tdb.props {
+                                            if menu_item(
+                                                ui,
+                                                pal,
+                                                tp.kind.glyph(),
+                                                &tp.name,
+                                                None,
+                                                p.cfg.rollup_prop == tp.id,
+                                                false,
+                                            )
+                                            .clicked()
+                                            {
+                                                acts.push(A::RollupProp(prop, tp.id));
+                                            }
+                                        }
+                                    });
                                 section_label(ui, pal, "CALCULATE");
-                                ScrollArea::vertical().max_height(150.0).id_salt(("rlf", prop)).auto_shrink([false, true]).show(ui, |ui| {
-                                    for f in RollupFn::ALL {
-                                        if menu_item(ui, pal, l::SIGMA, f.label(), None, p.cfg.rollup_fn == f, false).clicked() {
-                                            acts.push(A::RollupFn(prop, f));
+                                ScrollArea::vertical()
+                                    .max_height(150.0)
+                                    .id_salt(("rlf", prop))
+                                    .auto_shrink([false, true])
+                                    .show(ui, |ui| {
+                                        for f in RollupFn::ALL {
+                                            if menu_item(
+                                                ui,
+                                                pal,
+                                                l::SIGMA,
+                                                f.label(),
+                                                None,
+                                                p.cfg.rollup_fn == f,
+                                                false,
+                                            )
+                                            .clicked()
+                                            {
+                                                acts.push(A::RollupFn(prop, f));
+                                            }
                                         }
-                                    }
-                                });
+                                    });
                             }
                         }
                     }
@@ -1502,25 +1743,54 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                     section_label(ui, pal, "OPTIONS");
                     for o in &p.opts {
                         ui.horizontal(|ui| {
-                            let (r, resp) = ui.allocate_exact_size(vec2(22.0, 26.0), Sense::click());
-                            ui.painter().circle_filled(r.center(), 6.5, tag_color(o.color));
-                            if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(format!("{} — click to change colour", TAG_NAMES[o.color % 9])).clicked() {
+                            let (r, resp) =
+                                ui.allocate_exact_size(vec2(22.0, 26.0), Sense::click());
+                            ui.painter()
+                                .circle_filled(r.center(), 6.5, tag_color(o.color));
+                            if resp
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .on_hover_text(format!(
+                                    "{} — click to change colour",
+                                    TAG_NAMES[o.color % 9]
+                                ))
+                                .clicked()
+                            {
                                 acts.push(A::RecolorOpt(prop, o.id));
                             }
                             let mut n = o.name.clone();
-                            let r = ui.add(TextEdit::singleline(&mut n).frame(false).desired_width(170.0).font(body(14.0)).id(sid(("on", o.id))));
+                            let r = ui.add(
+                                TextEdit::singleline(&mut n)
+                                    .frame(false)
+                                    .desired_width(170.0)
+                                    .font(body(14.0))
+                                    .id(sid(("on", o.id))),
+                            );
                             if r.changed() {
                                 acts.push(A::RenameOpt(prop, o.id, n));
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if icon_button(ui, pal, Icon::Close, 10.0, "Delete option").clicked() {
+                                if icon_button(ui, pal, Icon::Close, 10.0, "Delete option")
+                                    .clicked()
+                                {
                                     acts.push(A::DelOpt(prop, o.id));
                                 }
                             });
                         });
                     }
-                    let r = field(ui, pal, pal.bg, &mut st.new_opt, "Add an option…", false, 250.0, sid(("no", prop)));
-                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && !st.new_opt.trim().is_empty() {
+                    let r = field(
+                        ui,
+                        pal,
+                        pal.bg,
+                        &mut st.new_opt,
+                        "Add an option…",
+                        false,
+                        250.0,
+                        sid(("no", prop)),
+                    );
+                    if r.lost_focus()
+                        && ui.input(|i| i.key_pressed(Key::Enter))
+                        && !st.new_opt.trim().is_empty()
+                    {
                         acts.push(A::AddOpt(prop, std::mem::take(&mut st.new_opt), None));
                         ui.ctx().memory_mut(|m| m.request_focus(sid(("no", prop))));
                     }
@@ -1534,20 +1804,41 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
         }
         Popup::ViewMenu(pos) => popup_area(&ctx, pid, pos, pal, &mut st.fresh, 270.0, |ui| {
             let mut name = view.name.clone();
-            let r = field(ui, pal, pal.bg, &mut name, "View name", false, 250.0, sid(("vn", view.id)));
+            let r = field(
+                ui,
+                pal,
+                pal.bg,
+                &mut name,
+                "View name",
+                false,
+                250.0,
+                sid(("vn", view.id)),
+            );
             if r.changed() {
                 acts.push(A::RenameView(vi, name));
             }
             ui.add_space(4.0);
             section_label(ui, pal, "LAYOUT");
             for k in ViewKind::ALL {
-                if menu_item(ui, pal, k.glyph(), k.label(), None, k == view.kind, false).clicked() && k != view.kind {
+                if menu_item(ui, pal, k.glyph(), k.label(), None, k == view.kind, false).clicked()
+                    && k != view.kind
+                {
                     acts.push(A::SetViewKind(vi, k));
                 }
             }
             rule(ui, pal);
-            egui::CollapsingHeader::new(RichText::new(format!("{}  Pin to dashboard", l::LAYOUT_DASHBOARD)).font(body(13.5)).color(pal.text)).id_salt(("pin_dash", view.id)).show(ui, |ui| {
-                ui.label(RichText::new("This view's filters and sorts come along.").font(body(11.5)).color(pal.muted));
+            egui::CollapsingHeader::new(
+                RichText::new(format!("{}  Pin to dashboard", l::LAYOUT_DASHBOARD))
+                    .font(body(13.5))
+                    .color(pal.text),
+            )
+            .id_salt(("pin_dash", view.id))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("This view's filters and sorts come along.")
+                        .font(body(11.5))
+                        .color(pal.muted),
+                );
                 for (kind, glyph, name) in [
                     ("table", l::TABLE, "Table"),
                     ("list", l::LAYOUT_LIST, "List"),
@@ -1565,36 +1856,78 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                 }
             });
             if view.kind == ViewKind::Board {
-                let sels: Vec<&Prop> = db.props.iter().filter(|p| p.kind == PropKind::Select).collect();
+                let sels: Vec<&Prop> = db
+                    .props
+                    .iter()
+                    .filter(|p| p.kind == PropKind::Select)
+                    .collect();
                 if !sels.is_empty() {
                     rule(ui, pal);
                     let cur = db.group_prop(view).unwrap_or(0);
                     let cname = db.prop(cur).map(|p| p.name.clone()).unwrap_or_default();
-                    if menu_item(ui, pal, l::KANBAN, &format!("Group by: {cname}"), Some("Click to switch property"), false, false).clicked() {
+                    if menu_item(
+                        ui,
+                        pal,
+                        l::KANBAN,
+                        &format!("Group by: {cname}"),
+                        Some("Click to switch property"),
+                        false,
+                        false,
+                    )
+                    .clicked()
+                    {
                         let pos = sels.iter().position(|p| p.id == cur).unwrap_or(0);
                         acts.push(A::SetGroup(vi, sels[(pos + 1) % sels.len()].id));
                     }
                 }
             }
             if view.kind == ViewKind::Timeline {
-                let selfrels: Vec<&Prop> = db.props.iter().filter(|p| p.kind == PropKind::Relation && p.cfg.relation == db_id).collect();
+                let selfrels: Vec<&Prop> = db
+                    .props
+                    .iter()
+                    .filter(|p| p.kind == PropKind::Relation && p.cfg.relation == db_id)
+                    .collect();
                 if !selfrels.is_empty() {
                     rule(ui, pal);
                     let cur = db.dep_prop(view, db_id).unwrap_or(0);
                     let cname = db.prop(cur).map(|p| p.name.clone()).unwrap_or_default();
-                    if menu_item(ui, pal, l::ARROW_UP_RIGHT, &format!("Dependencies: {cname}"), Some("Click to switch property"), false, false).clicked() {
+                    if menu_item(
+                        ui,
+                        pal,
+                        l::ARROW_UP_RIGHT,
+                        &format!("Dependencies: {cname}"),
+                        Some("Click to switch property"),
+                        false,
+                        false,
+                    )
+                    .clicked()
+                    {
                         let pos = selfrels.iter().position(|p| p.id == cur).unwrap_or(0);
                         acts.push(A::SetDep(vi, selfrels[(pos + 1) % selfrels.len()].id));
                     }
                 }
             }
             if view.kind == ViewKind::Calendar || view.kind == ViewKind::Timeline {
-                let ds: Vec<&Prop> = db.props.iter().filter(|p| p.kind == PropKind::Date).collect();
+                let ds: Vec<&Prop> = db
+                    .props
+                    .iter()
+                    .filter(|p| p.kind == PropKind::Date)
+                    .collect();
                 if !ds.is_empty() {
                     rule(ui, pal);
                     let cur = db.date_prop(view).unwrap_or(0);
                     let cname = db.prop(cur).map(|p| p.name.clone()).unwrap_or_default();
-                    if menu_item(ui, pal, l::CALENDAR_DAYS, &format!("Show by: {cname}"), Some("Click to switch property"), false, false).clicked() {
+                    if menu_item(
+                        ui,
+                        pal,
+                        l::CALENDAR_DAYS,
+                        &format!("Show by: {cname}"),
+                        Some("Click to switch property"),
+                        false,
+                        false,
+                    )
+                    .clicked()
+                    {
                         let pos = ds.iter().position(|p| p.id == cur).unwrap_or(0);
                         acts.push(A::SetDateProp(vi, ds[(pos + 1) % ds.len()].id));
                     }
@@ -1629,39 +1962,80 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
             };
             let multi = p.kind == PropKind::MultiSelect;
             popup_area(&ctx, pid, pos, pal, &mut st.fresh, 250.0, |ui| {
-                let r = field(ui, pal, pal.bg, &mut st.new_opt, "Search or create…", false, 230.0, sid(("sel_q", prop)));
+                let r = field(
+                    ui,
+                    pal,
+                    pal.bg,
+                    &mut st.new_opt,
+                    "Search or create…",
+                    false,
+                    230.0,
+                    sid(("sel_q", prop)),
+                );
                 if !r.has_focus() && st.new_opt.is_empty() {
                     r.request_focus();
                 }
                 let q = st.new_opt.trim().to_lowercase();
                 ui.add_space(4.0);
                 let mut exact = false;
-                ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
-                    for o in p.opts.iter().filter(|o| q.is_empty() || o.name.to_lowercase().contains(&q)) {
-                        exact |= o.name.to_lowercase() == q;
-                        let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
-                        let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-                        ui.painter().rect_filled(rr, 6.0, with_alpha(pal.hover, t));
-                        chip_paint(ui.painter(), pos2(rr.left() + 8.0, rr.center().y), &o.name, o.color, pal);
-                        if cur.contains(&o.id) {
-                            ui.painter().text(pos2(rr.right() - 14.0, rr.center().y), Align2::CENTER_CENTER, l::CHECK, body(15.0), pal.accent);
-                        }
-                        if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                            if multi {
-                                let mut m = cur.clone();
-                                if let Some(i) = m.iter().position(|x| *x == o.id) {
-                                    m.remove(i);
+                ScrollArea::vertical()
+                    .max_height(220.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for o in p
+                            .opts
+                            .iter()
+                            .filter(|o| q.is_empty() || o.name.to_lowercase().contains(&q))
+                        {
+                            exact |= o.name.to_lowercase() == q;
+                            let (rr, resp) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), 30.0),
+                                Sense::click(),
+                            );
+                            let t = ui
+                                .ctx()
+                                .animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+                            ui.painter().rect_filled(rr, 6.0, with_alpha(pal.hover, t));
+                            chip_paint(
+                                ui.painter(),
+                                pos2(rr.left() + 8.0, rr.center().y),
+                                &o.name,
+                                o.color,
+                                pal,
+                            );
+                            if cur.contains(&o.id) {
+                                ui.painter().text(
+                                    pos2(rr.right() - 14.0, rr.center().y),
+                                    Align2::CENTER_CENTER,
+                                    l::CHECK,
+                                    body(15.0),
+                                    pal.accent,
+                                );
+                            }
+                            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                if multi {
+                                    let mut m = cur.clone();
+                                    if let Some(i) = m.iter().position(|x| *x == o.id) {
+                                        m.remove(i);
+                                    } else {
+                                        m.push(o.id);
+                                    }
+                                    acts.push(A::SetVal(
+                                        row,
+                                        prop,
+                                        if m.is_empty() {
+                                            None
+                                        } else {
+                                            Some(Val::Multi(m))
+                                        },
+                                    ));
                                 } else {
-                                    m.push(o.id);
+                                    acts.push(A::SetVal(row, prop, Some(Val::Sel(o.id))));
+                                    next = Some(None);
                                 }
-                                acts.push(A::SetVal(row, prop, if m.is_empty() { None } else { Some(Val::Multi(m)) }));
-                            } else {
-                                acts.push(A::SetVal(row, prop, Some(Val::Sel(o.id))));
-                                next = Some(None);
                             }
                         }
-                    }
-                });
+                    });
                 if !q.is_empty() && !exact {
                     let label = format!("Create “{}”", st.new_opt.trim());
                     let enter = ui.input(|i| i.key_pressed(Key::Enter));
@@ -1682,7 +2056,13 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                 }
             })
         }
-        Popup::Date { row, prop, pos, y, m } => {
+        Popup::Date {
+            row,
+            prop,
+            pos,
+            y,
+            m,
+        } => {
             let curv = match ws.page(row).and_then(|r| r.props.get(&prop)) {
                 Some(Val::Text(s)) => dates::span(s),
                 _ => None,
@@ -1691,30 +2071,56 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
             popup_area(&ctx, pid, pos, pal, &mut st.fresh, 260.0, |ui| {
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
-                    ui.label(RichText::new(format!("{} {}", dates::MONTHS[m as usize - 1], y)).font(bold(14.0)));
+                    ui.label(
+                        RichText::new(format!("{} {}", dates::MONTHS[m as usize - 1], y))
+                            .font(bold(14.0)),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if icon_button(ui, pal, Icon::ChevronRight, 13.0, "Next month").clicked() {
                             let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
-                            next = Some(Some(Popup::Date { row, prop, pos, y: ny, m: nm }));
+                            next = Some(Some(Popup::Date {
+                                row,
+                                prop,
+                                pos,
+                                y: ny,
+                                m: nm,
+                            }));
                         }
-                        if icon_button(ui, pal, Icon::ChevronLeft, 13.0, "Previous month").clicked() {
+                        if icon_button(ui, pal, Icon::ChevronLeft, 13.0, "Previous month").clicked()
+                        {
                             let (ny, nm) = if m == 1 { (y - 1, 12) } else { (y, m - 1) };
-                            next = Some(Some(Popup::Date { row, prop, pos, y: ny, m: nm }));
+                            next = Some(Some(Popup::Date {
+                                row,
+                                prop,
+                                pos,
+                                y: ny,
+                                m: nm,
+                            }));
                         }
                     });
                 });
                 let cw = 36.0;
                 let first = dates::weekday(y, m, 1);
                 let dim = dates::days_in_month(y, m);
-                let (grid, _) = ui.allocate_exact_size(vec2(cw * 7.0, 20.0 + 32.0 * 6.0), Sense::hover());
+                let (grid, _) =
+                    ui.allocate_exact_size(vec2(cw * 7.0, 20.0 + 32.0 * 6.0), Sense::hover());
                 for (i, d) in dates::WEEKDAYS.iter().enumerate() {
-                    ui.painter().text(pos2(grid.left() + cw * i as f32 + cw / 2.0, grid.top() + 10.0), Align2::CENTER_CENTER, &d[..2], body(11.5), pal.muted);
+                    ui.painter().text(
+                        pos2(grid.left() + cw * i as f32 + cw / 2.0, grid.top() + 10.0),
+                        Align2::CENTER_CENTER,
+                        &d[..2],
+                        body(11.5),
+                        pal.muted,
+                    );
                 }
                 let today = dates::today();
                 for day in 1..=dim {
                     let idx = first + day - 1;
                     let (col, rw) = (idx % 7, idx / 7);
-                    let center = pos2(grid.left() + cw * col as f32 + cw / 2.0, grid.top() + 20.0 + 32.0 * rw as f32 + 16.0);
+                    let center = pos2(
+                        grid.left() + cw * col as f32 + cw / 2.0,
+                        grid.top() + 20.0 + 32.0 * rw as f32 + 16.0,
+                    );
                     let r = Rect::from_center_size(center, vec2(30.0, 28.0));
                     let dn = dates::days_from_civil(y, m, day);
                     let (is_s, is_e, inside) = match curv {
@@ -1722,26 +2128,54 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                         None => (false, false, false),
                     };
                     let resp = ui.interact(r, sid(("dp", day)), Sense::click());
-                    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.08);
+                    let t = ui
+                        .ctx()
+                        .animate_bool_with_time(resp.id, resp.hovered(), 0.08);
                     if inside || ((is_s || is_e) && curv.map_or(false, |(a, b)| a != b)) {
-                        let band = Rect::from_min_max(pos2(if is_s { center.x } else { center.x - cw / 2.0 }, r.top()), pos2(if is_e { center.x } else { center.x + cw / 2.0 }, r.bottom()));
-                        ui.painter().rect_filled(band, 0.0, with_alpha(pal.accent, 0.22));
+                        let band = Rect::from_min_max(
+                            pos2(if is_s { center.x } else { center.x - cw / 2.0 }, r.top()),
+                            pos2(
+                                if is_e { center.x } else { center.x + cw / 2.0 },
+                                r.bottom(),
+                            ),
+                        );
+                        ui.painter()
+                            .rect_filled(band, 0.0, with_alpha(pal.accent, 0.22));
                     }
                     if is_s || is_e {
                         ui.painter().rect_filled(r, 14.0, pal.accent);
                     } else {
                         ui.painter().rect_filled(r, 14.0, with_alpha(pal.hover, t));
                         if today == (y, m, day) {
-                            ui.painter().rect_stroke(r, 14.0, Stroke::new(1.3_f32, pal.accent), egui::StrokeKind::Inside);
+                            ui.painter().rect_stroke(
+                                r,
+                                14.0,
+                                Stroke::new(1.3_f32, pal.accent),
+                                egui::StrokeKind::Inside,
+                            );
                         }
                     }
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, day.to_string(), body(13.0), if is_s || is_e { Color32::WHITE } else { pal.text });
+                    ui.painter().text(
+                        r.center(),
+                        Align2::CENTER_CENTER,
+                        day.to_string(),
+                        body(13.0),
+                        if is_s || is_e {
+                            Color32::WHITE
+                        } else {
+                            pal.text
+                        },
+                    );
                     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                         let (nv, done) = match curv {
                             Some((a, b)) if range_on && a == b => ((a.min(dn), a.max(dn)), true),
                             _ => ((dn, dn), !range_on),
                         };
-                        acts.push(A::SetVal(row, prop, Some(Val::Text(dates::span_value(nv.0, nv.1)))));
+                        acts.push(A::SetVal(
+                            row,
+                            prop,
+                            Some(Val::Text(dates::span_value(nv.0, nv.1))),
+                        ));
                         if done {
                             next = Some(None);
                         }
@@ -1753,11 +2187,24 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                         acts.push(A::SetVal(row, prop, Some(Val::Text(dates::today_iso()))));
                         next = Some(None);
                     }
-                    if pill(ui, pal, if range_on { "✓ End date" } else { "End date" }, range_on, false).on_hover_text("Turn the date into a range (shown as a bar on the timeline)").clicked() {
+                    if pill(
+                        ui,
+                        pal,
+                        if range_on { "✓ End date" } else { "End date" },
+                        range_on,
+                        false,
+                    )
+                    .on_hover_text("Turn the date into a range (shown as a bar on the timeline)")
+                    .clicked()
+                    {
                         st.date_range = !range_on;
                         if range_on {
                             if let Some((a, _)) = curv {
-                                acts.push(A::SetVal(row, prop, Some(Val::Text(dates::iso_of_day(a)))));
+                                acts.push(A::SetVal(
+                                    row,
+                                    prop,
+                                    Some(Val::Text(dates::iso_of_day(a))),
+                                ));
                             }
                         }
                     }
@@ -1768,7 +2215,15 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                 });
                 if range_on {
                     ui.add_space(2.0);
-                    ui.label(RichText::new(if curv.map_or(true, |(a, b)| a != b) { "  Click a day to start a new range" } else { "  Now click the end day" }).font(body(12.0)).color(pal.muted));
+                    ui.label(
+                        RichText::new(if curv.map_or(true, |(a, b)| a != b) {
+                            "  Click a day to start a new range"
+                        } else {
+                            "  Now click the end day"
+                        })
+                        .font(body(12.0))
+                        .color(pal.muted),
+                    );
                 }
             })
         }
@@ -1782,44 +2237,103 @@ fn popups(ui: &mut Ui, ws: &Workspace, db_id: u64, db: &Database, vi: usize, st:
                 Some(Val::Multi(m)) => m.clone(),
                 _ => vec![],
             };
-            let target_rows: Vec<(u64, String)> = ws.rows(target).into_iter().filter(|r| *r != row).filter_map(|r| ws.page(r).map(|x| (r, title_of(x).to_owned()))).collect();
+            let target_rows: Vec<(u64, String)> = ws
+                .rows(target)
+                .into_iter()
+                .filter(|r| *r != row)
+                .filter_map(|r| ws.page(r).map(|x| (r, title_of(x).to_owned())))
+                .collect();
             let has_target = ws.db(target).is_some();
             popup_area(&ctx, pid, pos, pal, &mut st.fresh, 280.0, |ui| {
                 if !has_target {
-                    ui.label(RichText::new("   Choose the related database first.").font(body(13.0)).color(pal.muted));
-                    if menu_item(ui, pal, l::SLIDERS_HORIZONTAL, "Open property settings", None, false, false).clicked() {
+                    ui.label(
+                        RichText::new("   Choose the related database first.")
+                            .font(body(13.0))
+                            .color(pal.muted),
+                    );
+                    if menu_item(
+                        ui,
+                        pal,
+                        l::SLIDERS_HORIZONTAL,
+                        "Open property settings",
+                        None,
+                        false,
+                        false,
+                    )
+                    .clicked()
+                    {
                         next = Some(Some(Popup::PropMenu { prop, pos }));
                     }
                     return;
                 }
-                let r = field(ui, pal, pal.bg, &mut st.new_opt, &format!("Link {}…", ws.display_title(target)), false, 260.0, sid(("rel_q", prop)));
+                let r = field(
+                    ui,
+                    pal,
+                    pal.bg,
+                    &mut st.new_opt,
+                    &format!("Link {}…", ws.display_title(target)),
+                    false,
+                    260.0,
+                    sid(("rel_q", prop)),
+                );
                 if !r.has_focus() && st.new_opt.is_empty() {
                     r.request_focus();
                 }
                 let q = st.new_opt.trim().to_lowercase();
                 ui.add_space(4.0);
-                ScrollArea::vertical().max_height(240.0).auto_shrink([false, true]).show(ui, |ui| {
-                    if target_rows.is_empty() {
-                        ui.label(RichText::new("   The related database has no other rows.").font(body(13.0)).color(pal.muted));
-                    }
-                    for (rid, title) in target_rows.iter().filter(|(_, t)| q.is_empty() || t.to_lowercase().contains(&q)) {
-                        let (rr, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
-                        let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-                        ui.painter().rect_filled(rr, 6.0, with_alpha(pal.hover, t));
-                        let on = cur.contains(rid);
-                        check_box(ui, pal, pos2(rr.left() + 16.0, rr.center().y), on);
-                        crate::widgets::text_fit(ui.painter(), pos2(rr.left() + 34.0, rr.center().y), Align2::LEFT_CENTER, title, body(14.0), pal.text, rr.width() - 46.0);
-                        if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                            let mut m = cur.clone();
-                            if let Some(i) = m.iter().position(|x| x == rid) {
-                                m.remove(i);
-                            } else {
-                                m.push(*rid);
-                            }
-                            acts.push(A::SetVal(row, prop, if m.is_empty() { None } else { Some(Val::Multi(m)) }));
+                ScrollArea::vertical()
+                    .max_height(240.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        if target_rows.is_empty() {
+                            ui.label(
+                                RichText::new("   The related database has no other rows.")
+                                    .font(body(13.0))
+                                    .color(pal.muted),
+                            );
                         }
-                    }
-                });
+                        for (rid, title) in target_rows
+                            .iter()
+                            .filter(|(_, t)| q.is_empty() || t.to_lowercase().contains(&q))
+                        {
+                            let (rr, resp) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), 30.0),
+                                Sense::click(),
+                            );
+                            let t = ui
+                                .ctx()
+                                .animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+                            ui.painter().rect_filled(rr, 6.0, with_alpha(pal.hover, t));
+                            let on = cur.contains(rid);
+                            check_box(ui, pal, pos2(rr.left() + 16.0, rr.center().y), on);
+                            crate::widgets::text_fit(
+                                ui.painter(),
+                                pos2(rr.left() + 34.0, rr.center().y),
+                                Align2::LEFT_CENTER,
+                                title,
+                                body(14.0),
+                                pal.text,
+                                rr.width() - 46.0,
+                            );
+                            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                let mut m = cur.clone();
+                                if let Some(i) = m.iter().position(|x| x == rid) {
+                                    m.remove(i);
+                                } else {
+                                    m.push(*rid);
+                                }
+                                acts.push(A::SetVal(
+                                    row,
+                                    prop,
+                                    if m.is_empty() {
+                                        None
+                                    } else {
+                                        Some(Val::Multi(m))
+                                    },
+                                ));
+                            }
+                        }
+                    });
                 if !cur.is_empty() {
                     rule(ui, pal);
                     if menu_item(ui, pal, "×", "Clear all", None, false, false).clicked() {

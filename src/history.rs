@@ -210,10 +210,20 @@ pub fn stamp(ts_ms: f64) -> String {
     {
         ms -= js_sys::Date::new_0().get_timezone_offset() * 60_000.0;
     }
+    if !ms.is_finite() {
+        return "—".into();
+    }
     let days = (ms / 86_400_000.0).floor() as i64;
     let (_, m, d) = dates::civil_from_days(days);
-    let secs = ((ms - days as f64 * 86_400_000.0) / 1000.0) as u64;
-    format!("{} {}, {:02}:{:02}", &dates::MONTHS[m as usize - 1][..3], d, secs / 3600, (secs / 60) % 60)
+    let mi = (m as usize).saturating_sub(1).min(dates::MONTHS.len() - 1);
+    let secs = ((ms - days as f64 * 86_400_000.0).max(0.0) / 1000.0) as u64;
+    format!(
+        "{} {}, {:02}:{:02}",
+        &dates::MONTHS[mi][..3],
+        d,
+        secs / 3600,
+        (secs / 60) % 60
+    )
 }
 
 fn plain_line(b: &Block) -> String {

@@ -251,8 +251,10 @@ fn backup_dir(file_path: &Path) -> Option<PathBuf> {
     file_path.parent().map(|p| p.join("backups"))
 }
 
-/// One snapshot per hour (kept: the newest 72 = three days of hourly states).
+/// One snapshot per hour (kept: newest 16 snapshots, capped at 50 MB total while always retaining at least 2 recovery copies).
 fn rotate_backups(file_path: &Path) {
+    const MAX_BACKUPS: usize = 16;
+    const MAX_BACKUP_BYTES: u64 = 50 * 1024 * 1024;
     let Some(dir) = backup_dir(file_path) else { return };
     let hour = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() / 3600).unwrap_or(0);
     let target = dir.join(format!("app-{hour:08}.ron"));
@@ -262,10 +264,23 @@ fn rotate_backups(file_path: &Path) {
     if std::fs::copy(file_path, &target).is_err() {
         return;
     }
-    let mut names: Vec<PathBuf> = std::fs::read_dir(&dir).map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().map_or(false, |x| x == "ron")).collect()).unwrap_or_default();
-    names.sort();
-    while names.len() > 72 {
-        let _ = std::fs::remove_file(names.remove(0));
+    let mut entries: Vec<(PathBuf, u64)> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().map_or(false, |x| x == "ron"))
+                .map(|p| {
+                    let sz = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                    (p, sz)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut total: u64 = entries.iter().map(|(_, s)| *s).sum();
+    while entries.len() > MAX_BACKUPS || (entries.len() > 2 && total > MAX_BACKUP_BYTES) {
+        let (old, sz) = entries.remove(0);
+        total = total.saturating_sub(sz);
+        let _ = std::fs::remove_file(old);
     }
 }
 

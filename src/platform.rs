@@ -10,17 +10,31 @@ pub fn save_download(name: &str, data: &[u8], mime: &str) -> String {
     #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     {
         let _ = mime;
-        let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_else(|_| ".".into());
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| ".".into());
         let mut dir = std::path::PathBuf::from(home).join("Downloads");
         if !dir.is_dir() {
             dir = std::env::current_dir().unwrap_or_else(|_| ".".into());
         }
-        let mut path = dir.join(name);
+        let safe_name = safe_download_name(name);
+        let mut path = dir.join(&safe_name);
         let mut n = 1;
         while path.exists() {
-            let stem = std::path::Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-            let ext = std::path::Path::new(name).extension().and_then(|s| s.to_str()).unwrap_or("");
-            path = dir.join(format!("{stem} ({n}).{ext}"));
+            let stem = std::path::Path::new(&safe_name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("file");
+            let ext = std::path::Path::new(&safe_name)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            let candidate = if ext.is_empty() {
+                format!("{stem} ({n})")
+            } else {
+                format!("{stem} ({n}).{ext}")
+            };
+            path = dir.join(candidate);
             n += 1;
         }
         match std::fs::write(&path, data) {
@@ -38,7 +52,9 @@ pub fn save_download(name: &str, data: &[u8], mime: &str) -> String {
             opts.set_type(mime);
             let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &opts)?;
             let url = web_sys::Url::create_object_url_with_blob(&blob)?;
-            let doc = web_sys::window().and_then(|w| w.document()).ok_or("no document")?;
+            let doc = web_sys::window()
+                .and_then(|w| w.document())
+                .ok_or("no document")?;
             let a: web_sys::HtmlAnchorElement = doc.create_element("a")?.dyn_into()?;
             a.set_href(&url);
             a.set_download(name);
@@ -113,8 +129,41 @@ pub fn take_paste() -> Option<String> {
 
 // ───────────────────────────── opening links ─────────────────────────────
 
+/// Sanitizes a user- or peer-supplied filename to a safe basename (no path separators or traversal).
+fn safe_download_name(name: &str) -> String {
+    let base = std::path::Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let cleaned: String = base
+        .chars()
+        .filter(|c| {
+            !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') && !c.is_control()
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.');
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        "file".to_owned()
+    } else {
+        trimmed.chars().take(180).collect()
+    }
+}
+
+/// Validates that a URL uses an allowed scheme (`https://`, `http://`, and optionally `mailto:`).
+pub fn is_safe_url(url: &str, allow_mailto: bool) -> bool {
+    let u = url.trim();
+    let lower = u.to_ascii_lowercase();
+    lower.starts_with("https://")
+        || lower.starts_with("http://")
+        || (allow_mailto && lower.starts_with("mailto:"))
+}
+
 /// Opens a URL in the system browser (desktop) or a new tab (web).
 pub fn open_url(ctx: &egui::Context, url: &str) {
+    if !is_safe_url(url, true) {
+        return;
+    }
+    let url = url.trim();
     #[cfg(target_os = "android")]
     {
         let _ = ctx;
@@ -267,12 +316,19 @@ pub fn sync_iframes(items: &[EmbedRect]) {
                 None => {
                     let c = doc.create_element("div").ok()?;
                     c.set_id("lumen-embeds");
-                    c.set_attribute("style", "position:fixed;left:0;top:0;width:0;height:0;z-index:5;").ok()?;
+                    c.set_attribute(
+                        "style",
+                        "position:fixed;left:0;top:0;width:0;height:0;z-index:5;",
+                    )
+                    .ok()?;
                     doc.body()?.append_child(&c).ok()?;
                     c
                 }
             };
-            let want: std::collections::HashSet<String> = items.iter().map(|i| format!("lumen-embed-{}", i.id)).collect();
+            let want: std::collections::HashSet<String> = items
+                .iter()
+                .map(|i| format!("lumen-embed-{}", i.id))
+                .collect();
             let kids = container.children();
             let mut dead = vec![];
             for n in 0..kids.length() {
@@ -286,11 +342,18 @@ pub fn sync_iframes(items: &[EmbedRect]) {
                 k.remove();
             }
             for it in items {
+                if !is_safe_url(&it.url, false) {
+                    continue;
+                }
                 let eid = format!("lumen-embed-{}", it.id);
                 let frame: web_sys::HtmlElement = match doc.get_element_by_id(&eid) {
                     Some(e) => e.dyn_into().ok()?,
                     None => {
-                        let f: web_sys::HtmlElement = doc.create_element(if it.video { "video" } else { "iframe" }).ok()?.dyn_into().ok()?;
+                        let f: web_sys::HtmlElement = doc
+                            .create_element(if it.video { "video" } else { "iframe" })
+                            .ok()?
+                            .dyn_into()
+                            .ok()?;
                         f.set_id(&eid);
                         if it.video {
                             f.set_attribute("controls", "").ok()?;
@@ -308,10 +371,16 @@ pub fn sync_iframes(items: &[EmbedRect]) {
                                 f.set_attribute("loop", "").ok()?;
                             }
                         } else {
+                            f.set_attribute(
+                                "sandbox",
+                                "allow-scripts allow-same-origin allow-popups allow-presentation",
+                            )
+                            .ok()?;
                             f.set_attribute("allow", "autoplay; fullscreen; clipboard-write; encrypted-media; picture-in-picture").ok()?;
                             f.set_attribute("allowfullscreen", "true").ok()?;
                             f.set_attribute("loading", "lazy").ok()?;
-                            f.set_attribute("referrerpolicy", "no-referrer-when-downgrade").ok()?;
+                            f.set_attribute("referrerpolicy", "no-referrer-when-downgrade")
+                                .ok()?;
                         }
                         container.append_child(&f).ok()?;
                         f
@@ -326,18 +395,33 @@ pub fn sync_iframes(items: &[EmbedRect]) {
                     st.set_property("display", "none").ok()?;
                     continue;
                 }
-                let (t, l) = ((vis.top() - it.rect.top()).max(0.0), (vis.left() - it.rect.left()).max(0.0));
-                let (b, r) = ((it.rect.bottom() - vis.bottom()).max(0.0), (it.rect.right() - vis.right()).max(0.0));
+                let (t, l) = (
+                    (vis.top() - it.rect.top()).max(0.0),
+                    (vis.left() - it.rect.left()).max(0.0),
+                );
+                let (b, r) = (
+                    (it.rect.bottom() - vis.bottom()).max(0.0),
+                    (it.rect.right() - vis.right()).max(0.0),
+                );
                 st.set_property("display", "block").ok()?;
                 st.set_property("position", "absolute").ok()?;
                 st.set_property("border", "0").ok()?;
-                st.set_property("background", if it.video { "#000" } else { "#fff" }).ok()?;
+                st.set_property("background", if it.video { "#000" } else { "#fff" })
+                    .ok()?;
                 st.set_property("object-fit", "contain").ok()?;
-                st.set_property("left", &format!("{}px", it.rect.left())).ok()?;
-                st.set_property("top", &format!("{}px", it.rect.top())).ok()?;
-                st.set_property("width", &format!("{}px", it.rect.width())).ok()?;
-                st.set_property("height", &format!("{}px", it.rect.height())).ok()?;
-                st.set_property("clip-path", &format!("inset({t}px {r}px {b}px {l}px round 8px)")).ok()?;
+                st.set_property("left", &format!("{}px", it.rect.left()))
+                    .ok()?;
+                st.set_property("top", &format!("{}px", it.rect.top()))
+                    .ok()?;
+                st.set_property("width", &format!("{}px", it.rect.width()))
+                    .ok()?;
+                st.set_property("height", &format!("{}px", it.rect.height()))
+                    .ok()?;
+                st.set_property(
+                    "clip-path",
+                    &format!("inset({t}px {r}px {b}px {l}px round 8px)"),
+                )
+                .ok()?;
             }
             Some(())
         };
@@ -386,12 +470,21 @@ mod native {
             // dropping a WebView closes it and frees its memory
             v.retain(|id, _| items.iter().any(|i| i.id == *id));
             for it in items.iter().take(MAX_VIEWS) {
+                if !super::is_safe_url(&it.url, false) {
+                    continue;
+                }
                 let count = v.len();
                 let vis = it.rect.intersect(it.clip);
-                let fully_visible = vis.width() >= it.rect.width() - 1.0 && vis.height() >= it.rect.height() - 1.0;
+                let fully_visible =
+                    vis.width() >= it.rect.width() - 1.0 && vis.height() >= it.rect.height() - 1.0;
                 let bounds = Rect {
-                    position: LogicalPosition::new(it.rect.left() as f64, it.rect.top() as f64).into(),
-                    size: LogicalSize::new(it.rect.width().max(1.0) as f64, it.rect.height().max(1.0) as f64).into(),
+                    position: LogicalPosition::new(it.rect.left() as f64, it.rect.top() as f64)
+                        .into(),
+                    size: LogicalSize::new(
+                        it.rect.width().max(1.0) as f64,
+                        it.rect.height().max(1.0) as f64,
+                    )
+                    .into(),
                 };
                 match v.get_mut(&it.id) {
                     Some((url, wv)) => {
@@ -403,7 +496,11 @@ mod native {
                         let _ = wv.set_visible(fully_visible);
                     }
                     None if fully_visible && count < MAX_VIEWS => {
-                        if let Ok(wv) = WebViewBuilder::new().with_url(&it.url).with_bounds(bounds).build_as_child(frame) {
+                        if let Ok(wv) = WebViewBuilder::new()
+                            .with_url(&it.url)
+                            .with_bounds(bounds)
+                            .build_as_child(frame)
+                        {
                             v.insert(it.id, (it.url.clone(), wv));
                         }
                     }
@@ -426,7 +523,7 @@ pub fn open_html(name: &str, html: &str) -> String {
     #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     {
         let mut path = std::env::temp_dir();
-        path.push(name);
+        path.push(safe_download_name(name));
         match std::fs::write(&path, html.as_bytes()) {
             Ok(_) => match webbrowser::open(&path.to_string_lossy()) {
                 Ok(_) => "Opened the print preview in your browser".to_owned(),

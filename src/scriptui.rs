@@ -7,7 +7,10 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use egui::text::{LayoutJob, TextFormat};
-use egui::{pos2, vec2, Color32, CornerRadius, FontId, Frame, Id, Margin, Pos2, Rect, RichText, Sense, Stroke, TextEdit, Ui};
+use egui::{
+    pos2, vec2, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Id, Margin, Pos2, Rect,
+    RichText, Sense, Stroke, TextEdit, Ui,
+};
 
 use crate::automation::{self as au, Action, Output, Rule, Runtime, Script, Trigger};
 use crate::autoui::{self, caps, card, combo, databases, icon_btn, label, pill, Out};
@@ -15,7 +18,7 @@ use crate::lucide as l;
 use crate::model::Workspace;
 use crate::script::{self, Hl, ScriptError};
 use crate::scripthost::{self, ScriptCtx};
-use crate::theme::{bold, body, Palette};
+use crate::theme::{body, bold, lerp_color, Palette};
 use crate::widgets::{self, with_alpha};
 
 // ───────────────────────────── state ─────────────────────────────
@@ -29,6 +32,15 @@ struct St {
     console: HashMap<u64, Vec<Line>>,
     target: HashMap<u64, u64>,
     docs: bool,
+    info_pop: Option<InfoPop>,
+    info_pos: Pos2,
+    info_fresh: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InfoPop {
+    Header,
+    Example(usize),
 }
 
 thread_local! {
@@ -237,28 +249,72 @@ fn live_run(ws: &mut Workspace, rt: &mut Runtime, name: &str, code: &str, target
 // ───────────────────────────── inline editor (Run script action) ─────────────────────────────
 
 /// Editor used inside a rule / button action list. `ws` is only read (the Test button works on a copy).
-pub fn inline_editor(ui: &mut Ui, pal: &Palette, ws: &Workspace, db: u64, code: &mut String, salt: impl Hash + Copy) -> bool {
+pub fn inline_editor(
+    ui: &mut Ui,
+    pal: &Palette,
+    ws: &Workspace,
+    db: u64,
+    code: &mut String,
+    salt: impl Hash + Copy,
+) -> bool {
     let ctx = ui.ctx().clone();
     let err = cached_check(&ctx, Id::new((salt, "chk")), code);
-    let mut ch = code_editor(ui, pal, (salt, "code"), code, 8, err.as_ref().map(|e| e.line));
+    let mut ch = code_editor(
+        ui,
+        pal,
+        (salt, "code"),
+        code,
+        8,
+        err.as_ref().map(|e| e.line),
+    );
     status_line(ui, pal, code, &err);
     let con_id = Id::new((salt, "console"));
     ui.horizontal_wrapped(|ui| {
         if widgets::ghost_button(ui, pal, "▶ Test (changes nothing)").clicked() {
-            let lines = if let Some(e) = &err { vec![(2u8, e.to_string())] } else { test_run(ws, code, db, first_row(ws, db)) };
+            let lines = if let Some(e) = &err {
+                vec![(2u8, e.to_string())]
+            } else {
+                test_run(ws, code, db, first_row(ws, db))
+            };
             ctx.data_mut(|d| d.insert_temp(con_id, lines));
         }
-        let items: Vec<(String, usize)> = scripthost::EXAMPLES.iter().enumerate().map(|(i, e)| (e.name.to_owned(), i)).collect();
-        egui::ComboBox::from_id_salt(Id::new((salt, "ex"))).selected_text(RichText::new("Insert example").font(body(13.0))).width((150.0_f32).min((ui.available_width() - 12.0).max(90.0))).show_ui(ui, |ui| {
-            for (n, i) in &items {
-                if ui.selectable_label(false, RichText::new(n).font(body(13.5))).on_hover_text(scripthost::EXAMPLES[*i].desc).clicked() {
-                    *code = scripthost::EXAMPLES[*i].code.to_owned();
-                    ch = true;
+        let items: Vec<(String, usize)> = scripthost::EXAMPLES
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.name.to_owned(), i))
+            .collect();
+        egui::ComboBox::from_id_salt(Id::new((salt, "ex")))
+            .selected_text(RichText::new("Insert example").font(body(13.0)))
+            .width((150.0_f32).min((ui.available_width() - 12.0).max(90.0)))
+            .show_ui(ui, |ui| {
+                for (n, i) in &items {
+                    if ui
+                        .selectable_label(false, RichText::new(n).font(body(13.5)))
+                        .on_hover_text(scripthost::EXAMPLES[*i].desc)
+                        .clicked()
+                    {
+                        *code = scripthost::EXAMPLES[*i].code.to_owned();
+                        ch = true;
+                    }
                 }
-            }
-        });
+            });
+        let (qr, qresp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+        let qt = ui
+            .ctx()
+            .animate_bool_with_time(qresp.id, qresp.hovered(), 0.12);
+        ui.painter()
+            .circle_filled(qr.center(), 11.0, with_alpha(pal.muted, 0.10 + 0.16 * qt));
+        ui.painter().text(
+            qr.center(),
+            Align2::CENTER_CENTER,
+            "?",
+            bold(11.5),
+            lerp_color(with_alpha(pal.muted, 0.78), pal.text, qt),
+        );
+        qresp.on_hover_text(
+            "Uses row, db(\"Name\"), notify() … Full reference in Automations → Scripts.",
+        );
     });
-    label(ui, pal, "Uses `row`, `db(\"Name\")`, `notify()` … — full reference in Automations → Scripts.");
     if let Some(lines) = ctx.data(|d| d.get_temp::<Vec<Line>>(con_id)) {
         ui.add_space(4.0);
         console_view(ui, pal, &lines);
@@ -268,58 +324,119 @@ pub fn inline_editor(ui: &mut Ui, pal: &Palette, ws: &Workspace, db: u64, code: 
 
 // ───────────────────────────── Scripts tab ─────────────────────────────
 
-pub fn scripts_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette, out: &mut Out) {
+pub fn scripts_tab(
+    ui: &mut Ui,
+    ws: &mut Workspace,
+    rt: &mut Runtime,
+    pal: &Palette,
+    out: &mut Out,
+) {
     let dbs = databases(ws);
-    card(ui, pal, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            let (r, _) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::hover());
-            ui.painter().rect_filled(r, 10.0, with_alpha(pal.accent, 0.14));
-            crate::icons::glyph(ui.painter(), r.center(), 18.0, l::CODE_XML, pal.accent);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(RichText::new("Scripts").font(bold(15.5)));
-                ui.label(RichText::new("LumenScript — automate with code: loops, conditions, several databases").font(body(12.5)).color(pal.muted));
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if widgets::primary_button(ui, pal, "+ New script", 118.0).clicked() {
-                    let id = ws.id();
-                    ws.auto.scripts.push(Script { id, name: "New script".into(), code: scripthost::EXAMPLES[1].code.to_owned(), runs: 0, last_run: 0.0, every: 0 });
-                    st(|s| s.open = Some(id));
+    let dark = is_dark(pal);
+    let open_info = st(|s| s.info_pop);
+
+    // Clean, minimalist Scripts header — extra sandbox & usage details live under '?'
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
+        ui.painter()
+            .rect_filled(r, 8.0, with_alpha(pal.accent, 0.13));
+        crate::icons::glyph(ui.painter(), r.center(), 15.5, l::CODE_XML, pal.accent);
+        ui.add_space(4.0);
+        ui.label(RichText::new("Scripts").font(bold(17.0)).color(pal.text));
+
+        let q_sz = if autoui::roomy() { 26.0 } else { 22.0 };
+        let (qr, qresp) = ui.allocate_exact_size(vec2(q_sz, q_sz), Sense::click());
+        let q_open = open_info == Some(InfoPop::Header);
+        let qt = ui
+            .ctx()
+            .animate_bool_with_time(qresp.id, qresp.hovered() || q_open, 0.12);
+        ui.painter().circle_filled(
+            qr.center(),
+            q_sz * 0.5,
+            if q_open {
+                with_alpha(pal.accent, 0.18)
+            } else {
+                with_alpha(pal.muted, 0.09 + 0.16 * qt)
+            },
+        );
+        ui.painter().text(
+            qr.center(),
+            Align2::CENTER_CENTER,
+            "?",
+            bold(11.5),
+            if q_open {
+                pal.accent
+            } else {
+                lerp_color(with_alpha(pal.muted, 0.75), pal.text, qt)
+            },
+        );
+        let qresp = qresp.on_hover_cursor(CursorIcon::PointingHand);
+        let qresp = if !q_open {
+            qresp.on_hover_text("About LumenScript & sandbox limits")
+        } else {
+            qresp
+        };
+        if qresp.clicked() {
+            st(|s| {
+                if s.info_pop == Some(InfoPop::Header) {
+                    s.info_pop = None;
+                } else {
+                    s.info_pop = Some(InfoPop::Header);
+                    s.info_pos = pos2(qr.left(), qr.bottom() + 6.0);
+                    s.info_fresh = true;
                 }
             });
+        }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if widgets::primary_button(ui, pal, "+ New script", 114.0).clicked() {
+                let id = ws.id();
+                ws.auto.scripts.push(Script {
+                    id,
+                    name: "New script".into(),
+                    code: scripthost::EXAMPLES[1].code.to_owned(),
+                    runs: 0,
+                    last_run: 0.0,
+                    every: 0,
+                });
+                st(|s| s.open = Some(id));
+            }
         });
-        ui.add_space(6.0);
-        label(ui, pal, "Scripts run in a sandbox: no files, no network, an instruction budget and hard limits on rows and notifications. Use ▶ Test to see what a script would do before it touches your data. Use a script inside any rule or button with the “Run script” action.");
     });
     ui.add_space(10.0);
 
     if ws.auto.scripts.is_empty() {
-        card(ui, pal, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(8.0);
-                ui.label(RichText::new("No scripts yet").font(bold(15.0)));
-                label(ui, pal, "Start from an example, or write your own.");
-                ui.add_space(8.0);
+        Frame::new()
+            .fill(if dark { pal.code_bg } else { pal.card })
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(Margin::symmetric(16, 14))
+            .shadow(egui::epaint::Shadow {
+                offset: [0, 2],
+                blur: 10,
+                spread: 0,
+                color: Color32::from_black_alpha(if dark { 40 } else { 14 }),
+            })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
-                    for ex in scripthost::EXAMPLES.iter() {
-                        if widgets::ghost_button(ui, pal, ex.name).on_hover_text(ex.desc).clicked() {
-                            let id = ws.id();
-                            ws.auto.scripts.push(Script { id, name: ex.name.into(), code: ex.code.into(), runs: 0, last_run: 0.0, every: 0 });
-                            st(|s| s.open = Some(id));
-                        }
-                    }
+                    ui.label(
+                        RichText::new("No scripts yet")
+                            .font(bold(13.5))
+                            .color(pal.text),
+                    );
+                    label(ui, pal, "— create one or pick an example below.");
                 });
-                ui.add_space(8.0);
             });
-        });
-        ui.add_space(8.0);
+        ui.add_space(10.0);
     }
 
     let ids: Vec<u64> = ws.auto.scripts.iter().map(|s| s.id).collect();
     let mut delete: Option<u64> = None;
     let mut to_rule: Option<u64> = None;
     for id in ids {
-        let Some(idx) = ws.auto.scripts.iter().position(|s| s.id == id) else { continue };
+        let Some(idx) = ws.auto.scripts.iter().position(|s| s.id == id) else {
+            continue;
+        };
         let mut sc = ws.auto.scripts[idx].clone();
         let before = sc.clone();
         let open = st(|s| s.open) == Some(id);
@@ -330,19 +447,53 @@ pub fn scripts_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Pale
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
                     if open {
-                        ui.add(TextEdit::singleline(&mut sc.name).desired_width((220.0_f32).min((ui.available_width() - 12.0).max(90.0))).font(bold(15.0)).margin(Margin::symmetric(6, 4)));
-                    } else if ui.add(egui::Label::new(RichText::new(&sc.name).font(bold(15.0))).sense(Sense::click())).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        ui.add(
+                            TextEdit::singleline(&mut sc.name)
+                                .desired_width(
+                                    (220.0_f32).min((ui.available_width() - 12.0).max(90.0)),
+                                )
+                                .font(bold(15.0))
+                                .margin(Margin::symmetric(6, 4)),
+                        );
+                    } else if ui
+                        .add(
+                            egui::Label::new(RichText::new(&sc.name).font(bold(15.0)))
+                                .sense(Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
                         toggle = true;
                     }
                     let lines = sc.code.lines().count();
-                    let last = if sc.last_run > 0.0 { format!("last run {} ago", crate::app::ago(sc.last_run)) } else { "never run".into() };
-                    label(ui, pal, &format!("{lines} line(s) · {} run(s) · {last}", sc.runs));
+                    let last = if sc.last_run > 0.0 {
+                        format!("last run {} ago", crate::app::ago(sc.last_run))
+                    } else {
+                        "never run".into()
+                    };
+                    label(
+                        ui,
+                        pal,
+                        &format!("{lines} line(s) · {} run(s) · {last}", sc.runs),
+                    );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icon_btn(ui, pal, l::TRASH_2, "Delete script", true).clicked() {
                         delete = Some(id);
                     }
-                    if icon_btn(ui, pal, if open { l::CHEVRONS_UP_DOWN } else { l::SQUARE_PEN }, if open { "Collapse" } else { "Edit script" }, false).clicked() {
+                    if icon_btn(
+                        ui,
+                        pal,
+                        if open {
+                            l::CHEVRONS_UP_DOWN
+                        } else {
+                            l::SQUARE_PEN
+                        },
+                        if open { "Collapse" } else { "Edit script" },
+                        false,
+                    )
+                    .clicked()
+                    {
                         toggle = true;
                     }
                 });
@@ -351,7 +502,14 @@ pub fn scripts_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Pale
                 ui.add_space(6.0);
                 let ctx = ui.ctx().clone();
                 let err = cached_check(&ctx, Id::new(("script_chk", id)), &sc.code);
-                code_editor(ui, pal, ("script_code", id), &mut sc.code, 14, err.as_ref().map(|e| e.line));
+                code_editor(
+                    ui,
+                    pal,
+                    ("script_code", id),
+                    &mut sc.code,
+                    14,
+                    err.as_ref().map(|e| e.line),
+                );
                 status_line(ui, pal, &sc.code, &err);
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
@@ -359,16 +517,53 @@ pub fn scripts_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Pale
                     let mut items: Vec<(String, u64)> = vec![("once (no row)".to_owned(), 0)];
                     items.extend(dbs.iter().cloned());
                     let cur = st(|s| s.target.get(&id).copied()).unwrap_or(0);
-                    let cur = if items.iter().any(|i| i.1 == cur) { cur } else { 0 };
-                    let shown: Vec<(String, u64)> = items.iter().map(|(n, i)| (if *i == 0 { n.clone() } else { format!("every row of {n}") }, *i)).collect();
+                    let cur = if items.iter().any(|i| i.1 == cur) {
+                        cur
+                    } else {
+                        0
+                    };
+                    let shown: Vec<(String, u64)> = items
+                        .iter()
+                        .map(|(n, i)| {
+                            (
+                                if *i == 0 {
+                                    n.clone()
+                                } else {
+                                    format!("every row of {n}")
+                                },
+                                *i,
+                            )
+                        })
+                        .collect();
                     if let Some(n) = combo(ui, ("script_target", id), 210.0, &shown, &cur) {
                         st(|s| s.target.insert(id, n));
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
                     label(ui, pal, "Repeat every");
-                    ui.add(egui::DragValue::new(&mut sc.every).range(0..=86_400).suffix(" s"));
-                    ui.label(RichText::new(if sc.every == 0 { "off — runs only when you press Run" } else { "● repeats in the background, on every page, while the app is open" }).font(body(12.0)).color(if sc.every == 0 { pal.muted } else { pal.accent }));
+                    ui.add(
+                        egui::DragValue::new(&mut sc.every)
+                            .range(0..=86_400)
+                            .suffix(" s"),
+                    );
+                    ui.label(
+                        RichText::new(if sc.every == 0 {
+                            "Manual only"
+                        } else {
+                            "● Active in background"
+                        })
+                        .font(body(12.0))
+                        .color(if sc.every == 0 {
+                            pal.muted
+                        } else {
+                            pal.accent
+                        }),
+                    )
+                    .on_hover_text(if sc.every == 0 {
+                        "Runs only when you press Run or trigger it from a rule."
+                    } else {
+                        "Repeats automatically in the background while the app is open."
+                    });
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.add_enabled_ui(err.is_none(), |ui| {
@@ -394,10 +589,21 @@ pub fn scripts_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Pale
                     console_view(ui, pal, &lines);
                 }
             } else {
-                let first: String = sc.code.lines().find(|l| !l.trim().is_empty() && !l.trim_start().starts_with("//")).unwrap_or("").chars().take(80).collect();
+                let first: String = sc
+                    .code
+                    .lines()
+                    .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with("//"))
+                    .unwrap_or("")
+                    .chars()
+                    .take(80)
+                    .collect();
                 if !first.is_empty() {
                     ui.add_space(2.0);
-                    ui.label(RichText::new(first).font(FontId::monospace(12.0)).color(pal.muted));
+                    ui.label(
+                        RichText::new(first)
+                            .font(FontId::monospace(12.0))
+                            .color(pal.muted),
+                    );
                 }
             }
         });
@@ -418,7 +624,11 @@ pub fn scripts_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Pale
                 st(|s| s.console.insert(id, lines));
                 sc.runs += 1;
                 sc.last_run = crate::auth::now_ms();
-                out.toast = Some(if failed { "Script stopped with an error — see the console".into() } else { "Script finished".into() });
+                out.toast = Some(if failed {
+                    "Script stopped with an error — see the console".into()
+                } else {
+                    "Script finished".into()
+                });
             }
             _ => {}
         }
@@ -437,31 +647,264 @@ pub fn scripts_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Pale
         if let Some(sc) = ws.auto.scripts.iter().find(|s| s.id == id).cloned() {
             let target = st(|s| s.target.get(&id).copied()).unwrap_or(0);
             let rid = ws.id();
-            let trig = if target != 0 { Trigger::RowAdded } else { Trigger::Manual };
-            ws.auto.rules.push(Rule::new(rid, &format!("Script: {}", sc.name), target, trig, vec![Action::Script { code: sc.code }]));
+            let trig = if target != 0 {
+                Trigger::RowAdded
+            } else {
+                Trigger::Manual
+            };
+            ws.auto.rules.push(Rule::new(
+                rid,
+                &format!("Script: {}", sc.name),
+                target,
+                trig,
+                vec![Action::Script { code: sc.code }],
+            ));
             autoui::focus_rule(rid);
             rt.dirty = true;
             out.toast = Some("Rule created — pick its trigger below".into());
         }
     }
 
-    // examples
-    ui.add_space(4.0);
-    ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new("Examples").font(bold(15.0)));
-        label(ui, pal, "click to add to your library");
-    });
+    // examples — compact borderless elevated cards with hover '+' and '?' details
     ui.add_space(6.0);
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-        for ex in scripthost::EXAMPLES.iter() {
-            if widgets::ghost_button(ui, pal, &format!("+ {}", ex.name)).on_hover_text(ex.desc).clicked() {
-                let id = ws.id();
-                ws.auto.scripts.push(Script { id, name: ex.name.into(), code: ex.code.into(), runs: 0, last_run: 0.0, every: 0 });
-                st(|s| s.open = Some(id));
+    ui.label(RichText::new("Examples").font(bold(15.5)).color(pal.text));
+    ui.add_space(8.0);
+    let avail = ui
+        .available_width()
+        .min(ui.ctx().screen_rect().width() - 28.0)
+        .max(220.0);
+    let gap = 10.0;
+    let cols = if avail > 640.0 { 2 } else { 1 };
+    let cw = ((avail - gap * (cols as f32 - 1.0)) / cols as f32).floor();
+    let pad = 12.0_f32;
+    let icon = 26.0_f32;
+    let q_sz = if autoui::roomy() { 28.0_f32 } else { 22.0_f32 };
+    let plus_sz = 20.0_f32;
+    let tx = pad + icon + 10.0;
+    let right_reserve = pad + q_sz + 6.0 + plus_sz + 8.0;
+    let tw = (cw - tx - right_reserve).max(80.0);
+    let mut ex_idx = 0usize;
+
+    for chunk in scripthost::EXAMPLES.chunks(cols) {
+        let mut galleys = vec![];
+        let mut h_max = 0.0_f32;
+        for ex in chunk {
+            let gt = ui
+                .painter()
+                .layout(ex.name.to_owned(), bold(13.0), pal.text, tw);
+            h_max = h_max.max(pad * 2.0 + gt.size().y);
+            galleys.push(gt);
+        }
+        let h_max = h_max
+            .max(pad * 2.0 + icon)
+            .max(if autoui::roomy() { 52.0 } else { 48.0 });
+        let (row_rect, _) = ui.allocate_exact_size(vec2(avail, h_max), Sense::hover());
+        for (i, ex) in chunk.iter().enumerate() {
+            let idx = ex_idx;
+            ex_idx += 1;
+            let base_rect = Rect::from_min_size(
+                pos2(row_rect.left() + i as f32 * (cw + gap), row_rect.top()),
+                vec2(cw, h_max),
+            );
+            let card_id = Id::new(("script_ex", ex.name));
+            let q_id = Id::new(("script_ex_q", ex.name));
+
+            let card_resp = ui.interact(base_rect, card_id, Sense::click());
+            let q_rect_base = Rect::from_center_size(
+                pos2(base_rect.right() - pad - q_sz * 0.5, base_rect.center().y),
+                vec2(q_sz, q_sz),
+            );
+            let q_resp = ui.interact(q_rect_base, q_id, Sense::click());
+
+            let q_hovered = q_resp.hovered();
+            let card_hovered = ui.rect_contains_pointer(base_rect);
+            let add_hovered = card_hovered && !q_hovered;
+            let q_open = open_info == Some(InfoPop::Example(idx));
+
+            let t = ui.ctx().animate_bool_with_time(card_id, card_hovered, 0.15);
+            let plus_t = ui
+                .ctx()
+                .animate_bool_with_time(card_id.with("plus"), add_hovered, 0.15);
+            let q_t = ui
+                .ctx()
+                .animate_bool_with_time(q_id, q_hovered || q_open, 0.12);
+
+            let rect = base_rect.translate(vec2(0.0, -1.5 * t));
+            let radius = CornerRadius::same(12);
+
+            let sh_alpha = if dark {
+                (44.0 + 28.0 * t) as u8
+            } else {
+                (14.0 + 14.0 * t) as u8
+            };
+            let shadow = egui::epaint::Shadow {
+                offset: [0, (2.0 + 2.0 * t).round() as i8],
+                blur: (10.0 + 5.0 * t).round() as u8,
+                spread: 0,
+                color: Color32::from_black_alpha(sh_alpha),
+            };
+            let p = ui.painter();
+            p.add(shadow.as_shape(rect, radius));
+
+            let rest_fill = if dark { pal.code_bg } else { pal.card };
+            let hov_fill = if dark { pal.callout } else { pal.hover };
+            p.rect_filled(rect, radius, lerp_color(rest_fill, hov_fill, t));
+
+            let ir = Rect::from_center_size(
+                pos2(rect.left() + pad + icon * 0.5, rect.center().y),
+                vec2(icon, icon),
+            );
+            p.rect_filled(ir, 7.0, with_alpha(pal.accent, 0.11 + 0.07 * t));
+            crate::icons::glyph(p, ir.center(), 13.5, l::CODE_XML, pal.accent);
+
+            let gt = &galleys[i];
+            p.galley(
+                pos2(rect.left() + tx, rect.center().y - gt.size().y * 0.5),
+                gt.clone(),
+                pal.text,
+            );
+
+            let plus_alpha = if autoui::roomy() {
+                0.35 + 0.65 * plus_t
+            } else {
+                plus_t
+            };
+            if plus_alpha > 0.02 {
+                let plus_center = pos2(
+                    rect.right() - pad - q_sz - 6.0 - plus_sz * 0.5 + (1.0 - plus_t) * 3.0,
+                    rect.center().y,
+                );
+                let plus_rect = Rect::from_center_size(plus_center, vec2(plus_sz, plus_sz));
+                p.rect_filled(plus_rect, 7.0, with_alpha(pal.accent, 0.16 * plus_alpha));
+                crate::icons::glyph(
+                    p,
+                    plus_center,
+                    12.5,
+                    l::PLUS,
+                    with_alpha(pal.accent, plus_alpha),
+                );
+            }
+
+            let q_rect = q_rect_base.translate(vec2(0.0, -1.5 * t));
+            p.circle_filled(
+                q_rect.center(),
+                q_sz * 0.5,
+                if q_open {
+                    with_alpha(pal.accent, 0.18)
+                } else {
+                    with_alpha(pal.muted, 0.08 + 0.18 * q_t)
+                },
+            );
+            p.text(
+                q_rect.center(),
+                Align2::CENTER_CENTER,
+                "?",
+                bold(11.5),
+                if q_open {
+                    pal.accent
+                } else {
+                    lerp_color(with_alpha(pal.muted, 0.75), pal.text, q_t)
+                },
+            );
+
+            let q_resp = q_resp.on_hover_cursor(CursorIcon::PointingHand);
+            let q_resp = if !q_open {
+                q_resp.on_hover_text(ex.desc)
+            } else {
+                q_resp
+            };
+
+            if q_resp.clicked() {
+                st(|s| {
+                    if s.info_pop == Some(InfoPop::Example(idx)) {
+                        s.info_pop = None;
+                    } else {
+                        s.info_pop = Some(InfoPop::Example(idx));
+                        s.info_pos = pos2(q_rect.right(), q_rect.bottom() + 6.0);
+                        s.info_fresh = true;
+                    }
+                });
+            } else if add_hovered {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                if card_resp.clicked() {
+                    st(|s| s.info_pop = None);
+                    let id = ws.id();
+                    ws.auto.scripts.push(Script {
+                        id,
+                        name: ex.name.into(),
+                        code: ex.code.into(),
+                        runs: 0,
+                        last_run: 0.0,
+                        every: 0,
+                    });
+                    st(|s| s.open = Some(id));
+                }
             }
         }
-    });
+        ui.add_space(gap);
+    }
+
+    // Floating '?' details popover for Scripts header & Examples
+    if let Some(kind) = st(|s| s.info_pop) {
+        let content: Option<(&str, &str)> = match kind {
+            InfoPop::Header => Some((
+                "LumenScript Sandbox",
+                "Automate across databases with loops and conditions. Scripts run in an isolated local sandbox (no file or network access, with safe step, row, and notification limits). Use ▶ Test to preview changes on a copy, or run any script inside a rule or button via “Run script”.",
+            )),
+            InfoPop::Example(idx) => scripthost::EXAMPLES.get(idx).map(|e| (e.name, e.desc)),
+        };
+        if let Some((title, desc)) = content {
+            let screen = ui.ctx().screen_rect();
+            let pop_w = (288.0_f32).min(screen.width() - 24.0);
+            let anchor = st(|s| s.info_pos);
+            let raw_x = if matches!(kind, InfoPop::Header) {
+                anchor.x
+            } else {
+                anchor.x - pop_w
+            };
+            let px = raw_x.clamp(screen.left() + 12.0, screen.right() - pop_w - 12.0);
+            let py = anchor
+                .y
+                .min(screen.bottom() - 140.0)
+                .max(screen.top() + 12.0);
+            let area = egui::Area::new(Id::new("script_info_pop"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(pos2(px, py))
+                .show(ui.ctx(), |ui| {
+                    Frame::new()
+                        .fill(pal.popup)
+                        .corner_radius(CornerRadius::same(12))
+                        .inner_margin(Margin::same(13))
+                        .shadow(egui::epaint::Shadow {
+                            offset: [0, 6],
+                            blur: 18,
+                            spread: 0,
+                            color: Color32::from_black_alpha(if dark { 90 } else { 32 }),
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width(pop_w - 26.0);
+                            ui.label(RichText::new(title).font(bold(13.0)).color(pal.text));
+                            ui.add_space(5.0);
+                            ui.label(RichText::new(desc).font(body(12.0)).color(pal.muted));
+                        });
+                });
+            let fresh = st(|s| {
+                let f = s.info_fresh;
+                s.info_fresh = false;
+                f
+            });
+            let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let clicked_out = !fresh
+                && ui.input(|i| i.pointer.any_pressed())
+                && !area
+                    .response
+                    .rect
+                    .contains(ui.input(|i| i.pointer.interact_pos().unwrap_or(pos2(-1.0, -1.0))));
+            if esc || clicked_out {
+                st(|s| s.info_pop = None);
+            }
+        }
+    }
 
     // reference
     ui.add_space(14.0);
@@ -483,8 +926,18 @@ pub fn scripts_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Pale
                 ui.label(RichText::new(d.title).font(bold(14.0)));
                 ui.add_space(4.0);
                 for (sig, desc) in d.items {
-                    ui.add(egui::Label::new(RichText::new(*sig).font(FontId::monospace(12.0)).color(pal.accent)).wrap());
-                    ui.add(egui::Label::new(RichText::new(*desc).font(body(12.5)).color(pal.muted)).wrap());
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(*sig)
+                                .font(FontId::monospace(12.0))
+                                .color(pal.accent),
+                        )
+                        .wrap(),
+                    );
+                    ui.add(
+                        egui::Label::new(RichText::new(*desc).font(body(12.5)).color(pal.muted))
+                            .wrap(),
+                    );
                     ui.add_space(5.0);
                 }
             });

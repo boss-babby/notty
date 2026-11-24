@@ -160,14 +160,22 @@ fn ai_ui_renders_without_panics() {
     let mut ai = AiHost::default();
     ai.st.mcp.token = "lmn_abcdef0123456789".into();
     let frame = |ctx: &egui::Context, ai: &mut AiHost, ws: &mut Workspace, w: f32| {
-        let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 800.0))), ..Default::default() };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(w, 800.0),
+            )),
+            ..Default::default()
+        };
         let _ = ctx.run(input, |ctx| {
             if w < 720.0 {
-                crate::aiui::fullscreen(ctx, ai, ws, &pal);
+                crate::aiui::fullscreen(ctx, ai, ws, &pal, 1.0);
             } else {
-                egui::SidePanel::right("t").default_width(400.0).show(ctx, |ui| {
-                    crate::aiui::panel(ui, ctx, ai, ws, &pal);
-                });
+                egui::SidePanel::right("t")
+                    .default_width(400.0)
+                    .show(ctx, |ui| {
+                        crate::aiui::panel(ui, ctx, ai, ws, &pal);
+                    });
             }
             crate::aiui::settings(ctx, ai, ws, &pal);
         });
@@ -176,17 +184,51 @@ fn ai_ui_renders_without_panics() {
         frame(&ctx, &mut ai, &mut ws, w);
         ai.thread();
         let t = &mut ai.st.threads[0];
-        t.msgs.push(Msg { role: Role::User, text: "Build me a CRM".into(), calls: vec![], results: vec![], raw: None, raw_api: String::new(), error: false });
+        t.msgs.push(Msg {
+            role: Role::User,
+            text: "Build me a CRM".into(),
+            calls: vec![],
+            results: vec![],
+            raw: None,
+            raw_api: String::new(),
+            error: false,
+        });
         t.msgs.push(Msg { role: Role::Assistant, text: "# Plan\n- **one** `two`\n1. first\n> quote\n```\ncode\n```\n| a | b |\n[link](https://x.y)".into(), calls: vec![Call { id: "1".into(), name: "create_page".into(), args: json!({"title": "Hub"}) }], results: vec![], raw: None, raw_api: String::new(), error: false });
-        t.msgs.push(Msg { role: Role::Tool, text: String::new(), calls: vec![], results: vec![ToolRes { call_id: "1".into(), name: "create_page".into(), ok: true, text: "{\"id\":1}".into(), open: Some(1) }], raw: None, raw_api: String::new(), error: false });
-        t.msgs.push(Msg { role: Role::Assistant, text: "Invalid key (HTTP 401)".into(), calls: vec![], results: vec![], raw: None, raw_api: String::new(), error: true });
+        t.msgs.push(Msg {
+            role: Role::Tool,
+            text: String::new(),
+            calls: vec![],
+            results: vec![ToolRes {
+                call_id: "1".into(),
+                name: "create_page".into(),
+                ok: true,
+                text: "{\"id\":1}".into(),
+                open: Some(1),
+            }],
+            raw: None,
+            raw_api: String::new(),
+            error: false,
+        });
+        t.msgs.push(Msg {
+            role: Role::Assistant,
+            text: "Invalid key (HTTP 401)".into(),
+            calls: vec![],
+            results: vec![],
+            raw: None,
+            raw_api: String::new(),
+            error: true,
+        });
         for _ in 0..3 {
             frame(&ctx, &mut ai, &mut ws, w);
         }
         ai.rt.history = true;
         frame(&ctx, &mut ai, &mut ws, w);
         ai.rt.history = false;
-        for tab in [SettingsTab::Providers, SettingsTab::Agent, SettingsTab::Connect] {
+        for tab in [
+            SettingsTab::Providers,
+            SettingsTab::Agent,
+            SettingsTab::Connect,
+        ] {
             ai.rt.settings = Some(tab);
             for p in ["gemini", "custom", "ollama"] {
                 ai.rt.sel_provider = p.into();
@@ -195,7 +237,11 @@ fn ai_ui_renders_without_panics() {
         }
         ai.rt.settings = None;
         ai.rt.phase = crate::ai::Phase::Approval;
-        ai.rt.pending = vec![Call { id: "2".into(), name: "create_database".into(), args: json!({"title": "T", "rows": [1, 2]}) }];
+        ai.rt.pending = vec![Call {
+            id: "2".into(),
+            name: "create_database".into(),
+            args: json!({"title": "T", "rows": [1, 2]}),
+        }];
         frame(&ctx, &mut ai, &mut ws, w);
         ai.st.threads.clear();
         ai.rt.phase = crate::ai::Phase::Idle;

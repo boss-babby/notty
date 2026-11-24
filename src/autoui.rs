@@ -30,6 +30,9 @@ struct St {
     tab: u8,
     open_rule: Option<u64>,
     recipe_db: u64,
+    recipe_info: Option<usize>,
+    recipe_info_pos: Pos2,
+    recipe_info_fresh: bool,
     rem: NewRem,
     row_pop: Option<(u64, u64, Pos2)>,
     row_pop_fresh: bool,
@@ -423,7 +426,17 @@ fn default_setter(ws: &Workspace, db: u64, prop: u64) -> Setter {
     }
 }
 
-const KINDS_ROW: [&str; 9] = ["Set property", "Create row", "Move row", "Rename", "Add to page", "Notify", "Duplicate", "Move to trash", "Run script"];
+const KINDS_ROW: [&str; 9] = [
+    "Set property",
+    "Create row",
+    "Move row",
+    "Rename",
+    "Add to page",
+    "Notify",
+    "Duplicate",
+    "Move to trash",
+    "Run script",
+];
 
 fn kind_index(a: &Action) -> usize {
     match a {
@@ -914,7 +927,11 @@ pub fn row_popover(ctx: &egui::Context, ws: &mut Workspace, rt: &mut Runtime, pa
 pub fn show(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette) -> Out {
     let mut out = Out::default();
     let avail = ui.available_width();
-    let side = if avail > 900.0 { (avail - 820.0) / 2.0 } else { 14.0_f32.min(avail * 0.04) };
+    let side = if avail > 900.0 {
+        (avail - 820.0) / 2.0
+    } else {
+        14.0_f32.min(avail * 0.04)
+    };
     let narrow = avail < 560.0;
     let page_w = (avail - 2.0 * side - 8.0).clamp(240.0, 820.0);
     // The header and the tab strip are a fixed block *above* the scroll area (they never scroll under / over the page content, and the
@@ -923,63 +940,153 @@ pub fn show(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette) ->
     let full = ui.max_rect();
     let mut tab = st(|s| s.tab) as usize;
     let unread = ws.auto.unread();
-    let inbox_label = if unread > 0 { format!("Inbox · {unread}") } else { "Inbox".to_owned() };
-    let labels: Vec<&str> = vec!["Rules", "Reminders", &inbox_label, "Activity", "Scripts", "Roadmap"];
-    ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_max(pos2(full.left() + side, head_top), pos2(full.left() + side + page_w, full.bottom()))), |ui| {
-        ui.set_width(page_w);
-        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-        ui.add_space(14.0);
-        ui.horizontal(|ui| {
-            let (r, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
-            ui.painter().rect_filled(r, 12.0, with_alpha(pal.accent, 0.14));
-            icons::glyph(ui.painter(), r.center(), 22.0, l::ZAP, pal.accent);
-            let close_w = 44.0;
-            let text_w = (page_w - 44.0 - close_w - 2.0 * ui.spacing().item_spacing.x).max(100.0);
-            ui.allocate_ui_with_layout(vec2(text_w, 44.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                ui.set_max_width(text_w);
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.add(egui::Label::new(RichText::new("Automations").font(bold(if narrow { 22.0 } else { 26.0 })).color(pal.text)).truncate());
-                if !narrow {
-                    ui.add(egui::Label::new(RichText::new("Rules, scripts, buttons, recurring tasks and reminders").font(body(13.0)).color(pal.muted)).truncate());
-                }
+    let inbox_label = if unread > 0 {
+        format!("Inbox · {unread}")
+    } else {
+        "Inbox".to_owned()
+    };
+    let labels: Vec<&str> = vec![
+        "Rules",
+        "Reminders",
+        &inbox_label,
+        "Activity",
+        "Scripts",
+        "Roadmap",
+    ];
+    ui.scope_builder(
+        egui::UiBuilder::new().max_rect(Rect::from_min_max(
+            pos2(full.left() + side, head_top),
+            pos2(full.left() + side + page_w, full.bottom()),
+        )),
+        |ui| {
+            ui.set_width(page_w);
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
+                ui.painter()
+                    .rect_filled(r, 12.0, with_alpha(pal.accent, 0.14));
+                icons::glyph(ui.painter(), r.center(), 22.0, l::ZAP, pal.accent);
+                let close_w = 44.0;
+                let text_w =
+                    (page_w - 44.0 - close_w - 2.0 * ui.spacing().item_spacing.x).max(100.0);
+                ui.allocate_ui_with_layout(
+                    vec2(text_w, 44.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_max_width(text_w);
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new("Automations")
+                                    .font(bold(if narrow { 22.0 } else { 26.0 }))
+                                    .color(pal.text),
+                            )
+                            .truncate(),
+                        );
+                        if !narrow {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(
+                                        "Rules, scripts, buttons, recurring tasks and reminders",
+                                    )
+                                    .font(body(13.0))
+                                    .color(pal.muted),
+                                )
+                                .truncate(),
+                            );
+                        }
+                    },
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_btn(ui, pal, l::X, "Close", false).clicked() {
+                        out.close = true;
+                    }
+                });
             });
-            if icon_btn(ui, pal, l::X, "Close", false).clicked() {
-                out.close = true;
-            }
-        });
-        ui.add_space(10.0);
-        ScrollArea::horizontal().id_salt("auto_tabs").auto_shrink([false, true]).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
-            crate::uploader::segmented(ui, pal, Id::new("auto_seg"), &labels, &mut tab);
-        });
-        ui.add_space(10.0);
-    });
+            ui.add_space(10.0);
+            ScrollArea::horizontal()
+                .id_salt("auto_tabs")
+                .max_width(page_w)
+                .auto_shrink([false, true])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        for (i, lbl) in labels.iter().enumerate() {
+                            let sel = tab == i;
+                            let tw = (lbl.chars().count() as f32 * 7.6 + 20.0).max(56.0);
+                            let (r, rs) = ui.allocate_exact_size(vec2(tw, 32.0), Sense::click());
+                            if rs.hovered() && !sel {
+                                ui.painter().rect_filled(r, 6.0, with_alpha(pal.hover, 0.7));
+                            }
+                            ui.painter().text(
+                                r.center(),
+                                Align2::CENTER_CENTER,
+                                *lbl,
+                                if sel { bold(13.0) } else { body(13.0) },
+                                if sel { pal.text } else { pal.muted },
+                            );
+                            if sel {
+                                ui.painter().line_segment(
+                                    [
+                                        pos2(r.left() + 6.0, r.bottom() - 1.0),
+                                        pos2(r.right() - 6.0, r.bottom() - 1.0),
+                                    ],
+                                    Stroke::new(2.0_f32, pal.text),
+                                );
+                            }
+                            if rs.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                tab = i;
+                            }
+                        }
+                    });
+                });
+            let (hr, _) = ui.allocate_exact_size(vec2(page_w, 1.0), Sense::hover());
+            ui.painter().line_segment(
+                [
+                    pos2(hr.left(), hr.center().y),
+                    pos2(hr.right(), hr.center().y),
+                ],
+                Stroke::new(1.0_f32, pal.border),
+            );
+            ui.add_space(10.0);
+        },
+    );
     st(|s| s.tab = tab as u8);
-    let body_top = ui.cursor().min.y.max(head_top + 14.0 + 44.0 + 10.0 + 36.0 + 10.0);
+    let body_top = ui
+        .cursor()
+        .min
+        .y
+        .max(head_top + 14.0 + 44.0 + 10.0 + 36.0 + 10.0);
     let body_rect = Rect::from_min_max(pos2(full.left(), body_top), full.right_bottom());
     ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
         ui.set_clip_rect(body_rect.intersect(ui.clip_rect()));
-        ScrollArea::vertical().id_salt("auto_scroll").auto_shrink([false, false]).show(ui, |ui| {
-            ui.horizontal_top(|ui| {
-                ui.add_space(side);
-                ui.vertical(|ui| {
-                    ui.set_width(page_w);
-                    // long labels wrap inside their column instead of running over the next widget (phones)
-                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                    if let Some(m) = st(|s| s.msg.take()) {
-                        out.toast = Some(m);
-                    }
-                    match tab {
-                        0 => rules_tab(ui, ws, rt, pal, &mut out),
-                        1 => reminders_tab(ui, ws, rt, pal, &mut out),
-                        2 => inbox_tab(ui, ws, pal, &mut out),
-                        3 => activity_tab(ui, ws, pal),
-                        4 => crate::scriptui::scripts_tab(ui, ws, rt, pal, &mut out),
-                        _ => crate::scriptui::roadmap_tab(ui, pal),
-                    }
-                    ui.add_space(60.0);
+        ScrollArea::vertical()
+            .id_salt("auto_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.add_space(side);
+                    ui.vertical(|ui| {
+                        ui.set_width(page_w);
+                        // long labels wrap inside their column instead of running over the next widget (phones)
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        if let Some(m) = st(|s| s.msg.take()) {
+                            out.toast = Some(m);
+                        }
+                        match tab {
+                            0 => rules_tab(ui, ws, rt, pal, &mut out),
+                            1 => reminders_tab(ui, ws, rt, pal, &mut out),
+                            2 => inbox_tab(ui, ws, pal, &mut out),
+                            3 => activity_tab(ui, ws, pal),
+                            4 => crate::scriptui::scripts_tab(ui, ws, rt, pal, &mut out),
+                            _ => crate::scriptui::roadmap_tab(ui, pal),
+                        }
+                        ui.add_space(60.0);
+                    });
                 });
             });
-        });
     });
     out
 }
@@ -995,16 +1102,54 @@ fn rules_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette, o
             }
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                ui.label(RichText::new(if ws.auto.settings.rules_on { "Automations are running" } else { "Automations are paused" }).font(bold(14.5)));
-                ui.label(RichText::new(format!("{} rule(s) · {} run(s) so far", ws.auto.rules.len(), ws.auto.rules.iter().map(|r| r.runs).sum::<u32>())).font(body(12.5)).color(pal.muted));
+                ui.label(
+                    RichText::new(if ws.auto.settings.rules_on {
+                        "Automations are running"
+                    } else {
+                        "Automations are paused"
+                    })
+                    .font(bold(14.5)),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "{} rule(s) · {} run(s) so far",
+                        ws.auto.rules.len(),
+                        ws.auto.rules.iter().map(|r| r.runs).sum::<u32>()
+                    ))
+                    .font(body(12.5))
+                    .color(pal.muted),
+                );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if widgets::primary_button(ui, pal, "+ New rule", 112.0).clicked() {
                     let db = dbs.first().map(|x| x.1).unwrap_or(0);
-                    let prop = ws.db(db).and_then(|d| d.props.iter().find(|p| p.kind == PropKind::Select).map(|p| p.id)).unwrap_or(0);
+                    let prop = ws
+                        .db(db)
+                        .and_then(|d| {
+                            d.props
+                                .iter()
+                                .find(|p| p.kind == PropKind::Select)
+                                .map(|p| p.id)
+                        })
+                        .unwrap_or(0);
                     let id = ws.id();
-                    let trig = if prop != 0 { Trigger::PropChanged { prop, to: ChangeTo::Any } } else { Trigger::RowAdded };
-                    let r = Rule::new(id, "New rule", db, trig, vec![Action::Notify { message: "{title} changed".into() }]);
+                    let trig = if prop != 0 {
+                        Trigger::PropChanged {
+                            prop,
+                            to: ChangeTo::Any,
+                        }
+                    } else {
+                        Trigger::RowAdded
+                    };
+                    let r = Rule::new(
+                        id,
+                        "New rule",
+                        db,
+                        trig,
+                        vec![Action::Notify {
+                            message: "{title} changed".into(),
+                        }],
+                    );
                     ws.auto.rules.push(r);
                     st(|s| s.open_rule = Some(id));
                     rt.dirty = true;
@@ -1019,10 +1164,20 @@ fn rules_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette, o
         card(ui, pal, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(14.0);
-                icons::glyph(ui.painter(), ui.cursor().center_top() + vec2(0.0, 14.0), 28.0, l::WAND_SPARKLES, pal.muted);
+                icons::glyph(
+                    ui.painter(),
+                    ui.cursor().center_top() + vec2(0.0, 14.0),
+                    28.0,
+                    l::WAND_SPARKLES,
+                    pal.muted,
+                );
                 ui.add_space(36.0);
                 ui.label(RichText::new("No rules yet").font(bold(15.0)));
-                ui.label(RichText::new("Start from a recipe below, or build your own with “New rule”.").font(body(13.0)).color(pal.muted));
+                ui.label(
+                    RichText::new("Start from a recipe below, or build your own with “New rule”.")
+                        .font(body(13.0))
+                        .color(pal.muted),
+                );
                 ui.add_space(12.0);
             });
         });
@@ -1031,12 +1186,18 @@ fn rules_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette, o
     let mut delete: Option<u64> = None;
     let mut run_now: Option<u64> = None;
     for id in ids {
-        let Some(idx) = ws.auto.rules.iter().position(|r| r.id == id) else { continue };
+        let Some(idx) = ws.auto.rules.iter().position(|r| r.id == id) else {
+            continue;
+        };
         let mut rule = ws.auto.rules[idx].clone();
         let before = rule.clone();
         let open = st(|s| s.open_rule) == Some(id);
         let summary_t = describe_trigger(ws, &rule);
-        let summary_a: Vec<String> = rule.actions.iter().map(|a| describe_action(ws, rule.db, a)).collect();
+        let summary_a: Vec<String> = rule
+            .actions
+            .iter()
+            .map(|a| describe_action(ws, rule.db, a))
+            .collect();
         let mut toggle_open = false;
         card(ui, pal, |ui| {
             // phones: the title gets the whole row, the three buttons move to their own row (nothing overlaps)
@@ -1051,21 +1212,50 @@ fn rules_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette, o
                     let room = ui.available_width() - if stacked { 0.0 } else { btn_w };
                     ui.set_max_width(room.max(110.0));
                     ui.spacing_mut().item_spacing.y = 1.0;
-                    let r = ui.add(egui::Label::new(RichText::new(&rule.name).font(bold(15.0)).color(if rule.on { pal.text } else { pal.muted })).sense(Sense::click()).wrap());
+                    let r = ui.add(
+                        egui::Label::new(
+                            RichText::new(&rule.name)
+                                .font(bold(15.0))
+                                .color(if rule.on { pal.text } else { pal.muted }),
+                        )
+                        .sense(Sense::click())
+                        .wrap(),
+                    );
                     if r.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                         toggle_open = true;
                     }
-                    ui.add(egui::Label::new(RichText::new(format!("When {}", lc_first(&summary_t))).font(body(12.5)).color(pal.muted)).wrap());
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("When {}", lc_first(&summary_t)))
+                                .font(body(12.5))
+                                .color(pal.muted),
+                        )
+                        .wrap(),
+                    );
                 });
                 if !stacked {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon_btn(ui, pal, l::TRASH_2, "Delete rule", true).clicked() {
                             delete = Some(id);
                         }
-                        if icon_btn(ui, pal, if open { l::CHEVRONS_UP_DOWN } else { l::SETTINGS_2 }, if open { "Collapse" } else { "Edit rule" }, false).clicked() {
+                        if icon_btn(
+                            ui,
+                            pal,
+                            if open {
+                                l::CHEVRONS_UP_DOWN
+                            } else {
+                                l::SETTINGS_2
+                            },
+                            if open { "Collapse" } else { "Edit rule" },
+                            false,
+                        )
+                        .clicked()
+                        {
                             toggle_open = true;
                         }
-                        if icon_btn(ui, pal, l::PLAY, "Run now (all matching rows)", false).clicked() {
+                        if icon_btn(ui, pal, l::PLAY, "Run now (all matching rows)", false)
+                            .clicked()
+                        {
                             run_now = Some(id);
                         }
                     });
@@ -1077,7 +1267,19 @@ fn rules_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette, o
                     if icon_btn(ui, pal, l::PLAY, "Run now (all matching rows)", false).clicked() {
                         run_now = Some(id);
                     }
-                    if icon_btn(ui, pal, if open { l::CHEVRONS_UP_DOWN } else { l::SETTINGS_2 }, if open { "Collapse" } else { "Edit rule" }, false).clicked() {
+                    if icon_btn(
+                        ui,
+                        pal,
+                        if open {
+                            l::CHEVRONS_UP_DOWN
+                        } else {
+                            l::SETTINGS_2
+                        },
+                        if open { "Collapse" } else { "Edit rule" },
+                        false,
+                    )
+                    .clicked()
+                    {
                         toggle_open = true;
                     }
                     if icon_btn(ui, pal, l::TRASH_2, "Delete rule", true).clicked() {
@@ -1094,7 +1296,11 @@ fn rules_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette, o
                     }
                 });
                 ui.add_space(2.0);
-                let last = if rule.last_run > 0.0 { format!("last run {} ago", crate::app::ago(rule.last_run)) } else { "never run".into() };
+                let last = if rule.last_run > 0.0 {
+                    format!("last run {} ago", crate::app::ago(rule.last_run))
+                } else {
+                    "never run".into()
+                };
                 label(ui, pal, &format!("{} run(s) · {last}", rule.runs));
             } else {
                 rule_editor(ui, pal, ws, &mut rule, id);
@@ -1134,65 +1340,282 @@ fn rules_tab(ui: &mut Ui, ws: &mut Workspace, rt: &mut Runtime, pal: &Palette, o
         if !dbs.iter().any(|d| d.1 == cur) {
             cur = dbs.first().map(|d| d.1).unwrap_or(0);
         }
-        if let Some(n) = combo(ui, "recipe_db", 190.0, &dbs.iter().map(|(n, i)| (n.clone(), *i)).collect::<Vec<_>>(), &cur) {
+        if let Some(n) = combo(
+            ui,
+            "recipe_db",
+            190.0,
+            &dbs.iter().map(|(n, i)| (n.clone(), *i)).collect::<Vec<_>>(),
+            &cur,
+        ) {
             cur = n;
         }
         st(|s| s.recipe_db = cur);
     });
     ui.add_space(8.0);
     let db = st(|s| s.recipe_db);
-    let db = if dbs.iter().any(|d| d.1 == db) { db } else { dbs.first().map(|d| d.1).unwrap_or(0) };
-    let avail = ui.available_width();
+    let db = if dbs.iter().any(|d| d.1 == db) {
+        db
+    } else {
+        dbs.first().map(|d| d.1).unwrap_or(0)
+    };
+    let avail = ui
+        .available_width()
+        .min(ui.ctx().screen_rect().width() - 28.0)
+        .max(220.0);
     let gap = 10.0;
     let cols = if avail > 640.0 { 2 } else { 1 };
     let cw = ((avail - gap * (cols as f32 - 1.0)) / cols as f32).floor();
-    let (pad, icon, btn_h) = (14.0_f32, 34.0_f32, if roomy() { 40.0_f32 } else { 32.0_f32 });
-    let tx = pad + icon + 10.0;
-    let tw = (cw - tx - pad).max(80.0);
+    let pad = 12.0_f32;
+    let icon = 28.0_f32;
+    let q_sz = if roomy() { 28.0_f32 } else { 22.0_f32 };
+    let plus_sz = 20.0_f32;
+    let tx = pad + icon + 11.0;
+    let right_reserve = pad + q_sz + 6.0 + plus_sz + 8.0;
+    let tw = (cw - tx - right_reserve).max(80.0);
+    let dark = pal.bg.r() < 128;
     let recipes = au::recipes();
     let mut created: Option<String> = None;
+    let open_info = st(|s| s.recipe_info);
+    let mut recipe_idx = 0usize;
+
     for chunk in recipes.chunks(cols) {
-        // measure every tile of the row first, so all tiles of a row get the same height and the buttons line up
         let mut galleys = vec![];
         let mut h_max = 0.0_f32;
         for rc in chunk {
-            let gt = ui.painter().layout(rc.title.to_owned(), bold(14.0), pal.text, tw);
-            let gd = ui.painter().layout(rc.desc.to_owned(), body(12.5), pal.muted, tw);
-            h_max = h_max.max(pad + gt.size().y + 3.0 + gd.size().y + 10.0 + btn_h + pad);
-            galleys.push((gt, gd));
+            let gt = ui
+                .painter()
+                .layout(rc.title.to_owned(), bold(13.0), pal.text, tw);
+            h_max = h_max.max(pad * 2.0 + gt.size().y);
+            galleys.push(gt);
         }
-        let h_max = h_max.max(pad * 2.0 + icon);
+        let h_max = h_max
+            .max(pad * 2.0 + icon)
+            .max(if roomy() { 54.0 } else { 50.0 });
         let (row_rect, _) = ui.allocate_exact_size(vec2(avail, h_max), Sense::hover());
         for (i, rc) in chunk.iter().enumerate() {
-            let rect = Rect::from_min_size(pos2(row_rect.left() + i as f32 * (cw + gap), row_rect.top()), vec2(cw, h_max));
+            let idx = recipe_idx;
+            recipe_idx += 1;
+            let base_rect = Rect::from_min_size(
+                pos2(row_rect.left() + i as f32 * (cw + gap), row_rect.top()),
+                vec2(cw, h_max),
+            );
             let usable = !rc.needs_db || db != 0;
+
+            let card_id = Id::new(("auto_rc", rc.title));
+            let q_id = Id::new(("auto_rc_q", rc.title));
+
+            let card_resp = ui.interact(base_rect, card_id, Sense::click());
+            let q_rect_base = Rect::from_center_size(
+                pos2(base_rect.right() - pad - q_sz * 0.5, base_rect.center().y),
+                vec2(q_sz, q_sz),
+            );
+            let q_resp = ui.interact(q_rect_base, q_id, Sense::click());
+
+            let q_hovered = q_resp.hovered();
+            let card_hovered = ui.rect_contains_pointer(base_rect) && usable;
+            let add_hovered = card_hovered && !q_hovered;
+
+            let t = ui.ctx().animate_bool_with_time(card_id, card_hovered, 0.15);
+            let plus_t = ui
+                .ctx()
+                .animate_bool_with_time(card_id.with("plus"), add_hovered, 0.15);
+            let q_t =
+                ui.ctx()
+                    .animate_bool_with_time(q_id, q_hovered || open_info == Some(idx), 0.12);
+
+            let rect = base_rect.translate(vec2(0.0, -1.5 * t));
+            let radius = CornerRadius::same(12);
+
+            // Soft elevation shadow (borderless seamless card lifted from base)
+            let sh_alpha = if dark {
+                (44.0 + 28.0 * t) as u8
+            } else {
+                (14.0 + 14.0 * t) as u8
+            };
+            let shadow = egui::epaint::Shadow {
+                offset: [0, (2.0 + 2.0 * t).round() as i8],
+                blur: (10.0 + 5.0 * t).round() as u8,
+                spread: 0,
+                color: Color32::from_black_alpha(sh_alpha),
+            };
             let p = ui.painter();
-            p.rect_filled(rect, 12.0, pal.hover);
-            p.rect_stroke(rect, 12.0, Stroke::new(1.0_f32, with_alpha(pal.border, 0.6)), egui::StrokeKind::Inside);
-            let ir = Rect::from_min_size(rect.min + vec2(pad, pad), vec2(icon, icon));
-            p.rect_filled(ir, 9.0, with_alpha(pal.accent, 0.14));
-            icons::glyph(p, ir.center(), 16.0, rc.icon, pal.accent);
-            let (gt, gd) = &galleys[i];
-            let (tpos, dpos) = (pos2(rect.left() + tx, rect.top() + pad), pos2(rect.left() + tx, rect.top() + pad + gt.size().y + 3.0));
-            p.galley(tpos, gt.clone(), pal.text);
-            p.galley(dpos, gd.clone(), pal.muted);
-            let br = Rect::from_min_size(pos2(rect.left() + tx, rect.bottom() - pad - btn_h), vec2(tw, btn_h));
-            ui.scope_builder(egui::UiBuilder::new().max_rect(br).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
-                ui.add_enabled_ui(usable, |ui| {
-                    if widgets::ghost_button(ui, pal, "+ Add this rule").clicked() {
-                        if let Some(id) = rc.create(ws, if rc.needs_db { db } else { 0 }) {
-                            st(|s| s.open_rule = Some(id));
-                            created = Some(format!("Added “{}”", rc.title));
-                            rt.dirty = true;
-                        } else {
-                            created = Some("This database lacks the properties this recipe needs (e.g. a Status select or a Date).".into());
-                        }
+            p.add(shadow.as_shape(rect, radius));
+
+            let rest_fill = if dark { pal.code_bg } else { pal.card };
+            let hov_fill = if dark { pal.callout } else { pal.hover };
+            let fill = lerp_color(rest_fill, hov_fill, t);
+            p.rect_filled(rect, radius, fill);
+
+            // Leading icon badge
+            let ir = Rect::from_center_size(
+                pos2(rect.left() + pad + icon * 0.5, rect.center().y),
+                vec2(icon, icon),
+            );
+            p.rect_filled(ir, 8.0, with_alpha(pal.accent, 0.11 + 0.07 * t));
+            icons::glyph(p, ir.center(), 14.5, rc.icon, pal.accent);
+
+            // Title (compact, vertically centered)
+            let gt = &galleys[i];
+            let tpos = pos2(rect.left() + tx, rect.center().y - gt.size().y * 0.5);
+            p.galley(
+                tpos,
+                gt.clone(),
+                if usable {
+                    pal.text
+                } else {
+                    with_alpha(pal.muted, 0.7)
+                },
+            );
+
+            // Hover '+' indicator (fades/slides in smoothly on hover; subtle hint on touch)
+            let plus_alpha = if roomy() {
+                0.35 + 0.65 * plus_t
+            } else {
+                plus_t
+            };
+            if plus_alpha > 0.02 && usable {
+                let plus_center = pos2(
+                    rect.right() - pad - q_sz - 6.0 - plus_sz * 0.5 + (1.0 - plus_t) * 3.0,
+                    rect.center().y,
+                );
+                let plus_rect = Rect::from_center_size(plus_center, vec2(plus_sz, plus_sz));
+                p.rect_filled(plus_rect, 7.0, with_alpha(pal.accent, 0.16 * plus_alpha));
+                icons::glyph(
+                    p,
+                    plus_center,
+                    12.5,
+                    l::PLUS,
+                    with_alpha(pal.accent, plus_alpha),
+                );
+            }
+
+            // Question-mark details trigger
+            let q_rect = q_rect_base.translate(vec2(0.0, -1.5 * t));
+            let q_bg_alpha = 0.08 + 0.18 * q_t;
+            p.circle_filled(
+                q_rect.center(),
+                q_sz * 0.5,
+                if open_info == Some(idx) {
+                    with_alpha(pal.accent, 0.18)
+                } else {
+                    with_alpha(pal.muted, q_bg_alpha)
+                },
+            );
+            let q_fg = if open_info == Some(idx) {
+                pal.accent
+            } else {
+                lerp_color(with_alpha(pal.muted, 0.75), pal.text, q_t)
+            };
+            p.text(
+                q_rect.center(),
+                Align2::CENTER_CENTER,
+                "?",
+                bold(11.5),
+                q_fg,
+            );
+
+            let q_resp = q_resp.on_hover_cursor(CursorIcon::PointingHand);
+            let q_resp = if open_info != Some(idx) {
+                q_resp.on_hover_text(rc.desc)
+            } else {
+                q_resp
+            };
+
+            if q_resp.clicked() {
+                st(|s| {
+                    if s.recipe_info == Some(idx) {
+                        s.recipe_info = None;
+                    } else {
+                        s.recipe_info = Some(idx);
+                        s.recipe_info_pos = pos2(q_rect.right(), q_rect.bottom() + 6.0);
+                        s.recipe_info_fresh = true;
                     }
                 });
-            });
+            } else if usable && add_hovered {
+                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                if card_resp.clicked() {
+                    st(|s| s.recipe_info = None);
+                    if let Some(id) = rc.create(ws, if rc.needs_db { db } else { 0 }) {
+                        st(|s| s.open_rule = Some(id));
+                        created = Some(format!("Added “{}”", rc.title));
+                        rt.dirty = true;
+                    } else {
+                        created = Some("This database lacks the properties this recipe needs (e.g. a Status select or a Date).".into());
+                    }
+                }
+            }
         }
         ui.add_space(gap);
     }
+
+    // Question-mark detail menu popover
+    if let Some(idx) = st(|s| s.recipe_info) {
+        if let Some(rc) = recipes.get(idx) {
+            let screen = ui.ctx().screen_rect();
+            let pop_w = (268.0_f32).min(screen.width() - 24.0);
+            let anchor = st(|s| s.recipe_info_pos);
+            let px = (anchor.x - pop_w).clamp(screen.left() + 12.0, screen.right() - pop_w - 12.0);
+            let py = anchor
+                .y
+                .min(screen.bottom() - 120.0)
+                .max(screen.top() + 12.0);
+            let area = egui::Area::new(Id::new("auto_recipe_info_pop"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(pos2(px, py))
+                .show(ui.ctx(), |ui| {
+                    Frame::new()
+                        .fill(pal.popup)
+                        .corner_radius(CornerRadius::same(12))
+                        .inner_margin(Margin::same(12))
+                        .shadow(egui::epaint::Shadow {
+                            offset: [0, 6],
+                            blur: 18,
+                            spread: 0,
+                            color: Color32::from_black_alpha(if dark { 90 } else { 32 }),
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width(pop_w - 24.0);
+                            ui.horizontal(|ui| {
+                                icons::glyph(
+                                    ui.painter(),
+                                    ui.cursor().min + vec2(7.0, 8.0),
+                                    13.5,
+                                    rc.icon,
+                                    pal.accent,
+                                );
+                                ui.add_space(18.0);
+                                ui.label(RichText::new(rc.title).font(bold(13.0)).color(pal.text));
+                            });
+                            ui.add_space(5.0);
+                            ui.label(RichText::new(rc.desc).font(body(12.0)).color(pal.muted));
+                            if rc.needs_db && db == 0 {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new("Create a database first to use this recipe.")
+                                        .font(body(11.5))
+                                        .color(pal.danger),
+                                );
+                            }
+                        });
+                });
+            let fresh = st(|s| {
+                let f = s.recipe_info_fresh;
+                s.recipe_info_fresh = false;
+                f
+            });
+            let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            let clicked_out = !fresh
+                && ui.input(|i| i.pointer.any_pressed())
+                && !area
+                    .response
+                    .rect
+                    .contains(ui.input(|i| i.pointer.interact_pos().unwrap_or(pos2(-1.0, -1.0))));
+            if esc || clicked_out {
+                st(|s| s.recipe_info = None);
+            }
+        }
+    }
+
     if created.is_some() {
         out.toast = created;
     }

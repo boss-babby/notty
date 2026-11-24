@@ -74,7 +74,16 @@ pub fn frame_tick(ctx: &Context, dirty: bool) {
     static LAST: AtomicBool = AtomicBool::new(false);
     let ev = dirty
         || ctx.input(|i| {
-            i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. } | egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut | egui::Event::PointerButton { .. } | egui::Event::Ime(_)))
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key { pressed: true, .. }
+                        | egui::Event::Text(_)
+                        | egui::Event::Paste(_)
+                        | egui::Event::Cut
+                        | egui::Event::Ime(_)
+                )
+            })
         });
     let prev = LAST.swap(ev, Ordering::Relaxed);
     if ev || prev {

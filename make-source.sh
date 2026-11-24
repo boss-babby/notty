@@ -6,5 +6,6 @@ cd "$(dirname "$0")/.."
 OUT=public/downloads/Lumen-source.zip
 mkdir -p public/downloads
 rm -f "$OUT"
-git -C lumen ls-files -co --exclude-standard | grep -v '^[^/]*\.zip$' | sed 's#^#lumen/#' | zip -q -9 -@ "$OUT"
+REPO_NAME=$(basename "$(cd "$(dirname "$0")" && pwd)")
+git -C "$REPO_NAME" ls-files -co --exclude-standard | grep -v '^[^/]*\.zip$' | sed "s#^#$REPO_NAME/#" | zip -q -9 -@ "$OUT"
 ls -la "$OUT"

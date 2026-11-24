@@ -26,43 +26,15 @@ pub fn now_ms() -> f64 {
     }
 }
 
-fn entropy() -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&now_ms().to_le_bytes());
-    #[cfg(target_arch = "wasm32")]
-    {
-        for _ in 0..4 {
-            out.extend_from_slice(&js_sys::Math::random().to_le_bytes());
-        }
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        out.extend_from_slice(&n.to_le_bytes());
-        out.extend_from_slice(&std::process::id().to_le_bytes());
-        let local = 0u8;
-        out.extend_from_slice(&(&local as *const u8 as usize).to_le_bytes());
-    }
-    out
+fn csprng_bytes(n: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; n];
+    getrandom::getrandom(&mut buf).expect("OS CSPRNG unavailable");
+    buf
 }
 
-/// `n_bytes` of unpredictable hex (hash of time, address-space and (web) `Math.random`) — API / bridge tokens.
+/// `n_bytes` of cryptographically secure random hex (OS CSPRNG / Web Crypto) — API / bridge tokens & salts.
 pub fn random_hex(n_bytes: usize) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    let mut out = String::new();
-    while out.len() < n_bytes * 2 {
-        let mut h = Sha256::new();
-        h.update(entropy());
-        h.update(COUNTER.fetch_add(1, Ordering::Relaxed).to_le_bytes());
-        h.update(out.as_bytes());
-        out.push_str(&hex(&h.finalize()));
-    }
-    out.truncate(n_bytes * 2);
-    out
+    hex(&csprng_bytes(n_bytes))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -85,7 +57,7 @@ fn derive(password: &str, salt: &str) -> String {
 }
 
 pub fn create(password: &str) -> Credential {
-    let salt = hex(&Sha256::digest(entropy())[..16]);
+    let salt = random_hex(16);
     let hash = derive(password, &salt);
     Credential { salt, hash }
 }

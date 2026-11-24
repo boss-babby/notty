@@ -144,7 +144,13 @@ pub fn tool_def(name: &str) -> Option<ToolDef> {
 /// Runs a tool. The caller decides *whether* it may run (`access`); this function enforces it as well.
 pub fn call(ws: &mut Workspace, name: &str, args: &Json, access: Access) -> Outcome {
     let Some((def, handler)) = all_tools().into_iter().find(|(d, _)| d.name == name) else {
-        return Outcome { ok: false, text: format!("Unknown tool “{name}”. Call tools/list (or look at the tool list you were given)."), ..Default::default() };
+        return Outcome {
+            ok: false,
+            text: format!(
+                "Unknown tool “{name}”. Call tools/list (or look at the tool list you were given)."
+            ),
+            ..Default::default()
+        };
     };
     if !access.allows(def.risk) {
         return Outcome {
@@ -153,10 +159,67 @@ pub fn call(ws: &mut Workspace, name: &str, args: &Json, access: Access) -> Outc
             ..Default::default()
         };
     }
-    let before = if def.risk == Risk::Read { None } else { Some((ws.current, ws.pages.len())) };
+    let before = if def.risk == Risk::Read {
+        None
+    } else {
+        Some((ws.current, ws.pages.len()))
+    };
     let empty = json!({});
     let args = if args.is_null() { &empty } else { args };
     let args = &normalize_args(args);
+    if access != Access::Full {
+        let privileged = match name {
+            "create_rule" => args
+                .get("actions")
+                .and_then(|v| v.as_array())
+                .map_or(false, |arr| {
+                    arr.iter().any(|act| {
+                        let ty = act
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        matches!(ty.as_str(), "script" | "trash")
+                    })
+                }),
+            "create_flow" => {
+                let scheduled = args
+                    .get("every_seconds")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    > 0;
+                let has_net = args
+                    .get("nodes")
+                    .and_then(|v| v.as_array())
+                    .map_or(false, |arr| {
+                        arr.iter().any(|n| {
+                            let k = n
+                                .get("kind")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_lowercase();
+                            k.contains("http")
+                                || k.contains("fetch")
+                                || k.contains("webhook")
+                                || k.contains("network")
+                                || k.contains("request")
+                        })
+                    });
+                scheduled || has_net
+            }
+            _ => false,
+        };
+        if privileged {
+            return Outcome {
+                ok: false,
+                text: format!(
+                    "Not allowed: “{name}” with script/trash/network/scheduled actions requires Full access (current: “{}”). Ask the user to raise it in Settings → AI → Access.",
+                    access.label()
+                ),
+                ..Default::default()
+            };
+        }
+    }
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(ws, args)));
     let mut out = match r {
         Ok(Ok(v)) => {
@@ -183,23 +246,49 @@ pub fn call(ws: &mut Workspace, name: &str, args: &Json, access: Access) -> Outc
 
 /// Models sometimes send objects / arrays as JSON *strings* (Gemini schemas cannot express free-form objects) — decode them.
 fn normalize_args(a: &Json) -> Json {
-    fn fix(v: &Json) -> Json {
+    const TEXT_KEYS: &[&str] = &[
+        "text",
+        "markdown",
+        "intro_markdown",
+        "body",
+        "code",
+        "title",
+        "message",
+        "content",
+        "formula",
+        "description",
+        "label",
+        "name",
+        "instructions",
+        "query",
+        "url",
+    ];
+    fn fix(v: &Json, key: Option<&str>) -> Json {
+        if key.map_or(false, |k| TEXT_KEYS.contains(&k)) {
+            return v.clone();
+        }
         match v {
             Json::String(s) => {
                 let t = s.trim();
-                if (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']')) {
+                if (t.starts_with('{') && t.ends_with('}'))
+                    || (t.starts_with('[') && t.ends_with(']'))
+                {
                     if let Ok(p) = serde_json::from_str::<Json>(t) {
-                        return fix(&p);
+                        return fix(&p, None);
                     }
                 }
                 v.clone()
             }
-            Json::Array(a) => Json::Array(a.iter().map(fix).collect()),
-            Json::Object(m) => Json::Object(m.iter().map(|(k, x)| (k.clone(), fix(x))).collect()),
+            Json::Array(a) => Json::Array(a.iter().map(|x| fix(x, None)).collect()),
+            Json::Object(m) => Json::Object(
+                m.iter()
+                    .map(|(k, x)| (k.clone(), fix(x, Some(k.as_str()))))
+                    .collect(),
+            ),
             o => o.clone(),
         }
     }
-    fix(a)
+    fix(a, None)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -822,15 +911,29 @@ pub fn to_val(ws: &mut Workspace, db: u64, prop: u64, v: &Json) -> Result<Option
         PropKind::Number => match v {
             Json::Number(n) => n.as_f64().map(Val::Num),
             Json::String(s) => {
-                let c: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
-                Some(Val::Num(c.parse::<f64>().map_err(|_| format!("“{s}” is not a number."))?))
+                let trimmed = s.trim();
+                let parsed = trimmed.parse::<f64>().or_else(|_| {
+                    let c: String = trimmed
+                        .chars()
+                        .filter(|c| c.is_ascii_digit() || matches!(*c, '.' | '-' | '+' | 'e' | 'E'))
+                        .collect();
+                    c.parse::<f64>()
+                });
+                let n = parsed.map_err(|_| format!("“{s}” is not a number."))?;
+                if !n.is_finite() {
+                    return Err(format!("“{s}” is not a finite number."));
+                }
+                Some(Val::Num(n))
             }
             Json::Bool(b) => Some(Val::Num(*b as u8 as f64)),
             _ => None,
         },
         PropKind::Checkbox => Some(Val::Check(match v {
             Json::Bool(b) => *b,
-            Json::String(s) => matches!(s.to_lowercase().as_str(), "true" | "yes" | "1" | "done" | "checked"),
+            Json::String(s) => matches!(
+                s.to_lowercase().as_str(),
+                "true" | "yes" | "1" | "done" | "checked"
+            ),
             Json::Number(n) => n.as_f64().unwrap_or(0.0) != 0.0,
             _ => false,
         })),
@@ -855,7 +958,11 @@ pub fn to_val(ws: &mut Workspace, db: u64, prop: u64, v: &Json) -> Result<Option
                 Json::Array(a) => a.iter().map(text).collect(),
                 o => text(o).split(',').map(|x| x.trim().to_owned()).collect(),
             };
-            let ids: Vec<u64> = names.iter().filter(|n| !n.is_empty()).map(|n| ensure_opt(ws, db, prop, n)).collect();
+            let ids: Vec<u64> = names
+                .iter()
+                .filter(|n| !n.is_empty())
+                .map(|n| ensure_opt(ws, db, prop, n))
+                .collect();
             if ids.is_empty() {
                 None
             } else {
@@ -874,7 +981,9 @@ pub fn to_val(ws: &mut Workspace, db: u64, prop: u64, v: &Json) -> Result<Option
                     ws.page(id).filter(|p| p.row).map(|p| p.id)
                 } else {
                     let t = text(it).to_lowercase();
-                    ws.rows(target).into_iter().find(|r| ws.page(*r).map_or(false, |p| p.title.to_lowercase() == t))
+                    ws.rows(target)
+                        .into_iter()
+                        .find(|r| ws.page(*r).map_or(false, |p| p.title.to_lowercase() == t))
                 };
                 match found {
                     Some(id) => ids.push(id),

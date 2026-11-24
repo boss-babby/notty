@@ -247,7 +247,12 @@ impl Grants {
         let mut list: Vec<Grant> = serde_json::from_str(s).unwrap_or_default();
         list.truncate(MAX_GRANTS);
         for g in &mut list {
-            g.label.truncate(40);
+            g.label = g
+                .label
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(40)
+                .collect();
         }
         Grants { list }
     }

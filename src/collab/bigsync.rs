@@ -272,11 +272,23 @@ pub fn wanted(local: &Index, remote: &[(u64, u32, u64)]) -> Vec<u64> {
         .collect()
 }
 
+const MAX_UNPACK_BYTES: usize = 24 << 20;
+
 pub fn pack(rows: &[Row]) -> String {
     if rows.is_empty() {
         return String::new();
     }
-    crate::media::b64_encode(&encode_chunk(rows).0)
+    let raw = encode_chunk(rows).0;
+    if raw.len() > 256 {
+        let z = miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6);
+        if z.len() + 1 < raw.len() {
+            let mut out = Vec::with_capacity(z.len() + 1);
+            out.push(b'Z');
+            out.extend_from_slice(&z);
+            return crate::media::b64_encode(&out);
+        }
+    }
+    crate::media::b64_encode(&raw)
 }
 
 pub fn unpack(s: &str) -> Option<Vec<Row>> {
@@ -286,7 +298,14 @@ pub fn unpack(s: &str) -> Option<Vec<Row>> {
     if s.len() > MAX_B64 {
         return None;
     }
-    decode_chunk(&crate::media::b64_decode(s)?).ok()
+    let bytes = crate::media::b64_decode(s)?;
+    if bytes.first() == Some(&b'Z') {
+        let raw =
+            miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&bytes[1..], MAX_UNPACK_BYTES)
+                .ok()?;
+        return decode_chunk(&raw).ok();
+    }
+    decode_chunk(&bytes).ok()
 }
 
 /// What a bucket holds right now: rows (id order) and tombstones.
@@ -348,6 +367,12 @@ pub fn merge_cells(l: &Row, r: &Row, cr: &[u32], cl: &[u32]) -> Row {
             if let Some(v) = r.get(p) {
                 out.props.push((p, v.clone()));
             }
+        }
+    }
+    // Preserve brand-new columns added remotely that neither side conflicted on.
+    for (p, v) in &r.props {
+        if !cl.contains(p) && !cr.contains(p) && !out.props.iter().any(|x| x.0 == *p) {
+            out.props.push((*p, v.clone()));
         }
     }
     out.props.sort_by_key(|x| x.0);
@@ -1377,5 +1402,56 @@ mod tests {
         let offs = src.compact(&[(o2, 5)]).unwrap();
         assert_eq!(src.read(offs[0], 5).unwrap(), b"world");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compressed_big_chunks_shrink_and_reject_bombs() {
+        let rows: Vec<Row> = (1..=300u64)
+            .map(|id| {
+                let mut r = row(
+                    id,
+                    1000 + id,
+                    "Repeated project task description for compression",
+                );
+                r.props.push((2, Value::Text("In Progress".into())));
+                r.props.push((3, Value::Num(42.0)));
+                r
+            })
+            .collect();
+        let raw_b64 = crate::media::b64_encode(&encode_chunk(&rows).0);
+        let packed = pack(&rows);
+        assert!(
+            packed.len() * 2 < raw_b64.len(),
+            "compressed chunk ({}) should be less than half raw ({})",
+            packed.len(),
+            raw_b64.len()
+        );
+        assert_eq!(unpack(&packed).unwrap(), rows);
+        // Backwards compatibility with uncompressed chunks
+        assert_eq!(unpack(&raw_b64).unwrap(), rows);
+        // Corrupt compressed payload rejected cleanly
+        let bad = crate::media::b64_encode(b"Znot-valid-zlib");
+        assert!(unpack(&bad).is_none());
+    }
+
+    #[test]
+    fn cell_merge_preserves_deletions_and_new_columns() {
+        let mut l = row(1, 100, "Title");
+        l.props = vec![(1, Value::Text("old".into())), (2, Value::Num(10.0))];
+        let mut r = row(1, 105, "Title");
+        // Remote cleared property 1 (in cr) and added new column 3
+        r.props = vec![(2, Value::Num(10.0)), (3, Value::Check(true))];
+        let merged = merge_cells(&l, &r, &[1], &[2]);
+        assert_eq!(
+            merged.get(1),
+            None,
+            "explicit remote cell deletion must apply"
+        );
+        assert_eq!(merged.get(2), Some(&Value::Num(10.0)));
+        assert_eq!(
+            merged.get(3),
+            Some(&Value::Check(true)),
+            "new remote column must be preserved"
+        );
     }
 }

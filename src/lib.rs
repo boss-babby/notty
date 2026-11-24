@@ -1,97 +1,91 @@
 //! Lumen — a Notion-style workspace written entirely in Rust with egui.
 //! The same code runs as a native desktop app and as WebAssembly in the browser.
 
-#[cfg(target_os = "android")]
-mod android;
-mod autosave;
 mod agent_build;
 mod agent_tools;
 mod ai;
 mod aiui;
-mod mcp;
+#[cfg(target_os = "android")]
+mod android;
 mod app;
+mod auth;
+mod automation;
+mod autosave;
+mod autoui;
 mod bigdata;
 mod bigtable;
 mod bigui;
-mod memgov;
 mod canvas;
-mod collab;
+mod canvasdash;
 mod canvasdraw;
 mod canvasexport;
-mod whiteboard;
 mod canvasfmt;
 mod canvasui;
-mod canvasdash;
-mod crisp;
-mod workspaces;
 mod canvasx;
-mod flow;
-mod flowui;
-mod flowbg;
-mod demo;
-mod automation;
-mod autoui;
-mod uploader;
-mod auth;
-mod database;
-mod dates;
-mod editor;
-mod emoji;
-mod formula;
-mod history;
-mod print;
-mod timeline;
-mod icons;
-mod io;
-mod lock;
-mod lucide;
-mod math;
-mod outline;
-mod media;
-mod mediablocks;
-mod multisel;
-mod pdf;
-mod pdfbar;
-mod pdfnotes;
-mod pdftext;
-mod pickers;
-mod rich;
-mod script;
-mod scripthost;
-mod scriptui;
 mod clip;
-mod mdtable;
-mod tableblock;
-mod model;
-mod platform;
+mod collab;
+mod crisp;
 mod dashboard;
-mod inlinew;
 mod dashcfg;
 mod dashcharts;
 mod dashdata;
 mod dashedit;
 mod dashwidgets;
+mod database;
+mod dates;
+mod demo;
+mod editor;
+mod emoji;
+mod flow;
+mod flowbg;
+mod flowui;
+mod formula;
 mod graph;
+mod history;
+mod icons;
+mod inlinew;
+mod io;
+mod lock;
+mod lucide;
+mod math;
+mod mcp;
+mod mdtable;
+mod media;
+mod mediablocks;
+mod memgov;
+mod model;
+mod multisel;
+mod outline;
+mod pdf;
+mod pdfbar;
+mod pdfnotes;
+mod pdftext;
+mod pickers;
+mod platform;
+mod print;
+mod rich;
+mod script;
+mod scripthost;
+mod scriptui;
 mod smooth;
-mod views;
+mod tableblock;
 mod theme;
+mod timeline;
 mod touch;
+mod uploader;
+mod views;
+mod whiteboard;
 mod widgets;
+mod workspaces;
 
-#[cfg(test)]
-mod tests;
 #[cfg(test)]
 mod agent_tests;
 #[cfg(test)]
 mod dashtests;
+#[cfg(test)]
+mod tests;
 
 pub use app::LumenApp;
-
-/// `lumen-turn`: the UDP relay for collaboration through symmetric NATs (`collab/turn.rs`).
-#[cfg(not(target_arch = "wasm32"))]
-pub fn turn_cli(args: Vec<String>) -> i32 {
-    collab::turn::run(&args)
-}
 
 /// Entry point of the headless `lumen-mcp` binary (stdio MCP server over a workspace backup file).
 #[cfg(not(target_arch = "wasm32"))]
@@ -114,13 +108,19 @@ mod web {
         #[wasm_bindgen(constructor)]
         pub fn new() -> Self {
             eframe::WebLogger::init(log::LevelFilter::Warn).ok();
-            Self { runner: eframe::WebRunner::new() }
+            Self {
+                runner: eframe::WebRunner::new(),
+            }
         }
 
         #[wasm_bindgen]
         pub async fn start(&self, canvas: web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
             self.runner
-                .start(canvas, eframe::WebOptions::default(), Box::new(|cc| Ok(Box::new(crate::LumenApp::new(cc)))))
+                .start(
+                    canvas,
+                    eframe::WebOptions::default(),
+                    Box::new(|cc| Ok(Box::new(crate::LumenApp::new(cc)))),
+                )
                 .await
         }
 
@@ -152,7 +152,11 @@ pub fn android_main(app: android_activity::AndroidApp) {
         stencil_buffer: 0,
         ..Default::default()
     };
-    if let Err(e) = eframe::run_native("Lumen", options, Box::new(|cc| Ok(Box::new(LumenApp::new(cc))))) {
+    if let Err(e) = eframe::run_native(
+        "Lumen",
+        options,
+        Box::new(|cc| Ok(Box::new(LumenApp::new(cc)))),
+    ) {
         log::error!("Lumen stopped: {e}");
     }
 }

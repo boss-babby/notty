@@ -18,11 +18,6 @@ path = "src/main.rs"
 name = "lumen-mcp"
 path = "src/bin/lumen_mcp.rs"
 
-# UDP relay for collaboration through symmetric NATs (run it on any host with a public UDP port): lumen-turn --bind 0.0.0.0:3478
-[[bin]]
-name = "lumen-turn"
-path = "src/bin/lumen_turn.rs"
-
 [dependencies]
 egui = "0.31"
 egui_extras = { version = "0.31", default-features = false, features = ["image", "http"] }
@@ -47,7 +42,9 @@ chacha20poly1305 = "0.10"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+iroh = { version = "1.5", default-features = false, features = ["tls-ring", "portmapper"] }
+iroh-tickets = "1.0"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
 # mDNS / DNS-SD sockets (SO_REUSEADDR on the shared port 5353, per-interface multicast)
@@ -64,6 +61,7 @@ features = ["default_fonts", "glow", "persistence"]
 
 # Android: NativeActivity (android-activity) + winit + glow/EGL. The Java half lives in android/ (see build-android.sh).
 [target.'cfg(target_os = "android")'.dependencies]
+blake3 = { version = "1", features = ["pure"] }
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "persistence", "android-native-activity"] }
 android-activity = { version = "0.6", features = ["native-activity"] }
 egui-winit = { version = "0.31.1", default-features = false }
@@ -81,6 +79,9 @@ wry = { version = "0.53", default-features = false, features = ["os-webview"] }
 rfd = { version = "0.15", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+iroh = { version = "1.5", default-features = false, features = ["tls-ring"] }
+iroh-tickets = "1.0"
+tokio = { version = "1", features = ["sync"] }
 getrandom = { version = "0.2", features = ["js"] }
 ehttp = "0.5"
 # rfd's build script insists on a Linux backend feature even for wasm32; the feature pulls in nothing there.

@@ -659,6 +659,13 @@ fn format_date(day: i64, fmt: &str) -> String {
 }
 
 fn eval(e: &Expr, cx: Cx) -> Result<V, String> {
+    if cx.depth > 64 {
+        return Err("Formula too deeply nested".into());
+    }
+    let cx = Cx {
+        depth: cx.depth + 1,
+        ..cx
+    };
     Ok(match e {
         Expr::Num(n) => V::Num(*n),
         Expr::Str(s) => V::Str(s.clone()),
@@ -683,7 +690,9 @@ fn eval(e: &Expr, cx: Cx) -> Result<V, String> {
             let (x, y) = (eval(a, cx)?, eval(b, cx)?);
             match *op {
                 "+" => match (&x, &y) {
-                    (V::Num(_) | V::Empty | V::Bool(_), V::Num(_) | V::Empty | V::Bool(_)) => V::Num(x.num() + y.num()),
+                    (V::Num(_) | V::Empty | V::Bool(_), V::Num(_) | V::Empty | V::Bool(_)) => {
+                        V::Num(x.num() + y.num())
+                    }
                     (V::Date(a, b), V::Num(n)) => V::Date(a + *n as i64, b + *n as i64),
                     _ => V::Str(format!("{}{}", x.text(), y.text())),
                 },
@@ -700,15 +709,16 @@ fn eval(e: &Expr, cx: Cx) -> Result<V, String> {
                 "!=" => V::Bool(!veq(&x, &y)),
                 _ => {
                     let ord = match (&x, &y) {
-                        (V::Str(p), V::Str(q)) => p.to_lowercase().cmp(&q.to_lowercase()),
-                        (V::Date(p, _), V::Date(q, _)) => p.cmp(q),
-                        _ => x.num().partial_cmp(&y.num()).unwrap_or(std::cmp::Ordering::Equal),
+                        (V::Str(p), V::Str(q)) => Some(p.to_lowercase().cmp(&q.to_lowercase())),
+                        (V::Date(p, _), V::Date(q, _)) => Some(p.cmp(q)),
+                        _ => x.num().partial_cmp(&y.num()),
                     };
-                    V::Bool(match *op {
-                        "<" => ord.is_lt(),
-                        "<=" => ord.is_le(),
-                        ">" => ord.is_gt(),
-                        _ => ord.is_ge(),
+                    V::Bool(match (ord, *op) {
+                        (Some(o), "<") => o.is_lt(),
+                        (Some(o), "<=") => o.is_le(),
+                        (Some(o), ">") => o.is_gt(),
+                        (Some(o), _) => o.is_ge(),
+                        (None, _) => false,
                     })
                 }
             }
@@ -1005,13 +1015,44 @@ pub fn recompute(ws: &mut Workspace) -> bool {
         let mut updates: Vec<(u64, u64, Option<Val>)> = vec![];
         for page in ws.pages.iter().filter(|p| p.db.is_some() && !p.trashed) {
             let Some(db) = page.db.as_ref() else { continue };
-            let cps: Vec<&Prop> = db.props.iter().filter(|p| p.kind.computed()).collect();
+            let cps: Vec<(&Prop, Option<Result<Expr, String>>)> = db
+                .props
+                .iter()
+                .filter(|p| p.kind.computed())
+                .map(|p| {
+                    let ast = if p.kind == PropKind::Formula {
+                        Some(parse(&p.cfg.formula))
+                    } else {
+                        None
+                    };
+                    (p, ast)
+                })
+                .collect();
             if cps.is_empty() {
                 continue;
             }
-            for row in ws.pages.iter().filter(|r| r.row && r.parent == Some(page.id) && !r.trashed) {
-                for p in &cps {
-                    let nv = compute(ws, db, row, p);
+            for row in ws
+                .pages
+                .iter()
+                .filter(|r| r.row && r.parent == Some(page.id) && !r.trashed)
+            {
+                for (p, ast) in &cps {
+                    let nv = match ast {
+                        Some(Ok(expr)) => match eval(
+                            expr,
+                            Cx {
+                                ws,
+                                db,
+                                row,
+                                depth: 0,
+                            },
+                        ) {
+                            Ok(v) => v.to_val(),
+                            Err(e) => Some(Val::Text(format!("⚠ {e}"))),
+                        },
+                        Some(Err(e)) => Some(Val::Text(format!("⚠ {e}"))),
+                        None => compute(ws, db, row, p),
+                    };
                     if row.props.get(&p.id) != nv.as_ref() {
                         updates.push((row.id, p.id, nv));
                     }

@@ -333,7 +333,13 @@ impl McpRuntime {
         }
     }
 
-    fn poll_bridge(&mut self, ws: &mut Workspace, set: &McpSettings, locked: bool, ctx: &egui::Context) -> bool {
+    fn poll_bridge(
+        &mut self,
+        ws: &mut Workspace,
+        set: &McpSettings,
+        locked: bool,
+        ctx: &egui::Context,
+    ) -> bool {
         let now = now_ms();
         let mut changed = false;
         if let Some(slot) = self.bridge.slot.clone() {
@@ -355,17 +361,26 @@ impl McpRuntime {
                         let v: Json = serde_json::from_slice(&res.bytes).unwrap_or(Json::Null);
                         if let Some(reqs) = v.get("requests").and_then(|r| r.as_array()) {
                             for r in reqs {
-                                let (Some(id), Some(payload)) = (r.get("id").cloned(), r.get("payload").and_then(|p| p.as_str())) else { continue };
+                                let (Some(id), Some(payload)) = (
+                                    r.get("id").cloned(),
+                                    r.get("payload").and_then(|p| p.as_str()),
+                                ) else {
+                                    continue;
+                                };
                                 let (c, resp) = self.run(ws, payload, set.access, locked);
                                 changed |= c;
-                                self.bridge.results.push(json!({"id": id, "response": resp}));
+                                self.bridge
+                                    .results
+                                    .push(json!({"id": id, "response": resp}));
                             }
                         }
                         self.bridge.next_try = now;
                     } else {
                         self.bridge.connected = false;
                         self.bridge.status = match res.status {
-                            401 | 403 => "The site rejected the token — generate a new one".to_owned(),
+                            401 | 403 => {
+                                "The site rejected the token — generate a new one".to_owned()
+                            }
                             404 => "That server has no Lumen bridge (/api/bridge/poll)".to_owned(),
                             s => format!("Server answered HTTP {s}"),
                         };
@@ -375,7 +390,8 @@ impl McpRuntime {
                 Some(Err(e)) => {
                     self.bridge.slot = None;
                     self.bridge.connected = false;
-                    self.bridge.status = format!("Offline: {}", e.chars().take(80).collect::<String>());
+                    self.bridge.status =
+                        format!("Offline: {}", e.chars().take(80).collect::<String>());
                     self.bridge.next_try = now + 8000.0;
                 }
             }
@@ -386,6 +402,18 @@ impl McpRuntime {
                 self.bridge.status = "Enter your Lumen site URL".into();
                 self.bridge.next_try = now + 2000.0;
                 return changed;
+            }
+            if !base.is_empty() {
+                let lower = base.to_ascii_lowercase();
+                let is_https = lower.starts_with("https://");
+                let is_loopback = lower.starts_with("http://127.0.0.1")
+                    || lower.starts_with("http://localhost")
+                    || lower.starts_with("http://[::1]");
+                if !is_https && !is_loopback {
+                    self.bridge.status = "Bridge URL must use https:// (or localhost)".into();
+                    self.bridge.next_try = now + 2000.0;
+                    return changed;
+                }
             }
             if set.token.is_empty() {
                 self.bridge.status = "Generate a token first".into();
@@ -401,9 +429,13 @@ impl McpRuntime {
             };
             let send_manifest = mhash != self.bridge.sent_manifest;
             let body = json!({"manifest": if send_manifest { m } else { Json::Null }, "results": std::mem::take(&mut self.bridge.results), "client": format!("lumen/{}", env!("CARGO_PKG_VERSION")), "locked": locked});
-            let mut req = ehttp::Request::post(format!("{base}/api/bridge/poll"), body.to_string().into_bytes());
+            let mut req = ehttp::Request::post(
+                format!("{base}/api/bridge/poll"),
+                body.to_string().into_bytes(),
+            );
             req.headers.insert("Content-Type", "application/json");
-            req.headers.insert("Authorization", format!("Bearer {}", set.token));
+            req.headers
+                .insert("Authorization", format!("Bearer {}", set.token));
             if send_manifest {
                 self.bridge.sent_manifest = mhash;
             }
@@ -428,11 +460,32 @@ impl McpRuntime {
 /// A cheap fingerprint of "did anything change" (pages count + newest update + dashboards + automation sizes).
 fn ws_stamp(ws: &Workspace) -> (usize, u64, usize, usize, usize, u64) {
     let newest = ws.pages.iter().map(|p| p.updated as u64).max().unwrap_or(0);
-    (ws.pages.len(), newest, ws.dash.boards.iter().map(|b| b.widgets.len() + 1).sum(), ws.auto.rules.len() + ws.auto.reminders.len(), ws.auto.scripts.len(), ws.next_id)
+    let rule_sig: usize = ws
+        .auto
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(i, r)| ((r.on as usize) << (i % 24)) + r.runs as usize)
+        .sum();
+    (
+        ws.pages.len(),
+        newest,
+        ws.dash.boards.iter().map(|b| b.widgets.len() + 1).sum(),
+        ws.auto.rules.len() + ws.auto.reminders.len() + rule_sig,
+        ws.auto.scripts.len(),
+        ws.next_id,
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn serve_local(port: u16, token: String, queue: Queue, stop: Arc<std::sync::atomic::AtomicBool>, status: Arc<Mutex<String>>, ctx: egui::Context) {
+fn serve_local(
+    port: u16,
+    token: String,
+    queue: Queue,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    status: Arc<Mutex<String>>,
+    ctx: egui::Context,
+) {
     use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
         let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
@@ -448,12 +501,19 @@ fn serve_local(port: u16, token: String, queue: Queue, stop: Arc<std::sync::atom
         if let Ok(mut s) = status.lock() {
             *s = format!("Listening on http://127.0.0.1:{port}/mcp");
         }
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         while !stop.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let (q, t, c) = (queue.clone(), token.clone(), ctx.clone());
+                    if active.load(Ordering::SeqCst) >= 16 {
+                        drop(stream);
+                        continue;
+                    }
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let (q, t, c, a) = (queue.clone(), token.clone(), ctx.clone(), active.clone());
                     std::thread::spawn(move || {
                         let _ = serve_conn(stream, &t, q, c);
+                        a.fetch_sub(1, Ordering::SeqCst);
                     });
                 }
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(60)),
@@ -463,7 +523,12 @@ fn serve_local(port: u16, token: String, queue: Queue, stop: Arc<std::sync::atom
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn serve_conn(mut s: std::net::TcpStream, token: &str, queue: Queue, ctx: egui::Context) -> std::io::Result<()> {
+fn serve_conn(
+    mut s: std::net::TcpStream,
+    token: &str,
+    queue: Queue,
+    ctx: egui::Context,
+) -> std::io::Result<()> {
     use std::io::{Read, Write};
     let _ = s.set_nonblocking(false);
     s.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
@@ -499,39 +564,90 @@ fn serve_conn(mut s: std::net::TcpStream, token: &str, queue: Queue, ctx: egui::
             }
         }
     }
+    let reply = |s: &mut std::net::TcpStream,
+                 code: &str,
+                 ctype: &str,
+                 body: &str|
+     -> std::io::Result<()> {
+        write!(s, "HTTP/1.1 {code}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())?;
+        s.flush()
+    };
+    if len > 8_000_000 {
+        return reply(
+            &mut s,
+            "413 Payload Too Large",
+            "text/plain",
+            "Body exceeds 8 MB limit",
+        );
+    }
     let mut body = buf[head_end + 4..].to_vec();
-    while body.len() < len.min(8_000_000) {
+    while body.len() < len {
         let n = s.read(&mut tmp)?;
         if n == 0 {
             break;
         }
         body.extend_from_slice(&tmp[..n]);
     }
-    let reply = |s: &mut std::net::TcpStream, code: &str, ctype: &str, body: &str| -> std::io::Result<()> {
-        write!(s, "HTTP/1.1 {code}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: authorization, content-type, mcp-protocol-version, mcp-session-id, x-lumen-token\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nConnection: close\r\n\r\n{body}", body.len())?;
-        s.flush()
-    };
+    body.truncate(len);
     if method == "OPTIONS" {
         return reply(&mut s, "204 No Content", "text/plain", "");
     }
     if method == "GET" && (path == "/health" || path == "/") {
-        return reply(&mut s, "200 OK", "application/json", &json!({"ok": true, "server": "lumen-mcp", "version": env!("CARGO_PKG_VERSION")}).to_string());
+        return reply(
+            &mut s,
+            "200 OK",
+            "application/json",
+            &json!({"ok": true, "server": "lumen-mcp", "version": env!("CARGO_PKG_VERSION")})
+                .to_string(),
+        );
     }
-    if !token.is_empty() && auth != format!("Bearer {token}") {
-        return reply(&mut s, "401 Unauthorized", "application/json", &err(&Json::Null, -32001, "Missing or wrong bearer token").to_string());
+    let expected = format!("Bearer {token}");
+    let auth_ok = !token.is_empty()
+        && auth.len() == expected.len()
+        && auth
+            .as_bytes()
+            .iter()
+            .zip(expected.as_bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
+    if !auth_ok {
+        return reply(
+            &mut s,
+            "401 Unauthorized",
+            "application/json",
+            &err(&Json::Null, -32001, "Missing or wrong bearer token").to_string(),
+        );
     }
-    if method != "POST" {
-        return reply(&mut s, "405 Method Not Allowed", "text/plain", "POST JSON-RPC to /mcp");
+    if method != "POST" || (path != "/mcp" && path != "/") {
+        return reply(
+            &mut s,
+            "405 Method Not Allowed",
+            "text/plain",
+            "POST JSON-RPC to /mcp",
+        );
     }
     let (tx, rx) = std::sync::mpsc::channel();
     if let Ok(mut q) = queue.lock() {
-        q.push_back(Job { body: String::from_utf8_lossy(&body).to_string(), reply: tx });
+        q.push_back(Job {
+            body: String::from_utf8_lossy(&body).to_string(),
+            reply: tx,
+        });
     }
     ctx.request_repaint();
     match rx.recv_timeout(std::time::Duration::from_secs(90)) {
         Ok(Some(resp)) => reply(&mut s, "200 OK", "application/json", &resp),
         Ok(None) => reply(&mut s, "202 Accepted", "text/plain", ""),
-        Err(_) => reply(&mut s, "504 Gateway Timeout", "application/json", &err(&Json::Null, -32000, "Lumen did not answer in time (is the app open and unlocked?)").to_string()),
+        Err(_) => reply(
+            &mut s,
+            "504 Gateway Timeout",
+            "application/json",
+            &err(
+                &Json::Null,
+                -32000,
+                "Lumen did not answer in time (is the app open and unlocked?)",
+            )
+            .to_string(),
+        ),
     }
 }
 

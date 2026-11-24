@@ -379,7 +379,7 @@ fn open() -> Option<(UdpSocket, Socket)> {
 }
 
 fn v4_interfaces() -> Vec<Ipv4Addr> {
-    net::local_addrs()
+    local_addrs()
         .iter()
         .filter_map(|a| a.parse::<Ipv4Addr>().ok())
         .collect()
@@ -415,12 +415,12 @@ pub fn advertise(beacon: Arc<Mutex<Option<Beacon>>>, stop: Arc<AtomicBool>) {
                 compact.title = compact.title.chars().take(40).collect();
                 let info = serde_json::to_string(&compact).ok()?;
                 let inst = format!("lumen-{:x}", b.id);
-                let mut ips: Vec<IpAddr> = net::local_addrs()
+                let mut ips: Vec<IpAddr> = local_addrs()
                     .iter()
                     .filter_map(|a| a.parse().ok())
                     .collect();
                 ips.extend(
-                    net::local_addrs6()
+                    local_addrs6()
                         .iter()
                         .filter_map(|a| a.parse::<IpAddr>().ok()),
                 );
@@ -498,6 +498,7 @@ mod tests {
             what: "Workspace".into(),
             title: "Grüße — notes 📝".into(),
             people: 2,
+            iroh: "test_iroh_id".into(),
         }
     }
 
@@ -574,4 +575,50 @@ mod tests {
             let _ = parse(&v).map(|p| Browser::default().absorb(&p, "10.0.0.2".parse().unwrap()));
         }
     }
+}
+
+/// Local IPv4 addresses used for mDNS advertisements.
+pub(super) fn local_addrs() -> Vec<String> {
+    let mut out = vec![];
+    for probe in [
+        "192.168.1.1:80",
+        "10.0.0.1:80",
+        "172.16.0.1:80",
+        "8.8.8.8:80",
+    ] {
+        if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
+            if s.connect(probe).is_ok() {
+                if let Ok(a) = s.local_addr() {
+                    let ip = a.ip().to_string();
+                    if !a.ip().is_unspecified() && !out.contains(&ip) {
+                        out.push(ip);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Local global/ULA IPv6 addresses used for mDNS advertisements.
+pub(super) fn local_addrs6() -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for probe in ["[2001:4860:4860::8888]:80", "[fd00::1]:80"] {
+        if let Ok(s) = UdpSocket::bind("[::]:0") {
+            if s.connect(probe).is_ok() {
+                if let Ok(a) = s.local_addr() {
+                    if let IpAddr::V6(v6) = a.ip() {
+                        let seg = v6.segments()[0];
+                        let usable =
+                            !v6.is_unspecified() && !v6.is_loopback() && (seg & 0xffc0) != 0xfe80;
+                        let ip = format!("[{v6}]");
+                        if usable && !out.contains(&ip) {
+                            out.push(ip);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }

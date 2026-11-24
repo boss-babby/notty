@@ -5,6 +5,7 @@
 //! * every choice list (provider, model, access, chats) is a drop-down;
 //! * settings are a two-column page (Model · Behavior · On-device · Connections) that collapses to tabs on phones.
 
+use crate::widgets::LayerRaise;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{pos2, vec2, Align, Align2, Area, Color32, Context, CornerRadius, FontId, Frame, Id, Key, Layout, Margin, Modifiers, Order, RichText, ScrollArea, Sense, Stroke, TextEdit, Ui};
 
@@ -47,7 +48,7 @@ fn green() -> Color32 {
 
 fn glyph(ui: &mut Ui, g: &str, size: f32, color: Color32) {
     let (r, _) = ui.allocate_exact_size(vec2(size + 4.0, size + 4.0), Sense::hover());
-    ui.painter().text(r.center(), Align2::CENTER_CENTER, g, icons::font(size), color);
+    icons::glyph(ui.painter(), r.center(), size, g, color);
 }
 
 fn switch(ui: &mut Ui, pal: &Palette, on: &mut bool) -> egui::Response {
@@ -547,27 +548,85 @@ fn empty_state(ui: &mut Ui, pal: &Palette, ai: &AiHost, acts: &mut Vec<Act>) {
     });
     ui.add_space(16.0);
     if let Err(e) = ai.ready() {
-        Frame::new().fill(soft(pal)).corner_radius(CornerRadius::same(10)).inner_margin(Margin::symmetric(12, 10)).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.add(egui::Label::new(RichText::new(e).font(body(13.0)).color(pal.text)).wrap());
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if primary_button(ui, pal, "Choose a model", 140.0).clicked() {
-                    acts.push(Act::Settings);
-                }
+        Frame::new()
+            .fill(soft(pal))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.add(egui::Label::new(RichText::new(e).font(body(13.0)).color(pal.text)).wrap());
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if primary_button(ui, pal, "Choose a model", 140.0).clicked() {
+                        acts.push(Act::Settings);
+                    }
+                });
             });
-        });
         ui.add_space(10.0);
     }
-    for (label, prompt) in ai::SUGGESTIONS {
-        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), if crate::touch::touchy() { 42.0 } else { 34.0 }), Sense::click());
-        let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
-        ui.painter().rect_filled(rect, 8.0, lerp_color(panel_bg(pal), pal.hover, t));
-        ui.painter().text(pos2(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER, l::SPARKLES, icons::font(13.0), with_alpha(pal.accent, 0.9));
-        ui.painter().text(pos2(rect.left() + 34.0, rect.center().y), Align2::LEFT_CENTER, *label, body(13.5), pal.text);
-        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+    let sug_icons = [
+        l::KANBAN,
+        l::LAYOUT_GRID,
+        l::FILE_TEXT,
+        l::CALENDAR,
+        l::NETWORK,
+        l::ZAP,
+    ];
+    let dark = pal.bg.r() < 128;
+    for (idx, (label, prompt)) in ai::SUGGESTIONS.iter().enumerate() {
+        let (base_rect, resp) = ui.allocate_exact_size(
+            vec2(
+                ui.available_width(),
+                if crate::touch::touchy() { 44.0 } else { 38.0 },
+            ),
+            Sense::click(),
+        );
+        let t = ui
+            .ctx()
+            .animate_bool_with_time(resp.id, resp.hovered(), 0.14);
+        let rect = base_rect.translate(vec2(0.0, -1.0 * t));
+        let radius = CornerRadius::same(10);
+        let sh = egui::epaint::Shadow {
+            offset: [0, (1.0 + 2.0 * t).round() as i8],
+            blur: (6.0 + 4.0 * t).round() as u8,
+            spread: 0,
+            color: Color32::from_black_alpha(if dark {
+                (28.0 + 20.0 * t) as u8
+            } else {
+                (10.0 + 10.0 * t) as u8
+            }),
+        };
+        ui.painter().add(sh.as_shape(rect, radius));
+        ui.painter()
+            .rect_filled(rect, radius, lerp_color(soft(pal), pal.hover, t));
+        let ic = sug_icons.get(idx).copied().unwrap_or(l::SPARKLES);
+        let ib = egui::Rect::from_center_size(
+            pos2(rect.left() + 20.0, rect.center().y),
+            vec2(24.0, 24.0),
+        );
+        ui.painter()
+            .rect_filled(ib, 6.0, with_alpha(pal.accent, 0.10 + 0.06 * t));
+        ui.painter().text(
+            ib.center(),
+            Align2::CENTER_CENTER,
+            ic,
+            icons::font(12.5),
+            pal.accent,
+        );
+        ui.painter().text(
+            pos2(rect.left() + 40.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            *label,
+            body(13.5),
+            pal.text,
+        );
+        if resp
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
             acts.push(Act::Send((*prompt).to_owned()));
         }
+        ui.add_space(5.0);
     }
 }
 
@@ -589,68 +648,175 @@ fn composer(ui: &mut Ui, ctx: &Context, pal: &Palette, ai: &mut AiHost, acts: &m
     let touchy = crate::touch::touchy();
     let id = Id::new("ai_input");
     let busy = ai.busy();
-    let enter = !touchy && !busy && ctx.memory(|m| m.has_focus(id)) && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+    let enter = !touchy
+        && !busy
+        && ctx.memory(|m| m.has_focus(id))
+        && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
     ui.add_space(6.0);
-    Frame::new().inner_margin(Margin::symmetric(10, 0)).show(ui, |ui| {
-        let focused = ctx.memory(|m| m.has_focus(id));
-        let t = ctx.animate_bool_with_time(id.with("f"), focused, 0.15);
-        Frame::new()
-            .fill(soft(pal))
-            .stroke(Stroke::new(1.0_f32, lerp_color(soft(pal), pal.accent, t * 0.75)))
-            .corner_radius(CornerRadius::same(14))
-            .inner_margin(Margin { left: 12, right: 8, top: 10, bottom: 8 })
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                let hint_txt = if ai.thread_ref().map_or(true, |t| t.msgs.is_empty()) { "Ask or tell Lumen AI to do anything…" } else { "Reply…" };
-                ScrollArea::vertical().id_salt("ai_input_scroll").max_height(if touchy { 120.0 } else { 150.0 }).auto_shrink([false, true]).show(ui, |ui| {
-                    let r = ui.add(TextEdit::multiline(&mut ai.rt.input).id(id).frame(false).desired_rows(1).desired_width(ui.available_width()).font(body(15.0)).hint_text(RichText::new(hint_txt).color(with_alpha(pal.muted, 0.85))));
-                    if ai.rt.focus_input {
-                        r.request_focus();
-                        ai.rt.focus_input = false;
-                    }
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let def = ai::provider(&ai.st.active);
-                    let label = format!("{} · {}", def.name.split(' ').next().unwrap_or(def.name), ai_trunc(&ai.st.model_of(&ai.st.active), 18));
-                    let cur = format!("p:{}", ai.st.active);
-                    let items = model_items(ai);
-                    if let Some(k) = dropdown(ui, pal, Id::new("ai_model_dd"), &label, &items, &cur, true, false, 340.0) {
-                        if k == "__settings" {
-                            acts.push(Act::Settings);
-                        } else if let Some(p) = k.strip_prefix("p:") {
-                            ai.st.active = p.to_owned();
-                        }
-                    }
-                    let acc = ai.st.access;
-                    if let Some(k) = dropdown(ui, pal, Id::new("ai_access_dd"), acc.label(), &access_items(), access_key(acc), true, false, 330.0) {
-                        ai.st.access = access_from(&k);
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let (rect, resp) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
-                        let has = !ai.rt.input.trim().is_empty();
-                        let fill = if busy { pal.text } else if has { pal.accent } else { lerp_color(pal.bg, pal.muted, 0.35) };
-                        ui.painter().circle_filled(rect.center(), 14.0, fill);
-                        ui.painter().text(rect.center(), Align2::CENTER_CENTER, if busy { l::SQUARE } else { l::ARROW_UP }, icons::font(if busy { 11.0 } else { 16.0 }), if busy { pal.bg } else { Color32::WHITE });
-                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(if busy { "Stop" } else { "Send" }).clicked() {
-                            if busy {
-                                ai.stop();
-                            } else if has {
-                                acts.push(Act::Send(std::mem::take(&mut ai.rt.input)));
+    Frame::new()
+        .inner_margin(Margin::symmetric(10, 0))
+        .show(ui, |ui| {
+            let focused = ctx.memory(|m| m.has_focus(id));
+            let t = ctx.animate_bool_with_time(id.with("f"), focused, 0.15);
+            Frame::new()
+                .fill(soft(pal))
+                .stroke(Stroke::new(
+                    1.0_f32,
+                    lerp_color(soft(pal), pal.accent, t * 0.75),
+                ))
+                .corner_radius(CornerRadius::same(14))
+                .inner_margin(Margin {
+                    left: 12,
+                    right: 8,
+                    top: 10,
+                    bottom: 8,
+                })
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let hint_txt = if ai.thread_ref().map_or(true, |t| t.msgs.is_empty()) {
+                        "Ask or tell Lumen AI to do anything…"
+                    } else {
+                        "Reply…"
+                    };
+                    ScrollArea::vertical()
+                        .id_salt("ai_input_scroll")
+                        .max_height(if touchy { 120.0 } else { 150.0 })
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            let r = ui.add(
+                                TextEdit::multiline(&mut ai.rt.input)
+                                    .id(id)
+                                    .frame(false)
+                                    .desired_rows(1)
+                                    .desired_width(ui.available_width())
+                                    .font(body(15.0))
+                                    .hint_text(
+                                        RichText::new(hint_txt).color(with_alpha(pal.muted, 0.85)),
+                                    ),
+                            );
+                            if ai.rt.focus_input {
+                                r.request_focus();
+                                ai.rt.focus_input = false;
+                            }
+                        });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let compact = ui.available_width() < 375.0;
+                        let def = ai::provider(&ai.st.active);
+                        let model_name = ai.st.model_of(&ai.st.active);
+                        let label = if compact {
+                            ai_trunc(
+                                if model_name.is_empty() {
+                                    def.name
+                                } else {
+                                    &model_name
+                                },
+                                15,
+                            )
+                        } else {
+                            format!(
+                                "{} · {}",
+                                def.name.split(' ').next().unwrap_or(def.name),
+                                ai_trunc(&model_name, 18)
+                            )
+                        };
+                        let cur = format!("p:{}", ai.st.active);
+                        let items = model_items(ai);
+                        if let Some(k) = dropdown(
+                            ui,
+                            pal,
+                            Id::new("ai_model_dd"),
+                            &label,
+                            &items,
+                            &cur,
+                            true,
+                            false,
+                            340.0,
+                        ) {
+                            if k == "__settings" {
+                                acts.push(Act::Settings);
+                            } else if let Some(p) = k.strip_prefix("p:") {
+                                ai.st.active = p.to_owned();
                             }
                         }
+                        let acc = ai.st.access;
+                        let acc_lbl = if compact {
+                            match acc {
+                                Access::ReadOnly => "Read",
+                                Access::Edit => "Edit",
+                                Access::Full => "Full",
+                            }
+                        } else {
+                            acc.label()
+                        };
+                        if let Some(k) = dropdown(
+                            ui,
+                            pal,
+                            Id::new("ai_access_dd"),
+                            acc_lbl,
+                            &access_items(),
+                            access_key(acc),
+                            true,
+                            false,
+                            330.0,
+                        ) {
+                            ai.st.access = access_from(&k);
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let (rect, resp) =
+                                ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
+                            let has = !ai.rt.input.trim().is_empty();
+                            let fill = if busy {
+                                pal.text
+                            } else if has {
+                                pal.accent
+                            } else {
+                                lerp_color(pal.bg, pal.muted, 0.35)
+                            };
+                            ui.painter().circle_filled(rect.center(), 14.0, fill);
+                            ui.painter().text(
+                                rect.center(),
+                                Align2::CENTER_CENTER,
+                                if busy { l::SQUARE } else { l::ARROW_UP },
+                                icons::font(if busy { 11.0 } else { 16.0 }),
+                                if busy { pal.bg } else { Color32::WHITE },
+                            );
+                            if resp
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text(if busy { "Stop" } else { "Send" })
+                                .clicked()
+                            {
+                                if busy {
+                                    ai.stop();
+                                } else if has {
+                                    acts.push(Act::Send(std::mem::take(&mut ai.rt.input)));
+                                }
+                            }
+                        });
                     });
                 });
-            });
-    });
+        });
     if enter && !ai.rt.input.trim().is_empty() {
         acts.push(Act::Send(std::mem::take(&mut ai.rt.input)));
     }
     ui.horizontal(|ui| {
         ui.add_space(16.0);
-        let usage = if ai.rt.tokens_in + ai.rt.tokens_out > 0 { format!("{} in · {} out this session", kfmt(ai.rt.tokens_in), kfmt(ai.rt.tokens_out)) } else { "AI can make mistakes.".to_owned() };
-        ui.label(RichText::new(usage).font(body(11.5)).color(with_alpha(pal.muted, 0.9)));
-        if ai.rt.snapshot.is_some() && !busy && ghost_button(ui, pal, "↩ Undo AI changes").clicked() {
+        let usage = if ai.rt.tokens_in + ai.rt.tokens_out > 0 {
+            format!(
+                "{} in · {} out this session",
+                kfmt(ai.rt.tokens_in),
+                kfmt(ai.rt.tokens_out)
+            )
+        } else {
+            "AI can make mistakes.".to_owned()
+        };
+        ui.label(
+            RichText::new(usage)
+                .font(body(11.5))
+                .color(with_alpha(pal.muted, 0.9)),
+        );
+        if ai.rt.snapshot.is_some() && !busy && ghost_button(ui, pal, "↩ Undo AI changes").clicked()
+        {
             ai.rt.status = "undo".into();
         }
     });
@@ -742,20 +908,57 @@ pub fn panel(ui: &mut Ui, ctx: &Context, ai: &mut AiHost, ws: &mut Workspace, pa
     out
 }
 
-/// Phones: the chat covers the screen like a native sheet.
-pub fn fullscreen(ctx: &Context, ai: &mut AiHost, ws: &mut Workspace, pal: &Palette) -> PanelOut {
+/// Phones: the chat smoothly slides up from the bottom to full-screen cover (and slides back down on close).
+pub fn fullscreen(
+    ctx: &Context,
+    ai: &mut AiHost,
+    ws: &mut Workspace,
+    pal: &Palette,
+    t: f32,
+) -> PanelOut {
     let screen = ctx.screen_rect();
     let mut out = PanelOut::default();
-    let t = crate::widgets::appear(ctx, Id::new("ai_sheet_a"), 0.22);
-    let area = Area::new(Id::new("ai_sheet")).order(Order::Foreground).fixed_pos(pos2(screen.min.x, screen.min.y + (1.0 - t) * 40.0)).show(ctx, |ui| {
-        ui.set_opacity(t);
-        let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::click_and_drag());
-        ui.painter().rect_filled(rect, 0.0, panel_bg(pal));
-        let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Min)));
-        inner.set_clip_rect(rect);
-        out = panel(&mut inner, ctx, ai, ws, pal);
-    });
-    ctx.move_to_top(area.response.layer_id);
+    if t < 0.997 {
+        let bd = Area::new(Id::new("ai_sheet_bd"))
+            .order(crate::widgets::HOST_ORDER)
+            .fixed_pos(screen.min)
+            .interactable(false)
+            .show(ctx, |ui| {
+                ui.painter()
+                    .rect_filled(screen, 0.0, Color32::from_black_alpha((96.0 * t) as u8));
+            });
+        if ai.rt.settings.is_none() {
+            ctx.raise_layer(bd.response.layer_id);
+        }
+    }
+    let y = screen.min.y + (1.0 - t) * screen.height();
+    let top_r = ((1.0 - t) * 20.0).round() as u8;
+    let area = Area::new(Id::new("ai_sheet"))
+        .order(crate::widgets::HOST_ORDER)
+        .fixed_pos(pos2(screen.min.x, y))
+        .show(ctx, |ui| {
+            let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::click_and_drag());
+            ui.painter().rect_filled(
+                rect,
+                CornerRadius {
+                    nw: top_r,
+                    ne: top_r,
+                    sw: 0,
+                    se: 0,
+                },
+                panel_bg(pal),
+            );
+            let mut inner = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .layout(Layout::top_down(Align::Min)),
+            );
+            inner.set_clip_rect(rect);
+            out = panel(&mut inner, ctx, ai, ws, pal);
+        });
+    if ai.rt.settings.is_none() {
+        ctx.raise_layer(area.response.layer_id);
+    }
     if ctx.input(|i| i.key_pressed(Key::Escape)) && ai.rt.settings.is_none() {
         out.close = true;
     }
@@ -983,41 +1186,211 @@ fn nav_item(ui: &mut Ui, pal: &Palette, glyph_s: &str, label: &str, on: bool, wi
 }
 
 pub fn settings(ctx: &Context, ai: &mut AiHost, ws: &Workspace, pal: &Palette) {
-    let Some(tab) = ai.rt.settings else { return };
-    let mut tab = tab;
+    let want_open = ai.rt.settings.is_some();
+    let screen = ctx.screen_rect();
+    let narrow = screen.width() < 680.0;
+    let sheet_t = if narrow {
+        ctx.animate_bool_with_time_and_easing(
+            Id::new("ai_settings_sheet_t"),
+            want_open,
+            0.24,
+            egui::emath::easing::cubic_in_out,
+        )
+    } else {
+        0.0
+    };
+    let last_tab_id = Id::new("ai_settings_last_tab");
+    if let Some(t) = ai.rt.settings {
+        ctx.data_mut(|d| d.insert_temp(last_tab_id, t));
+    }
+    if narrow {
+        if sheet_t <= 0.003 {
+            return;
+        }
+    } else if !want_open {
+        return;
+    }
+
+    let mut tab = ai.rt.settings.unwrap_or_else(|| {
+        ctx.data(|d| d.get_temp(last_tab_id))
+            .unwrap_or(SettingsTab::Providers)
+    });
     let mut toast = None;
-    let narrow = ctx.screen_rect().width() < 680.0;
-    let max_h = (ctx.screen_rect().height() - if narrow { 120.0 } else { 150.0 }).max(260.0);
-    let tabs = [(SettingsTab::Providers, l::SPARKLES, "Model"), (SettingsTab::Agent, l::SETTINGS, "Behavior"), (SettingsTab::Local, l::ZAP, "On-device"), (SettingsTab::Connect, l::NETWORK, "Connections")];
-    let open = crate::app::modal(ctx, Id::new("ai_settings"), pal, 800.0, if narrow { 12.0 } else { 36.0 }, |ui| {
-        let mut body_ui = |ui: &mut Ui, tab: SettingsTab, toast: &mut Option<String>| {
-            ScrollArea::vertical().id_salt("ai_settings_scroll").max_height(max_h - 20.0).auto_shrink([false, true]).show(ui, |ui| {
-                Frame::new().inner_margin(Margin::symmetric(10, 0)).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    match tab {
-                        SettingsTab::Providers => model_tab(ui, ctx, pal, ai, ws),
-                        SettingsTab::Agent => agent_tab(ui, ctx, pal, ai),
-                        SettingsTab::Local => local_tab(ui, ctx, pal, ai, toast),
-                        SettingsTab::Connect => connect_tab(ui, ctx, pal, ai, toast),
-                    }
-                    ui.add_space(14.0);
-                });
+    let tabs = [
+        (SettingsTab::Providers, l::SPARKLES, "Model"),
+        (SettingsTab::Agent, l::SETTINGS, "Behavior"),
+        (SettingsTab::Local, l::ZAP, "On-device"),
+        (SettingsTab::Connect, l::NETWORK, "Connect"),
+    ];
+
+    let mut open = want_open;
+    if narrow {
+        let max_h = (screen.height() * 0.72).max(280.0);
+        let bd = Area::new(Id::new("ai_settings_scrim"))
+            .order(crate::widgets::HOST_ORDER)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter().rect_filled(
+                    r,
+                    0.0,
+                    Color32::from_black_alpha((115.0 * sheet_t) as u8),
+                );
+                if resp.clicked() {
+                    open = false;
+                }
             });
-        };
-        if narrow {
-            ui.add_space(4.0);
-            ScrollArea::horizontal().id_salt("ai_settings_tabs").show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    for (t, g, name) in tabs {
-                        if nav_item(ui, pal, g, name, tab == t, 128.0).clicked() {
-                            tab = t;
+        ctx.move_to_top(bd.response.layer_id);
+
+        let sheet_w = (screen.width() - 12.0).max(260.0);
+        let slide = (1.0 - sheet_t) * (max_h + 40.0);
+        let md = Area::new(Id::new("ai_settings"))
+            .order(crate::widgets::HOST_ORDER)
+            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -6.0 + slide))
+            .show(ctx, |ui| {
+                let frame = Frame::NONE
+                    .fill(pal.popup)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .corner_radius(CornerRadius {
+                        nw: 18,
+                        ne: 18,
+                        sw: 12,
+                        se: 12,
+                    })
+                    .inner_margin(Margin {
+                        left: 12,
+                        right: 12,
+                        top: 6,
+                        bottom: 14,
+                    })
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, -6],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha(75),
+                    });
+                frame.show(ui, |ui| {
+                    ui.set_width((sheet_w - 24.0).max(220.0));
+                    // Drag handle pill
+                    let (hr, _) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 10.0), Sense::hover());
+                    ui.painter().rect_filled(
+                        egui::Rect::from_center_size(hr.center(), vec2(36.0, 3.5)),
+                        2.0,
+                        with_alpha(pal.muted, 0.45),
+                    );
+                    ui.add_space(4.0);
+                    // Sheet header with title + close '×'
+                    ui.horizontal(|ui| {
+                        glyph(ui, l::SPARKLES, 15.0, pal.accent);
+                        ui.label(
+                            RichText::new("AI Settings")
+                                .font(bold(15.5))
+                                .color(pal.text),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if crate::autoui::icon_btn(ui, pal, l::X, "Close", false).clicked() {
+                                open = false;
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                    // 4-way segmented tab strip — fits 100% on 360px+ phones with zero clipping
+                    let mob_tabs = [
+                        (SettingsTab::Providers, "Model"),
+                        (SettingsTab::Agent, "Behavior"),
+                        (SettingsTab::Local, "Local"),
+                        (SettingsTab::Connect, "Connect"),
+                    ];
+                    let seg_gap = 4.0_f32;
+                    let seg_w = ((ui.available_width() - seg_gap * 3.0) / 4.0)
+                        .floor()
+                        .max(60.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = seg_gap;
+                        for (t, name) in mob_tabs {
+                            let on = tab == t;
+                            let (r, resp) =
+                                ui.allocate_exact_size(vec2(seg_w, 32.0), Sense::click());
+                            let ht = ui.ctx().animate_bool_with_time(
+                                resp.id,
+                                resp.hovered() || on,
+                                0.12,
+                            );
+                            let fill = if on {
+                                pal.hover
+                            } else {
+                                with_alpha(pal.hover, 0.45 * ht)
+                            };
+                            ui.painter().rect_filled(r, 8.0, fill);
+                            ui.painter().text(
+                                r.center(),
+                                Align2::CENTER_CENTER,
+                                name,
+                                if on { bold(12.5) } else { body(12.5) },
+                                if on { pal.text } else { pal.muted },
+                            );
+                            if resp
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                tab = t;
+                            }
                         }
-                    }
+                    });
+                    ui.add_space(6.0);
+                    ui.painter().hline(
+                        ui.max_rect().x_range(),
+                        ui.cursor().top(),
+                        Stroke::new(1.0_f32, with_alpha(pal.border, 0.7)),
+                    );
+                    ui.add_space(6.0);
+                    ScrollArea::vertical()
+                        .id_salt("ai_settings_scroll")
+                        .max_height((max_h - 96.0).max(180.0))
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            match tab {
+                                SettingsTab::Providers => model_tab(ui, ctx, pal, ai, ws),
+                                SettingsTab::Agent => agent_tab(ui, ctx, pal, ai),
+                                SettingsTab::Local => local_tab(ui, ctx, pal, ai, &mut toast),
+                                SettingsTab::Connect => connect_tab(ui, ctx, pal, ai, &mut toast),
+                            }
+                            ui.add_space(10.0);
+                        });
                 });
             });
-            ui.add_space(6.0);
-            body_ui(ui, tab, &mut toast);
-        } else {
+        ctx.move_to_top(md.response.layer_id);
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            open = false;
+        }
+        if !open && want_open {
+            ctx.memory_mut(|m| m.close_popup());
+        }
+    } else {
+        let max_h = (screen.height() - 150.0).max(260.0);
+        open = crate::app::modal(ctx, Id::new("ai_settings"), pal, 800.0, 36.0, |ui| {
+            let mut body_ui = |ui: &mut Ui, tab: SettingsTab, toast: &mut Option<String>| {
+                ScrollArea::vertical()
+                    .id_salt("ai_settings_scroll")
+                    .max_height(max_h - 20.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        Frame::new()
+                            .inner_margin(Margin::symmetric(10, 0))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                match tab {
+                                    SettingsTab::Providers => model_tab(ui, ctx, pal, ai, ws),
+                                    SettingsTab::Agent => agent_tab(ui, ctx, pal, ai),
+                                    SettingsTab::Local => local_tab(ui, ctx, pal, ai, toast),
+                                    SettingsTab::Connect => connect_tab(ui, ctx, pal, ai, toast),
+                                }
+                                ui.add_space(14.0);
+                            });
+                    });
+            };
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     ui.set_width(176.0);
@@ -1040,15 +1413,15 @@ pub fn settings(ctx: &Context, ai: &mut AiHost, ws: &Workspace, pal: &Palette) {
                     body_ui(ui, tab, &mut toast);
                 });
             });
+        });
+        if !open {
+            crate::widgets::reset_appear(ctx, Id::new("ai_settings").with("a"));
         }
-    });
+    }
     if toast.is_some() {
         ai.rt.toast = toast;
     }
     ai.rt.settings = if open { Some(tab) } else { None };
-    if !open {
-        crate::widgets::reset_appear(ctx, Id::new("ai_settings").with("a"));
-    }
 }
 
 fn code_box(ui: &mut Ui, ctx: &Context, pal: &Palette, text: &str, toast: &mut Option<String>) {
@@ -1062,21 +1435,52 @@ fn code_box(ui: &mut Ui, ctx: &Context, pal: &Palette, text: &str, toast: &mut O
     }
 }
 
-fn connect_tab(ui: &mut Ui, ctx: &Context, pal: &Palette, ai: &mut AiHost, toast: &mut Option<String>) {
+fn connect_tab(
+    ui: &mut Ui,
+    ctx: &Context,
+    pal: &Palette,
+    ai: &mut AiHost,
+    toast: &mut Option<String>,
+) {
     ui.add(egui::Label::new(RichText::new("Let other AI agents (Claude, ChatGPT connectors, Cursor, your own scripts …) use this workspace through the Model Context Protocol. They get the same tools Lumen AI has.").font(body(13.0)).color(pal.muted)).wrap());
     ui.add_space(8.0);
     sub_head(ui, pal, "What may external agents do?", "");
-    if let Some(k) = dropdown(ui, pal, Id::new("mcp_access_dd"), ai.st.mcp.access.label(), &access_items(), access_key(ai.st.mcp.access), false, true, 360.0) {
+    if let Some(k) = dropdown(
+        ui,
+        pal,
+        Id::new("mcp_access_dd"),
+        ai.st.mcp.access.label(),
+        &access_items(),
+        access_key(ai.st.mcp.access),
+        false,
+        true,
+        360.0,
+    ) {
         ai.st.mcp.access = access_from(&k);
     }
-    ui.add(egui::Label::new(RichText::new(ai.st.mcp.access.hint()).font(body(12.0)).color(pal.muted)).wrap());
+    ui.add(
+        egui::Label::new(
+            RichText::new(ai.st.mcp.access.hint())
+                .font(body(12.0))
+                .color(pal.muted),
+        )
+        .wrap(),
+    );
     ui.add_space(10.0);
     let w = ui.available_width();
     let origin = {
         let o = crate::platform::site_origin();
-        if o.is_empty() { ai.st.mcp.bridge_url.trim().trim_end_matches('/').to_owned() } else { o }
+        if o.is_empty() {
+            ai.st.mcp.bridge_url.trim().trim_end_matches('/').to_owned()
+        } else {
+            o
+        }
     };
-    let site = if origin.is_empty() { "https://YOUR-LUMEN-SITE".to_owned() } else { origin };
+    let site = if origin.is_empty() {
+        "https://YOUR-LUMEN-SITE".to_owned()
+    } else {
+        origin
+    };
     sub_head(ui, pal, "Cloud bridge", "Works from anywhere");
     toggle_row(ui, pal, "Connect to the Lumen site", "Agents call your site's /api/mcp; the site relays to this app while it is open. Works on web, Android and Windows.", &mut ai.st.mcp.bridge_on);
     if ai.st.mcp.bridge_on {
@@ -1084,26 +1488,62 @@ fn connect_tab(ui: &mut Ui, ctx: &Context, pal: &Palette, ai: &mut AiHost, toast
         if !cfg!(target_arch = "wasm32") {
             ui.label(RichText::new("Site URL").font(bold(12.5)).color(pal.muted));
             let mut u = ai.st.mcp.bridge_url.clone();
-            if field(ui, pal, soft(pal), &mut u, "https://your-lumen-site.example", false, w, Id::new("mcp_url")).changed() {
+            if field(
+                ui,
+                pal,
+                soft(pal),
+                &mut u,
+                "https://your-lumen-site.example",
+                false,
+                w,
+                Id::new("mcp_url"),
+            )
+            .changed()
+            {
                 ai.st.mcp.bridge_url = u.trim().to_owned();
             }
         }
         let (ok, msg) = ai.rt.mcp.bridge_status();
         ui.horizontal(|ui| {
             let (r, _) = ui.allocate_exact_size(vec2(12.0, 14.0), Sense::hover());
-            ui.painter().circle_filled(r.center(), 4.0, if ok { Color32::from_rgb(70, 170, 110) } else { pal.muted });
+            ui.painter().circle_filled(
+                r.center(),
+                4.0,
+                if ok {
+                    Color32::from_rgb(70, 170, 110)
+                } else {
+                    pal.muted
+                },
+            );
             ui.add(egui::Label::new(RichText::new(msg).font(body(12.5)).color(pal.muted)).wrap());
         });
     }
     ui.add_space(8.0);
-    ui.label(RichText::new("Access token").font(bold(12.5)).color(pal.muted));
+    ui.label(
+        RichText::new("Access token")
+            .font(bold(12.5))
+            .color(pal.muted),
+    );
     if ai.st.mcp.token.is_empty() {
         ai.st.mcp.token = crate::mcp::new_token();
     }
     let tok = ai.st.mcp.token.clone();
-    let masked = format!("{}…{}", &tok[..8.min(tok.len())], &tok[tok.len().saturating_sub(4)..]);
+    let head: String = tok.chars().take(8).collect();
+    let tail: String = tok
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    let masked = format!("{head}…{tail}");
     ui.horizontal(|ui| {
-        ui.label(RichText::new(masked).font(FontId::monospace(13.0)).color(pal.text));
+        ui.label(
+            RichText::new(masked)
+                .font(FontId::monospace(13.0))
+                .color(pal.text),
+        );
         if ghost_button(ui, pal, "Copy").clicked() {
             ctx.copy_text(tok.clone());
             *toast = Some("Token copied".into());
@@ -1117,21 +1557,52 @@ fn connect_tab(ui: &mut Ui, ctx: &Context, pal: &Palette, ai: &mut AiHost, toast
     ui.label(RichText::new("Endpoint").font(bold(12.5)).color(pal.muted));
     code_box(ui, ctx, pal, &format!("{site}/api/mcp"), toast);
     ui.add_space(4.0);
-    ui.label(RichText::new("Config for Claude Desktop, Cursor, Windsurf, VS Code …").font(bold(12.5)).color(pal.muted));
-    let cfg = format!("{{\n  \"mcpServers\": {{\n    \"lumen\": {{\n      \"url\": \"{site}/api/mcp\",\n      \"headers\": {{ \"Authorization\": \"Bearer {tok}\" }}\n    }}\n  }}\n}}");
-    code_box(ui, ctx, pal, &cfg, toast);
+    ui.label(
+        RichText::new("Config for Claude Desktop, Cursor, Windsurf, VS Code …")
+            .font(bold(12.5))
+            .color(pal.muted),
+    );
+    let cfg_display = format!("{{\n  \"mcpServers\": {{\n    \"lumen\": {{\n      \"url\": \"{site}/api/mcp\",\n      \"headers\": {{ \"Authorization\": \"Bearer <YOUR_TOKEN>\" }}\n    }}\n  }}\n}}");
+    let cfg_real = format!("{{\n  \"mcpServers\": {{\n    \"lumen\": {{\n      \"url\": \"{site}/api/mcp\",\n      \"headers\": {{ \"Authorization\": \"Bearer {tok}\" }}\n    }}\n  }}\n}}");
+    code_box(ui, ctx, pal, &cfg_display, toast);
+    if ghost_button(ui, pal, "Copy config with token").clicked() {
+        ctx.copy_text(cfg_real);
+        *toast = Some("Config copied".into());
+    }
     ui.add(egui::Label::new(RichText::new("Clients that only speak stdio can bridge with:  npx mcp-remote … --header \"Authorization: Bearer <token>\"").font(body(12.0)).color(with_alpha(pal.muted, 0.9))).wrap());
 
     #[cfg(not(target_arch = "wasm32"))]
     {
         ui.add_space(12.0);
-        sub_head(ui, pal, "Local server", "This device only — no internet needed");
-        toggle_row(ui, pal, "Run a local MCP server", "http://127.0.0.1 only. No internet needed.", &mut ai.st.mcp.local_on);
+        sub_head(
+            ui,
+            pal,
+            "Local server",
+            "This device only — no internet needed",
+        );
+        toggle_row(
+            ui,
+            pal,
+            "Run a local MCP server",
+            "http://127.0.0.1 only. No internet needed.",
+            &mut ai.st.mcp.local_on,
+        );
         if ai.st.mcp.local_on {
             let mut port = ai.st.mcp.port.to_string();
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Port").font(bold(12.5)).color(pal.muted));
-                if field(ui, pal, soft(pal), &mut port, "7878", false, 100.0, Id::new("mcp_port")).changed() {
+                if field(
+                    ui,
+                    pal,
+                    soft(pal),
+                    &mut port,
+                    "7878",
+                    false,
+                    100.0,
+                    Id::new("mcp_port"),
+                )
+                .changed()
+                {
                     if let Ok(p) = port.trim().parse::<u16>() {
                         if p >= 1024 {
                             ai.st.mcp.port = p;
@@ -1139,20 +1610,52 @@ fn connect_tab(ui: &mut Ui, ctx: &Context, pal: &Palette, ai: &mut AiHost, toast
                     }
                 }
             });
-            ui.add(egui::Label::new(RichText::new(ai.rt.mcp.local_status()).font(body(12.5)).color(pal.muted)).wrap());
+            ui.add(
+                egui::Label::new(
+                    RichText::new(ai.rt.mcp.local_status())
+                        .font(body(12.5))
+                        .color(pal.muted),
+                )
+                .wrap(),
+            );
         }
     }
     ui.add_space(12.0);
     sub_head(ui, pal, "Recent agent activity", "");
     if ai.rt.mcp.activity.is_empty() {
-        ui.label(RichText::new("Nothing yet — connect an agent and ask it to list your pages.").font(body(12.5)).color(pal.muted));
+        ui.label(
+            RichText::new("Nothing yet — connect an agent and ask it to list your pages.")
+                .font(body(12.5))
+                .color(pal.muted),
+        );
     }
     for (t, what, ok) in ai.rt.mcp.activity.iter().rev().take(8) {
         let secs = ((crate::auth::now_ms() - t) / 1000.0).max(0.0) as u64;
         ui.horizontal(|ui| {
-            glyph(ui, if *ok { l::CHECK } else { l::X }, 12.0, if *ok { Color32::from_rgb(70, 170, 110) } else { pal.danger });
-            ui.label(RichText::new(what.replace('_', " ")).font(body(12.5)).color(pal.text));
-            ui.label(RichText::new(if secs < 60 { format!("{secs}s ago") } else { format!("{}m ago", secs / 60) }).font(body(11.5)).color(pal.muted));
+            glyph(
+                ui,
+                if *ok { l::CHECK } else { l::X },
+                12.0,
+                if *ok {
+                    Color32::from_rgb(70, 170, 110)
+                } else {
+                    pal.danger
+                },
+            );
+            ui.label(
+                RichText::new(what.replace('_', " "))
+                    .font(body(12.5))
+                    .color(pal.text),
+            );
+            ui.label(
+                RichText::new(if secs < 60 {
+                    format!("{secs}s ago")
+                } else {
+                    format!("{}m ago", secs / 60)
+                })
+                .font(body(11.5))
+                .color(pal.muted),
+            );
         });
     }
 }

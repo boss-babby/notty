@@ -197,17 +197,36 @@ impl MediaStore {
     }
 
     /// Stores a file received from a collaborator under the id it has on every device (ids are content hashes).
-    pub fn insert_raw(&mut self, ctx: &egui::Context, id: u64, name: &str, mime: &str, bytes: Vec<u8>) {
+    pub fn insert_raw(
+        &mut self,
+        ctx: &egui::Context,
+        id: u64,
+        name: &str,
+        mime: &str,
+        bytes: Vec<u8>,
+    ) {
         if self.items.contains_key(&id) {
             return;
         }
         let size = bytes.len();
+        let total: usize = self.items.values().map(|it| it.size).sum();
+        if size > MAX_FILE || total.saturating_add(size) > MAX_TOTAL {
+            return;
+        }
         let data: Arc<[u8]> = bytes.into();
         if is_image_mime(mime) {
             ctx.include_bytes(uri_for(id), egui::load::Bytes::from(data.clone()));
             ctx.forget_image(&uri_for(id));
         }
-        self.items.insert(id, MediaItem { name: name.to_owned(), mime: mime.to_owned(), size, data: Some(data) });
+        self.items.insert(
+            id,
+            MediaItem {
+                name: name.to_owned(),
+                mime: mime.to_owned(),
+                size,
+                data: Some(data),
+            },
+        );
         self.pending.push(id);
         self.index_dirty = true;
     }
@@ -226,21 +245,39 @@ impl MediaStore {
         if !self.index_dirty && self.pending.is_empty() && self.removed.is_empty() {
             return;
         }
-        let idx: Vec<IndexEntry> = self.items.iter().map(|(id, it)| IndexEntry { id: *id, name: it.name.clone(), mime: it.mime.clone() }).collect();
+        let idx: Vec<IndexEntry> = self
+            .items
+            .iter()
+            .map(|(id, it)| IndexEntry {
+                id: *id,
+                name: it.name.clone(),
+                mime: it.mime.clone(),
+            })
+            .collect();
         let idx_json = serde_json::to_string(&idx).unwrap_or_default();
+        let mut failed: HashSet<u64> = HashSet::new();
         #[cfg(not(target_arch = "wasm32"))]
         {
             let _ = storage;
             if let Some(dir) = data_dir() {
+                let mut retry = Vec::new();
                 for id in self.pending.drain(..) {
                     if let Some(d) = self.items.get(&id).and_then(|it| it.data.as_ref()) {
-                        let _ = std::fs::write(dir.join(format!("{id:016x}.bin")), &**d);
+                        if std::fs::write(dir.join(format!("{id:016x}.bin")), &**d).is_err() {
+                            failed.insert(id);
+                            retry.push(id);
+                        }
                     }
                 }
+                self.pending = retry;
                 for id in self.removed.drain(..) {
                     let _ = std::fs::remove_file(dir.join(format!("{id:016x}.bin")));
                 }
                 let _ = std::fs::write(dir.join("index.json"), idx_json);
+            } else {
+                for &id in &self.pending {
+                    failed.insert(id);
+                }
             }
         }
         #[cfg(target_arch = "wasm32")]
@@ -256,12 +293,12 @@ impl MediaStore {
             storage.set_string(INDEX_KEY, idx_json);
         }
         // attached files are not kept resident once they are safely stored
-        for it in self.items.values_mut() {
-            if !is_image_mime(&it.mime) {
+        for (id, it) in self.items.iter_mut() {
+            if !is_image_mime(&it.mime) && !failed.contains(id) {
                 it.data = None;
             }
         }
-        self.index_dirty = false;
+        self.index_dirty = !failed.is_empty();
     }
 }
 
@@ -442,7 +479,13 @@ pub fn is_video_file(url: &str) -> bool {
     [".mp4", ".webm", ".mov", ".m4v", ".ogv"].iter().any(|e| p.ends_with(e))
 }
 
-pub const ASPECTS: [(&str, f32); 5] = [("16:9", 16.0 / 9.0), ("4:3", 4.0 / 3.0), ("21:9", 21.0 / 9.0), ("1:1", 1.0), ("9:16", 9.0 / 16.0)];
+pub const ASPECTS: [(&str, f32); 5] = [
+    ("16:9", 16.0 / 9.0),
+    ("4:3", 4.0 / 3.0),
+    ("21:9", 21.0 / 9.0),
+    ("1:1", 1.0),
+    ("9:16", 9.0 / 16.0),
+];
 
 /// Embeddable URL with the user's playback options (autoplay 1, muted 2, loop 4) and start offset applied.
 pub fn frame_url(info: &Embed, opts: u8, start: u32) -> String {
@@ -479,14 +522,34 @@ pub fn proxied(url: &str) -> String {
 /// Recognises well-known services and derives their embeddable URL.
 pub fn embed_info(url: &str) -> Embed {
     let host = host_of(url);
-    let mut e = Embed { kind: EmbedKind::Web, service: "Website", host: host.clone(), thumb: None, thumb_alt: None, file: false, frame: url.to_owned() };
-    let yt = if host.ends_with("youtube.com") {
-        query_param(url, "v").map(|s| s.to_owned()).or_else(|| path_seg(url, "/embed/")).or_else(|| path_seg(url, "/shorts/")).or_else(|| path_seg(url, "/live/"))
+    let mut e = Embed {
+        kind: EmbedKind::Web,
+        service: "Website",
+        host: host.clone(),
+        thumb: None,
+        thumb_alt: None,
+        file: false,
+        frame: url.to_owned(),
+    };
+    let host_is = |domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
+    let yt = if host_is("youtube.com") {
+        query_param(url, "v")
+            .map(|s| s.to_owned())
+            .or_else(|| path_seg(url, "/embed/"))
+            .or_else(|| path_seg(url, "/shorts/"))
+            .or_else(|| path_seg(url, "/live/"))
     } else if host == "youtu.be" {
         path_seg(url, "youtu.be/")
     } else {
         None
-    };
+    }
+    .filter(|id| {
+        !id.is_empty()
+            && id.len() <= 32
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    });
     if let Some(id) = yt {
         e.kind = EmbedKind::Video;
         e.service = "YouTube";
@@ -497,13 +560,15 @@ pub fn embed_info(url: &str) -> Embed {
         e.kind = EmbedKind::Video;
         e.service = "Video file";
         e.file = true;
-    } else if host.ends_with("vimeo.com") {
-        if let Some(id) = path_seg(url, "vimeo.com/").filter(|s| s.chars().all(|c| c.is_ascii_digit())) {
+    } else if host_is("vimeo.com") {
+        if let Some(id) =
+            path_seg(url, "vimeo.com/").filter(|s| s.chars().all(|c| c.is_ascii_digit()))
+        {
             e.kind = EmbedKind::Video;
             e.service = "Vimeo";
             e.frame = format!("https://player.vimeo.com/video/{id}");
         }
-    } else if host.ends_with("loom.com") {
+    } else if host_is("loom.com") {
         if let Some(id) = path_seg(url, "/share/").or_else(|| path_seg(url, "/embed/")) {
             e.kind = EmbedKind::Video;
             e.service = "Loom";
@@ -516,20 +581,34 @@ pub fn embed_info(url: &str) -> Embed {
             e.service = "Spotify";
             e.frame = format!("https://open.spotify.com/embed/{rest}");
         }
-    } else if host.ends_with("google.com") && url.contains("/maps") || host == "maps.app.goo.gl" {
+    } else if host_is("google.com") && url.contains("/maps") || host == "maps.app.goo.gl" {
         e.kind = EmbedKind::Map;
         e.service = "Google Maps";
-        e.frame = format!("https://www.google.com/maps?q={}&output=embed", pct(url.split("/maps/place/").nth(1).and_then(|s| s.split('/').next()).unwrap_or(&host)));
-    } else if host.ends_with("figma.com") {
+        e.frame = format!(
+            "https://www.google.com/maps?q={}&output=embed",
+            pct(url
+                .split("/maps/place/")
+                .nth(1)
+                .and_then(|s| s.split('/').next())
+                .unwrap_or(&host))
+        );
+    } else if host_is("figma.com") {
         e.kind = EmbedKind::Design;
         e.service = "Figma";
-        e.frame = format!("https://www.figma.com/embed?embed_host=lumen&url={}", pct(url));
-    } else if host.ends_with("codepen.io") {
+        e.frame = format!(
+            "https://www.figma.com/embed?embed_host=lumen&url={}",
+            pct(url)
+        );
+    } else if host_is("codepen.io") {
         e.service = "CodePen";
         e.frame = url.replace("/pen/", "/embed/");
-    } else if host.ends_with("docs.google.com") || host.ends_with("drive.google.com") {
+    } else if host_is("docs.google.com") || host_is("drive.google.com") {
         e.service = "Google Docs";
-        e.frame = if url.contains("/edit") { url.replace("/edit", "/preview") } else { url.to_owned() };
+        e.frame = if url.contains("/edit") {
+            url.replace("/edit", "/preview")
+        } else {
+            url.to_owned()
+        };
     }
     e
 }

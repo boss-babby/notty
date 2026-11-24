@@ -9,28 +9,17 @@ mod bigsync;
 pub mod changes;
 mod comments;
 pub mod crdt;
-pub mod dht;
+pub mod iroh_transport;
 pub mod pair;
-mod relay;
 mod secure;
 pub mod textcrdt;
 mod textmerge;
 pub mod ui;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod lan;
 #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 mod mdns;
-#[cfg(not(target_arch = "wasm32"))]
-mod net;
-#[cfg(not(target_arch = "wasm32"))]
-mod punch;
-#[cfg(target_arch = "wasm32")]
-mod rtc;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod turn;
-#[cfg(not(target_arch = "wasm32"))]
-mod upnp;
-#[cfg(target_arch = "wasm32")]
-mod webnet;
 
 use crdt::{Applied, Hlc, Key, Op, Replica, Scope, ScopeKind};
 use serde::{Deserialize, Serialize};
@@ -399,6 +388,9 @@ pub struct Beacon {
     pub what: String,
     pub title: String,
     pub people: u32,
+    /// Host's Iroh EndpointId or compact ticket for direct local QUIC dialing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub iroh: String,
 }
 
 #[derive(Clone, Debug)]
@@ -419,6 +411,10 @@ pub trait Sink: Send {
     /// Seals messages that were queued while the handshake ran (only the cipher wrapper has anything to do).
     fn flush_pending(&self) {}
     fn close(&self);
+    /// Active transport path classification (Direct LAN, Direct P2P, or Relayed).
+    fn path_kind(&self) -> iroh_transport::PathKind {
+        iroh_transport::PathKind::Unknown
+    }
 }
 
 pub enum Event {
@@ -517,25 +513,9 @@ pub struct JoinRequest {
 }
 
 /// How this device joined (kept so a dropped connection can be re-dialled).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum Target {
-    Addr {
-        addr: String,
-        token: String,
-    },
-    Relay {
-        base: String,
-        room: String,
-        token: String,
-    },
-}
-
-/// A hole-punch attempt of a joiner (its thread opens the connection itself; on failure the relay takes over).
-struct PunchJoin {
-    rx: std::sync::mpsc::Receiver<bool>,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    base: String,
-    room: String,
+    Iroh { ticket: String, token: String },
 }
 
 /// A joined session whose connection broke: the replica and the workspace stay, the dial is retried with a back-off and the next
@@ -660,17 +640,7 @@ pub struct Ui {
     pub hs_poll: f64,
 }
 
-/// Direct internet access to this host (UPnP port mapping + the public address). See `upnp.rs`.
-#[derive(Default, Clone, Debug)]
-pub struct Wan {
-    /// 0 off, 1 looking, 2 ready, 3 failed.
-    pub state: u8,
-    pub ip: String,
-    pub port: u16,
-    /// The router forwarded the port by itself.
-    pub mapped: bool,
-    pub note: String,
-}
+/// Optional custom Iroh relay configuration (empty = automatic n0 public relays).
 
 /// A link that carries the credentials of a nearby phone's hotspot: connect to that Wi-Fi first, then dial.
 struct PendingWifi {
@@ -692,9 +662,6 @@ pub struct Collab {
     pub roster: Vec<(PeerInfo, Role)>,
     pub token: String,
     pub addr_hint: Vec<String>,
-    pub relay_room: Option<String>,
-    /// A direct link that also names a relay room: when no direct address answers, the join falls back to the relay (`(base, room)`).
-    relay_fb: Option<(String, String)>,
     pub show_cursors: bool,
     pub last_error: Option<String>,
     pub stats: Stats,
@@ -725,17 +692,14 @@ pub struct Collab {
     host_pin: Option<String>,
     plan_seq: u64,
     quorum: Option<Quorum>,
-    dht_ann: Option<dht::Announcer>,
-    dht_find: Option<(String, std::sync::mpsc::Receiver<Vec<std::net::SocketAddr>>)>,
     listen_pref: u16,
-    /// A relay joiner's handshake that already sent its first message (adopted by the first virtual connection that answers).
-    relay_init: Option<Arc<Mutex<secure::Crypt>>>,
     /// Wrong-token attempts per address: (count, last time).
     fails: HashMap<String, (u32, f64)>,
     target: Option<Target>,
     resume: Option<Resume>,
     /// A hand-over this host started and is waiting for the successor to confirm.
     baton: Option<BatonWait>,
+    pending_baton_ack: Option<(ConnId, f64)>,
     /// Roles of the people of the session a hand-over left us with: a device that comes back with the new token keeps its role.
     inherited: HashMap<u32, Role>,
     /// Devices (by Noise static key) the host removed: they cannot walk back in with the share token.
@@ -771,12 +735,8 @@ pub struct Collab {
     stamps_at: f64,
     /// Android: the foreground service is running (it follows `mode`).
     svc_on: bool,
-    /// Host: lets the hole-punch listener thread end (set while a relay room with punching is offered).
-    punch_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// Joiner: a hole-punch attempt that runs before the relay is used.
-    punch_join: Option<PunchJoin>,
-    /// The link said the host can punch (`p=1`).
-    want_punch: bool,
+    /// Custom Iroh relay URL (empty = use n0's free default public relays automatically).
+    pub custom_iroh_relay: String,
     prompted: bool,
     bound_at: f64,
     last_op_at: f64,
@@ -792,16 +752,19 @@ pub struct Collab {
     reassert: Vec<(Key, Hlc)>,
     /// Pages edited on this device while it was away from the host (listed in the Changes window).
     pub away: Vec<(u64, String)>,
-    /// Host option: reachable from the internet (UPnP + public address).
-    pub internet: bool,
-    pub wan: Arc<Mutex<Wan>>,
-    wan_gw: Arc<Mutex<Option<(String, u16)>>>,
     /// Nearby hotspot of this phone: (state, ssid, passphrase) as last reported by Android.
     pub hs: (String, String, String),
     pending_wifi: Option<PendingWifi>,
+    /// Unified Iroh QUIC transport (P2P hole-punching + n0 public relays on native, Android, Windows, and WASM).
+    pub iroh: iroh_transport::IrohNet,
     #[cfg(not(target_arch = "wasm32"))]
-    net: net::Net,
-    relay: Option<relay::Relay>,
+    lan_adv_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    lan_disc_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    mdns_adv_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    mdns_disc_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     beacon: Arc<Mutex<Option<Beacon>>>,
     ctx: egui::Context,
 }
@@ -974,24 +937,11 @@ pub fn pct_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// What the internet sees of this device: asks the relay site (`/api/collab/ip`). Native only; blocks (runs on a worker thread).
-#[cfg(not(target_arch = "wasm32"))]
-fn fetch_public_ip(site: &str) -> Option<String> {
-    let r = ehttp::fetch_blocking(&ehttp::Request::get(format!("{site}/api/collab/ip"))).ok()?;
-    if !r.ok {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_slice(&r.bytes).ok()?;
-    let ip = v.get("ip")?.as_str()?.trim().to_owned();
-    (ip.parse::<std::net::IpAddr>().is_ok() && !ip.is_empty()).then_some(ip)
-}
-
-/// Printable, bounded text from the network (names that end up in menus and toasts).
-/// What a hand-over message may tell a device to dial: a few plain `host:port` strings and / or an http(s) site with a room code.
+/// What a hand-over message may tell a device to dial: Iroh tickets/IDs (`iroh:...`) or plain `host:port` strings.
 fn valid_target(addrs: &[String], relay: &Option<(String, String)>, token: &str) -> bool {
     let plain = |a: &String| {
         !a.is_empty()
-            && a.len() <= 64
+            && a.len() <= 512
             && a.chars()
                 .all(|c| c.is_ascii_alphanumeric() || ".:-[]_".contains(c))
     };
@@ -1021,6 +971,9 @@ fn clean(s: &str, max: usize) -> String {
 
 /// The part of an address that identifies a machine (the port changes with every connection).
 fn peer_key(addr: &str) -> String {
+    if addr.starts_with("iroh:") {
+        return addr.to_owned();
+    }
     addr.rsplit_once(':').map_or(addr, |(h, _)| h).to_owned()
 }
 
@@ -1057,8 +1010,6 @@ impl Collab {
             roster: vec![],
             token: String::new(),
             addr_hint: vec![],
-            relay_room: None,
-            relay_fb: None,
             show_cursors,
             last_error: None,
             stats: Stats::default(),
@@ -1090,23 +1041,18 @@ impl Collab {
             host_pin: None,
             plan_seq: 0,
             quorum: None,
-            dht_ann: None,
-            dht_find: None,
             listen_pref: PORT,
-            relay_init: None,
             suggestions: vec![],
             held_in: VecDeque::new(),
             reassert: vec![],
             away: vec![],
-            internet: false,
-            wan: Arc::new(Mutex::new(Wan::default())),
-            wan_gw: Arc::new(Mutex::new(None)),
             hs: ("idle".into(), String::new(), String::new()),
             pending_wifi: None,
             fails: HashMap::new(),
             target: None,
             resume: None,
             baton: None,
+            pending_baton_ack: None,
             inherited: HashMap::new(),
             banned: HashSet::new(),
             demoted: HashSet::new(),
@@ -1137,18 +1083,24 @@ impl Collab {
             reused: false,
             stamps_at: 0.0,
             svc_on: false,
-            punch_stop: None,
-            punch_join: None,
-            want_punch: false,
+            custom_iroh_relay: ctx
+                .data_mut(|d| d.get_persisted::<String>(egui::Id::new("collab_iroh_relay")))
+                .unwrap_or_default(),
             prompted: false,
             bound_at: 0.0,
             last_op_at: 0.0,
             changes: changes::Log::default(),
             keep_copy: true,
             auto_admit: false,
+            iroh: iroh_transport::IrohNet::default(),
             #[cfg(not(target_arch = "wasm32"))]
-            net: net::Net::default(),
-            relay: None,
+            lan_adv_stop: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            lan_disc_stop: None,
+            #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+            mdns_adv_stop: None,
+            #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+            mdns_disc_stop: None,
             beacon: Arc::new(Mutex::new(None)),
             ctx: ctx.clone(),
         }
@@ -1276,76 +1228,123 @@ impl Collab {
         self.token = random_code(10);
         self.roster = vec![(self.me.clone(), Role::Editor)];
         self.last_error = None;
+        let _ = with_relay;
         self.open_listener(scope, title, false);
-        if let Some(base) = with_relay {
-            self.enable_relay(base);
-        }
         self.next_scan = 0.0;
-        if self.internet {
-            let site = self.ui.relay_url.clone();
-            self.set_internet(true, &site);
-        }
     }
 
-    /// Opens the TCP listener, the LAN beacon and (Android) the NSD registration of a hosting session. `keep`: leave the connections this
-    /// device already has open (a joiner that takes over hosting still talks to the old host while it answers).
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Deterministic 32-byte seed for this device's Iroh `SecretKey`, derived from the persisted device key.
+    fn iroh_seed(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"lumen-iroh-key-v1");
+        if let Some(k) = &self.keys {
+            h.update(k.private_bytes());
+        } else {
+            h.update(self.me.id.to_le_bytes());
+        }
+        let digest = h.finalize();
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&digest[..32]);
+        seed
+    }
+
+    /// Current Iroh `EndpointTicket` string for this host (updates automatically once the relay connects).
+    pub fn iroh_ticket(&self) -> Option<String> {
+        self.iroh.ticket()
+    }
+
+    /// Current 32-byte Ed25519 Iroh `EndpointId` string.
+    pub fn iroh_endpoint_id(&self) -> Option<String> {
+        self.iroh.endpoint_id()
+    }
+
+    /// Human-readable transport status string for the Share dialog.
+    pub fn iroh_status(&self) -> String {
+        self.iroh.status()
+    }
+
+    /// Active connection path classification for a specific peer (`Direct LAN`, `Direct P2P`, or `Relayed`).
+    pub fn peer_path(&self, peer_id: u32) -> iroh_transport::PathKind {
+        self.conns
+            .values()
+            .find(|c| c.active && c.peer.as_ref().map_or(false, |p| p.id == peer_id))
+            .map(|c| c.sink.path_kind())
+            .unwrap_or_default()
+    }
+
+    /// Best active connection path classification for this session (used by joiners and status indicators).
+    pub fn primary_path(&self) -> iroh_transport::PathKind {
+        let mut best = iroh_transport::PathKind::Unknown;
+        for c in self.conns.values().filter(|c| c.active) {
+            let k = c.sink.path_kind();
+            match (best, k) {
+                (_, iroh_transport::PathKind::DirectLan) => return k,
+                (
+                    iroh_transport::PathKind::Unknown | iroh_transport::PathKind::Relayed,
+                    iroh_transport::PathKind::DirectP2p,
+                ) => best = k,
+                (iroh_transport::PathKind::Unknown, iroh_transport::PathKind::Relayed) => best = k,
+                _ => {}
+            }
+        }
+        best
+    }
+
+    /// Opens the Iroh QUIC endpoint and LAN mDNS/NSD advertisement for a hosting session (works on native, Android, Windows, and WASM).
     fn open_listener(&mut self, scope: Scope, title: String, keep: bool) {
+        let custom = (!self.custom_iroh_relay.trim().is_empty())
+            .then(|| self.custom_iroh_relay.trim().to_owned());
+        let bind_port = (self.listen_pref != PORT).then_some(self.listen_pref);
+        self.iroh.start_host(
+            self.iroh_seed(),
+            custom,
+            keep,
+            bind_port,
+            self.inbox.clone(),
+            self.ctx.clone(),
+        );
+        let b = Beacon {
+            v: PROTO,
+            id: self.me.id,
+            device: self.me.device.clone(),
+            name: self.me.name.clone(),
+            platform: self.me.platform.clone(),
+            port: PORT,
+            what: Self::scope_label(scope).into(),
+            title,
+            people: 1,
+            iroh: self.iroh.endpoint_id().unwrap_or_default(),
+        };
+        if let Ok(mut g) = self.beacon.lock() {
+            *g = Some(b);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         {
-            match self.net.listen_pref(&self.inbox, keep, self.listen_pref) {
-                Ok(port) => {
-                    self.addr_hint = Self::local_ips()
-                        .into_iter()
-                        .map(|ip| format!("{ip}:{port}"))
-                        .chain(
-                            net::local_addrs6()
-                                .into_iter()
-                                .map(|ip| format!("{ip}:{port}")),
-                        )
-                        .collect();
-                    let b = Beacon {
-                        v: PROTO,
-                        id: self.me.id,
-                        device: self.me.device.clone(),
-                        name: self.me.name.clone(),
-                        platform: self.me.platform.clone(),
-                        port,
-                        what: Self::scope_label(scope).into(),
-                        title,
-                        people: 1,
-                    };
-                    if let Ok(mut g) = self.beacon.lock() {
-                        *g = Some(b);
-                    }
-                    self.net.announce(self.beacon.clone());
-                    #[cfg(target_os = "android")]
-                    if let Some(b) = self.beacon.lock().ok().and_then(|g| g.clone()) {
-                        let mut compact = b.clone();
-                        compact.title = compact.title.chars().take(40).collect();
-                        if let Ok(j) = serde_json::to_string(&compact) {
-                            crate::android::nsd_register(&format!("{:x}", self.me.id), port, &j);
-                        }
-                    }
-                }
-                Err(e) => self.last_error = Some(format!("Could not open a port: {e}")),
+            if let Some(s) = self.lan_adv_stop.take() {
+                s.store(true, Ordering::Relaxed);
             }
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            lan::advertise(self.beacon.clone(), stop.clone());
+            self.lan_adv_stop = Some(stop);
         }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn open_listener(&mut self, _scope: Scope, _title: String, _keep: bool) {}
-
-    /// Addresses of this device that peers on the same network can dial (every interface on Android, the default routes elsewhere).
-    #[cfg(not(target_arch = "wasm32"))]
-    fn local_ips() -> Vec<String> {
-        let mut v = net::local_addrs();
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+        {
+            if let Some(s) = self.mdns_adv_stop.take() {
+                s.store(true, Ordering::Relaxed);
+            }
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            mdns::advertise(self.beacon.clone(), stop.clone());
+            self.mdns_adv_stop = Some(stop);
+        }
         #[cfg(target_os = "android")]
-        for ip in crate::android::local_ips() {
-            if !v.contains(&ip) {
-                v.push(ip);
+        if let Some(b) = self.beacon.lock().ok().and_then(|g| g.clone()) {
+            let mut compact = b.clone();
+            compact.title = compact.title.chars().take(40).collect();
+            if let Ok(j) = serde_json::to_string(&compact) {
+                crate::android::nsd_register(&format!("{:x}", self.me.id), PORT, &j);
             }
         }
-        v
     }
 
     /// Stable identifier of "this workspace / page shared from this device" (one-way hash of the device key — it reveals nothing).
@@ -1362,96 +1361,10 @@ impl Collab {
         hex(&h.finalize()[..10])
     }
 
-    pub fn enable_relay(&mut self, base: String) {
-        if self.mode != Mode::Hosting {
-            return;
-        }
-        let room = random_code(10);
-        self.enable_relay_room(base, room);
-    }
-
-    /// Hosts in a given relay room (a fresh code normally; the one derived from the session secret after a fail-over).
-    fn enable_relay_room(&mut self, base: String, room: String) {
-        self.relay = Some(relay::Relay::start(&base, &room, self.me.id, &self.inbox));
-        // peers that can punch through their NATs get a direct UDP path (the room only carries two addresses); everyone else uses the relay
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            punch::host(base, room.clone(), self.inbox.clone(), stop.clone());
-            self.punch_stop = Some(stop);
-        }
-        // a browser host answers WebRTC offers instead (browser ⇄ browser data channel; the relay stays the fall-back)
-        #[cfg(target_arch = "wasm32")]
-        {
-            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            rtc::host(&base, &room, &self.inbox, stop.clone());
-            self.punch_stop = Some(stop);
-        }
-        self.relay_room = Some(room);
-    }
-
-    pub fn relay_link(&self, base: &str) -> Option<String> {
-        let room = self.relay_room.as_ref()?;
-        Some(format!(
-            "{}/app?join={}&t={}{}",
-            base.trim_end_matches('/'),
-            room,
-            self.token,
-            if self.punch_stop.is_none() {
-                ""
-            } else if cfg!(target_arch = "wasm32") {
-                "&r=1"
-            } else {
-                "&p=1"
-            }
-        ))
-    }
-
-    pub fn lan_link(&self) -> Option<String> {
-        if self.addr_hint.is_empty() {
-            return None;
-        }
-        Some(format!(
-            "lumen://join?h={}&t={}",
-            self.addr_hint.join(","),
-            self.token
-        ))
-    }
-
-    /// The address a device on another network dials (only while *Internet access* is on and ready).
-    pub fn wan_address(&self) -> Option<String> {
-        if !self.internet {
-            return None;
-        }
-        let w = self.wan.lock().ok()?;
-        if w.state != 2 || w.ip.is_empty() {
-            return None;
-        }
-        Some(if w.ip.contains(':') {
-            format!("[{}]:{}", w.ip, w.port)
-        } else {
-            format!("{}:{}", w.ip, w.port)
-        })
-    }
-
-    /// One link with every way to reach this host: LAN addresses, the public address and — when a nearby hotspot is up — its Wi-Fi
-    /// credentials. The joiner dials all addresses at once and keeps the first that answers.
-    pub fn direct_link(&self) -> Option<String> {
-        let mut hosts = self.addr_hint.clone();
-        if let Some(w) = self.wan_address() {
-            hosts.push(w);
-        }
-        if hosts.is_empty() {
-            return None;
-        }
-        let mut s = format!("lumen://join?h={}&t={}", hosts.join(","), self.token);
-        // the same link also names the relay room: a joiner that reaches no direct address falls back to the relay by itself
-        if let (Some(room), false) = (&self.relay_room, self.ui.relay_url.trim().is_empty()) {
-            s.push_str(&format!(
-                "&rr={room}&rb={}",
-                pct_encode(self.ui.relay_url.trim().trim_end_matches('/'))
-            ));
-        }
+    /// Universal share link (`lumen://join?iroh=<ticket>&t=<token>`) that works on LAN, Wi-Fi, 5G, CGNAT, and browsers.
+    pub fn iroh_link(&self) -> Option<String> {
+        let ticket = self.iroh.ticket()?;
+        let mut s = format!("lumen://join?iroh={}&t={}", pct_encode(&ticket), self.token);
         if self.hs.0 == "up" && !self.hs.1.is_empty() {
             s.push_str(&format!(
                 "&ws={}&wp={}",
@@ -1462,112 +1375,19 @@ impl Collab {
         Some(s)
     }
 
-    /// Opt in / out of direct internet access. Maps the port on the router (UPnP) and finds the public address.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn set_internet(&mut self, on: bool, site: &str) {
-        self.internet = on;
-        if !on {
-            self.release_wan();
-            self.dht_ann = None;
-            return;
+    /// Optional web-app URL (`https://.../app?iroh=<ticket>&t=<token>`) for one-click browser joining.
+    pub fn iroh_web_link(&self, site_base: &str) -> Option<String> {
+        let base = site_base.trim().trim_end_matches('/');
+        if base.is_empty() {
+            return None;
         }
-        if self.mode != Mode::Hosting || self.net.port == 0 {
-            return;
-        }
-        let port = self.net.port;
-        // announce the share code in the BitTorrent DHT: "dht:CODE" joins from anywhere without our site
-        self.dht_ann = Some(dht::Announcer::start(&self.token, port, vec![]));
-        let (wan, gw, ctx) = (self.wan.clone(), self.wan_gw.clone(), self.ctx.clone());
-        let site = site.trim().trim_end_matches('/').to_owned();
-        if let Ok(mut w) = wan.lock() {
-            *w = Wan {
-                state: 1,
-                port,
-                ..Default::default()
-            };
-        }
-        let _ = std::thread::Builder::new().name("lumen-collab-wan".into()).spawn(move || {
-            let mut w = Wan { state: 2, port, ..Default::default() };
-            let mut router_ip = None;
-            match upnp::discover() {
-                Some(g) => match g.add(port, port) {
-                    Ok(ext) => {
-                        w.port = ext;
-                        w.mapped = true;
-                        router_ip = g.external_ip();
-                        if let Ok(mut x) = gw.lock() {
-                            *x = Some((format!("{}|{}|{}", g.host, g.path, g.service), ext));
-                        }
-                    }
-                    Err(e) => w.note = format!("Your router refused automatic forwarding ({e}). Forward TCP port {port} to this device in the router settings."),
-                },
-                None => w.note = format!("No UPnP router found. Forward TCP port {port} to this device in the router settings, or use the link relay."),
-            }
-            // what the internet sees (the site answers with the caller's address); the router's own answer wins when it is public
-            let seen = if site.is_empty() { None } else { fetch_public_ip(&site) };
-            let ip = match (&router_ip, &seen) {
-                (Some(r), _) if !upnp::is_private_v4(r) => r.clone(),
-                (_, Some(s)) => s.clone(),
-                _ => String::new(),
-            };
-            if router_ip.as_deref().is_some_and(upnp::is_private_v4) {
-                // the router itself sits behind another NAT (carrier-grade NAT, double router): nobody outside can dial in
-                w.mapped = false;
-                w.note = "Your internet provider shares one public address between customers (CGNAT) — a direct connection is not possible here. Use the link relay instead.".into();
-                w.state = 3;
-            } else if ip.is_empty() {
-                w.state = 3;
-                if w.note.is_empty() {
-                    w.note = "Could not find out the public address (offline, or no relay site is set).".into();
-                }
-            } else {
-                w.ip = ip;
-            }
-            // no usable IPv4 path (no UPnP, CGNAT, no public address): a global IPv6 address needs neither a mapping nor a relay
-            if w.ip.is_empty() || w.state == 3 {
-                if let Some(v6) = net::local_addrs6().into_iter().find(|a| !a.starts_with("fd") && !a.starts_with("fc")) {
-                    w.ip = v6;
-                    w.port = port;
-                    w.mapped = false;
-                    w.state = 2;
-                    w.note = "Direct over IPv6 — no router setup needed (your router's IPv6 firewall must allow incoming connections to this device).".into();
-                }
-            }
-            if let Ok(mut x) = wan.lock() {
-                *x = w;
-            }
-            ctx.request_repaint();
-        });
+        let ticket = self.iroh.ticket()?;
+        Some(format!(
+            "{base}/app?iroh={}&t={}",
+            pct_encode(&ticket),
+            self.token
+        ))
     }
-
-    #[cfg(target_arch = "wasm32")]
-    pub fn set_internet(&mut self, on: bool, _site: &str) {
-        self.internet = on;
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn release_wan(&mut self) {
-        if let Ok(mut w) = self.wan.lock() {
-            *w = Wan::default();
-        }
-        let taken = self.wan_gw.lock().ok().and_then(|mut g| g.take());
-        if let Some((desc, port)) = taken {
-            let mut it = desc.splitn(3, '|');
-            if let (Some(host), Some(path), Some(service)) = (it.next(), it.next(), it.next()) {
-                let g = upnp::Gateway {
-                    host: host.to_owned(),
-                    path: path.to_owned(),
-                    service: service.to_owned(),
-                };
-                let _ = std::thread::Builder::new()
-                    .name("lumen-collab-unmap".into())
-                    .spawn(move || g.remove(port));
-            }
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn release_wan(&mut self) {}
 
     /// Starts / stops this phone's private hotspot (Android only; elsewhere a no-op).
     pub fn set_hotspot(&mut self, on: bool) {
@@ -1597,15 +1417,6 @@ impl Collab {
                 let came_up = st.0 == "up" && self.hs.0 != "up";
                 self.hs = st;
                 if came_up && self.mode == Mode::Hosting {
-                    let port = self
-                        .addr_hint
-                        .first()
-                        .and_then(|a| a.rsplit_once(':'))
-                        .map_or(PORT, |(_, p)| p.parse().unwrap_or(PORT));
-                    self.addr_hint = Self::local_ips()
-                        .into_iter()
-                        .map(|ip| format!("{ip}:{port}"))
-                        .collect();
                     self.ui.qr_cache = None;
                 }
                 self.ctx.request_repaint();
@@ -1614,7 +1425,7 @@ impl Collab {
         let _ = now;
     }
 
-    /// Wi-Fi join that precedes a dial (link with `ws` / `wp`): waits for Android, then dials.
+    /// Wi-Fi join that precedes a dial (link with `ws` / `wp`): waits for Android, then dials via Iroh.
     fn poll_wifi(&mut self, now: f64) {
         let Some(p) = self.pending_wifi.as_mut() else {
             return;
@@ -1630,7 +1441,7 @@ impl Collab {
         let (state, msg) = ("failed".to_owned(), String::new());
         if state == "up" {
             if let Some(p) = self.pending_wifi.take() {
-                self.join_addr(&p.hosts, &p.token);
+                self.join_iroh(&p.hosts, &p.token);
             }
         } else if state == "failed" || timed_out {
             let ssid = self.pending_wifi.take().map(|p| p.ssid).unwrap_or_default();
@@ -1645,15 +1456,11 @@ impl Collab {
             .request_repaint_after(std::time::Duration::from_millis(300));
     }
 
-    /// Joins by whatever the user typed / scanned: `ip:port`, `lumen://join?h=…&t=…`, or a link with `join=ROOM&t=TOKEN`.
-    pub fn join_text(&mut self, text: &str, relay_base: &str) {
+    /// Joins by whatever the user pasted / scanned: `lumen://join?iroh=...&t=...`, `https://.../app?iroh=...&t=...`,
+    /// a bare `endpoint...` Iroh ticket, or a bare Iroh `EndpointId`.
+    pub fn join_text(&mut self, text: &str, _relay_base: &str) {
         let t = text.trim();
-        // `dht:CODE` — find the host through the BitTorrent DHT (no site, no LAN needed)
-        if let Some(code) = t.strip_prefix("dht:").map(str::trim).filter(|c| {
-            (4..=64).contains(&c.len()) && c.chars().all(|ch| ch.is_ascii_alphanumeric())
-        }) {
-            self.dht_find = Some((code.to_ascii_uppercase(), dht::lookup(code, vec![])));
-            self.toast("Looking for the host in the DHT…");
+        if t.is_empty() {
             return;
         }
         let q = |key: &str| -> Option<String> {
@@ -1662,69 +1469,39 @@ impl Collab {
                 .split('&')
                 .find_map(|kv| kv.strip_prefix(&format!("{key}=")).map(pct_decode))
         };
-        if let Some(room) = q("join") {
-            let token = q("t").unwrap_or_default();
-            self.want_punch = q(if cfg!(target_arch = "wasm32") {
-                "r"
-            } else {
-                "p"
-            })
-            .as_deref()
-                == Some("1");
-            let base = if t.starts_with("http") {
-                t.split("/app").next().unwrap_or(relay_base).to_owned()
-            } else {
-                relay_base.to_owned()
-            };
-            self.join_relay(&base, &room, &token);
-        } else if let Some(h) = q("h") {
+        if let Some(ticket) = q("iroh") {
             let token = q("t").unwrap_or_default();
             match (q("ws"), q("wp")) {
                 (Some(ssid), pass) if cfg!(target_os = "android") && !ssid.is_empty() => {
-                    self.join_via_wifi(&ssid, &pass.unwrap_or_default(), &h, &token)
+                    self.join_via_wifi(&ssid, &pass.unwrap_or_default(), &ticket, &token)
                 }
-                _ => {
-                    self.join_addr(&h, &token);
-                    if let Some(room) = q("rr").filter(|r| {
-                        (4..=32).contains(&r.len()) && r.chars().all(|c| c.is_ascii_alphanumeric())
-                    }) {
-                        let base = q("rb")
-                            .filter(|b| b.starts_with("http"))
-                            .unwrap_or_else(|| relay_base.to_owned());
-                        if !base.trim().is_empty() {
-                            self.relay_fb =
-                                Some((base.trim().trim_end_matches('/').to_owned(), room));
-                        }
-                    }
-                }
+                _ => self.join_iroh(&ticket, &token),
             }
-        } else if t.contains(':') || t.contains('.') {
-            self.join_addr(t, "");
-        } else if t.len() >= 4 {
-            self.join_relay(relay_base, &t.to_uppercase(), "");
+            return;
+        }
+        let raw = t.strip_prefix("iroh:").unwrap_or(t).trim();
+        if iroh_transport::parse_endpoint_addr(raw).is_ok() {
+            self.join_iroh(raw, "");
+        } else {
+            self.last_error = Some(
+                "Paste a Lumen Iroh link or ticket (starts with lumen://join?iroh= or endpoint…)"
+                    .into(),
+            );
         }
     }
 
-    /// `addr` may list several candidates separated by commas (LAN, public, hotspot): all are tried at once.
-    pub fn join_addr(&mut self, addr: &str, token: &str) {
+    /// Joins a host by its Iroh `EndpointTicket` or `EndpointId`.
+    pub fn join_iroh(&mut self, ticket_or_id: &str, token: &str) {
         self.stop(false);
-        let addr = addr
-            .split(',')
-            .map(str::trim)
-            .filter(|a| !a.is_empty())
-            .take(8)
-            .map(with_port)
-            .collect::<Vec<_>>()
-            .join(",");
-        self.target = Some(Target::Addr {
-            addr,
+        self.target = Some(Target::Iroh {
+            ticket: ticket_or_id.trim().to_owned(),
             token: token.to_owned(),
         });
         self.dial();
     }
 
-    /// A link made by a phone that opened its private hotspot: join that Wi-Fi (Android asks the user once), then dial.
-    pub fn join_via_wifi(&mut self, ssid: &str, pass: &str, hosts: &str, token: &str) {
+    /// A link made by a phone that opened its private hotspot: join that Wi-Fi (Android asks the user once), then dial via Iroh.
+    pub fn join_via_wifi(&mut self, ssid: &str, pass: &str, ticket: &str, token: &str) {
         self.stop(false);
         #[cfg(target_os = "android")]
         crate::android::wifi_join(ssid, pass);
@@ -1735,7 +1512,7 @@ impl Collab {
         let now = mono_ms();
         self.pending_wifi = Some(PendingWifi {
             ssid: ssid.to_owned(),
-            hosts: hosts.to_owned(),
+            hosts: ticket.to_owned(),
             token: token.to_owned(),
             since: now,
             next_check: now + 500.0,
@@ -1744,96 +1521,24 @@ impl Collab {
             .request_repaint_after(std::time::Duration::from_millis(300));
     }
 
-    pub fn join_relay(&mut self, base: &str, room: &str, token: &str) {
-        self.stop(false);
-        self.target = Some(Target::Relay {
-            base: base.to_owned(),
-            room: room.to_owned(),
-            token: token.to_owned(),
-        });
-        self.dial();
-    }
-
-    /// Opens the connection described by `self.target` (first join and every reconnect).
+    /// Opens the Iroh QUIC connection described by `self.target` (first join and every reconnect).
     fn dial(&mut self) {
-        let Some(t) = self.target.clone() else { return };
+        let Some(Target::Iroh { ticket, token }) = self.target.clone() else {
+            return;
+        };
         self.mode = Mode::Joining;
         self.joining_since = mono_ms();
         self.last_error = None;
-        match t {
-            Target::Addr { addr, token } => {
-                self.token = token;
-                #[cfg(not(target_arch = "wasm32"))]
-                self.net.connect(&addr, &self.inbox);
-                #[cfg(target_arch = "wasm32")]
-                webnet::connect(addr.split(',').next().unwrap_or(&addr), &self.inbox);
-            }
-            Target::Relay { base, room, token } => {
-                self.token = token;
-                #[cfg(not(target_arch = "wasm32"))]
-                if self.want_punch && self.punch_join.is_none() {
-                    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    let (b2, r2, ib, st, ctx) = (
-                        base.clone(),
-                        room.clone(),
-                        self.inbox.clone(),
-                        stop.clone(),
-                        self.ctx.clone(),
-                    );
-                    let spawned = std::thread::Builder::new()
-                        .name("lumen-collab-punchj".into())
-                        .spawn(move || {
-                            let ok = punch::dial(b2, r2, ib, st);
-                            let _ = tx.send(ok);
-                            ctx.request_repaint();
-                        });
-                    if spawned.is_ok() {
-                        self.punch_join = Some(PunchJoin {
-                            rx,
-                            stop,
-                            base,
-                            room,
-                        });
-                        return;
-                    }
-                }
-                #[cfg(target_arch = "wasm32")]
-                if self.want_punch && self.punch_join.is_none() {
-                    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    rtc::dial(
-                        &base,
-                        &room,
-                        &self.inbox,
-                        stop.clone(),
-                        tx,
-                        self.ctx.clone(),
-                    );
-                    self.punch_join = Some(PunchJoin {
-                        rx,
-                        stop,
-                        base,
-                        room,
-                    });
-                    return;
-                }
-                self.start_relay(&base, &room);
-            }
-        }
-    }
-
-    /// Joins through the site's relay room (the first handshake message goes out through the room).
-    fn start_relay(&mut self, base: &str, room: &str) {
-        self.relay = Some(relay::Relay::start(base, room, self.me.id, &self.inbox));
-        // tell the room we are here: whoever hosts answers, the encrypted channel is set up from there
-        if let (Some(r), Some(keys)) = (&self.relay, self.keys.clone()) {
-            let mut cr = secure::Crypt::new();
-            if let Some(d) = cr.start_initiator(&keys) {
-                self.relay_init = Some(Arc::new(Mutex::new(cr)));
-                r.hello(&Msg::Hs { d });
-            }
-        }
+        self.token = token;
+        let custom = (!self.custom_iroh_relay.trim().is_empty())
+            .then(|| self.custom_iroh_relay.trim().to_owned());
+        self.iroh.dial(
+            self.iroh_seed(),
+            ticket,
+            custom,
+            self.inbox.clone(),
+            self.ctx.clone(),
+        );
     }
 
     /// True while a joined session is re-dialling its host after the connection broke.
@@ -1882,12 +1587,7 @@ impl Collab {
             c.sink.close();
         }
         self.conns.clear();
-        self.relay_init = None;
-        #[cfg(not(target_arch = "wasm32"))]
-        self.net.stop();
-        if let Some(r) = self.relay.take() {
-            r.stop();
-        }
+        self.iroh.stop();
         self.inq.clear();
         self.ops_in.clear();
         self.mode = Mode::Joining;
@@ -1944,8 +1644,6 @@ impl Collab {
     }
 
     pub fn stop(&mut self, notify: bool) {
-        self.dht_ann = None;
-        self.dht_find = None;
         self.quorum = None;
         self.big = Default::default();
         if std::mem::take(&mut self.big_tracking) {
@@ -1959,18 +1657,11 @@ impl Collab {
         self.electing = None;
         self.listen_pref = PORT;
         self.save_stamps();
-        if let Some(s) = self.punch_stop.take() {
-            s.store(true, Ordering::Relaxed);
-        }
-        if let Some(pj) = self.punch_join.take() {
-            pj.stop.store(true, Ordering::Relaxed);
-        }
         for c in self.conns.values() {
             c.sink.send(&Msg::Bye);
             c.sink.close();
         }
         if notify {
-            self.release_wan();
             self.set_hotspot(false);
             self.pending_wifi = None;
             #[cfg(target_os = "android")]
@@ -1980,11 +1671,14 @@ impl Collab {
         self.held_in.clear();
         self.reassert.clear();
         self.conns.clear();
-        self.relay_init = None;
+        self.iroh.stop();
         #[cfg(not(target_arch = "wasm32"))]
-        self.net.stop();
-        if let Some(r) = self.relay.take() {
-            r.stop();
+        if let Some(s) = self.lan_adv_stop.take() {
+            s.store(true, Ordering::Relaxed);
+        }
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+        if let Some(s) = self.mdns_adv_stop.take() {
+            s.store(true, Ordering::Relaxed);
         }
         if let Ok(mut g) = self.beacon.lock() {
             *g = None;
@@ -1996,6 +1690,7 @@ impl Collab {
         self.banned.clear();
         self.demoted.clear();
         self.baton = None;
+        self.pending_baton_ack = None;
         self.inherited.clear();
         self.rep = None;
         self.session = None;
@@ -2004,8 +1699,7 @@ impl Collab {
         self.presence.clear();
         self.inq.clear();
         self.ops_in.clear();
-        self.relay_room = None;
-        self.relay_fb = None;
+
         self.addr_hint.clear();
         self.want_ws = None;
         self.ready = false;
@@ -2015,22 +1709,42 @@ impl Collab {
         ID_BASE.store(0, Ordering::Relaxed);
     }
 
-    /// Listen for hosts on the network (only while the connect dialog is open).
+    /// Listen for nearby hosts on the LAN via UDP broadcast + mDNS (desktop) and NsdManager (Android).
+    /// Only active while the Nearby tab is open.
     pub fn discover(&mut self, on: bool) {
         #[cfg(not(target_arch = "wasm32"))]
         {
+            if let Some(s) = self.lan_disc_stop.take() {
+                s.store(true, Ordering::Relaxed);
+            }
             if on {
-                self.net.discover(&self.inbox);
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                lan::browse(self.inbox.clone(), stop.clone());
+                self.lan_disc_stop = Some(stop);
             } else {
-                self.net.stop_discovery();
                 self.found.clear();
             }
-            #[cfg(target_os = "android")]
+        }
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+        {
+            if let Some(s) = self.mdns_disc_stop.take() {
+                s.store(true, Ordering::Relaxed);
+            }
+            if on {
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                mdns::browse(self.inbox.clone(), stop.clone());
+                self.mdns_disc_stop = Some(stop);
+            }
+        }
+        #[cfg(target_os = "android")]
+        {
             crate::android::nsd_discover(on);
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = on;
+            if !on {
+                self.found.clear();
+            }
         }
         self.ui.discovering = on;
     }
@@ -2242,9 +1956,7 @@ impl Collab {
         let Some(session) = self.session.clone() else {
             return;
         };
-        let base = self.ui.relay_url.trim().trim_end_matches('/').to_owned();
-        // a browser cannot listen: it can only host through the site's relay
-        let can_host = cfg!(not(target_arch = "wasm32")) || !base.is_empty();
+        let can_host = true;
         if !can_host {
             if let Some(c) = self.conns.get(&conn) {
                 c.sink.send(&Msg::BatonAck {
@@ -2265,18 +1977,18 @@ impl Collab {
         self.target = None;
         self.reused = false;
         self.open_listener(session.scope, session.name.clone(), true);
-        if !base.is_empty() {
-            self.enable_relay(base.clone());
-        }
-        let mut addrs = self.addr_hint.clone();
-        addrs.extend(self.wan_address());
-        let relay = self.relay_room.clone().map(|r| (base, r));
-        if let Some(c) = self.conns.get(&conn) {
-            c.sink.send(&Msg::BatonAck {
-                addrs,
-                relay,
-                token: self.token.clone(),
-            });
+        // Never block the UI thread waiting for iroh: send BatonAck immediately if a ticket is
+        // already ready, otherwise defer it to `poll()` until the ticket arrives (or 1.5 s elapses).
+        if let Some(t) = self.iroh.ticket() {
+            if let Some(c) = self.conns.get(&conn) {
+                c.sink.send(&Msg::BatonAck {
+                    addrs: vec![format!("iroh:{t}")],
+                    relay: None,
+                    token: self.token.clone(),
+                });
+            }
+        } else {
+            self.pending_baton_ack = Some((conn, mono_ms() + 1500.0));
         }
         self.update_beacon();
         self.next_scan = 0.0;
@@ -2345,21 +2057,12 @@ impl Collab {
         relay: Option<(String, String)>,
         token: String,
     ) -> bool {
-        let was_relay = matches!(self.target, Some(Target::Relay { .. }));
-        let target = match (addrs.is_empty(), relay) {
-            (false, Some(_)) if !was_relay => Target::Addr {
-                addr: addrs.join(","),
-                token,
-            },
-            (_, Some((base, room))) if was_relay || addrs.is_empty() => {
-                Target::Relay { base, room, token }
-            }
-            (false, _) => Target::Addr {
-                addr: addrs.join(","),
-                token,
-            },
-            _ => return false,
+        let _ = relay;
+        let Some(first) = addrs.first() else {
+            return false;
         };
+        let ticket = first.strip_prefix("iroh:").unwrap_or(first).to_owned();
+        let target = Target::Iroh { ticket, token };
         let Some(session) = self.session.as_ref().map(|s| s.id.clone()) else {
             return false;
         };
@@ -2367,21 +2070,18 @@ impl Collab {
             return false;
         }
         self.host_pin = None;
-        if let Some(s) = self.punch_stop.take() {
-            s.store(true, Ordering::Relaxed);
-        }
-        if let Some(pj) = self.punch_join.take() {
-            pj.stop.store(true, Ordering::Relaxed);
-        }
         for c in self.conns.values() {
             c.sink.close();
         }
         self.conns.clear();
-        self.relay_init = None;
+        self.iroh.stop();
         #[cfg(not(target_arch = "wasm32"))]
-        self.net.stop();
-        if let Some(r) = self.relay.take() {
-            r.stop();
+        if let Some(s) = self.lan_adv_stop.take() {
+            s.store(true, Ordering::Relaxed);
+        }
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+        if let Some(s) = self.mdns_adv_stop.take() {
+            s.store(true, Ordering::Relaxed);
         }
         if let Ok(mut g) = self.beacon.lock() {
             *g = None;
@@ -2396,7 +2096,6 @@ impl Collab {
         self.demoted.clear();
         self.inq.clear();
         self.ops_in.clear();
-        self.relay_room = None;
         self.addr_hint.clear();
         self.baton = None;
         self.standby = None;
@@ -2505,9 +2204,7 @@ impl Collab {
             .collect();
         order.sort_unstable();
         order.truncate(6);
-        let base = self.ui.relay_url.trim().trim_end_matches('/').to_owned();
-        let relay =
-            (!base.is_empty() && self.relay_room.is_some()).then(|| (base, standby_room(&key)));
+        let relay: Option<(String, String)> = None;
         let addrs: Vec<(u32, Vec<String>)> = order
             .iter()
             .filter_map(|id| self.peer_addrs.get(id).map(|a| (*id, a.clone())))
@@ -2606,21 +2303,13 @@ impl Collab {
         self.standby = Some(sb.clone());
         if first_for_host && sb.order.contains(&self.me.id) && !sb.secret.is_empty() {
             self.standby_sent = sb.host;
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let port = standby_port(self.me.id);
-                let addrs: Vec<String> = Self::local_ips()
-                    .into_iter()
-                    .map(|ip| {
-                        format!(
-                            "{}:{port}",
-                            ip.rsplit_once(':').map_or(ip.as_str(), |x| x.0)
-                        )
-                    })
-                    .collect();
-                if let Some(c) = self.conns.get(&conn) {
-                    c.sink.send(&Msg::StandbyAddr { addrs });
-                }
+            let my_id = iroh_transport::secret_key_from_seed(self.iroh_seed())
+                .public()
+                .to_string();
+            if let Some(c) = self.conns.get(&conn) {
+                c.sink.send(&Msg::StandbyAddr {
+                    addrs: vec![format!("iroh:{my_id}")],
+                });
             }
         }
     }
@@ -2636,9 +2325,15 @@ impl Collab {
         };
         if self.mode != Mode::Hosting
             || addrs.len() > 12
-            || addrs
-                .iter()
-                .any(|a| a.len() > 64 || a.parse::<std::net::SocketAddr>().is_err())
+            || addrs.iter().any(|a| {
+                if let Some(raw) = a.strip_prefix("iroh:") {
+                    raw.is_empty()
+                        || raw.len() > 480
+                        || iroh_transport::parse_endpoint_addr(raw).is_err()
+                } else {
+                    a.len() > 64 || a.parse::<std::net::SocketAddr>().is_err()
+                }
+            })
             || (self.peer_addrs.len() > 64 && !self.peer_addrs.contains_key(&id))
         {
             return;
@@ -2664,7 +2359,7 @@ impl Collab {
             el.tried.push(dead);
             el.cand = 0;
         }
-        let can_host = cfg!(not(target_arch = "wasm32")) || sb.relay.is_some();
+        let can_host = true;
         loop {
             let tried = self
                 .electing
@@ -2696,22 +2391,15 @@ impl Collab {
                     .find(|(id, _)| *id == cand)
                     .map(|(_, a)| a.clone())
                     .unwrap_or_default();
-                let target = match (addrs.is_empty(), sb.relay.clone()) {
-                    (false, _) => Target::Addr {
-                        addr: addrs.join(","),
-                        token: sb.cap.clone(),
-                    },
-                    (true, Some((base, room))) => Target::Relay {
-                        base,
-                        room,
-                        token: sb.cap.clone(),
-                    },
-                    (true, None) => {
-                        if let Some(e) = self.electing.as_mut() {
-                            e.tried.push(cand);
-                        }
-                        continue;
+                let Some(first) = addrs.first() else {
+                    if let Some(e) = self.electing.as_mut() {
+                        e.tried.push(cand);
                     }
+                    continue;
+                };
+                let target = Target::Iroh {
+                    ticket: first.strip_prefix("iroh:").unwrap_or(first).to_owned(),
+                    token: sb.cap.clone(),
                 };
                 self.target = Some(target);
                 self.host_pin = None;
@@ -2730,7 +2418,6 @@ impl Collab {
         let Some(session) = self.session.clone() else {
             return;
         };
-        let base = self.ui.relay_url.trim().trim_end_matches('/').to_owned();
         self.inherited = self.roster.iter().map(|(p, r)| (p.id, *r)).collect();
         self.grants = access::Grants::from_json(&sb.grants);
         // three or more editors: this device is only a *provisional* host until a majority of them has reconnected (`check_quorum`)
@@ -2760,45 +2447,9 @@ impl Collab {
         self.conns.clear();
         self.listen_pref = standby_port(self.me.id);
         self.open_listener(session.scope, session.name.clone(), false);
-        if let Some((b, room)) = sb.relay.filter(|_| !base.is_empty()) {
-            self.enable_relay_room(b, room);
-        }
         self.update_beacon();
         self.next_scan = 0.0;
         self.toast("The host disappeared — you are now hosting this session");
-    }
-
-    /// The DHT lookup of `join_text("dht:CODE")` finished: dial what it found with the code as the token.
-    fn poll_dht(&mut self) {
-        let Some((code, rx)) = &self.dht_find else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(peers) => {
-                let code = code.clone();
-                self.dht_find = None;
-                if peers.is_empty() {
-                    self.toast("Nobody announced that code in the DHT");
-                } else {
-                    let addrs: Vec<String> = peers.iter().take(4).map(|a| a.to_string()).collect();
-                    self.join_addr(&addrs.join(","), &code);
-                }
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => self
-                .ctx
-                .request_repaint_after(std::time::Duration::from_millis(300)),
-            Err(_) => {
-                self.dht_find = None;
-                self.toast("The DHT is not reachable from here");
-            }
-        }
-    }
-
-    /// Short status line of the DHT announcement (host side).
-    pub fn dht_status(&self) -> Option<String> {
-        self.dht_ann
-            .as_ref()
-            .and_then(|a| a.status.lock().ok().map(|s| s.clone()))
     }
 
     fn ensure_signer(&mut self) {
@@ -2865,11 +2516,7 @@ impl Collab {
             cand: 0,
             since: mono_ms(),
         });
-        #[cfg(not(target_arch = "wasm32"))]
-        self.net.stop();
-        if let Some(r) = self.relay.take() {
-            r.stop();
-        }
+        self.iroh.stop();
         let next = self.elect();
         if !next || !self.try_resume("Connection lost", true) {
             self.stop(false);
@@ -2938,36 +2585,43 @@ impl Collab {
             return;
         }
         let now = now_ms();
-        let dead: Vec<String> = self
-            .conns
-            .values()
-            .filter_map(|c| c.grant_token.clone())
-            .filter(|t| {
-                // a connection opened with a link that has since expired, been revoked or used up is dropped
-                !self.grants.token_live(t, now) && self.grants.list.iter().any(|g| g.token == *t)
-            })
-            .collect();
+        let dead: Vec<String> =
+            self.conns
+                .values()
+                .filter_map(|c| c.grant_token.clone())
+                .filter(|t| {
+                    // Only drop active connections whose grant was explicitly revoked or time-expired
+                    // (never kick a joiner simply because their own join consumed the last max_uses slot).
+                    self.grants.list.iter().any(|g| {
+                        g.token == *t && (g.revoked || (g.expires != 0 && now >= g.expires))
+                    })
+                })
+                .collect();
         for t in dead {
             self.drop_grant_conns(&t, "This link has expired");
         }
     }
 
-    /// The link for a grant (same shapes as the main link, other token).
+    /// The universal Iroh share link for a grant (same ticket, grant-specific token).
     pub fn grant_link(&self, token: &str, base: &str) -> Option<String> {
-        let room = self.relay_room.as_ref()?;
-        Some(format!(
-            "{}/app?join={}&t={}",
-            base.trim_end_matches('/'),
-            room,
-            token
-        ))
+        let ticket = self.iroh.ticket()?;
+        let base = base.trim().trim_end_matches('/');
+        if !base.is_empty() {
+            Some(format!("{base}/app?iroh={}&t={token}", pct_encode(&ticket)))
+        } else {
+            Some(format!(
+                "lumen://join?iroh={}&t={token}",
+                pct_encode(&ticket)
+            ))
+        }
     }
 
     pub fn grant_lan_text(&self, token: &str) -> Option<String> {
-        self.lan_link().map(|l| match l.rsplit_once("&t=") {
-            Some((head, _)) => format!("{head}&t={token}"),
-            None => l,
-        })
+        let ticket = self.iroh.ticket()?;
+        Some(format!(
+            "lumen://join?iroh={}&t={token}",
+            pct_encode(&ticket)
+        ))
     }
 
     pub fn provisional(&self) -> bool {
@@ -3165,7 +2819,6 @@ impl Collab {
         }
         #[cfg(not(target_os = "android"))]
         let _ = self.svc_on;
-        self.poll_dht();
         if self.mode == Mode::Off
             && self.pending_wifi.is_none()
             && self.hs.0 == "idle"
@@ -3175,24 +2828,48 @@ impl Collab {
             return false;
         }
         let now = mono_ms();
+        if let Some((conn, deadline)) = self.pending_baton_ack {
+            let ready = self.iroh.ticket();
+            if ready.is_some() || now >= deadline {
+                self.pending_baton_ack = None;
+                let addrs = ready
+                    .or_else(|| self.iroh.endpoint_id())
+                    .map(|t| vec![format!("iroh:{t}")])
+                    .unwrap_or_default();
+                if let Some(c) = self.conns.get(&conn) {
+                    c.sink.send(&Msg::BatonAck {
+                        addrs,
+                        relay: None,
+                        token: self.token.clone(),
+                    });
+                }
+            }
+        }
         self.poll_wifi(now);
         self.poll_hotspot(now);
-        if let Some(r) = &self.relay {
-            r.tick();
-        }
-        if let Some(pj) = &self.punch_join {
-            match pj.rx.try_recv() {
-                Ok(true) => self.punch_join = None, // the link's `Open` event is already queued
-                Ok(false) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    if let Some(pj) = self.punch_join.take() {
-                        if self.mode == Mode::Joining {
-                            self.start_relay(&pj.base, &pj.room);
+        // Keep the LAN UDP/mDNS/NSD beacon's `iroh` field synchronized with the live ticket (includes local IP:port for offline LAN dialing).
+        if self.mode == Mode::Hosting {
+            if let Some(tkt) = self.iroh.ticket().or_else(|| self.iroh.endpoint_id()) {
+                let mut updated = false;
+                if let Ok(mut g) = self.beacon.lock() {
+                    if let Some(b) = g.as_mut() {
+                        if b.iroh != tkt {
+                            b.iroh = tkt;
+                            updated = true;
                         }
                     }
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => self
-                    .ctx
-                    .request_repaint_after(std::time::Duration::from_millis(200)),
+                #[cfg(target_os = "android")]
+                if updated {
+                    if let Some(b) = self.beacon.lock().ok().and_then(|g| g.clone()) {
+                        let mut compact = b.clone();
+                        compact.title = compact.title.chars().take(40).collect();
+                        if let Ok(j) = serde_json::to_string(&compact) {
+                            crate::android::nsd_register(&format!("{:x}", self.me.id), PORT, &j);
+                        }
+                    }
+                }
+                let _ = updated;
             }
         }
         if matches!(self.mode, Mode::Hosting | Mode::Joined) && now - self.stamps_at > 120_000.0 {
@@ -3422,7 +3099,15 @@ impl Collab {
         }
         // stale presence
         self.presence.retain(|_, (_, t)| now - *t < 12_000.0);
-        self.found.retain(|f| now - f.seen < 7000.0);
+        self.found.retain(|f| {
+            let ttl = if f.ip.starts_with("relay:") {
+                16_000.0
+            } else {
+                15_000.0
+            };
+            now - f.seen < ttl
+        });
+
         if self.mode != Mode::Off {
             self.ctx
                 .request_repaint_after(std::time::Duration::from_millis(
@@ -3560,10 +3245,11 @@ impl Collab {
         for ev in self.inbox.drain() {
             match ev {
                 Event::Found(mut b, ip) => {
-                    if b.id == self.me.id || b.port == 0 {
+                    let is_relay = ip.starts_with("relay:");
+                    if b.id == self.me.id || (b.port == 0 && !is_relay) {
                         continue;
                     }
-                    // beacons are unauthenticated UDP: bound and sanitise everything that is drawn
+                    // beacons are unauthenticated UDP/HTTP: bound and sanitise everything that is drawn
                     b.device = clean(&b.device, 40);
                     b.name = clean(&b.name, 40);
                     b.platform = clean(&b.platform, 12);
@@ -3576,9 +3262,14 @@ impl Collab {
                     let seen = mono_ms();
                     match self.found.iter_mut().find(|f| f.beacon.id == b.id) {
                         Some(f) => {
-                            f.beacon = b;
-                            f.ip = ip;
-                            f.seen = seen;
+                            // Never let a relay-discovered entry overwrite a live direct LAN address for the same host.
+                            if is_relay && !f.ip.starts_with("relay:") && seen - f.seen < 6_500.0 {
+                                f.beacon.people = b.people;
+                            } else {
+                                f.beacon = b;
+                                f.ip = ip;
+                                f.seen = seen;
+                            }
                         }
                         None => self.found.push(Found {
                             beacon: b,
@@ -3601,17 +3292,14 @@ impl Collab {
                         continue;
                     }
                     let now = mono_ms();
-                    let crypt = match (self.mode, self.relay_init.take()) {
-                        // relay joiner: the first handshake message already went out through the room
-                        (Mode::Joining, Some(c)) => c,
-                        (Mode::Joining, None) if !incoming => {
-                            let mut cr = secure::Crypt::new();
-                            if let Some(d) = cr.start_initiator(self.keys.as_ref().unwrap()) {
-                                sink.send(&Msg::Hs { d });
-                            }
-                            Arc::new(Mutex::new(cr))
+                    let crypt = if self.mode == Mode::Joining && !incoming {
+                        let mut cr = secure::Crypt::new();
+                        if let Some(d) = cr.start_initiator(self.keys.as_ref().unwrap()) {
+                            sink.send(&Msg::Hs { d });
                         }
-                        _ => Arc::new(Mutex::new(secure::Crypt::new())),
+                        Arc::new(Mutex::new(cr))
+                    } else {
+                        Arc::new(Mutex::new(secure::Crypt::new()))
                     };
                     let sink: Box<dyn Sink> =
                         Box::new(secure::SecureSink::new(sink, crypt.clone()));
@@ -3799,16 +3487,6 @@ impl Collab {
 
     fn on_closed(&mut self, conn: ConnId, why: &str) {
         let Some(c) = self.conns.remove(&conn) else {
-            // the direct addresses of a link did not answer and the link names a relay room: use the relay instead
-            if self.mode == Mode::Joining && self.conns.is_empty() && self.session.is_none() {
-                if let Some((base, room)) = self.relay_fb.clone() {
-                    let token = self.token.clone();
-                    self.want_punch = true;
-                    self.join_relay(&base, &room, &token);
-                    self.toast("No direct path — connecting through the relay");
-                    return;
-                }
-            }
             // a re-dial that never got as far as a connection (refused / unreachable): count the attempt now instead of waiting 25 s for `reap`
             if self.mode == Mode::Joining
                 && self.conns.is_empty()
@@ -4784,7 +4462,7 @@ pub fn take_launch_link() -> Option<String> {
         if !DONE.with(|d| d.replace(true)) {
             if let Some(w) = web_sys::window() {
                 if let Ok(s) = w.location().search() {
-                    if s.contains("join=") {
+                    if (s.contains("iroh=") || s.contains("join=")) {
                         return Some(s);
                     }
                 }
@@ -4872,8 +4550,8 @@ mod tests {
         bw.pages.clear();
         bw.current = None;
         let token = host.token.clone();
-        a.join_addr(&format!("127.0.0.1:{port}"), &token);
-        b.join_addr(&format!("127.0.0.1:{port}"), &token);
+        a.join_iroh(&port, &token);
+        b.join_iroh(&port, &token);
         let blocks = |w: &Workspace| w.pages.iter().map(|p| p.blocks.len()).sum::<usize>();
         let t0 = Instant::now();
         let mut synced = false;
@@ -4898,10 +4576,9 @@ mod tests {
         );
         // the devices would report their addresses themselves (their LAN address is not known in a sandbox): tell the host where they listen
         for c in [&a, &b] {
-            host.peer_addrs.insert(
-                c.me.id,
-                vec![format!("127.0.0.1:{}", standby_port(c.me.id))],
-            );
+            let sa = std::net::SocketAddr::from(([127, 0, 0, 1], standby_port(c.me.id)));
+            let tkt = iroh_transport::standby_ticket(c.iroh_seed(), &[sa]);
+            host.peer_addrs.insert(c.me.id, vec![format!("iroh:{tkt}")]);
         }
         host.push_standby();
         let t0 = Instant::now();
@@ -4909,7 +4586,7 @@ mod tests {
             round3(&mut host, &mut hw, &mut a, &mut aw, &mut b, &mut bw);
         }
         // the host's process dies: sockets vanish, nobody says goodbye
-        host.net.stop();
+        host.iroh.stop();
         for c in host.conns.values() {
             c.sink.close();
         }
@@ -4981,8 +4658,8 @@ mod tests {
         bw.pages.clear();
         bw.current = None;
         let token = host.token.clone();
-        a.join_addr(&format!("127.0.0.1:{port}"), &token);
-        b.join_addr(&format!("127.0.0.1:{port}"), &token);
+        a.join_iroh(&port, &token);
+        b.join_iroh(&port, &token);
         let blocks = |w: &Workspace| w.pages.iter().map(|p| p.blocks.len()).sum::<usize>();
         let t0 = std::time::Instant::now();
         let mut synced = false;
@@ -5097,15 +4774,15 @@ mod tests {
         let ctx = egui::Context::default();
         let mut host = Collab::new(&ctx);
         host.auto_admit = true;
-        let mut join = Collab::new(&ctx);
+        let mut join = Collab::new(&egui::Context::default());
         let mut hw = Workspace::seed();
         let mut jw = Workspace::blank("joiner", false, 0);
         jw.pages.clear();
         jw.current = None;
         host.start_host(&mut hw, 1, Scope::ALL, None);
-        let port = host.net.port;
-        assert!(port > 0, "host could not listen");
-        join.join_addr(&format!("127.0.0.1:{port}"), &host.token.clone());
+        let port = wait_ticket(&host);
+        assert!(!port.is_empty(), "host could not listen");
+        join.join_iroh(&port, &host.token.clone());
         let blocks = |w: &Workspace| w.pages.iter().map(|p| p.blocks.len()).sum::<usize>();
         assert!(
             until(&mut host, &mut hw, &mut join, &mut jw, 10, |a, b| a
@@ -5157,7 +4834,18 @@ mod tests {
         join.stop(true);
     }
 
-    fn pair() -> (Collab, Workspace, Collab, Workspace, u16) {
+    fn wait_ticket(host: &Collab) -> String {
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(6) {
+            if let Some(t) = host.iroh.ticket() {
+                return t;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        panic!("host iroh ticket never became ready");
+    }
+
+    fn pair() -> (Collab, Workspace, Collab, Workspace, String) {
         let mut host = Collab::new(&egui::Context::default());
         host.auto_admit = true;
         let join = Collab::new(&egui::Context::default());
@@ -5166,8 +4854,8 @@ mod tests {
         jw.pages.clear();
         jw.current = None;
         host.start_host(&mut hw, 1, Scope::ALL, None);
-        let port = host.net.port;
-        (host, hw, join, jw, port)
+        let ticket = wait_ticket(&host);
+        (host, hw, join, jw, ticket)
     }
 
     #[test]
@@ -5180,7 +4868,7 @@ mod tests {
         let (mut host, mut hw, mut join, mut jw, port) = pair();
         let tid = bt::create_sample(&mut hw, "Big", 6000, None).expect("sample table");
         let rows = |w: &Workspace| bt::store(w, tid).map(|s| s.lock().unwrap().len().unwrap());
-        join.join_addr(&format!("127.0.0.1:{port}"), &host.token.clone());
+        join.join_iroh(&port, &host.token.clone());
         assert!(
             until(&mut host, &mut hw, &mut join, &mut jw, 25, |_, b| rows(b)
                 == Some(6000)),
@@ -5254,7 +4942,7 @@ mod tests {
     #[test]
     fn a_dropped_connection_is_re_dialled_and_catches_up() {
         let (mut host, mut hw, mut join, mut jw, port) = pair();
-        join.join_addr(&format!("127.0.0.1:{port}"), &host.token.clone());
+        join.join_iroh(&port, &host.token.clone());
         assert!(
             until(&mut host, &mut hw, &mut join, &mut jw, 10, |a, b| !b
                 .pages
@@ -5306,7 +4994,7 @@ mod tests {
     fn a_removed_device_cannot_come_back_with_the_token() {
         let (mut host, mut hw, mut join, mut jw, port) = pair();
         let token = host.token.clone();
-        join.join_addr(&format!("127.0.0.1:{port}"), &token);
+        join.join_iroh(&port, &token);
         assert!(
             until(&mut host, &mut hw, &mut join, &mut jw, 10, |_, b| !b
                 .pages
@@ -5320,7 +5008,7 @@ mod tests {
             step(&mut host, &mut hw, &mut join, &mut jw);
         }
         assert_eq!(join.mode, Mode::Off, "the kicked device must leave");
-        join.join_addr(&format!("127.0.0.1:{port}"), &token);
+        join.join_iroh(&port, &token);
         let t1 = Instant::now();
         while t1.elapsed() < Duration::from_secs(4) {
             step(&mut host, &mut hw, &mut join, &mut jw);
@@ -5334,8 +5022,8 @@ mod tests {
     #[test]
     fn an_approved_device_is_recognised_next_time() {
         let (mut host, mut hw, mut join, mut jw, port) = pair();
-        let addr = format!("127.0.0.1:{port}");
-        join.join_addr(&addr, "");
+        let addr = port.clone();
+        join.join_iroh(&addr, "");
         let t0 = Instant::now();
         while host.requests.is_empty() && t0.elapsed() < Duration::from_secs(8) {
             step(&mut host, &mut hw, &mut join, &mut jw);
@@ -5355,7 +5043,7 @@ mod tests {
             step(&mut host, &mut hw, &mut join, &mut jw);
         }
         assert_eq!(host.trusted_list().len(), 1);
-        join.join_addr(&addr, "");
+        join.join_iroh(&addr, "");
         let t2 = Instant::now();
         while t2.elapsed() < Duration::from_secs(6) && join.mode != Mode::Joined {
             step(&mut host, &mut hw, &mut join, &mut jw);
@@ -5373,19 +5061,11 @@ mod tests {
         join.stop(true);
     }
 
-    /// Needs the website running: `LUMEN_RELAY_TEST=http://127.0.0.1:3000 cargo test --lib relay -- --ignored`.
     #[test]
-    #[ignore]
-    fn two_devices_sync_through_the_site_relay() {
-        let base =
-            std::env::var("LUMEN_RELAY_TEST").unwrap_or_else(|_| "http://127.0.0.1:3000".into());
+    fn two_devices_sync_through_iroh_universal_link() {
         let (mut host, mut hw, mut join, mut jw, _port) = pair();
-        host.enable_relay(base.clone());
-        let room = host.relay_room.clone().expect("relay room");
-        // a real host has been polling for a long time before anybody holds the link; the relay shows a device only frames posted
-        // after it first appeared (a late joiner must not see other people's old handshakes)
-        std::thread::sleep(Duration::from_millis(800));
-        join.join_relay(&base, &room, &host.token.clone());
+        let link = host.iroh_link().expect("iroh link");
+        join.join_text(&link, "");
         let blocks = |w: &Workspace| w.pages.iter().map(|p| p.blocks.len()).sum::<usize>();
         assert!(
             until(&mut host, &mut hw, &mut join, &mut jw, 30, |a, b| !b
@@ -5420,7 +5100,7 @@ mod tests {
     fn a_new_device_needs_the_hosts_approval() {
         let (mut host, mut hw, mut join, mut jw, port) = pair();
         host.auto_admit = false;
-        join.join_addr(&format!("127.0.0.1:{port}"), &host.token.clone());
+        join.join_iroh(&port, &host.token.clone());
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(8) && host.requests.is_empty() {
             step(&mut host, &mut hw, &mut join, &mut jw);
@@ -5452,7 +5132,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut host = Collab::new(&ctx);
         host.auto_admit = true;
-        let mut join = Collab::new(&ctx);
+        let mut join = Collab::new(&egui::Context::default());
         let mut hw = Workspace::seed();
         let mut jw = Workspace::blank("joiner", false, 0);
         jw.pages.clear();
@@ -5460,7 +5140,7 @@ mod tests {
         host.start_host(&mut hw, 1, Scope::ALL, None);
         let share = host.session.as_ref().unwrap().share.clone();
         assert!(!share.is_empty());
-        join.join_addr(&format!("127.0.0.1:{}", host.net.port), &host.token.clone());
+        join.join_iroh(&wait_ticket(&host), &host.token.clone());
         assert!(until(&mut host, &mut hw, &mut join, &mut jw, 10, |a, b| !b
             .pages
             .is_empty()
@@ -5483,7 +5163,7 @@ mod tests {
             share,
             "the share id must survive a restart"
         );
-        join.join_addr(&format!("127.0.0.1:{}", host.net.port), &host.token.clone());
+        join.join_iroh(&wait_ticket(&host), &host.token.clone());
         let t0 = Instant::now();
         let mut reused = false;
         while t0.elapsed() < Duration::from_secs(10) {
@@ -5521,7 +5201,7 @@ mod tests {
     #[test]
     fn comments_reach_the_other_device_without_waiting_for_the_full_scan() {
         let (mut host, mut hw, mut join, mut jw, port) = pair();
-        join.join_addr(&format!("127.0.0.1:{port}"), &host.token.clone());
+        join.join_iroh(&port, &host.token.clone());
         assert!(until(&mut host, &mut hw, &mut join, &mut jw, 10, |a, b| !b
             .pages
             .is_empty()
@@ -5587,46 +5267,28 @@ mod tests {
     }
 
     #[test]
-    fn one_link_carries_every_address_and_the_hotspot() {
-        let (mut host, _hw, _join, _jw, port) = pair();
-        host.addr_hint = vec![format!("192.168.1.5:{port}"), format!("10.0.0.7:{port}")];
-        let l = host.lan_link().unwrap();
-        assert!(
-            l.contains(&format!("h=192.168.1.5:{port},10.0.0.7:{port}")),
-            "{l}"
-        );
+    fn one_iroh_link_carries_ticket_and_hotspot() {
+        let (mut host, _hw, _join, _jw, _ticket) = pair();
+        let l = host.iroh_link().unwrap();
+        assert!(l.starts_with("lumen://join?iroh="), "{l}");
+        assert!(l.contains(&format!("&t={}", host.token)), "{l}");
         host.hs = ("up".into(), "DIRECT-lumen 1".into(), "pw d/1".into());
-        host.internet = true;
-        *host.wan.lock().unwrap() = Wan {
-            state: 2,
-            ip: "203.0.113.9".into(),
-            port: 40000,
-            mapped: true,
-            note: String::new(),
-        };
-        let d = host.direct_link().unwrap();
-        assert!(d.contains(",203.0.113.9:40000"), "{d}");
+        let d = host.iroh_link().unwrap();
         assert!(d.contains("&ws=DIRECT-lumen%201&wp=pw%20d%2F1"), "{d}");
         host.stop(true);
     }
 
     #[test]
-    fn a_device_dials_every_candidate_and_keeps_the_one_that_answers() {
-        let (mut host, mut hw, mut join, mut jw, port) = pair();
-        // first candidate is a dead address (nothing listens on port 1), the second is the host
-        join.join_text(
-            &format!(
-                "lumen://join?h=127.0.0.1:1,127.0.0.1:{port}&t={}",
-                host.token
-            ),
-            "",
-        );
+    fn a_device_dials_universal_iroh_link_and_syncs() {
+        let (mut host, mut hw, mut join, mut jw, _ticket) = pair();
+        let link = host.iroh_link().expect("iroh_link");
+        join.join_text(&link, "");
         assert!(
             until(&mut host, &mut hw, &mut join, &mut jw, 12, |a, b| !b
                 .pages
                 .is_empty()
                 && a.pages.len() == b.pages.len()),
-            "did not connect through the second candidate"
+            "did not connect through the universal iroh link"
         );
         host.stop(true);
         join.stop(true);
@@ -5636,7 +5298,7 @@ mod tests {
     fn a_suggestion_waits_for_the_host_and_a_refusal_restores_the_joiner() {
         let (mut host, mut hw, mut join, mut jw, port) = pair();
         host.auto_admit = false;
-        join.join_addr(&format!("127.0.0.1:{port}"), &host.token.clone());
+        join.join_iroh(&port, &host.token.clone());
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(8) && host.requests.is_empty() {
             step(&mut host, &mut hw, &mut join, &mut jw);
@@ -5734,30 +5396,16 @@ mod tests {
     }
 
     #[test]
-    fn a_direct_link_names_its_relay_and_falls_back_to_it() {
+    fn universal_iroh_link_parses_ticket_and_token() {
         let ctx = egui::Context::default();
-        let mut host = Collab::new(&ctx);
-        host.relay_room = Some("ROOM123456".into());
-        host.addr_hint = vec!["127.0.0.1:1".into()];
-        host.ui.relay_url = "http://127.0.0.1:9".into();
-        let link = host.direct_link().expect("link");
-        assert!(link.contains("&rr=ROOM123456&rb="), "{link}");
         let mut join = Collab::new(&ctx);
+        let sk = iroh_transport::secret_key_from_seed([7u8; 32]);
+        let eid = sk.public().to_string();
+        let link = format!("lumen://join?iroh={eid}&t=ABCD123456");
         join.join_text(&link, "");
-        assert_eq!(
-            join.relay_fb,
-            Some(("http://127.0.0.1:9".to_owned(), "ROOM123456".to_owned()))
-        );
-        assert!(matches!(join.target, Some(Target::Addr { .. })));
-        // the direct dial fails: the very same join continues through the relay room
-        join.on_closed(
-            987_654,
-            "Could not reach that device on any of its addresses",
-        );
         assert!(
-            matches!(join.target, Some(Target::Relay { ref room, .. }) if room == "ROOM123456")
+            matches!(join.target, Some(Target::Iroh { ref ticket, ref token }) if ticket == &eid && token == "ABCD123456")
         );
-        assert!(join.relay_fb.is_none(), "one fall-back only, never a loop");
         join.stop(false);
     }
 
@@ -5776,5 +5424,68 @@ mod tests {
         publish(&c);
         assert!(follow_pointer(1).is_none());
         VIEW.with(|v| assert!(!v.borrow().follow_cursor));
+    }
+
+    #[test]
+    fn universal_nearby_prefers_lan_over_relay_and_accepts_browser_hosts() {
+        let mut c = Collab::new(&egui::Context::default());
+        let mut ws = crate::model::Workspace::blank("Test", false, 0);
+        // Browser host has port 0 and arrives via relay:ROOM
+        c.inbox.push(Event::Found(
+            Beacon {
+                v: PROTO,
+                id: 777,
+                device: "Chrome".into(),
+                name: "Ada".into(),
+                platform: "web".into(),
+                port: 0,
+                what: "Workspace".into(),
+                title: "Notes".into(),
+                people: 1,
+                iroh: String::new(),
+            },
+            "relay:ABCD1234".into(),
+        ));
+        // Native host arrives via LAN first, then via relay
+        c.inbox.push(Event::Found(
+            Beacon {
+                v: PROTO,
+                id: 888,
+                device: "Laptop".into(),
+                name: "Bob".into(),
+                platform: "windows".into(),
+                port: PORT,
+                what: "Page".into(),
+                title: "Plan".into(),
+                people: 2,
+                iroh: String::new(),
+            },
+            "192.168.1.42:47615".into(),
+        ));
+        c.inbox.push(Event::Found(
+            Beacon {
+                v: PROTO,
+                id: 888,
+                device: "Laptop".into(),
+                name: "Bob".into(),
+                platform: "windows".into(),
+                port: PORT,
+                what: "Page".into(),
+                title: "Plan".into(),
+                people: 3,
+                iroh: String::new(),
+            },
+            "relay:WXYZ9999".into(),
+        ));
+        c.poll(&mut ws, 1, None, &|_| false);
+        assert_eq!(c.found.len(), 2);
+        let web = c.found.iter().find(|f| f.beacon.id == 777).unwrap();
+        assert_eq!(web.ip, "relay:ABCD1234");
+        let lan = c.found.iter().find(|f| f.beacon.id == 888).unwrap();
+        assert_eq!(
+            lan.ip, "192.168.1.42:47615",
+            "direct LAN must win over relay"
+        );
+        assert_eq!(lan.beacon.people, 3);
     }
 }

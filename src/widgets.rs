@@ -96,31 +96,105 @@ pub fn popup_area_on(
 ) -> bool {
     let t = appear(ctx, id.with("appear"), 0.16);
     let screen = ctx.screen_rect();
-    // phones: a popup can never be wider than the screen
-    let width = width.min((screen.width() - 16.0).max(180.0));
-    let x = pos.x.min(screen.right() - width - 12.0).max(8.0);
-    // Keep the whole popup on screen: use the size measured on the previous frame.
-    let h = ctx.data(|d| d.get_temp::<f32>(id.with("h"))).unwrap_or(0.0);
-    let y = if h > 0.0 { pos.y.min(screen.bottom() - h - 10.0).max(8.0) } else { pos.y };
-    let resp = Area::new(id)
-        .order(order)
-        .fixed_pos(pos2(x, y + (1.0 - t) * -6.0))
-        .show(ctx, |ui| {
-            ui.set_opacity(t);
-            popup_frame(pal).show(ui, |ui| {
-                ui.set_width(width);
-                // a menu taller than the screen (phones, landscape) scrolls instead of running off it
-                let max_h = (screen.height() - 28.0).max(140.0);
-                egui::ScrollArea::vertical().id_salt(id.with("popup_scroll")).max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
-                    add(ui);
-                });
+    let mobile_sheet = screen.width() < 600.0 && width >= 190.0;
+    let mut scrim_clicked = false;
+    let resp = if mobile_sheet {
+        // Dimmed backdrop scrim behind mobile bottom sheet (absorbs outside taps so they don't hit drawer/page behind)
+        let scrim = Area::new(id.with("scrim"))
+            .order(order)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (r, sr) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter()
+                    .rect_filled(r, 0.0, Color32::from_black_alpha((92.0 * t) as u8));
+                if sr.clicked() && !*fresh {
+                    scrim_clicked = true;
+                }
             });
-        });
+        ctx.raise_layer(scrim.response.layer_id);
+
+        let sheet_w = (screen.width() - 12.0).max(200.0);
+        let max_h = (screen.height() * 0.68).max(180.0);
+        let slide = (1.0 - t) * 28.0;
+        let frame = Frame::NONE
+            .fill(pal.popup)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .corner_radius(CornerRadius {
+                nw: 16,
+                ne: 16,
+                sw: 10,
+                se: 10,
+            })
+            .inner_margin(Margin {
+                left: 12,
+                right: 12,
+                top: 4,
+                bottom: 14,
+            })
+            .shadow(egui::epaint::Shadow {
+                offset: [0, -6],
+                blur: 24,
+                spread: 0,
+                color: Color32::from_black_alpha(70),
+            });
+        Area::new(id)
+            .order(order)
+            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -6.0 + slide))
+            .show(ctx, |ui| {
+                ui.set_opacity(t);
+                frame.show(ui, |ui| {
+                    ui.set_width((sheet_w - 24.0).max(180.0));
+                    // Subtle top drag handle pill
+                    let (hr, _) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 8.0), Sense::hover());
+                    ui.painter().rect_filled(
+                        Rect::from_center_size(hr.center(), vec2(36.0, 3.5)),
+                        2.0,
+                        with_alpha(pal.muted, 0.45),
+                    );
+                    ui.add_space(2.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt(id.with("popup_scroll"))
+                        .max_height(max_h)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            add(ui);
+                        });
+                });
+            })
+    } else {
+        // Desktop / compact popover: anchored cleanly near trigger
+        let width = width.min((screen.width() - 16.0).max(180.0));
+        let x = pos.x.min(screen.right() - width - 12.0).max(8.0);
+        let h = ctx.data(|d| d.get_temp::<f32>(id.with("h"))).unwrap_or(0.0);
+        let y = if h > 0.0 {
+            pos.y.min(screen.bottom() - h - 10.0).max(8.0)
+        } else {
+            pos.y
+        };
+        Area::new(id)
+            .order(order)
+            .fixed_pos(pos2(x, y + (1.0 - t) * -6.0))
+            .show(ctx, |ui| {
+                ui.set_opacity(t);
+                popup_frame(pal).show(ui, |ui| {
+                    ui.set_width(width);
+                    let max_h = (screen.height() - 28.0).max(140.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt(id.with("popup_scroll"))
+                        .max_height(max_h)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            add(ui);
+                        });
+                });
+            })
+    };
     // Always draw popups above everything else (modal backdrops included).
     ctx.raise_layer(resp.response.layer_id);
     let rect = resp.response.rect;
     ctx.data_mut(|d| d.insert_temp(id.with("h"), rect.height()));
-    let mut open = true;
+    let mut open = !scrim_clicked;
     if ctx.input(|i| i.pointer.any_pressed()) && !*fresh {
         if let Some(p) = ctx.pointer_interact_pos() {
             if !rect.contains(p) {
@@ -212,9 +286,21 @@ pub fn menu_item(
     danger: bool,
 ) -> Response {
     let tt = crate::touch::touchy();
-    let h = if sub.is_some() { if tt { 54.0 } else { 46.0 } } else if tt { 40.0 } else { 30.0 };
+    let h = if sub.is_some() {
+        if tt {
+            54.0
+        } else {
+            46.0
+        }
+    } else if tt {
+        40.0
+    } else {
+        30.0
+    };
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || selected, 0.1);
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id, resp.hovered() || selected, 0.1);
     let p = ui.painter();
     if t > 0.0 {
         p.rect_filled(rect, 6.0, with_alpha(pal.hover, t));
@@ -222,29 +308,88 @@ pub fn menu_item(
     let col = if danger { pal.danger } else { pal.text };
     let mut x = rect.left() + 8.0;
     if !lead.is_empty() {
-        let is_icon = lead.chars().next().map_or(false, |c| (0xE000..=0xF8FF).contains(&(c as u32)));
+        let is_icon = lead
+            .chars()
+            .next()
+            .map_or(false, |c| (0xE000..=0xF8FF).contains(&(c as u32)));
         if sub.is_some() {
             let b = Rect::from_center_size(pos2(x + 17.0, rect.center().y), vec2(34.0, 34.0));
             p.rect_filled(b, 6.0, pal.bg);
-            p.rect_stroke(b, 6.0, Stroke::new(1.0_f32, pal.border), egui::StrokeKind::Inside);
-            let f = if is_icon { icons::font(17.0) } else { bold(13.0) };
-            p.text(b.center(), Align2::CENTER_CENTER, lead, f, lerp_color(col, pal.accent, t * 0.6));
+            p.rect_stroke(
+                b,
+                6.0,
+                Stroke::new(1.0_f32, pal.border),
+                egui::StrokeKind::Inside,
+            );
+            let f = if is_icon {
+                icons::font(17.0)
+            } else {
+                bold(13.0)
+            };
+            let ic_col = lerp_color(col, pal.accent, t * 0.6);
+            if lead == crate::lucide::SPARKLES {
+                icons::paint_ai_emblem(p, b.center(), 17.5, ic_col);
+            } else {
+                p.text(b.center(), Align2::CENTER_CENTER, lead, f, ic_col);
+            }
             x += 44.0;
         } else {
-            let f = if is_icon { icons::font(15.5) } else { bold(12.5) };
-            let ic = if danger { pal.danger } else { lerp_color(pal.muted, pal.text, t) };
-            p.text(pos2(x + 9.0, rect.center().y), Align2::CENTER_CENTER, lead, f, ic);
+            let f = if is_icon {
+                icons::font(15.5)
+            } else {
+                bold(12.5)
+            };
+            let ic = if danger {
+                pal.danger
+            } else {
+                lerp_color(pal.muted, pal.text, t)
+            };
+            if lead == crate::lucide::SPARKLES {
+                icons::paint_ai_emblem(p, pos2(x + 9.0, rect.center().y), 16.0, ic);
+            } else {
+                p.text(
+                    pos2(x + 9.0, rect.center().y),
+                    Align2::CENTER_CENTER,
+                    lead,
+                    f,
+                    ic,
+                );
+            }
             x += 28.0;
         }
     }
     match sub {
         Some(s) => {
             let mw = rect.right() - x - 8.0;
-            text_fit(p, pos2(x, rect.center().y - 8.0), Align2::LEFT_CENTER, label, body(14.0), col, mw);
-            text_fit(p, pos2(x, rect.center().y + 9.0), Align2::LEFT_CENTER, s, body(12.0), pal.muted, mw);
+            text_fit(
+                p,
+                pos2(x, rect.center().y - 8.0),
+                Align2::LEFT_CENTER,
+                label,
+                body(14.0),
+                col,
+                mw,
+            );
+            text_fit(
+                p,
+                pos2(x, rect.center().y + 9.0),
+                Align2::LEFT_CENTER,
+                s,
+                body(12.0),
+                pal.muted,
+                mw,
+            );
         }
         None => {
-            text_fit(p, pos2(x, rect.center().y), Align2::LEFT_CENTER, label, body(14.0), col, rect.right() - x - 8.0);
+            text_fit(
+                p,
+                pos2(x, rect.center().y),
+                Align2::LEFT_CENTER,
+                label,
+                body(14.0),
+                col,
+                rect.right() - x - 8.0,
+            );
         }
     }
     resp.on_hover_cursor(CursorIcon::PointingHand)
@@ -424,7 +569,14 @@ impl CtxItem {
 
 /// Animated right-click menu. Returns `(still_open, picked_index)`.
 /// Flips to stay on screen, supports ↑/↓/Enter, closes on Esc or when clicking elsewhere.
-pub fn context_menu(ctx: &Context, id: Id, pos: Pos2, pal: &Palette, fresh: &mut bool, items: &[CtxItem]) -> (bool, Option<usize>) {
+pub fn context_menu(
+    ctx: &Context,
+    id: Id,
+    pos: Pos2,
+    pal: &Palette,
+    fresh: &mut bool,
+    items: &[CtxItem],
+) -> (bool, Option<usize>) {
     const W: f32 = 236.0;
     let t = appear(ctx, id.with("appear"), 0.14);
     let screen = ctx.screen_rect();
@@ -470,42 +622,160 @@ pub fn context_menu(ctx: &Context, id: Id, pos: Pos2, pal: &Palette, fresh: &mut
         }
     }
 
-    let resp = Area::new(id).order(HOST_ORDER).fixed_pos(pos2(x, y + slide)).show(ctx, |ui| {
+    let hide_shortcuts = screen.width() < 600.0 || crate::touch::touchy();
+    let mobile_sheet = screen.width() < 600.0 && items.len() > 5;
+    let row_w = if mobile_sheet {
+        (screen.width() - 36.0).max(200.0)
+    } else {
+        W
+    };
+    let row_h = if hide_shortcuts { 38.0 } else { 30.0 };
+    let mut scrim_clicked = false;
+    if mobile_sheet {
+        let scrim = Area::new(id.with("ctx_scrim"))
+            .order(HOST_ORDER)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (r, sr) = ui.allocate_exact_size(screen.size(), Sense::click());
+                ui.painter()
+                    .rect_filled(r, 0.0, Color32::from_black_alpha((92.0 * t) as u8));
+                if sr.clicked() && !*fresh {
+                    scrim_clicked = true;
+                }
+            });
+        ctx.raise_layer(scrim.response.layer_id);
+    }
+    let area = if mobile_sheet {
+        Area::new(id)
+            .order(HOST_ORDER)
+            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -6.0 + (1.0 - t) * 28.0))
+    } else {
+        Area::new(id)
+            .order(HOST_ORDER)
+            .fixed_pos(pos2(x, y + slide))
+    };
+    let frame = if mobile_sheet {
+        Frame::NONE
+            .fill(pal.popup)
+            .stroke(Stroke::new(1.0_f32, pal.border))
+            .corner_radius(CornerRadius {
+                nw: 16,
+                ne: 16,
+                sw: 10,
+                se: 10,
+            })
+            .inner_margin(Margin {
+                left: 12,
+                right: 12,
+                top: 4,
+                bottom: 14,
+            })
+    } else {
+        popup_frame(pal).inner_margin(Margin::same(6))
+    };
+    let resp = area.show(ctx, |ui| {
         ui.set_opacity(t);
-        popup_frame(pal).inner_margin(Margin::same(6)).show(ui, |ui| {
-            ui.set_width(W);
-            ui.spacing_mut().item_spacing.y = 0.0;
-            for (i, it) in items.iter().enumerate() {
-                if it.sep && i > 0 {
-                    ui.add_space(3.0);
-                    let r = ui.available_rect_before_wrap();
-                    ui.painter().hline(r.x_range().shrink(6.0), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
-                    ui.add_space(4.0);
-                }
-                let (rect, r) = ui.allocate_exact_size(vec2(W, 30.0), if it.enabled { Sense::click() } else { Sense::hover() });
-                if r.hovered() && it.enabled {
-                    sel = Some(i);
-                }
-                let active = sel == Some(i) && it.enabled;
-                let h = ui.ctx().animate_bool_with_time(r.id, active, 0.09);
-                let p = ui.painter();
-                if h > 0.0 {
-                    let base = if it.danger { pal.danger.gamma_multiply(0.14) } else { pal.hover };
-                    p.rect_filled(rect, 6.0, with_alpha(base, h));
-                }
-                let dim = if it.enabled { 1.0 } else { 0.38 };
-                let col = if it.danger { pal.danger } else { pal.text };
-                let ic = if it.danger { pal.danger } else { lerp_color(pal.muted, pal.text, h) };
-                p.text(pos2(rect.left() + 17.0, rect.center().y), Align2::CENTER_CENTER, it.icon, icons::font(15.5), with_alpha(ic, dim));
-                let mut hint_w = 0.0;
-                if !it.hint.is_empty() {
-                    hint_w = text_fit(p, pos2(rect.right() - 10.0, rect.center().y), Align2::RIGHT_CENTER, it.hint, body(11.5), with_alpha(pal.muted, 0.9 * dim), 90.0) + 12.0;
-                }
-                text_fit(p, pos2(rect.left() + 36.0, rect.center().y), Align2::LEFT_CENTER, it.label, body(14.0), with_alpha(col, dim), W - 46.0 - hint_w);
-                if r.on_hover_cursor(if it.enabled { CursorIcon::PointingHand } else { CursorIcon::Default }).clicked() && it.enabled {
-                    picked = Some(i);
-                }
+        frame.show(ui, |ui| {
+            ui.set_width(row_w);
+            if mobile_sheet {
+                let (hr, _) = ui.allocate_exact_size(vec2(row_w, 12.0), Sense::hover());
+                ui.painter().rect_filled(
+                    Rect::from_center_size(hr.center(), vec2(36.0, 4.0)),
+                    2.0,
+                    with_alpha(pal.muted, 0.45),
+                );
+                ui.add_space(4.0);
             }
+            egui::ScrollArea::vertical()
+                .id_salt(id.with("ctx_scroll"))
+                .max_height(if mobile_sheet {
+                    (screen.height() * 0.54).max(160.0)
+                } else {
+                    (screen.height() - 24.0).max(160.0)
+                })
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for (i, it) in items.iter().enumerate() {
+                        if it.sep && i > 0 {
+                            ui.add_space(3.0);
+                            let r = ui.available_rect_before_wrap();
+                            ui.painter().hline(
+                                r.x_range().shrink(6.0),
+                                ui.cursor().top(),
+                                Stroke::new(1.0_f32, pal.border),
+                            );
+                            ui.add_space(4.0);
+                        }
+                        let (rect, r) = ui.allocate_exact_size(
+                            vec2(row_w, row_h),
+                            if it.enabled {
+                                Sense::click()
+                            } else {
+                                Sense::hover()
+                            },
+                        );
+                        if r.hovered() && it.enabled {
+                            sel = Some(i);
+                        }
+                        let active = sel == Some(i) && it.enabled;
+                        let h = ui.ctx().animate_bool_with_time(r.id, active, 0.09);
+                        let p = ui.painter();
+                        if h > 0.0 {
+                            let base = if it.danger {
+                                pal.danger.gamma_multiply(0.14)
+                            } else {
+                                pal.hover
+                            };
+                            p.rect_filled(rect, 6.0, with_alpha(base, h));
+                        }
+                        let dim = if it.enabled { 1.0 } else { 0.38 };
+                        let col = if it.danger { pal.danger } else { pal.text };
+                        let ic = if it.danger {
+                            pal.danger
+                        } else {
+                            lerp_color(pal.muted, pal.text, h)
+                        };
+                        p.text(
+                            pos2(rect.left() + 17.0, rect.center().y),
+                            Align2::CENTER_CENTER,
+                            it.icon,
+                            icons::font(15.5),
+                            with_alpha(ic, dim),
+                        );
+                        let mut hint_w = 0.0;
+                        if !it.hint.is_empty() && !hide_shortcuts {
+                            hint_w = text_fit(
+                                p,
+                                pos2(rect.right() - 10.0, rect.center().y),
+                                Align2::RIGHT_CENTER,
+                                it.hint,
+                                body(11.5),
+                                with_alpha(pal.muted, 0.9 * dim),
+                                90.0,
+                            ) + 12.0;
+                        }
+                        text_fit(
+                            p,
+                            pos2(rect.left() + 36.0, rect.center().y),
+                            Align2::LEFT_CENTER,
+                            it.label,
+                            body(14.0),
+                            with_alpha(col, dim),
+                            row_w - 46.0 - hint_w,
+                        );
+                        if r.on_hover_cursor(if it.enabled {
+                            CursorIcon::PointingHand
+                        } else {
+                            CursorIcon::Default
+                        })
+                        .clicked()
+                            && it.enabled
+                        {
+                            picked = Some(i);
+                        }
+                    }
+                });
         });
     });
     ctx.raise_layer(resp.response.layer_id);
@@ -520,7 +790,7 @@ pub fn context_menu(ctx: &Context, id: Id, pos: Pos2, pal: &Palette, fresh: &mut
         }
     });
 
-    let mut open = true;
+    let mut open = !scrim_clicked;
     if !*fresh {
         if ctx.input(|i| i.pointer.any_pressed()) {
             if let Some(p) = ctx.pointer_interact_pos() {

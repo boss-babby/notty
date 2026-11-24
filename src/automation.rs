@@ -671,6 +671,9 @@ impl Runtime {
 
     /// Rate limit: a rule may run at most 12 times per minute for the same row (protects against A→B→A loops).
     fn allow(&mut self, rule: u64, row: u64, now: f64) -> bool {
+        if self.guard.len() > 256 {
+            self.guard.retain(|_, (t, _)| now - *t <= 60_000.0);
+        }
         let e = self.guard.entry((rule, row)).or_insert((now, 0));
         if now - e.0 > 60_000.0 {
             *e = (now, 0);
@@ -1196,23 +1199,61 @@ pub fn render(ws: &Workspace, row: Option<u64>, tpl: &str) -> String {
         return tpl.to_owned();
     }
     let now_clock = dates::hhmm(dates::now_local_min().rem_euclid(1440) as u16);
-    let mut s = tpl.replace("{today}", &dates::pretty(&dates::today_iso())).replace("{now}", &format!("{} {now_clock}", dates::pretty(&dates::today_iso())));
+    let mut s = tpl
+        .replace("{today}", &dates::pretty(&dates::today_iso()))
+        .replace(
+            "{now}",
+            &format!("{} {now_clock}", dates::pretty(&dates::today_iso())),
+        );
     if let Some(p) = row.and_then(|r| ws.page(r)) {
-        s = s.replace("{title}", if p.title.is_empty() { "Untitled" } else { &p.title });
+        s = s.replace(
+            "{title}",
+            if p.title.is_empty() {
+                "Untitled"
+            } else {
+                &p.title
+            },
+        );
         if let Some(db) = p.parent.and_then(|d| ws.db(d)) {
             if s.contains("{db}") {
-                s = s.replace("{db}", &p.parent.map(|d| ws.display_title(d)).unwrap_or_default());
+                s = s.replace(
+                    "{db}",
+                    &p.parent.map(|d| ws.display_title(d)).unwrap_or_default(),
+                );
             }
             if let Some(dp) = db.first_of(PropKind::Date) {
                 if let Some(Val::Text(v)) = p.props.get(&dp) {
                     s = s.replace("{date}", &dates::pretty(v));
                 }
             }
-            while let Some(a) = s.find("{prop:") {
-                let Some(len) = s[a..].find('}') else { break };
-                let name = s[a + 6..a + len].to_owned();
-                let val = db.props.iter().find(|pr| pr.name.eq_ignore_ascii_case(&name)).and_then(|pr| p.props.get(&pr.id).map(|v| db.val_text(pr.id, v))).unwrap_or_default();
-                s.replace_range(a..a + len + 1, &val);
+            if s.contains("{prop:") {
+                let mut out = String::with_capacity(s.len());
+                let mut rest = s.as_str();
+                while let Some(a) = rest.find("{prop:") {
+                    out.push_str(&rest[..a]);
+                    let after = &rest[a + 6..];
+                    let Some(end) = after.find('}') else {
+                        out.push_str(&rest[a..]);
+                        rest = "";
+                        break;
+                    };
+                    let name = &after[..end];
+                    let val = db
+                        .props
+                        .iter()
+                        .find(|pr| pr.name.eq_ignore_ascii_case(name))
+                        .and_then(|pr| p.props.get(&pr.id).map(|v| db.val_text(pr.id, v)))
+                        .unwrap_or_default();
+                    out.push_str(&val);
+                    rest = &after[end + 1..];
+                    if out.len() >= 32_768 {
+                        break;
+                    }
+                }
+                if out.len() < 32_768 {
+                    out.push_str(rest);
+                }
+                s = out;
             }
         }
     }

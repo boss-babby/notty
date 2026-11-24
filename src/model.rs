@@ -924,17 +924,49 @@ pub const ICONS: [&str; 36] = [
 pub const TEMPLATES: [(&str, &str, &str); 13] = [
     ("Meeting notes", "📝", "Agenda, notes and action items."),
     ("Weekly planner", "📅", "Plan every day of the week."),
-    ("Project tracker", "🎯", "Database with table, board and calendar views."),
+    (
+        "Project tracker",
+        "🎯",
+        "Database with table, board and calendar views.",
+    ),
     ("Task list", "✅", "Tasks with due dates and tags."),
-    ("Reading list", "📚", "Books with status, author and rating."),
+    (
+        "Reading list",
+        "📚",
+        "Books with status, author and rating.",
+    ),
     ("Journal entry", "📖", "Daily reflection prompts."),
     ("Team wiki", "🏠", "Docs home with contents and FAQ."),
-    ("Product spec", "📋", "Problem, goals, requirements, launch plan."),
-    ("Sales CRM", "💼", "Contacts + deals pipeline: stages, value, win probability, weighted forecast, relations."),
-    ("Support tickets", "🎧", "Ticket board with priority, customer, assignee and due-date calendar."),
-    ("Recruiting pipeline", "👥", "Candidates through screening, interview and offer, with rating, role and source."),
-    ("Content calendar", "📣", "Ideas to published posts by channel, with board, table and calendar views."),
-    ("OKRs & goals", "🏆", "Objectives with quarter, owner, status and progress — charted on the dashboard."),
+    (
+        "Product spec",
+        "📋",
+        "Problem, goals, requirements, launch plan.",
+    ),
+    (
+        "Sales CRM",
+        "💼",
+        "Contacts + deals pipeline: stages, value, win probability, weighted forecast, relations.",
+    ),
+    (
+        "Support tickets",
+        "🎧",
+        "Ticket board with priority, customer, assignee and due-date calendar.",
+    ),
+    (
+        "Recruiting pipeline",
+        "👥",
+        "Candidates through screening, interview and offer, with rating, role and source.",
+    ),
+    (
+        "Content calendar",
+        "📣",
+        "Ideas to published posts by channel, with board, table and calendar views.",
+    ),
+    (
+        "OKRs & goals",
+        "🏆",
+        "Objectives with quarter, owner, status and progress — charted on the dashboard.",
+    ),
 ];
 
 pub(crate) fn blank_page(id: u64, parent: Option<u64>, kind: PageKind) -> Page {
@@ -998,25 +1030,49 @@ impl Workspace {
     /// database / dashboard used to be O(rows²)). The map is *validated* on every hit (`pages[i].id == id`) and rebuilt on a miss, so it
     /// is always correct no matter how `pages` was mutated.
     fn index_of(&self, id: u64) -> Option<usize> {
-        thread_local! {
-            static IDX: std::cell::RefCell<std::collections::HashMap<u64, usize>> = std::cell::RefCell::new(std::collections::HashMap::new());
+        if id == 0 {
+            return None;
         }
         if self.pages.len() < 24 {
             return self.pages.iter().position(|p| p.id == id);
         }
+        struct Cache {
+            sig: (usize, usize, u64, u64, u64),
+            map: std::collections::HashMap<u64, usize>,
+        }
+        thread_local! {
+            static IDX: std::cell::RefCell<Cache> = std::cell::RefCell::new(Cache {
+                sig: (0, 0, 0, 0, 0),
+                map: std::collections::HashMap::new(),
+            });
+        }
+        let first = self.pages.first().map_or(0, |p| p.id);
+        let last = self.pages.last().map_or(0, |p| p.id);
+        let sig = (
+            self.pages.as_ptr() as usize,
+            self.pages.len(),
+            self.next_id,
+            first,
+            last,
+        );
         IDX.with(|c| {
             let mut c = c.borrow_mut();
-            if let Some(&i) = c.get(&id) {
-                if self.pages.get(i).map_or(false, |p| p.id == id) {
-                    return Some(i);
+            if c.sig == sig {
+                if let Some(&i) = c.map.get(&id) {
+                    if self.pages.get(i).map_or(false, |p| p.id == id) {
+                        return Some(i);
+                    }
+                } else {
+                    return None;
                 }
             }
-            c.clear();
-            c.reserve(self.pages.len());
+            c.map.clear();
+            c.map.reserve(self.pages.len());
             for (i, p) in self.pages.iter().enumerate().rev() {
-                c.insert(p.id, i);
+                c.map.insert(p.id, i);
             }
-            c.get(&id).copied()
+            c.sig = sig;
+            c.map.get(&id).copied()
         })
     }
 
