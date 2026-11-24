@@ -100,6 +100,8 @@ pub(crate) enum A {
     AddRow(Option<(u64, Val)>),
     DelRow(u64),
     Open(u64),
+    /// Open a row as a full page (never the side peek).
+    OpenPage(u64),
     SetActive(usize),
     /// View index, property id (0 = name column), width (0 = reset).
     SetColW(usize, u64, f32),
@@ -346,6 +348,7 @@ fn row_menu(ui: &mut Ui, ws: &Workspace, st: &mut DbState, pal: &Palette, acts: 
     };
     let title = row.title.clone();
     let items = [
+        CtxItem::new(l::PANEL_RIGHT, "Open in side peek"),
         CtxItem::new(l::FILE_TEXT, "Open as page"),
         CtxItem::new(l::COPY_PLUS, "Duplicate"),
         CtxItem::new(l::COPY, "Copy title").enabled(!title.is_empty()),
@@ -354,9 +357,10 @@ fn row_menu(ui: &mut Ui, ws: &Workspace, st: &mut DbState, pal: &Palette, acts: 
     let (open, pick) = context_menu(ui.ctx(), sid("db_row_menu"), pos, pal, &mut st.rmenu_fresh, &items);
     match pick {
         Some(0) => acts.push(A::Open(rid)),
-        Some(1) => acts.push(A::DupRow(rid)),
-        Some(2) => ui.ctx().copy_text(title),
-        Some(3) => acts.push(A::DelRow(rid)),
+        Some(1) => acts.push(A::OpenPage(rid)),
+        Some(2) => acts.push(A::DupRow(rid)),
+        Some(3) => ui.ctx().copy_text(title),
+        Some(4) => acts.push(A::DelRow(rid)),
         _ => {}
     }
     if !open {
@@ -2403,7 +2407,8 @@ fn apply(ws: &mut Workspace, db_id: u64, a: A, ed: &mut EditorState) {
             ed.db.rmenu = Some((r, pos));
             ed.db.rmenu_fresh = true;
         }
-        A::Open(r) => ed.nav = Some(r),
+        A::Open(r) => ed.peek = Some(r),
+        A::OpenPage(r) => ed.nav = Some(r),
         A::SetColW(vi, key, w) => {
             if let Some(v) = ws.db_mut(db_id).and_then(|d| d.views.get_mut(vi)) {
                 if w <= 0.0 {

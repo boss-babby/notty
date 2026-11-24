@@ -42,6 +42,11 @@ pub fn db_table_md(ws: &Workspace, id: u64) -> String {
 
 /// Page → Markdown (databases become a table).
 pub fn page_markdown(ws: &Workspace, id: u64) -> String {
+    page_markdown_with(ws, id, &|_| None)
+}
+
+/// Like [`page_markdown`]; `asset` maps a local media id to a relative path (vault export), `None` keeps the placeholder.
+pub fn page_markdown_with(ws: &Workspace, id: u64, asset: &dyn Fn(u64) -> Option<String>) -> String {
     let Some(p) = ws.page(id) else { return String::new() };
     let mut out = String::new();
     if !p.title.is_empty() {
@@ -92,9 +97,12 @@ pub fn page_markdown(ws: &Workspace, id: u64) -> String {
             BlockKind::Equation => format!("{pad}$$\n{}\n{pad}$$", b.text),
             BlockKind::Divider => format!("{pad}---"),
             BlockKind::Toc => String::new(),
-            BlockKind::Image => format!("{pad}![{}]({})", b.text, if b.media != 0 { "(embedded image)".to_owned() } else { b.url.clone() }),
+            BlockKind::Image => format!("{pad}![{}]({})", b.text, if b.media != 0 { asset(b.media).unwrap_or_else(|| "(embedded image)".to_owned()) } else { b.url.clone() }),
             BlockKind::Embed | BlockKind::Bookmark => format!("{pad}[{}]({})", if b.text.is_empty() { b.url.as_str() } else { b.text.as_str() }, b.url),
-            BlockKind::File => format!("{pad}📎 {}", if b.url.is_empty() { b.text.clone() } else { format!("[{}]({})", b.text, b.url) }),
+            BlockKind::File => match (b.media != 0).then(|| asset(b.media)).flatten() {
+                Some(path) => format!("{pad}📎 [{}]({})", if b.text.is_empty() { "file" } else { b.text.as_str() }, path),
+                None => format!("{pad}📎 {}", if b.url.is_empty() { b.text.clone() } else { format!("[{}]({})", b.text, b.url) }),
+            },
             BlockKind::PageLink => format!("{pad}[{}]", b.link.map(|l| ws.display_title(l)).unwrap_or_else(|| "Missing page".into())),
             BlockKind::Columns | BlockKind::Column => String::new(),
             BlockKind::Widget => format!("{pad}[Dashboard widget]"),

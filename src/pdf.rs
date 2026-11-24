@@ -90,6 +90,8 @@ pub struct Request {
     pub key: u64,
     pub title: String,
     pub source: Option<Source>,
+    /// Deep link target: (zero-based page, annotation id) to jump to and select once the document is loaded.
+    pub start: Option<(usize, u64)>,
 }
 
 pub fn key_of(s: &str) -> u64 {
@@ -225,6 +227,8 @@ struct Tile {
 type TileKey = (usize, u32, u16, u16, bool, u32);
 
 struct Reader {
+    /// Deep link waiting for the document to load: (page, annotation).
+    start: Option<(usize, u64)>,
     key: u64,
     title: String,
     remote: Option<String>,
@@ -322,6 +326,7 @@ impl Reader {
             None => (Load::Failed("Nothing to show".into()), None),
         };
         let r = Reader {
+            start: req.start.take(),
             key: req.key,
             title: req.title.clone(),
             remote,
@@ -946,7 +951,13 @@ pub fn reader_ui(ctx: &Context, req: &mut Option<Request>, annots: &mut BTreeMap
             *g = Some(Reader::new(r, annots.get(&r.key).cloned().unwrap_or_default()));
         }
         let rd = g.as_mut().expect("reader");
+        if let Some(s) = r.start.take() {
+            rd.start = Some(s);
+        }
         let keep = draw(rd, ctx, pal);
+        if std::mem::take(&mut rd.notes.extract) {
+            crate::extract::queue(crate::extract::Extract { key: rd.key, title: rd.title.clone(), list: rd.notes.list.clone() });
+        }
         if rd.notes.dirty {
             rd.notes.dirty = false;
             if rd.notes.list.is_empty() {
@@ -1007,6 +1018,13 @@ fn draw(rd: &mut Reader, ctx: &Context, pal: &Palette) -> bool {
     let mut goto_req: Option<usize> = None;
     let mut fit: Option<bool> = None;
     let mut scroll_by: Option<f32> = None;
+    // deep link (`lumenpdf://…`): jump to the page as soon as the document is laid out and select the annotation
+    if rd.engine.is_some() {
+        if let Some((page, annot)) = rd.start.take() {
+            goto_req = Some(page);
+            rd.notes.focus(annot);
+        }
+    }
     let editing = ctx.memory(|m| m.focused()).is_some();
     if ctx.input(|i| !i.events.is_empty() || i.pointer.velocity().length() > 0.0 || i.smooth_scroll_delta != Vec2::ZERO) {
         rd.active_at = now_ms();
@@ -1969,7 +1987,7 @@ mod tests {
     fn opening_thumbnails_and_notes_does_not_change_the_page() {
         let ctx = Context::default();
         crate::theme::setup_fonts(&ctx);
-        let mut req = Some(Request { key: 11, title: "long.pdf".into(), source: Some(Source::Local(multi_pdf(40).into())) });
+        let mut req = Some(Request { key: 11, title: "long.pdf".into(), source: Some(Source::Local(multi_pdf(40).into())), start: None });
         let mut annots = BTreeMap::new();
         let mut t = 0.0;
         let size = vec2(1280.0, 800.0);
@@ -2018,7 +2036,7 @@ mod tests {
     fn reader_is_pixel_exact_annotates_and_cleans_up() {
         let ctx = Context::default();
         crate::theme::setup_fonts(&ctx);
-        let mut req = Some(Request { key: 7, title: "t.pdf".into(), source: Some(Source::Local(tiny_pdf().into())) });
+        let mut req = Some(Request { key: 7, title: "t.pdf".into(), source: Some(Source::Local(tiny_pdf().into())), start: None });
         let mut annots = BTreeMap::new();
         let mut t = 0.0;
         for size in [vec2(1280.0, 800.0), vec2(360.0, 640.0)] {
@@ -2073,7 +2091,7 @@ mod tests {
         run(&ctx, &mut req, &mut annots, &mut t, size, vec![]);
         assert!(READER.with(|c| c.borrow().is_none()), "reader state is dropped on close");
         // re-open: annotations come back
-        req = Some(Request { key: 7, title: "t.pdf".into(), source: Some(Source::Local(tiny_pdf().into())) });
+        req = Some(Request { key: 7, title: "t.pdf".into(), source: Some(Source::Local(tiny_pdf().into())), start: None });
         for _ in 0..4 {
             run(&ctx, &mut req, &mut annots, &mut t, size, vec![]);
         }
@@ -2110,7 +2128,7 @@ mod tests {
     fn text_can_be_selected_copied_and_highlighted() {
         let ctx = Context::default();
         crate::theme::setup_fonts(&ctx);
-        let mut req = Some(Request { key: 9, title: "t.pdf".into(), source: Some(Source::Local(tiny_pdf().into())) });
+        let mut req = Some(Request { key: 9, title: "t.pdf".into(), source: Some(Source::Local(tiny_pdf().into())), start: None });
         let mut annots = BTreeMap::new();
         let mut t = 0.0;
         let size = vec2(1280.0, 800.0);

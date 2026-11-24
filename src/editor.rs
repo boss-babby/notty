@@ -119,6 +119,10 @@ pub struct EditorState {
     /// PDF reader: "open this" request from a block (media id, url, title) and the active reader request.
     pub pdf_ask: Option<(u64, String, String)>,
     pub pdf_req: Option<crate::pdf::Request>,
+    /// A `lumenpdf://…` deep link that was clicked (see `extract.rs`): the app opens the reader on that page.
+    pub pdf_link: Option<String>,
+    /// A database row that was clicked: opens in the right-hand side peek (`peek.rs`) unless the user prefers full pages.
+    pub peek: Option<u64>,
     /// History tracking (see `history.rs`): page, previous blocks, fingerprints, last change, dirty-since.
     pub hist_page: u64,
     pub hist_prev: Vec<Block>,
@@ -4179,6 +4183,7 @@ fn text_edit(
         if resp.clicked() {
             match link_hit {
                 Some(url) if url.starts_with("wiki:") => ed.wiki = Some(url[5..].to_owned()),
+                Some(url) if url.starts_with(crate::extract::SCHEME) => ed.pdf_link = Some(url),
                 Some(url) => platform::open_url(&ctx, &url),
                 None => ed.focus = Some((b.id, usize::MAX)),
             }

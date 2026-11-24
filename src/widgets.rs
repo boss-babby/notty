@@ -511,14 +511,15 @@ pub fn menu_item(
     danger: bool,
 ) -> Response {
     let tt = crate::touch::touchy();
+    // touch targets: Notion's phone sheet uses ≈ 56 dp rows; two-line rows get a little more
     let h = if sub.is_some() {
         if tt {
-            54.0
+            60.0
         } else {
             46.0
         }
     } else if tt {
-        40.0
+        50.0
     } else {
         30.0
     };
@@ -1518,4 +1519,27 @@ pub fn universal_text_menu(ctx: &Context, pal: &Palette) {
     if !open {
         ctx.data_mut(|d| d.remove::<UMenu>(mkey));
     }
+}
+
+/// A row with a switch on the right (Notion's "Available offline" style). The caller flips the value when the row is clicked.
+pub fn menu_switch(ui: &mut Ui, pal: &Palette, lead: &str, label: &str, on: bool) -> Response {
+    let tt = crate::touch::touchy();
+    let h = if tt { 52.0 } else { 32.0 };
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
+    let t = ui.ctx().animate_bool_with_time(resp.id.with("hover"), resp.hovered(), 0.1);
+    let k = ui.ctx().animate_bool_with_time(resp.id.with("on"), on, 0.14);
+    let p = ui.painter();
+    if t > 0.0 {
+        p.rect_filled(rect, 6.0, with_alpha(pal.hover, t));
+    }
+    let is_icon = lead.chars().next().map_or(false, |c| (0xE000..=0xF8FF).contains(&(c as u32)));
+    let f = if is_icon { icons::font(16.0) } else { bold(13.0) };
+    p.text(pos2(rect.left() + 20.0, rect.center().y), Align2::CENTER_CENTER, lead, f, pal.muted);
+    p.text(pos2(rect.left() + 40.0, rect.center().y), Align2::LEFT_CENTER, label, body(if tt { 15.0 } else { 13.5 }), pal.text);
+    let sw = vec2(if tt { 46.0 } else { 34.0 }, if tt { 28.0 } else { 20.0 });
+    let sr = Rect::from_center_size(pos2(rect.right() - 8.0 - sw.x / 2.0, rect.center().y), sw);
+    p.rect_filled(sr, sw.y / 2.0, lerp_color(pal.active, pal.accent, k));
+    let cx = sr.left() + sw.y / 2.0 + k * (sw.x - sw.y);
+    p.circle_filled(pos2(cx, sr.center().y), sw.y / 2.0 - 3.0, Color32::WHITE);
+    resp.on_hover_cursor(CursorIcon::PointingHand)
 }

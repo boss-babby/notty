@@ -240,13 +240,15 @@ pub struct Notes {
     scroll_to: Option<u64>,
     /// Set whenever `list` changed; the reader copies it back into the workspace.
     pub dirty: bool,
+    /// "Extract highlights to a note" was pressed; the reader hands the request to the app (`extract.rs`).
+    pub extract: bool,
     /// An annotation is being moved / resized with the pointer.
     edit: Option<Edit>,
 }
 
 impl Notes {
     pub fn new(list: Vec<PdfAnnot>) -> Notes {
-        Notes { doc: 0, tool: Tool::Hand, color: 0, list, draft: None, selected: None, panel: false, bar: false, scroll_to: None, dirty: false, edit: None }
+        Notes { doc: 0, tool: Tool::Hand, color: 0, list, draft: None, selected: None, panel: false, bar: false, scroll_to: None, dirty: false, extract: false, edit: None }
     }
 
     /// A drawing tool is armed (page dragging is then reserved for marking).
@@ -658,6 +660,16 @@ impl Notes {
         None
     }
 
+    /// Opens the toolbar and the list and selects annotation `id` (deep link from an extracted note).
+    pub fn focus(&mut self, id: u64) {
+        if self.list.iter().any(|a| a.id == id) {
+            self.bar = true;
+            self.panel = true;
+            self.selected = Some(id);
+            self.scroll_to = Some(id);
+        }
+    }
+
     /// Markdown export of every annotation (page order).
     pub fn markdown(&self, title: &str) -> String {
         let mut v: Vec<&PdfAnnot> = self.list.iter().collect();
@@ -883,7 +895,16 @@ pub fn panel(ui: &mut Ui, ctx: &Context, pal: &Palette, rect: Rect, notes: &mut 
     ui.painter().rect_filled(rect, 0.0, pal.bg);
     ui.painter().vline(rect.left(), rect.y_range(), Stroke::new(1.0_f32, pal.border));
     let head = Rect::from_min_size(rect.min, vec2(rect.width(), 44.0));
-    crate::widgets::text_fit(ui.painter(), pos2(head.left() + 14.0, head.center().y), Align2::LEFT_CENTER, &format!("Annotations ({})", notes.list.len()), bold(14.0), pal.text, (head.width() - 140.0).max(40.0));
+    crate::widgets::text_fit(ui.painter(), pos2(head.left() + 14.0, head.center().y), Align2::LEFT_CENTER, &format!("Annotations ({})", notes.list.len()), bold(14.0), pal.text, (head.width() - 216.0).max(40.0));
+    // one click: every highlight / note / drawing becomes a linked note with deep links back to the exact page and box
+    let ext = Rect::from_center_size(pos2(head.right() - 146.0, head.center().y), vec2(64.0, 28.0));
+    let eresp = ui.interact(ext, Id::new("pdfn_extract"), Sense::click());
+    let can = !notes.list.is_empty();
+    ui.painter().rect_filled(ext, 7.0, if can { with_alpha(pal.accent, if eresp.hovered() { 1.0 } else { 0.85 }) } else { with_alpha(pal.active, 0.4) });
+    ui.painter().text(ext.center(), Align2::CENTER_CENTER, "→ Note", bold(12.5), if can { Color32::WHITE } else { pal.muted });
+    if eresp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Extract Highlights to Note — a linked page with every passage and a jump-back link").clicked() && can {
+        notes.extract = true;
+    }
     let copy = Rect::from_center_size(pos2(head.right() - 74.0, head.center().y), vec2(60.0, 28.0));
     let resp = ui.interact(copy, Id::new("pdfn_copy"), Sense::click());
     ui.painter().rect_filled(copy, 7.0, with_alpha(pal.active, if resp.hovered() { 1.0 } else { 0.6 }));

@@ -157,3 +157,15 @@ These remaining items are visual restructuring of the page menu itself (grouping
 ## Verification
 
 VERIFICATION_PLACEHOLDER
+
+---
+
+## 15.0 follow-up (status of the table above)
+
+| Item | Status |
+|------|--------|
+| Row height ≈ 56 dp | **Done** — 50 dp rows, 60 dp with a subtitle (`widgets::menu_item`) |
+| Toggles (switch on the row) | **Done** for Small text, Full width, Favorite, Dark mode (`widgets::menu_switch`) |
+| Rounded cards with hairline separators | Open — NEXT-PASS.md §2.1 |
+| Typeface picker (Default / Serif / Mono) | Open — needs a per-page font field + two bundled faces, NEXT-PASS.md §2.2 |
+| Database rows on phones | Still full pages (a side panel would hide the table); bottom-sheet peek is NEXT-PASS.md §1 |

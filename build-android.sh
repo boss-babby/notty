@@ -12,6 +12,7 @@
 # Requirements (see README "Android build"): JDK 17, Android SDK (platforms;android-34, build-tools;34.0.0), NDK r26
 #   (ANDROID_HOME, ANDROID_NDK_ROOT), `rustup target add aarch64-linux-android`.
 set -euo pipefail
+export PATH="$HOME/.cargo/bin:$PATH:$HOME/.local/bin"
 cd "$(dirname "$0")"
 
 export ANDROID_HOME="${ANDROID_HOME:-$HOME/android-sdk}"
@@ -23,7 +24,7 @@ TRIPLE=aarch64-linux-android
 ABI=arm64-v8a
 TC="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64"
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
-OUT_DIR="${OUT_DIR:-../public/downloads}"
+OUT_DIR="${OUT_DIR:-/app/public/downloads}"
 WORK="${ANDROID_WORK:-$TARGET_DIR/android-apk}"
 APK_NAME="${APK_NAME:-Lumen-android-arm64.apk}"
 
@@ -79,5 +80,5 @@ mkdir -p "$OUT_DIR"
 "$BT/apksigner" sign --ks "$KS" --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" --ks-key-alias lumen \
   --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true --v4-signing-enabled false --out "$OUT_DIR/$APK_NAME" "$WORK/aligned.apk"
 "$BT/apksigner" verify --verbose "$OUT_DIR/$APK_NAME" | head -n 6
-./make-sums.sh >/dev/null
+bash make-sums.sh >/dev/null
 echo "APK: $(readlink -f "$OUT_DIR/$APK_NAME")  ($(du -h "$OUT_DIR/$APK_NAME" | cut -f1), $(stat -c %s "$OUT_DIR/$APK_NAME") bytes)"

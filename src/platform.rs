@@ -245,6 +245,7 @@ pub fn pick_file(ctx: &egui::Context, target: PickTarget, images_only: bool) {
                 d = match mode {
                     0 => d.add_filter("Markdown / text", &["md", "markdown", "txt"]),
                     1 => d.add_filter("CSV / TSV", &["csv", "tsv", "txt"]),
+                    3 => d.add_filter("Notion / Obsidian ZIP", &["zip"]),
                     _ => d.add_filter("Lumen backup", &["json"]),
                 };
             }
@@ -269,6 +270,7 @@ pub fn pick_file(ctx: &egui::Context, target: PickTarget, images_only: bool) {
                 d = match mode {
                     0 => d.add_filter("Markdown / text", &["md", "markdown", "txt"]),
                     1 => d.add_filter("CSV / TSV", &["csv", "tsv", "txt"]),
+                    3 => d.add_filter("Notion / Obsidian ZIP", &["zip"]),
                     _ => d.add_filter("Lumen backup", &["json"]),
                 };
             }

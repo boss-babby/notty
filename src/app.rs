@@ -103,8 +103,11 @@ enum PalAct {
     Import,
     ExportMd,
     ExportCsv,
+    ExportVault,
+    Storage,
     Backup,
     Focus,
+    PeekPref,
     Help,
     Theme,
     Lock,
@@ -203,6 +206,12 @@ pub struct LumenApp {
     hier_exp: std::collections::HashSet<u64>,
     hier_init: bool,
     focus_mode: bool,
+    /// Side peek of database rows (`peek.rs`).
+    peek: crate::peek::Peek,
+    /// Storage manager dialog (`vault.rs`).
+    storage: Option<crate::vault::Storage>,
+    /// Clone of the egui context, kept for media imports that happen outside `update` (ZIP vault).
+    ctx_for_media: Option<Context>,
     last_accent: usize,
     last_touch: bool,
     media: MediaStore,
@@ -338,6 +347,9 @@ impl LumenApp {
             hier_exp: Default::default(),
             hier_init: false,
             focus_mode: false,
+            peek: Default::default(),
+            storage: None,
+            ctx_for_media: None,
             last_accent: usize::MAX,
             last_touch: false,
             media,
@@ -512,6 +524,31 @@ impl LumenApp {
         );
     }
 
+    /// `lumenpdf://…` deep link from an extracted note: re-opens the attached PDF on the page / annotation.
+    fn open_pdf_link(&mut self, url: &str) {
+        let Some(t) = crate::extract::parse(url) else { return };
+        let found = self.ws.pages.iter().filter(|p| !p.trashed).flat_map(|p| p.blocks.iter()).find(|b| {
+            b.kind == BlockKind::File && if b.media != 0 { b.media == t.key } else { !b.url.is_empty() && crate::pdf::key_of(&b.url) == t.key }
+        });
+        let Some(b) = found else {
+            self.toast("The PDF of this link is not attached to the workspace any more", None);
+            return;
+        };
+        let title = if b.text.trim().is_empty() { "document.pdf".to_owned() } else { b.text.trim().to_owned() };
+        let (media_id, burl) = (b.media, b.url.clone());
+        let source = if media_id != 0 {
+            self.media.bytes(media_id).map(crate::pdf::Source::Local)
+        } else {
+            Some(crate::pdf::Source::Remote(media::normalize_url(&burl)))
+        };
+        match source {
+            Some(s) => {
+                self.ed.pdf_req = Some(crate::pdf::Request { key: t.key, title, source: Some(s), start: Some((t.page, t.annot)) })
+            }
+            None => self.toast("The attached file could not be read", None),
+        }
+    }
+
     /// Applies finished file dialogs, saves requested attachments.
     fn poll_media(&mut self, ctx: &Context) {
         if let Some((media_id, url, title)) = self.ed.pdf_ask.take() {
@@ -532,6 +569,7 @@ impl LumenApp {
                         key,
                         title,
                         source: Some(s),
+                        start: None,
                     })
                 }
                 None => self.toast("The attached file could not be read", None),
@@ -646,6 +684,125 @@ impl LumenApp {
         self.toast(msg, None);
     }
 
+    /// Whole workspace → Markdown vault ZIP (pages, front-matter, CSV, assets/).
+    fn export_vault(&mut self) {
+        let media = &self.media;
+        let out = crate::vault::export_zip(&self.ws, &|id| {
+            let name = media.items.get(&id)?.name.clone();
+            Some((name, media.bytes(id)?))
+        });
+        let name = format!("{}-vault.zip", nio::file_safe(&self.ws.name));
+        let msg = platform::save_download(&name, &out.zip, "application/zip");
+        let extra = if out.skipped > 0 { format!(" · {} whiteboard/flow page(s) stay in the JSON backup", out.skipped) } else { String::new() };
+        self.toast(format!("{msg} — {} pages, {} databases, {} files{extra}", out.pages, out.databases, out.assets), None);
+    }
+
+    /// Notion "Markdown & CSV" export or Obsidian vault (ZIP).
+    fn import_vault(&mut self, file_name: &str, bytes: &[u8]) {
+        let media = &mut self.media;
+        let ctx = self.ctx_for_media.clone();
+        let res = match ctx {
+            Some(ctx) => crate::vault::import_zip(&mut self.ws, bytes, &mut |name, data| media.add(&ctx, name, data, true).ok()),
+            None => crate::vault::import_zip(&mut self.ws, bytes, &mut |_, _| None),
+        };
+        self.import = None;
+        match res {
+            Ok(r) => {
+                if let Some(id) = r.first {
+                    crate::views::set(crate::views::Mode::Page, None);
+                    self.ws.current = Some(id);
+                }
+                self.auto_rt.resync(&self.ws);
+                self.toast(format!("Imported {file_name}: {} pages, {} databases, {} pictures", r.pages, r.databases, r.assets), None);
+            }
+            Err(e) => self.toast(e, None),
+        }
+    }
+
+    fn open_storage(&mut self) {
+        let items = self.media.items.values().map(|i| (i.name.clone(), i.size));
+        self.storage = Some(crate::vault::storage_report(&self.ws, items));
+    }
+
+    fn storage_ui(&mut self, ctx: &Context, pal: &Palette) {
+        let Some(rep) = self.storage.clone() else { return };
+        let phone = ctx.screen_rect().width() < 600.0;
+        let w = if phone { ctx.screen_rect().width() - 24.0 } else { 440.0 };
+        let mut close = false;
+        let mut act: u8 = 0;
+        egui::Window::new("storage_manager")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size(vec2(w, 0.0))
+            .frame(Frame::new().fill(pal.popup).stroke(Stroke::new(1.0_f32, pal.border)).corner_radius(CornerRadius::same(12)).inner_margin(Margin::same(18)))
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Storage").font(bold(18.0)).color(pal.text));
+                let total = rep.workspace_bytes + rep.media_bytes;
+                ui.label(RichText::new(format!("{} in total · {} pages · {} blocks · {} in the trash", crate::vault::fmt_bytes(total), rep.pages, rep.blocks, rep.trashed)).font(body(13.0)).color(pal.muted));
+                ui.add_space(10.0);
+                let content = rep.workspace_bytes.saturating_sub(rep.history_bytes);
+                let rows = [
+                    ("Pages & databases", content, pal.accent),
+                    ("Page history", rep.history_bytes, Color32::from_rgb(224, 144, 64)),
+                    ("Pictures & attachments", rep.media_bytes, Color32::from_rgb(76, 175, 120)),
+                ];
+                for (name, bytes, col) in rows {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(name).font(body(13.5)).color(pal.text));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(crate::vault::fmt_bytes(bytes)).font(bold(13.5)).color(pal.text));
+                        });
+                    });
+                    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 8.0), Sense::hover());
+                    ui.painter().rect_filled(r, 4.0, pal.active);
+                    let f = if total == 0 { 0.0 } else { (bytes as f32 / total as f32).clamp(0.0, 1.0) };
+                    ui.painter().rect_filled(Rect::from_min_size(r.min, vec2((r.width() * f).max(if bytes > 0 { 3.0 } else { 0.0 }), 8.0)), 4.0, col);
+                    ui.add_space(8.0);
+                }
+                ui.label(RichText::new(format!("{} saved versions · {} files · {} PDF annotations", rep.history_versions, rep.media_items, rep.annotations)).font(body(12.5)).color(pal.muted));
+                if !rep.largest.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Largest attachments").font(bold(13.0)).color(pal.text));
+                    for (n, b) in &rep.largest {
+                        ui.label(RichText::new(format!("{}  —  {}", if n.len() > 42 { format!("{}…", n.chars().take(40).collect::<String>()) } else { n.clone() }, crate::vault::fmt_bytes(*b))).font(body(12.5)).color(pal.muted));
+                    }
+                }
+                ui.add_space(12.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Prune history (keep named + newest 5)").clicked() {
+                        act = 1;
+                    }
+                    if ui.button("Export vault (.zip)").clicked() {
+                        act = 2;
+                    }
+                    if ui.button("Back up (.json)").clicked() {
+                        act = 3;
+                    }
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            close = true;
+        }
+        match act {
+            1 => {
+                let n = crate::vault::prune_history(&mut self.ws, 5);
+                self.toast(format!("Removed {n} old snapshot(s)"), None);
+                self.open_storage();
+            }
+            2 => self.export_vault(),
+            3 => self.backup(),
+            _ => {}
+        }
+        if close {
+            self.storage = None;
+        }
+    }
+
     fn backup(&mut self) {
         match serde_json::to_vec_pretty(&self.ws) {
             Ok(b) => {
@@ -658,6 +815,10 @@ impl LumenApp {
 
     /// A file chosen with the import dialog's "Choose file" buttons (Markdown → page, CSV → database, JSON backup).
     fn import_file(&mut self, mode: u8, file_name: &str, bytes: &[u8]) {
+        if mode == 3 {
+            self.import_vault(file_name, bytes);
+            return;
+        }
         let text = String::from_utf8_lossy(bytes)
             .trim_start_matches('\u{feff}')
             .to_string();
@@ -878,6 +1039,8 @@ impl LumenApp {
             PalAct::Import => self.import = Some(ImportDialog::default()),
             PalAct::ExportMd => self.export_md(),
             PalAct::ExportCsv => self.export_csv(),
+            PalAct::ExportVault => self.export_vault(),
+            PalAct::Storage => self.open_storage(),
             PalAct::Backup => self.backup(),
             PalAct::Help => self.help_open = true,
             PalAct::Focus => {
@@ -885,6 +1048,12 @@ impl LumenApp {
                 if self.focus_mode {
                     self.toast("Focus mode — press Ctrl+. to exit", None);
                 }
+            }
+            PalAct::PeekPref => {
+                self.peek.full_pages = !self.peek.full_pages;
+                self.peek.close();
+                let msg = if self.peek.full_pages { "Database rows now open as full pages" } else { "Database rows now open in the side peek" };
+                self.toast(msg, None);
             }
             PalAct::Theme => self.ws.dark = !self.ws.dark,
             PalAct::Lock => {
@@ -1890,7 +2059,7 @@ impl LumenApp {
                     .map(|(_, a, i, t, s)| (a, i, t, s)),
             );
         }
-        let actions: [(PalAct, &str, &str, &str); 28] = [
+        let actions: [(PalAct, &str, &str, &str); 31] = [
             (PalAct::Ai, l::SPARKLES, "Ask Lumen AI", "Chat with the agent that can build pages, databases, dashboards and automations  (Ctrl+Shift+J)"),
             (PalAct::AiSettings, l::KEY_ROUND, "AI settings & agent connections", "API keys (Gemini, OpenAI, Claude, OpenRouter …), access level, MCP server"),
             (PalAct::Automations, l::ZAP, "Automations", "Rules, buttons, recurring tasks, reminders  (Ctrl+Shift+A)"),
@@ -1912,8 +2081,11 @@ impl LumenApp {
             (PalAct::Import, l::FILE_DOWN, "Import…", "Markdown, CSV or a workspace backup"),
             (PalAct::ExportMd, l::FILE_UP, "Export page as Markdown", "Download the current page"),
             (PalAct::ExportCsv, l::FILE_SPREADSHEET, "Export database as CSV", "Download the current database"),
+            (PalAct::ExportVault, l::FILE_UP, "Export vault as Markdown ZIP", "Every page as .md with YAML front-matter, folders, CSV and assets/ — Obsidian-ready"),
+            (PalAct::Storage, l::PACKAGE, "Storage manager", "Workspace size, page history, attachments — prune what you do not need"),
             (PalAct::Backup, l::PACKAGE, "Back up workspace", "Download everything as JSON"),
             (PalAct::Focus, l::FOCUS, "Toggle focus mode", "Hide sidebar and top bar  (Ctrl+.)"),
+            (PalAct::PeekPref, l::PANEL_RIGHT, "Open rows: side peek ⇄ full page", "Choose how clicking a database row opens it"),
             (PalAct::Theme, l::SUN_MOON, "Toggle theme", "Switch between light and dark"),
             (PalAct::Lock, l::LOCK, "Lock workspace", "Require your password again"),
             (PalAct::Sidebar, l::PANEL_LEFT, "Toggle sidebar", "Show or hide the sidebar"),
@@ -3127,38 +3299,10 @@ impl LumenApp {
                     if menu_item(ui, pal, l::REDO_2, "Redo", None, false, false).clicked() {
                         act = Some(15);
                     }
-                    if menu_item(
-                        ui,
-                        pal,
-                        l::STAR,
-                        if fav {
-                            "Remove from favorites"
-                        } else {
-                            "Add to favorites"
-                        },
-                        None,
-                        fav,
-                        false,
-                    )
-                    .clicked()
-                    {
+                    if crate::widgets::menu_switch(ui, pal, l::STAR, "Favorite", fav).clicked() {
                         act = Some(11);
                     }
-                    if menu_item(
-                        ui,
-                        pal,
-                        if dark { l::SUN } else { l::MOON },
-                        if dark {
-                            "Switch to light mode"
-                        } else {
-                            "Switch to dark mode"
-                        },
-                        None,
-                        false,
-                        false,
-                    )
-                    .clicked()
-                    {
+                    if crate::widgets::menu_switch(ui, pal, if dark { l::MOON } else { l::SUN }, "Dark mode", dark).clicked() {
                         act = Some(12);
                     }
                     if menu_item(
@@ -3209,38 +3353,10 @@ impl LumenApp {
                 ui.add_space(4.0);
                 section_label(ui, pal, "PAGE STYLE");
 
-                if menu_item(
-                    ui,
-                    pal,
-                    l::TYPE,
-                    if small {
-                        "Normal text size"
-                    } else {
-                        "Small text"
-                    },
-                    None,
-                    false,
-                    false,
-                )
-                .clicked()
-                {
+                if crate::widgets::menu_switch(ui, pal, l::TYPE, "Small text", small).clicked() {
                     act = Some(0);
                 }
-                if menu_item(
-                    ui,
-                    pal,
-                    l::MAXIMIZE,
-                    if full {
-                        "Standard page width"
-                    } else {
-                        "Full width"
-                    },
-                    None,
-                    false,
-                    false,
-                )
-                .clicked()
-                {
+                if crate::widgets::menu_switch(ui, pal, l::MAXIMIZE, "Full width", full).clicked() {
                     act = Some(1);
                 }
                 if !is_db
@@ -3606,11 +3722,12 @@ impl LumenApp {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 3.0;
-                            let tw = (ui.available_width() - 6.0).max(60.0) / 3.0;
+                            let tw = (ui.available_width() - 9.0).max(60.0) / 4.0;
                             for (i, (g, lbl)) in [
                                 (l::FILE_TEXT, "Markdown"),
                                 (l::TABLE, "CSV / TSV"),
                                 (l::DATABASE, "Backup"),
+                                (l::PACKAGE, "ZIP vault"),
                             ]
                             .into_iter()
                             .enumerate()
@@ -3656,6 +3773,7 @@ impl LumenApp {
                         let pick_lbl = match dlg.mode {
                             0 => "Choose Markdown / text file…",
                             1 => "Choose CSV / TSV file…",
+                            3 => "Choose Notion / Obsidian ZIP…",
                             _ => "Choose Lumen backup (.json)…",
                         };
                         let (r, rs) = ui.allocate_exact_size(
@@ -4345,6 +4463,9 @@ impl eframe::App for LumenApp {
     }
 
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+        if self.ctx_for_media.is_none() {
+            self.ctx_for_media = Some(ctx.clone());
+        }
         self.last_frame_ms = now_ms();
         self.closing = ctx.input(|i| i.viewport().close_requested() || !i.focused);
         self.collect_autosave(frame);
@@ -4616,6 +4737,12 @@ impl LumenApp {
                 LockEvent::Unlocked => {
                     self.locked = false;
                     self.last_active = now;
+                }
+                LockEvent::Upgraded(c) => {
+                    self.cred = Some(c);
+                    self.locked = false;
+                    self.last_active = now;
+                    self.toast("Vault upgraded to Argon2id", None);
                 }
                 LockEvent::Created(c) => {
                     self.cred = Some(c);
@@ -5008,6 +5135,12 @@ impl LumenApp {
                 self.ws.current = Some(id);
             }
         }
+        if !self.locked {
+            if let Some(id) = self.peek.panel(ctx, &mut self.ws, &mut self.ed, &pal, screen_w) {
+                crate::views::set(crate::views::Mode::Page, None);
+                self.ws.current = Some(id);
+            }
+        }
         crate::views::sync(self.ws.current);
         if let Some(t) = crate::dashcfg::take_toast() {
             self.toast(t, None);
@@ -5220,6 +5353,26 @@ impl LumenApp {
                 self.ws.current = Some(id);
             }
         }
+        // a clicked database row: side peek on wide windows, full page on phones / by preference
+        if let Some(id) = self.ed.peek.take() {
+            if let Some(full) = self.peek.request(&self.ws, id, ctx.screen_rect().width()) {
+                if self.ws.page(full).map_or(false, |p| !p.trashed) {
+                    self.ws.current = Some(full);
+                }
+            }
+        }
+        // PDF reader → note: every highlight / note / drawing becomes a linked page
+        if let Some(ex) = crate::extract::take() {
+            let n = ex.list.len();
+            let id = crate::extract::build_note(&mut self.ws, &ex, None);
+            self.ed.pdf_req = None;
+            crate::views::set(crate::views::Mode::Page, None);
+            self.ws.current = Some(id);
+            self.toast(format!("Extracted {n} annotation(s) to a note — each links back to its page"), None);
+        }
+        if let Some(url) = self.ed.pdf_link.take() {
+            self.open_pdf_link(&url);
+        }
         if let Some(title) = self.ed.wiki.take() {
             let key = title.trim().to_lowercase();
             let hit = self
@@ -5279,6 +5432,7 @@ impl LumenApp {
         self.side_menu_ui(ctx, &pal);
         self.page_menu_ui(ctx, &pal);
         self.templates_ui(ctx, &pal);
+        self.storage_ui(ctx, &pal);
         self.hier_ui(ctx, &pal);
         self.import_ui(ctx, &pal);
         self.help_ui(ctx, &pal);

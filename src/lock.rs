@@ -13,6 +13,8 @@ pub enum LockEvent {
     None,
     Unlocked,
     Created(Credential),
+    /// The right password was typed for a legacy (SHA-256) credential: here is the same password as an Argon2id credential.
+    Upgraded(Credential),
     Skipped,
     Reset,
 }
@@ -309,8 +311,12 @@ impl LockScreen {
                                             std::time::Duration::from_millis(250),
                                         );
                                     } else if auth::verify(c, &self.pw) {
+                                        let upgraded = auth::is_legacy(c).then(|| auth::create(&self.pw));
                                         self.clear();
-                                        event = LockEvent::Unlocked;
+                                        event = match upgraded {
+                                            Some(n) => LockEvent::Upgraded(n),
+                                            None => LockEvent::Unlocked,
+                                        };
                                     } else {
                                         self.pw.clear();
                                         self.fails = self.fails.saturating_add(1);

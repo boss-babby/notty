@@ -4,8 +4,9 @@
 #   (cargo install wasm-bindgen-cli --version <version in Cargo.lock>  — or the prebuilt binary from the GitHub release)
 # Optional: WASM_OPT=1 runs binaryen wasm-opt — NOT the default: with this toolchain it breaks the externref table and the app fails to start in Chrome.
 set -euo pipefail
+export PATH="$HOME/.cargo/bin:$PATH"
 cd "$(dirname "$0")"
-OUT="${OUT:-../public/webapp}"
+OUT="${OUT:-/app/public/webapp}"
 # URL prefix the folder is served from. The page is reachable at /webapp and (rewrite in next.config.ts) at /app, so <base href> is mandatory.
 WEB_BASE="${WEB_BASE:-/webapp/}"
 cargo build --lib --profile web --target wasm32-unknown-unknown
