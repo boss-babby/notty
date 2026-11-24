@@ -6,8 +6,9 @@ use std::f32::consts::FRAC_PI_2;
 use std::time::Duration;
 
 use egui::{
-    pos2, vec2, Align, Align2, Area, Color32, Context, CornerRadius, CursorIcon, Frame, Id, Key, Layout, Margin,
-    Modifiers, Order, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, Ui,
+    pos2, vec2, Align, Align2, Area, Color32, Context, CornerRadius, CursorIcon, Frame, Id, Key,
+    Layout, Margin, Modifiers, Order, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, TextEdit,
+    Ui,
 };
 use serde::{Deserialize, Serialize};
 
@@ -19,10 +20,11 @@ use crate::lock::{LockEvent, LockScreen};
 use crate::media::{self, MediaStore};
 use crate::model::{Block, BlockKind, Page, PageKind, Workspace, TEMPLATES};
 use crate::platform;
-use crate::platform::{PickTarget};
-use crate::theme::{self, bold, body, lerp_color, Palette, ACCENTS};
+use crate::platform::PickTarget;
+use crate::theme::{self, body, bold, lerp_color, Palette, ACCENTS};
 use crate::widgets::{
-    appear, context_menu, field, icon_button, menu_item, popup_area, primary_button, reset_appear, section_label, with_alpha, CtxItem,
+    appear, context_menu, field, icon_button, menu_item, popup_area, primary_button, reset_appear,
+    section_label, with_alpha, CtxItem,
 };
 
 const SIDEBAR_W: f32 = 264.0;
@@ -41,7 +43,9 @@ const UNREADABLE_KEY: &str = "lumen_v1_unreadable";
 fn load_saved(s: &dyn eframe::Storage) -> (Option<Saved>, Option<String>) {
     let mut rescued = None;
     for (i, key) in [STORAGE_KEY, PREV_KEY, UPGRADE_KEY].into_iter().enumerate() {
-        let Some(raw) = s.get_string(key) else { continue };
+        let Some(raw) = s.get_string(key) else {
+            continue;
+        };
         if raw.trim().is_empty() {
             continue;
         }
@@ -261,19 +265,35 @@ impl LumenApp {
             media.gc(&used);
             media.register(&cc.egui_ctx);
         }
-        let ai = crate::ai::AiHost { st: cc.storage.and_then(|s| eframe::get_value::<crate::ai::AiState>(s, crate::ai::STORAGE_KEY)).unwrap_or_default(), rt: Default::default() };
-        let mut wsreg = cc.storage.and_then(|s| eframe::get_value::<crate::workspaces::Registry>(s, crate::workspaces::REG_KEY)).unwrap_or_default();
+        let ai = crate::ai::AiHost {
+            st: cc
+                .storage
+                .and_then(|s| eframe::get_value::<crate::ai::AiState>(s, crate::ai::STORAGE_KEY))
+                .unwrap_or_default(),
+            rt: Default::default(),
+        };
+        let mut wsreg = cc
+            .storage
+            .and_then(|s| {
+                eframe::get_value::<crate::workspaces::Registry>(s, crate::workspaces::REG_KEY)
+            })
+            .unwrap_or_default();
         wsreg.ensure(&ws.name);
         let mut wsother = std::collections::BTreeMap::new();
         if let Some(s) = cc.storage {
             for m in wsreg.list.iter().filter(|m| m.id != wsreg.active) {
-                if let Some(t) = s.get_string(&crate::workspaces::key(m.id)).filter(|t| !t.trim().is_empty()) {
+                if let Some(t) = s
+                    .get_string(&crate::workspaces::key(m.id))
+                    .filter(|t| !t.trim().is_empty())
+                {
                     wsother.insert(m.id, t);
                 }
             }
         }
         let active_id = wsreg.active;
-        wsreg.list.retain(|m| m.id == active_id || wsother.contains_key(&m.id));
+        wsreg
+            .list
+            .retain(|m| m.id == active_id || wsother.contains_key(&m.id));
         let mut ed = EditorState::default();
         ed.media_sizes = media.items.iter().map(|(k, v)| (*k, v.size)).collect();
         Self {
@@ -336,7 +356,10 @@ impl LumenApp {
 
     /// Stores a picked / dropped file and wires it into its target (block, cover or icon).
     fn set_media(&mut self, ctx: &Context, target: PickTarget, name: &str, bytes: Vec<u8>) {
-        let as_image = !matches!(target, PickTarget::BlockFile { .. } | PickTarget::CanvasFile { .. });
+        let as_image = !matches!(
+            target,
+            PickTarget::BlockFile { .. } | PickTarget::CanvasFile { .. }
+        );
         let size_hint = bytes.len();
         match self.media.add(ctx, name, bytes, as_image) {
             Err(e) => self.toast(e, None),
@@ -345,7 +368,12 @@ impl LumenApp {
                 self.ed.media_sizes.insert(id, size);
                 let page = match target {
                     PickTarget::ImportFile { .. } => return,
-                    PickTarget::BlockImage { page, .. } | PickTarget::BlockFile { page, .. } | PickTarget::Cover { page } | PickTarget::Icon { page } | PickTarget::CanvasImage { page, .. } | PickTarget::CanvasFile { page, .. } => page,
+                    PickTarget::BlockImage { page, .. }
+                    | PickTarget::BlockFile { page, .. }
+                    | PickTarget::Cover { page }
+                    | PickTarget::Icon { page }
+                    | PickTarget::CanvasImage { page, .. }
+                    | PickTarget::CanvasFile { page, .. } => page,
                 };
                 if let Some(p) = self.ws.page_mut(page) {
                     match target {
@@ -379,7 +407,11 @@ impl LumenApp {
                             if let Some(c) = p.canvas.as_mut() {
                                 if let Some(n) = c.node_mut(node) {
                                     let pdf = crate::pdf::looks_like_pdf(name, "");
-                                    n.kind = if pdf { crate::canvas::Kind::Pdf } else { crate::canvas::Kind::File };
+                                    n.kind = if pdf {
+                                        crate::canvas::Kind::Pdf
+                                    } else {
+                                        crate::canvas::Kind::File
+                                    };
                                     n.url = format!("media:{id}");
                                     n.text = name.to_owned();
                                     n.num = if pdf { 0 } else { (size / 1024).max(1) as u32 };
@@ -416,10 +448,19 @@ impl LumenApp {
     /// Appends an image / file block to the current page (used by drag & drop).
     fn add_media_block(&mut self, ctx: &Context, kind: BlockKind, name: &str, bytes: Vec<u8>) {
         let Some(cur) = self.ws.current else { return };
-        if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Canvas) {
+        if self
+            .ws
+            .page(cur)
+            .map_or(false, |p| p.kind == PageKind::Canvas)
+        {
             if kind == BlockKind::Image {
                 if let Some(node) = crate::canvasui::new_image_node(&mut self.ws, cur) {
-                    self.set_media(ctx, PickTarget::CanvasImage { page: cur, node }, name, bytes);
+                    self.set_media(
+                        ctx,
+                        PickTarget::CanvasImage { page: cur, node },
+                        name,
+                        bytes,
+                    );
                 }
             } else if let Some(node) = crate::canvasui::new_file_node(&mut self.ws, cur) {
                 self.set_media(ctx, PickTarget::CanvasFile { page: cur, node }, name, bytes);
@@ -428,7 +469,17 @@ impl LumenApp {
         }
         let bid = self.ws.id();
         let tail_id = self.ws.id();
-        let target = if kind == BlockKind::Image { PickTarget::BlockImage { page: cur, block: bid } } else { PickTarget::BlockFile { page: cur, block: bid } };
+        let target = if kind == BlockKind::Image {
+            PickTarget::BlockImage {
+                page: cur,
+                block: bid,
+            }
+        } else {
+            PickTarget::BlockFile {
+                page: cur,
+                block: bid,
+            }
+        };
         if let Some(p) = self.ws.page_mut(cur) {
             if p.kind != PageKind::Doc {
                 self.toast("Open a document page to add files", None);
@@ -436,27 +487,53 @@ impl LumenApp {
             }
             let mut b = Block::new(bid, kind, "", 0);
             b.text = String::new();
-            let empty_tail = p.blocks.last().map_or(false, |l| l.kind == BlockKind::Text && l.text.is_empty());
-            let at = if empty_tail { p.blocks.len() - 1 } else { p.blocks.len() };
+            let empty_tail = p
+                .blocks
+                .last()
+                .map_or(false, |l| l.kind == BlockKind::Text && l.text.is_empty());
+            let at = if empty_tail {
+                p.blocks.len() - 1
+            } else {
+                p.blocks.len()
+            };
             p.blocks.insert(at, b);
             if !empty_tail {
                 p.blocks.push(Block::new(tail_id, BlockKind::Text, "", 0));
             }
         }
         self.set_media(ctx, target, name, bytes);
-        self.toast(if kind == BlockKind::Image { "Image added to the page" } else { "File attached" }, None);
+        self.toast(
+            if kind == BlockKind::Image {
+                "Image added to the page"
+            } else {
+                "File attached"
+            },
+            None,
+        );
     }
 
     /// Applies finished file dialogs, saves requested attachments.
     fn poll_media(&mut self, ctx: &Context) {
         if let Some((media_id, url, title)) = self.ed.pdf_ask.take() {
             let (key, source) = if media_id != 0 {
-                (media_id, self.media.bytes(media_id).map(crate::pdf::Source::Local))
+                (
+                    media_id,
+                    self.media.bytes(media_id).map(crate::pdf::Source::Local),
+                )
             } else {
-                (crate::pdf::key_of(&url), Some(crate::pdf::Source::Remote(media::normalize_url(&url))))
+                (
+                    crate::pdf::key_of(&url),
+                    Some(crate::pdf::Source::Remote(media::normalize_url(&url))),
+                )
             };
             match source {
-                Some(s) => self.ed.pdf_req = Some(crate::pdf::Request { key, title, source: Some(s) }),
+                Some(s) => {
+                    self.ed.pdf_req = Some(crate::pdf::Request {
+                        key,
+                        title,
+                        source: Some(s),
+                    })
+                }
                 None => self.toast("The attached file could not be read", None),
             }
         }
@@ -502,7 +579,11 @@ impl LumenApp {
     }
 
     fn toast(&mut self, msg: impl Into<String>, undo: Option<u64>) {
-        self.toasts.push(Toast { msg: msg.into(), undo, born: now_ms() / 1000.0 });
+        self.toasts.push(Toast {
+            msg: msg.into(),
+            undo,
+            born: now_ms() / 1000.0,
+        });
     }
 
     fn new_page(&mut self, parent: Option<u64>, kind: PageKind) {
@@ -511,7 +592,11 @@ impl LumenApp {
     }
 
     fn link_block(&mut self, page: u64, bid: u64, target: u64) {
-        if let Some(b) = self.ws.page_mut(page).and_then(|p| p.blocks.iter_mut().find(|b| b.id == bid)) {
+        if let Some(b) = self
+            .ws
+            .page_mut(page)
+            .and_then(|p| p.blocks.iter_mut().find(|b| b.id == bid))
+        {
             b.link = Some(target);
         }
     }
@@ -531,7 +616,12 @@ impl LumenApp {
                 self.toast("Database created — click the link to open it", None);
             }
             Req::PickLink(bid) => {
-                self.palette = Some(PaletteState { query: String::new(), sel: 0, focused: false, pick: Some(bid) });
+                self.palette = Some(PaletteState {
+                    query: String::new(),
+                    sel: 0,
+                    focused: false,
+                    pick: Some(bid),
+                });
             }
         }
     }
@@ -568,9 +658,18 @@ impl LumenApp {
 
     /// A file chosen with the import dialog's "Choose file" buttons (Markdown → page, CSV → database, JSON backup).
     fn import_file(&mut self, mode: u8, file_name: &str, bytes: &[u8]) {
-        let text = String::from_utf8_lossy(bytes).trim_start_matches('\u{feff}').to_string();
-        let stem = file_name.rsplit_once('.').map(|x| x.0.to_owned()).unwrap_or_else(|| file_name.to_owned());
-        let typed = self.import.as_ref().map(|d| d.name.trim().to_owned()).unwrap_or_default();
+        let text = String::from_utf8_lossy(bytes)
+            .trim_start_matches('\u{feff}')
+            .to_string();
+        let stem = file_name
+            .rsplit_once('.')
+            .map(|x| x.0.to_owned())
+            .unwrap_or_else(|| file_name.to_owned());
+        let typed = self
+            .import
+            .as_ref()
+            .map(|d| d.name.trim().to_owned())
+            .unwrap_or_default();
         let name = if typed.is_empty() { stem } else { typed };
         if text.trim().is_empty() {
             self.toast("That file is empty", None);
@@ -603,7 +702,10 @@ impl LumenApp {
                     self.ws.current = Some(id);
                     self.toast("Imported as a database", None);
                 }
-                None => self.toast("That doesn't look like CSV (need a header and at least one row)", None),
+                None => self.toast(
+                    "That doesn't look like CSV (need a header and at least one row)",
+                    None,
+                ),
             }
         } else {
             let id = nio::import_markdown(&mut self.ws, name, text, None);
@@ -614,42 +716,89 @@ impl LumenApp {
 
     fn print_page(&mut self) {
         let Some(cur) = self.ws.current else { return };
-        let html = crate::print::page_html(&self.ws, &self.media, cur, !cfg!(target_arch = "wasm32"));
+        let html =
+            crate::print::page_html(&self.ws, &self.media, cur, !cfg!(target_arch = "wasm32"));
         let name = format!("{}-print.html", nio::file_safe(&self.ws.display_title(cur)));
         let msg = platform::open_html(&name, &html);
         self.toast(msg, None);
     }
 
     fn can_undo_redo(&self, cur: u64) -> (bool, bool) {
-        if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Canvas) {
+        if self
+            .ws
+            .page(cur)
+            .map_or(false, |p| p.kind == PageKind::Canvas)
+        {
             crate::canvasui::can_undo_redo(&self.ws, cur)
-        } else if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Flow) {
+        } else if self
+            .ws
+            .page(cur)
+            .map_or(false, |p| p.kind == PageKind::Flow)
+        {
             crate::flowui::can_undo_redo(&self.ws, cur)
         } else {
-            (crate::history::can_undo(&self.ed, cur), crate::history::can_redo(&self.ed, cur))
+            (
+                crate::history::can_undo(&self.ed, cur),
+                crate::history::can_redo(&self.ed, cur),
+            )
         }
     }
 
     fn undo_redo(&mut self, redo: bool) {
         let Some(cur) = self.ws.current else { return };
-        if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Canvas) {
+        if self
+            .ws
+            .page(cur)
+            .map_or(false, |p| p.kind == PageKind::Canvas)
+        {
             if !crate::canvasui::undo_redo(&mut self.ws, cur, redo) {
-                self.toast(if redo { "Nothing to redo" } else { "Nothing to undo" }, None);
+                self.toast(
+                    if redo {
+                        "Nothing to redo"
+                    } else {
+                        "Nothing to undo"
+                    },
+                    None,
+                );
             }
             return;
         }
-        if self.ws.page(cur).map_or(false, |p| p.kind == PageKind::Flow) {
+        if self
+            .ws
+            .page(cur)
+            .map_or(false, |p| p.kind == PageKind::Flow)
+        {
             if !crate::flowui::undo_redo(&mut self.ws, cur, redo) {
-                self.toast(if redo { "Nothing to redo" } else { "Nothing to undo" }, None);
+                self.toast(
+                    if redo {
+                        "Nothing to redo"
+                    } else {
+                        "Nothing to undo"
+                    },
+                    None,
+                );
             }
             return;
         }
-        let Some(p) = self.ws.page_mut(cur) else { return };
-        let ok = if redo { crate::history::redo(&mut self.ed, p) } else { crate::history::undo(&mut self.ed, p) };
+        let Some(p) = self.ws.page_mut(cur) else {
+            return;
+        };
+        let ok = if redo {
+            crate::history::redo(&mut self.ed, p)
+        } else {
+            crate::history::undo(&mut self.ed, p)
+        };
         if ok {
             p.updated = now_ms();
         } else {
-            self.toast(if redo { "Nothing to redo" } else { "Nothing to undo" }, None);
+            self.toast(
+                if redo {
+                    "Nothing to redo"
+                } else {
+                    "Nothing to undo"
+                },
+                None,
+            );
         }
     }
 
@@ -671,14 +820,26 @@ impl LumenApp {
             PalAct::NewPage => self.new_page(None, PageKind::Doc),
             PalAct::NewDb => self.new_page(None, PageKind::Database),
             PalAct::NewBigSample => {
-                let n = if cfg!(target_arch = "wasm32") { 200_000 } else { 1_000_000 };
-                match crate::bigtable::create_sample(&mut self.ws, "Large dataset (sample)", n, None) {
+                let n = if cfg!(target_arch = "wasm32") {
+                    200_000
+                } else {
+                    1_000_000
+                };
+                match crate::bigtable::create_sample(
+                    &mut self.ws,
+                    "Large dataset (sample)",
+                    n,
+                    None,
+                ) {
                     Some(id) => {
                         crate::views::set(crate::views::Mode::Page, None);
                         self.ws.current = Some(id);
                         self.toast(format!("Created a large dataset with {n} rows — rows stay on disk, only the visible ones are in memory"), None);
                     }
-                    None => self.toast("Could not create the dataset (is the data folder writable?)", None),
+                    None => self.toast(
+                        "Could not create the dataset (is the data folder writable?)",
+                        None,
+                    ),
                 }
             }
             PalAct::NewCanvas => self.new_page(None, PageKind::Canvas),
@@ -693,7 +854,9 @@ impl LumenApp {
                 Err(e) => self.toast(format!("Could not build the demo: {e}"), None),
             },
             PalAct::Journal => self.ws.open_today(),
-            PalAct::Dashboard => crate::views::toggle(crate::views::Mode::Dashboard, self.ws.current),
+            PalAct::Dashboard => {
+                crate::views::toggle(crate::views::Mode::Dashboard, self.ws.current)
+            }
             PalAct::Graph => crate::views::toggle(crate::views::Mode::Graph, self.ws.current),
             PalAct::Ai => {
                 self.ai.rt.open = !self.ai.rt.open;
@@ -987,7 +1150,13 @@ impl LumenApp {
             i.events
                 .iter()
                 .filter_map(|e| match e {
-                    egui::Event::Text(t) | egui::Event::Paste(t) | egui::Event::Ime(egui::ImeEvent::Commit(t)) if !t.is_ascii() => Some(t.clone()),
+                    egui::Event::Text(t)
+                    | egui::Event::Paste(t)
+                    | egui::Event::Ime(egui::ImeEvent::Commit(t))
+                        if !t.is_ascii() =>
+                    {
+                        Some(t.clone())
+                    }
                     _ => None,
                 })
                 .collect()
@@ -996,7 +1165,9 @@ impl LumenApp {
             theme::ensure_scripts(ctx, &t);
         }
         let now = ctx.input(|i| i.time);
-        let last: f64 = ctx.data(|d| d.get_temp(Id::new("script_scan_t"))).unwrap_or(-10.0);
+        let last: f64 = ctx
+            .data(|d| d.get_temp(Id::new("script_scan_t")))
+            .unwrap_or(-10.0);
         if now - last > 2.0 && !self.locked {
             ctx.data_mut(|d| d.insert_temp(Id::new("script_scan_t"), now));
             if let Some(p) = self.ws.current.and_then(|c| self.ws.page(c)) {
@@ -1006,7 +1177,21 @@ impl LumenApp {
                 }
             }
             if self.ai.rt.open {
-                let texts: Vec<String> = self.ai.st.threads.iter().max_by(|a, b| a.updated.total_cmp(&b.updated)).map(|t| t.msgs.iter().rev().take(3).map(|m| m.text.clone()).collect()).unwrap_or_default();
+                let texts: Vec<String> = self
+                    .ai
+                    .st
+                    .threads
+                    .iter()
+                    .max_by(|a, b| a.updated.total_cmp(&b.updated))
+                    .map(|t| {
+                        t.msgs
+                            .iter()
+                            .rev()
+                            .take(3)
+                            .map(|m| m.text.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 for t in texts {
                     theme::ensure_scripts(ctx, &t);
                 }
@@ -1334,14 +1519,22 @@ impl LumenApp {
 
     /// The visible sidebar rows in order (depth-first, collapsed branches skipped), cached by a cheap signature of the page tree.
     fn side_rows(&mut self) -> std::rc::Rc<Vec<(u64, u8, bool)>> {
-        let sig = self.ws.pages.iter().fold(self.ws.pages.len() as u64, |h, p| {
-            let f = (p.parent.map_or(0, |x| x.wrapping_add(1))).wrapping_mul(31) ^ ((p.trashed as u64) << 1) ^ ((p.row as u64) << 2) ^ ((p.expanded as u64) << 3);
-            (h ^ p.id ^ f.rotate_left(17)).wrapping_mul(0x0000_0100_0000_01b3)
-        });
+        let sig = self
+            .ws
+            .pages
+            .iter()
+            .fold(self.ws.pages.len() as u64, |h, p| {
+                let f = (p.parent.map_or(0, |x| x.wrapping_add(1))).wrapping_mul(31)
+                    ^ ((p.trashed as u64) << 1)
+                    ^ ((p.row as u64) << 2)
+                    ^ ((p.expanded as u64) << 3);
+                (h ^ p.id ^ f.rotate_left(17)).wrapping_mul(0x0000_0100_0000_01b3)
+            });
         if self.side_cache.0 == sig && !self.side_cache.1.is_empty() {
             return self.side_cache.1.clone();
         }
-        let mut kids: std::collections::HashMap<Option<u64>, Vec<u64>> = std::collections::HashMap::new();
+        let mut kids: std::collections::HashMap<Option<u64>, Vec<u64>> =
+            std::collections::HashMap::new();
         let mut expanded: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for p in self.ws.pages.iter().filter(|p| !p.trashed && !p.row) {
             kids.entry(p.parent).or_default().push(p.id);
@@ -1358,7 +1551,9 @@ impl LumenApp {
             if guard > self.ws.pages.len() * 2 + 8 {
                 break;
             }
-            let Some(list) = kids.get(&parent) else { continue };
+            let Some(list) = kids.get(&parent) else {
+                continue;
+            };
             let Some(&id) = list.get(i) else { continue };
             stack.push((parent, i + 1, depth));
             let has = kids.contains_key(&Some(id));
@@ -1373,7 +1568,15 @@ impl LumenApp {
     }
 
     #[allow(dead_code)]
-    fn tree(&self, ui: &mut Ui, pal: &Palette, w: f32, parent: Option<u64>, depth: usize, ev: &mut Vec<Ev>) {
+    fn tree(
+        &self,
+        ui: &mut Ui,
+        pal: &Palette,
+        w: f32,
+        parent: Option<u64>,
+        depth: usize,
+        ev: &mut Vec<Ev>,
+    ) {
         for id in self.ws.children(parent) {
             let Some(p) = self.ws.page(id) else { continue };
             let has = self.ws.has_children(id);
@@ -1391,7 +1594,9 @@ impl LumenApp {
             if let Some(pos) = out.more.or(out.rclick) {
                 ev.push(Ev::Menu(id, pos));
             }
-            let t = ui.ctx().animate_bool_with_time(key.with("kids"), p.expanded && has, 0.18);
+            let t = ui
+                .ctx()
+                .animate_bool_with_time(key.with("kids"), p.expanded && has, 0.18);
             if t > 0.0 {
                 ui.scope(|ui| {
                     ui.set_opacity(t);
@@ -1411,8 +1616,17 @@ impl LumenApp {
         // Automations is its own workspace: the bar must not show (or act on) the page that is hidden behind it.
         if crate::views::mode() == crate::views::Mode::Automations {
             ui.add_space(4.0);
-            ui.add(egui::Label::new(RichText::new(l::ZAP).font(body(15.0)).color(pal.accent)));
-            ui.add(egui::Label::new(RichText::new("Automations").font(bold(15.0)).color(pal.text)).truncate());
+            ui.add(egui::Label::new(
+                RichText::new(l::ZAP).font(body(15.0)).color(pal.accent),
+            ));
+            ui.add(
+                egui::Label::new(
+                    RichText::new("Automations")
+                        .font(bold(15.0))
+                        .color(pal.text),
+                )
+                .truncate(),
+            );
             return;
         }
         let Some(cur) = self.ws.current else { return };
@@ -1423,7 +1637,16 @@ impl LumenApp {
         }
         // room for the breadcrumb: the screen minus the menu button and the four right-hand buttons (phones: never overlap them)
         let btn = if crate::touch::touchy() { 38.0 } else { 28.0 };
-        let crumb_w = if narrow { (ui.ctx().screen_rect().width() - 8.0 - btn * 5.0 - ui.spacing().item_spacing.x * 6.0 - 30.0).clamp(48.0, 260.0) } else { 260.0 };
+        let crumb_w = if narrow {
+            (ui.ctx().screen_rect().width()
+                - 8.0
+                - btn * 5.0
+                - ui.spacing().item_spacing.x * 6.0
+                - 30.0)
+                .clamp(48.0, 260.0)
+        } else {
+            260.0
+        };
         let crumbs = self.ws.breadcrumb(cur);
         let n = crumbs.len();
         let mut nav: Option<u64> = None;
@@ -1433,7 +1656,11 @@ impl LumenApp {
                 continue;
             }
             if let Some(p) = self.ws.page(*id) {
-                let title = if p.title.is_empty() { "Untitled" } else { &p.title };
+                let title = if p.title.is_empty() {
+                    "Untitled"
+                } else {
+                    &p.title
+                };
                 let cr = crumb(ui, pal, &p.icon, title, i + 1 == n, crumb_w);
                 if cr.clicked() {
                     nav = Some(*id);
@@ -1442,7 +1669,11 @@ impl LumenApp {
                     crumb_menu = Some((*id, pos));
                 }
                 if i + 1 < n {
-                    ui.label(RichText::new("/").color(with_alpha(pal.muted, 0.6)).font(body(14.0)));
+                    ui.label(
+                        RichText::new("/")
+                            .color(with_alpha(pal.muted, 0.6))
+                            .font(body(14.0)),
+                    );
                 }
             }
         }
@@ -1454,11 +1685,19 @@ impl LumenApp {
             self.fresh = true;
         }
         ui.add_space(6.0);
-        let open_comments = self.ws.comments.get(&cur).map_or(0, |v| v.iter().filter(|x| !x.resolved).count());
+        let open_comments = self
+            .ws
+            .comments
+            .get(&cur)
+            .map_or(0, |v| v.iter().filter(|x| !x.resolved).count());
         crate::collab::ui::comments_button(ui, pal, &mut self.collab, open_comments);
         crate::collab::ui::changes_button(ui, pal, &mut self.collab);
         crate::collab::ui::chip(ui, pal, &mut self.collab);
-        let (updated, fav) = self.ws.page(cur).map(|p| (p.updated, p.favorite)).unwrap_or((0.0, false));
+        let (updated, fav) = self
+            .ws
+            .page(cur)
+            .map(|p| (p.updated, p.favorite))
+            .unwrap_or((0.0, false));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(10.0);
             let r = icon_button(ui, pal, Icon::Dots, 16.0, "Page options");
@@ -1467,7 +1706,15 @@ impl LumenApp {
                 self.fresh = true;
             }
             let (can_u, can_r) = self.can_undo_redo(cur);
-            if icon_button(ui, pal, Icon::Sparkles, 16.0, "Ask Lumen AI  (Ctrl+Shift+J)").clicked() {
+            if icon_button(
+                ui,
+                pal,
+                Icon::Sparkles,
+                16.0,
+                "Ask Lumen AI  (Ctrl+Shift+J)",
+            )
+            .clicked()
+            {
                 self.run(PalAct::Ai);
             }
             let unread = self.ws.auto.unread();
@@ -1475,26 +1722,57 @@ impl LumenApp {
             if unread > 0 {
                 let c = br.rect.right_top() + vec2(-6.0, 7.0);
                 ui.painter().circle_filled(c, 7.5, pal.danger);
-                ui.painter().text(c, Align2::CENTER_CENTER, if unread > 9 { "9+".to_owned() } else { unread.to_string() }, bold(9.5), Color32::WHITE);
+                ui.painter().text(
+                    c,
+                    Align2::CENTER_CENTER,
+                    if unread > 9 {
+                        "9+".to_owned()
+                    } else {
+                        unread.to_string()
+                    },
+                    bold(9.5),
+                    Color32::WHITE,
+                );
             }
             if br.clicked() {
-                crate::autoui::open_tab(if unread > 0 { crate::autoui::TAB_INBOX } else { crate::autoui::TAB_RULES });
+                crate::autoui::open_tab(if unread > 0 {
+                    crate::autoui::TAB_INBOX
+                } else {
+                    crate::autoui::TAB_RULES
+                });
                 crate::views::toggle(crate::views::Mode::Automations, self.ws.current);
             }
-            let (lock_icon, tip) = if self.cred.is_some() { (Icon::Lock, "Lock workspace  (Ctrl+L)") } else { (Icon::Shield, "Set a password") };
+            let (lock_icon, tip) = if self.cred.is_some() {
+                (Icon::Lock, "Lock workspace  (Ctrl+L)")
+            } else {
+                (Icon::Shield, "Set a password")
+            };
             if !narrow {
                 if icon_button(ui, pal, lock_icon, 16.0, tip).clicked() {
                     self.run(PalAct::Lock);
                 }
             }
-            let (ti, tt) = if self.ws.dark { (Icon::Sun, "Switch to light mode") } else { (Icon::Moon, "Switch to dark mode") };
+            let (ti, tt) = if self.ws.dark {
+                (Icon::Sun, "Switch to light mode")
+            } else {
+                (Icon::Moon, "Switch to dark mode")
+            };
             if icon_button(ui, pal, ti, 16.0, tt).clicked() {
                 self.ws.dark = !self.ws.dark;
             }
             if icon_button(ui, pal, Icon::Search, 16.0, "Search  (Ctrl+K)").clicked() {
-                self.palette = Some(PaletteState { query: String::new(), sel: 0, focused: false, pick: None });
+                self.palette = Some(PaletteState {
+                    query: String::new(),
+                    sel: 0,
+                    focused: false,
+                    pick: None,
+                });
             }
-            let (si, st) = if fav { (Icon::StarFilled, "Remove from favorites") } else { (Icon::Star, "Add to favorites") };
+            let (si, st) = if fav {
+                (Icon::StarFilled, "Remove from favorites")
+            } else {
+                (Icon::Star, "Add to favorites")
+            };
             let r = icon_button(ui, pal, si, 16.0, st);
             if r.clicked() {
                 if let Some(p) = self.ws.page_mut(cur) {
@@ -1503,17 +1781,33 @@ impl LumenApp {
             }
             ui.add_space(6.0);
             if !narrow {
-                if ui.add_enabled_ui(can_r, |ui| icon_button(ui, pal, Icon::Redo, 16.0, "Redo  (Ctrl+Shift+Z)")).inner.clicked() {
+                if ui
+                    .add_enabled_ui(can_r, |ui| {
+                        icon_button(ui, pal, Icon::Redo, 16.0, "Redo  (Ctrl+Shift+Z)")
+                    })
+                    .inner
+                    .clicked()
+                {
                     self.run(PalAct::Redo);
                 }
-                if ui.add_enabled_ui(can_u, |ui| icon_button(ui, pal, Icon::Undo, 16.0, "Undo  (Ctrl+Z)")).inner.clicked() {
+                if ui
+                    .add_enabled_ui(can_u, |ui| {
+                        icon_button(ui, pal, Icon::Undo, 16.0, "Undo  (Ctrl+Z)")
+                    })
+                    .inner
+                    .clicked()
+                {
                     self.run(PalAct::Undo);
                 }
                 if icon_button(ui, pal, Icon::History, 16.0, "Page history").clicked() {
                     self.run(PalAct::History);
                 }
                 ui.add_space(6.0);
-                ui.label(RichText::new(format!("Edited {}", ago(updated))).color(pal.muted).font(body(12.5)));
+                ui.label(
+                    RichText::new(format!("Edited {}", ago(updated)))
+                        .color(pal.muted)
+                        .font(body(12.5)),
+                );
             }
         });
     }
@@ -1635,7 +1929,9 @@ impl LumenApp {
     }
 
     fn palette_ui(&mut self, ctx: &Context, pal: &Palette) {
-        let Some(mut st) = self.palette.take() else { return };
+        let Some(mut st) = self.palette.take() else {
+            return;
+        };
         let mut items = self.palette_items(&st.query);
         if st.pick.is_some() {
             items.retain(|i| matches!(i.0, PalAct::Open(_)));
@@ -1676,14 +1972,22 @@ impl LumenApp {
                         .font(body(18.0))
                         .desired_width(520.0)
                         .margin(Margin::symmetric(4, 10))
-                        .hint_text(RichText::new(if st.pick.is_some() { "Link to which page?" } else { "Search pages or run a command…" }).color(with_alpha(pal.muted, 0.8))),
+                        .hint_text(
+                            RichText::new(if st.pick.is_some() {
+                                "Link to which page?"
+                            } else {
+                                "Search pages or run a command…"
+                            })
+                            .color(with_alpha(pal.muted, 0.8)),
+                        ),
                 );
                 if before != st.query {
                     st.sel = 0;
                 }
             });
             let y = ui.cursor().top();
-            ui.painter().hline(ui.max_rect().x_range(), y, Stroke::new(1.0_f32, pal.border));
+            ui.painter()
+                .hline(ui.max_rect().x_range(), y, Stroke::new(1.0_f32, pal.border));
             ui.add_space(6.0);
             if items.is_empty() {
                 ui.add_space(18.0);
@@ -1691,21 +1995,24 @@ impl LumenApp {
                 ui.add_space(18.0);
             }
             let mut last_page = true;
-            ScrollArea::vertical().max_height(380.0).auto_shrink([false, true]).show(ui, |ui| {
-                for (i, (act, lead, title, sub)) in items.iter().enumerate() {
-                    if last_page && !matches!(act, PalAct::Open(_)) {
-                        last_page = false;
-                        section_label(ui, pal, "COMMANDS");
+            ScrollArea::vertical()
+                .max_height(380.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (i, (act, lead, title, sub)) in items.iter().enumerate() {
+                        if last_page && !matches!(act, PalAct::Open(_)) {
+                            last_page = false;
+                            section_label(ui, pal, "COMMANDS");
+                        }
+                        let r = menu_item(ui, pal, lead, title, sub.as_deref(), i == st.sel, false);
+                        if r.hovered() && ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO) {
+                            st.sel = i;
+                        }
+                        if r.clicked() {
+                            exec = Some(*act);
+                        }
                     }
-                    let r = menu_item(ui, pal, lead, title, sub.as_deref(), i == st.sel, false);
-                    if r.hovered() && ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO) {
-                        st.sel = i;
-                    }
-                    if r.clicked() {
-                        exec = Some(*act);
-                    }
-                }
-            });
+                });
         });
         if open && exec.is_none() {
             self.palette = Some(st);
@@ -1726,7 +2033,9 @@ impl LumenApp {
     }
 
     fn row_menu_ui(&mut self, ctx: &Context, pal: &Palette) {
-        let Some((id, pos)) = self.row_menu else { return };
+        let Some((id, pos)) = self.row_menu else {
+            return;
+        };
         let Some(page) = self.ws.page(id) else {
             self.row_menu = None;
             return;
@@ -1735,14 +2044,22 @@ impl LumenApp {
         let title = page.title.clone();
         let items = [
             CtxItem::new(l::FILE_TEXT, "Open"),
-            CtxItem::new(l::STAR, if fav { "Remove from favorites" } else { "Add to favorites" }),
+            CtxItem::new(
+                l::STAR,
+                if fav {
+                    "Remove from favorites"
+                } else {
+                    "Add to favorites"
+                },
+            ),
             CtxItem::new(l::PENCIL, "Rename").hint("F2"),
             CtxItem::new(l::COPY_PLUS, "Duplicate"),
             CtxItem::new(l::FILE_PLUS, "Add sub-page"),
             CtxItem::new(l::COPY, "Copy title").enabled(!title.is_empty()),
             CtxItem::new(l::TRASH_2, "Move to trash").danger().sep(),
         ];
-        let (open, pick) = context_menu(ctx, Id::new("row_menu"), pos, pal, &mut self.fresh, &items);
+        let (open, pick) =
+            context_menu(ctx, Id::new("row_menu"), pos, pal, &mut self.fresh, &items);
         if !open {
             self.row_menu = None;
         }
@@ -1783,7 +2100,8 @@ impl LumenApp {
             CtxItem::new(l::FILE_DOWN, "Import…"),
             CtxItem::new(l::TRASH_2, "Open trash"),
         ];
-        let (open, pick) = context_menu(ctx, Id::new("side_menu"), pos, pal, &mut self.fresh, &items);
+        let (open, pick) =
+            context_menu(ctx, Id::new("side_menu"), pos, pal, &mut self.fresh, &items);
         if !open {
             self.side_menu = None;
         }
@@ -1847,10 +2165,16 @@ impl LumenApp {
         }
         let cur = self.ws.current;
         let (page, cursor) = crate::collab::view_state();
-        self.collab.set_view(cur.filter(|_| !self.locked), self.ed.active, cursor.filter(|_| page == cur));
+        self.collab.set_view(
+            cur.filter(|_| !self.locked),
+            self.ed.active,
+            cursor.filter(|_| page == cur),
+        );
         let ws_id = self.wsreg.active;
         let media = &self.media;
-        let changed = self.collab.poll(&mut self.ws, ws_id, cur, &|id| media.get(id).is_some());
+        let changed = self
+            .collab
+            .poll(&mut self.ws, ws_id, cur, &|id| media.get(id).is_some());
         for (id, name, mime, bytes) in self.collab.take_media() {
             self.media.insert_raw(ctx, id, &name, &mime, bytes);
         }
@@ -1858,9 +2182,14 @@ impl LumenApp {
             if self.collab.serving.as_ref().map_or(true, |s| s.0 != id) {
                 self.collab.serving = self.media.bytes(id).map(|b| (id, b));
             }
-            let (name, mime) = self.media.get(id).map(|i| (i.name.clone(), i.mime.clone())).unwrap_or_default();
+            let (name, mime) = self
+                .media
+                .get(id)
+                .map(|i| (i.name.clone(), i.mime.clone()))
+                .unwrap_or_default();
             let bytes = self.collab.serving.as_ref().map(|s| s.1.clone());
-            self.collab.serve_media(conn, id, off, &name, &mime, bytes.as_deref());
+            self.collab
+                .serve_media(conn, id, off, &name, &mime, bytes.as_deref());
         }
         if changed {
             self.calc_dirty = true;
@@ -1875,16 +2204,36 @@ impl LumenApp {
         let ws_id = self.wsreg.active;
         if self.temp_ws.map_or(false, |t| t.0 == ws_id) && self.collab.active() {
             let mut keep = false;
-            egui::Area::new(Id::new("temp_chip")).order(egui::Order::Foreground).anchor(Align2::LEFT_BOTTOM, vec2(12.0, -12.0)).show(ctx, |ui| {
-                crate::widgets::popup_frame(pal).corner_radius(egui::CornerRadius::same(18)).inner_margin(egui::Margin::symmetric(12, 6)).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Temporary · removed when the session ends").font(body(12.0)).color(pal.muted));
-                        if ui.add(egui::Button::new(RichText::new("Keep a copy").font(bold(12.0)).color(pal.accent)).frame(false)).clicked() {
-                            keep = true;
-                        }
-                    });
+            egui::Area::new(Id::new("temp_chip"))
+                .order(egui::Order::Foreground)
+                .anchor(Align2::LEFT_BOTTOM, vec2(12.0, -12.0))
+                .show(ctx, |ui| {
+                    crate::widgets::popup_frame(pal)
+                        .corner_radius(egui::CornerRadius::same(18))
+                        .inner_margin(egui::Margin::symmetric(12, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Temporary · removed when the session ends")
+                                        .font(body(12.0))
+                                        .color(pal.muted),
+                                );
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Keep a copy")
+                                                .font(bold(12.0))
+                                                .color(pal.accent),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .clicked()
+                                {
+                                    keep = true;
+                                }
+                            });
+                        });
                 });
-            });
             if keep {
                 self.keep_temp_copy(ctx);
             }
@@ -1910,7 +2259,9 @@ impl LumenApp {
     /// * Shared as *temporary* → a scratch workspace that disappears when the session ends (unless the user keeps it).
     fn new_shared_workspace(&mut self, ctx: &Context, nw: crate::collab::NewWs) {
         let prev = self.wsreg.active;
-        let known: Vec<(String, u64, u64)> = ctx.data_mut(|d| d.get_persisted(Id::new("collab_shares"))).unwrap_or_default();
+        let known: Vec<(String, u64, u64)> = ctx
+            .data_mut(|d| d.get_persisted(Id::new("collab_shares")))
+            .unwrap_or_default();
         if nw.keep && !nw.share.is_empty() {
             if let Some((_, id, ts)) = known.iter().find(|k| k.0 == nw.share).cloned() {
                 if self.wsreg.list.iter().any(|m| m.id == id) {
@@ -1925,11 +2276,17 @@ impl LumenApp {
                 }
             }
         }
-        let name = if nw.keep { nw.name.clone() } else { nw.name.replacen("Shared", "Temporary", 1) };
+        let name = if nw.keep {
+            nw.name.clone()
+        } else {
+            nw.name.replacen("Shared", "Temporary", 1)
+        };
         let mut ws = Workspace::blank(&name, self.ws.dark, self.ws.accent);
         ws.pages.clear();
         ws.current = None;
-        let Ok(text) = serde_json::to_string(&ws) else { return };
+        let Ok(text) = serde_json::to_string(&ws) else {
+            return;
+        };
         let id = self.wsreg.add(&name);
         self.wsother.insert(id, text);
         self.wsdirty.insert(id);
@@ -1948,7 +2305,9 @@ impl LumenApp {
     }
 
     fn remember_share(&mut self, ctx: &Context, share: &str, ws_id: u64) {
-        let mut known: Vec<(String, u64, u64)> = ctx.data_mut(|d| d.get_persisted(Id::new("collab_shares"))).unwrap_or_default();
+        let mut known: Vec<(String, u64, u64)> = ctx
+            .data_mut(|d| d.get_persisted(Id::new("collab_shares")))
+            .unwrap_or_default();
         known.retain(|k| k.0 != share && self.wsreg.list.iter().any(|m| m.id == k.1));
         known.push((share.to_owned(), ws_id, now_ms() as u64));
         if known.len() > 200 {
@@ -1962,7 +2321,9 @@ impl LumenApp {
         if !self.temp_loaded {
             self.temp_loaded = true;
             // a temporary workspace left behind by a crash / forced close is cleaned up at the next start
-            if let Some(Some(t)) = ctx.data_mut(|d| d.get_persisted::<Option<(u64, u64)>>(Id::new("collab_temp"))) {
+            if let Some(Some(t)) =
+                ctx.data_mut(|d| d.get_persisted::<Option<(u64, u64)>>(Id::new("collab_temp")))
+            {
                 self.temp_ws = Some(t);
             }
         }
@@ -1986,7 +2347,11 @@ impl LumenApp {
             ctx.data_mut(|d| d.insert_persisted(Id::new("collab_temp"), None::<(u64, u64)>));
             if self.wsreg.list.iter().any(|m| m.id == tid) {
                 if self.wsreg.active == tid {
-                    let target = if self.wsreg.list.iter().any(|m| m.id == back && m.id != tid) { Some(back) } else { self.wsreg.list.iter().find(|m| m.id != tid).map(|m| m.id) };
+                    let target = if self.wsreg.list.iter().any(|m| m.id == back && m.id != tid) {
+                        Some(back)
+                    } else {
+                        self.wsreg.list.iter().find(|m| m.id != tid).map(|m| m.id)
+                    };
                     if let Some(t) = target {
                         self.switch_workspace(ctx, t);
                     }
@@ -2003,7 +2368,9 @@ impl LumenApp {
 
     /// "Keep a copy" for a temporary shared workspace that is still open.
     fn keep_temp_copy(&mut self, ctx: &Context) {
-        let Some((tid, _)) = self.temp_ws.take() else { return };
+        let Some((tid, _)) = self.temp_ws.take() else {
+            return;
+        };
         ctx.data_mut(|d| d.insert_persisted(Id::new("collab_temp"), None::<(u64, u64)>));
         let name = self.ws.name.replacen("Temporary", "Shared", 1);
         if self.wsreg.active == tid {
@@ -2012,7 +2379,13 @@ impl LumenApp {
         if let Some(m) = self.wsreg.list.iter_mut().find(|m| m.id == tid) {
             m.name = name;
         }
-        if let Some(sid) = self.collab.session.as_ref().map(|s| s.share.clone()).filter(|s| !s.is_empty()) {
+        if let Some(sid) = self
+            .collab
+            .session
+            .as_ref()
+            .map(|s| s.share.clone())
+            .filter(|s| !s.is_empty())
+        {
             self.remember_share(ctx, &sid, tid);
             self.joined_share = Some(sid);
         }
@@ -2023,14 +2396,19 @@ impl LumenApp {
         if target == self.wsreg.active {
             return;
         }
-        let Some(text) = self.wsother.get(&target).cloned() else { return };
+        let Some(text) = self.wsother.get(&target).cloned() else {
+            return;
+        };
         let Ok(mut next) = serde_json::from_str::<Workspace>(&text) else {
             self.toast("That workspace could not be read", None);
             return;
         };
         crate::bigtable::flush_all();
         let Ok(current) = serde_json::to_string(&self.ws) else {
-            self.toast("The current workspace could not be saved — not switching", None);
+            self.toast(
+                "The current workspace could not be saved — not switching",
+                None,
+            );
             return;
         };
         next.migrate();
@@ -2048,7 +2426,9 @@ impl LumenApp {
     fn new_workspace(&mut self, ctx: &Context) {
         let name = self.wsreg.fresh_name();
         let ws = Workspace::blank(&name, self.ws.dark, self.ws.accent);
-        let Ok(text) = serde_json::to_string(&ws) else { return };
+        let Ok(text) = serde_json::to_string(&ws) else {
+            return;
+        };
         let id = self.wsreg.add(&name);
         self.wsother.insert(id, text);
         self.wsdirty.insert(id);
@@ -2058,7 +2438,9 @@ impl LumenApp {
     /// Deletes the open workspace (the next one in the list is opened). The last workspace cannot be deleted.
     fn delete_workspace(&mut self, ctx: &Context) {
         let cur = self.wsreg.active;
-        let Some(target) = self.wsreg.list.iter().find(|m| m.id != cur).map(|m| m.id) else { return };
+        let Some(target) = self.wsreg.list.iter().find(|m| m.id != cur).map(|m| m.id) else {
+            return;
+        };
         let gone = self.ws.name.clone();
         self.switch_workspace(ctx, target);
         if self.wsreg.active == target {
@@ -2077,88 +2459,225 @@ impl LumenApp {
         let accent = self.ws.accent;
         let mut acc_pick: Option<usize> = None;
         self.wsreg.sync_active_name(&self.ws.name);
-        let wlist: Vec<(u64, String)> = self.wsreg.list.iter().map(|m| (m.id, m.name.clone())).collect();
+        let wlist: Vec<(u64, String)> = self
+            .wsreg
+            .list
+            .iter()
+            .map(|m| (m.id, m.name.clone()))
+            .collect();
         let w_active = self.wsreg.active;
         let confirm = self.ws_confirm_delete;
         let mut w_act: Option<(u8, u64)> = None;
         let mut w_confirm = confirm;
         let name = &mut self.ws.name;
-        let open = popup_area(ctx, Id::new("ws_menu"), pos, pal, &mut self.fresh, 286.0, |ui| {
-            section_label(ui, pal, "WORKSPACE");
-            ui.horizontal(|ui| {
-                ui.add_space(6.0);
-                ui.add(TextEdit::singleline(name).font(bold(15.0)).frame(false).desired_width(220.0).margin(Margin::symmetric(0, 4)));
-            });
-            ui.add_space(3.0);
-            ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
-            ui.add_space(4.0);
-            section_label(ui, pal, "WORKSPACES");
-            for (id, nm) in &wlist {
-                let on = *id == w_active;
-                let shown = if nm.trim().is_empty() { "Untitled" } else { nm.as_str() };
-                if menu_item(ui, pal, if on { l::CHECK } else { l::BRIEFCASE }, shown, None, on, false).clicked() && !on {
-                    w_act = Some((0, *id));
-                }
-            }
-            if menu_item(ui, pal, l::CIRCLE_PLUS, "New workspace", None, false, false).clicked() {
-                w_act = Some((1, 0));
-            }
-            if wlist.len() > 1 {
-                let label = if confirm { "Click again to delete this workspace" } else { "Delete this workspace…" };
-                if menu_item(ui, pal, l::TRASH_2, label, None, confirm, true).clicked() {
-                    if confirm {
-                        w_act = Some((2, 0));
+        let open = popup_area(
+            ctx,
+            Id::new("ws_menu"),
+            pos,
+            pal,
+            &mut self.fresh,
+            286.0,
+            |ui| {
+                section_label(ui, pal, "WORKSPACE");
+                ui.horizontal(|ui| {
+                    ui.add_space(6.0);
+                    ui.add(
+                        TextEdit::singleline(name)
+                            .font(bold(15.0))
+                            .frame(false)
+                            .desired_width(220.0)
+                            .margin(Margin::symmetric(0, 4)),
+                    );
+                });
+                ui.add_space(3.0);
+                ui.painter().hline(
+                    ui.max_rect().x_range(),
+                    ui.cursor().top(),
+                    Stroke::new(1.0_f32, pal.border),
+                );
+                ui.add_space(4.0);
+                section_label(ui, pal, "WORKSPACES");
+                for (id, nm) in &wlist {
+                    let on = *id == w_active;
+                    let shown = if nm.trim().is_empty() {
+                        "Untitled"
                     } else {
-                        w_confirm = true;
+                        nm.as_str()
+                    };
+                    if menu_item(
+                        ui,
+                        pal,
+                        if on { l::CHECK } else { l::BRIEFCASE },
+                        shown,
+                        None,
+                        on,
+                        false,
+                    )
+                    .clicked()
+                        && !on
+                    {
+                        w_act = Some((0, *id));
                     }
                 }
-            }
-            ui.add_space(3.0);
-            ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
-            ui.add_space(4.0);
-            if menu_item(ui, pal, l::SUN_MOON, if dark { "Light mode" } else { "Dark mode" }, None, false, false).clicked() {
-                act = Some(0);
-            }
-            if has_pw && menu_item(ui, pal, l::LOCK, "Lock now", None, false, false).clicked() {
-                act = Some(1);
-            }
-            if menu_item(ui, pal, l::KEY_ROUND, if has_pw { "Change or remove password…" } else { "Set a password…" }, None, false, false).clicked() {
-                act = Some(2);
-            }
-            if menu_item(ui, pal, l::LAYOUT_TEMPLATE, "Templates…", None, false, false).clicked() {
-                act = Some(4);
-            }
-            if menu_item(ui, pal, l::FILE_DOWN, "Import Markdown / CSV / backup…", None, false, false).clicked() {
-                act = Some(5);
-            }
-            if menu_item(ui, pal, l::PACKAGE, "Back up workspace (download JSON)", None, false, false).clicked() {
-                act = Some(6);
-            }
-            if menu_item(ui, pal, l::COPY, "Copy workspace as JSON", None, false, false).clicked() {
-                act = Some(3);
-            }
-            if menu_item(ui, pal, l::KEYBOARD, "Keyboard shortcuts", None, false, false).clicked() {
-                act = Some(7);
-            }
-            ui.add_space(3.0);
-            ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
-            ui.add_space(4.0);
-            section_label(ui, pal, "ACCENT COLOUR");
-            ui.horizontal(|ui| {
-                ui.add_space(6.0);
-                for (i, (nm, (r, g, b))) in ACCENTS.iter().enumerate() {
-                    let (rc, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
-                    let col = Color32::from_rgb(*r, *g, *b);
-                    ui.painter().circle_filled(rc.center(), 9.0 + if resp.hovered() { 1.5 } else { 0.0 }, col);
-                    if accent == i {
-                        ui.painter().circle_stroke(rc.center(), 12.0, Stroke::new(1.6_f32, pal.text));
-                    }
-                    if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(*nm).clicked() {
-                        acc_pick = Some(i);
+                if menu_item(ui, pal, l::CIRCLE_PLUS, "New workspace", None, false, false).clicked()
+                {
+                    w_act = Some((1, 0));
+                }
+                if wlist.len() > 1 {
+                    let label = if confirm {
+                        "Click again to delete this workspace"
+                    } else {
+                        "Delete this workspace…"
+                    };
+                    if menu_item(ui, pal, l::TRASH_2, label, None, confirm, true).clicked() {
+                        if confirm {
+                            w_act = Some((2, 0));
+                        } else {
+                            w_confirm = true;
+                        }
                     }
                 }
-            });
-        });
+                ui.add_space(3.0);
+                ui.painter().hline(
+                    ui.max_rect().x_range(),
+                    ui.cursor().top(),
+                    Stroke::new(1.0_f32, pal.border),
+                );
+                ui.add_space(4.0);
+                if menu_item(
+                    ui,
+                    pal,
+                    l::SUN_MOON,
+                    if dark { "Light mode" } else { "Dark mode" },
+                    None,
+                    false,
+                    false,
+                )
+                .clicked()
+                {
+                    act = Some(0);
+                }
+                if has_pw && menu_item(ui, pal, l::LOCK, "Lock now", None, false, false).clicked() {
+                    act = Some(1);
+                }
+                if menu_item(
+                    ui,
+                    pal,
+                    l::KEY_ROUND,
+                    if has_pw {
+                        "Change or remove password…"
+                    } else {
+                        "Set a password…"
+                    },
+                    None,
+                    false,
+                    false,
+                )
+                .clicked()
+                {
+                    act = Some(2);
+                }
+                if menu_item(
+                    ui,
+                    pal,
+                    l::LAYOUT_TEMPLATE,
+                    "Templates…",
+                    None,
+                    false,
+                    false,
+                )
+                .clicked()
+                {
+                    act = Some(4);
+                }
+                if menu_item(
+                    ui,
+                    pal,
+                    l::FILE_DOWN,
+                    "Import Markdown / CSV / backup…",
+                    None,
+                    false,
+                    false,
+                )
+                .clicked()
+                {
+                    act = Some(5);
+                }
+                if menu_item(
+                    ui,
+                    pal,
+                    l::PACKAGE,
+                    "Back up workspace (download JSON)",
+                    None,
+                    false,
+                    false,
+                )
+                .clicked()
+                {
+                    act = Some(6);
+                }
+                if menu_item(
+                    ui,
+                    pal,
+                    l::COPY,
+                    "Copy workspace as JSON",
+                    None,
+                    false,
+                    false,
+                )
+                .clicked()
+                {
+                    act = Some(3);
+                }
+                if menu_item(
+                    ui,
+                    pal,
+                    l::KEYBOARD,
+                    "Keyboard shortcuts",
+                    None,
+                    false,
+                    false,
+                )
+                .clicked()
+                {
+                    act = Some(7);
+                }
+                ui.add_space(3.0);
+                ui.painter().hline(
+                    ui.max_rect().x_range(),
+                    ui.cursor().top(),
+                    Stroke::new(1.0_f32, pal.border),
+                );
+                ui.add_space(4.0);
+                section_label(ui, pal, "ACCENT COLOUR");
+                ui.horizontal(|ui| {
+                    ui.add_space(6.0);
+                    for (i, (nm, (r, g, b))) in ACCENTS.iter().enumerate() {
+                        let (rc, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+                        let col = Color32::from_rgb(*r, *g, *b);
+                        ui.painter().circle_filled(
+                            rc.center(),
+                            9.0 + if resp.hovered() { 1.5 } else { 0.0 },
+                            col,
+                        );
+                        if accent == i {
+                            ui.painter().circle_stroke(
+                                rc.center(),
+                                12.0,
+                                Stroke::new(1.6_f32, pal.text),
+                            );
+                        }
+                        if resp
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text(*nm)
+                            .clicked()
+                        {
+                            acc_pick = Some(i);
+                        }
+                    }
+                });
+            },
+        );
         if let Some(i) = acc_pick {
             self.ws.accent = i;
         }
@@ -2198,8 +2717,24 @@ impl LumenApp {
             .ws
             .pages
             .iter()
-            .filter(|p| p.trashed && !p.parent.and_then(|pp| self.ws.page(pp)).map_or(false, |pp| pp.trashed))
-            .map(|p| (p.id, if p.title.is_empty() { "Untitled".into() } else { p.title.clone() }, icons::icon_text(&p.icon).to_owned()))
+            .filter(|p| {
+                p.trashed
+                    && !p
+                        .parent
+                        .and_then(|pp| self.ws.page(pp))
+                        .map_or(false, |pp| pp.trashed)
+            })
+            .map(|p| {
+                (
+                    p.id,
+                    if p.title.is_empty() {
+                        "Untitled".into()
+                    } else {
+                        p.title.clone()
+                    },
+                    icons::icon_text(&p.icon).to_owned(),
+                )
+            })
             .collect();
         let mut restore: Option<u64> = None;
         let mut delete: Option<u64> = None;
@@ -2211,7 +2746,9 @@ impl LumenApp {
                 ui.label(RichText::new("Trash").font(bold(18.0)));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.add_space(8.0);
-                    if !trashed.is_empty() && crate::widgets::ghost_button(ui, pal, "Empty trash").clicked() {
+                    if !trashed.is_empty()
+                        && crate::widgets::ghost_button(ui, pal, "Empty trash").clicked()
+                    {
                         empty = true;
                     }
                 });
@@ -2225,28 +2762,54 @@ impl LumenApp {
                 });
                 ui.add_space(30.0);
             }
-            ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
-                for (id, title, icon) in &trashed {
-                    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
-                    let t = ui.ctx().animate_bool_with_time(Id::new(("trash_row", *id)), ui.rect_contains_pointer(r), 0.1);
-                    ui.painter().rect_filled(r, 7.0, with_alpha(pal.hover, t));
-                    ui.painter().text(pos2(r.left() + 20.0, r.center().y), Align2::CENTER_CENTER, if icon.is_empty() { l::FILE_TEXT } else { icon }, body(16.0), pal.text);
-                    ui.painter().text(pos2(r.left() + 42.0, r.center().y), Align2::LEFT_CENTER, title, body(14.5), pal.text);
-                    let _ = resp;
-                    let rr = Rect::from_center_size(pos2(r.right() - 48.0, r.center().y), vec2(28.0, 28.0));
-                    let dr = Rect::from_center_size(pos2(r.right() - 16.0, r.center().y), vec2(28.0, 28.0));
-                    let a = ui.interact(rr, Id::new(("restore", *id)), Sense::click());
-                    let b = ui.interact(dr, Id::new(("purge", *id)), Sense::click());
-                    crate::widgets::paint_icon_button(ui, pal, rr, &a, Icon::Restore, 15.0);
-                    crate::widgets::paint_icon_button(ui, pal, dr, &b, Icon::Close, 15.0);
-                    if a.on_hover_text("Restore").clicked() {
-                        restore = Some(*id);
+            ScrollArea::vertical()
+                .max_height(320.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (id, title, icon) in &trashed {
+                        let (r, resp) = ui
+                            .allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
+                        let t = ui.ctx().animate_bool_with_time(
+                            Id::new(("trash_row", *id)),
+                            ui.rect_contains_pointer(r),
+                            0.1,
+                        );
+                        ui.painter().rect_filled(r, 7.0, with_alpha(pal.hover, t));
+                        ui.painter().text(
+                            pos2(r.left() + 20.0, r.center().y),
+                            Align2::CENTER_CENTER,
+                            if icon.is_empty() { l::FILE_TEXT } else { icon },
+                            body(16.0),
+                            pal.text,
+                        );
+                        ui.painter().text(
+                            pos2(r.left() + 42.0, r.center().y),
+                            Align2::LEFT_CENTER,
+                            title,
+                            body(14.5),
+                            pal.text,
+                        );
+                        let _ = resp;
+                        let rr = Rect::from_center_size(
+                            pos2(r.right() - 48.0, r.center().y),
+                            vec2(28.0, 28.0),
+                        );
+                        let dr = Rect::from_center_size(
+                            pos2(r.right() - 16.0, r.center().y),
+                            vec2(28.0, 28.0),
+                        );
+                        let a = ui.interact(rr, Id::new(("restore", *id)), Sense::click());
+                        let b = ui.interact(dr, Id::new(("purge", *id)), Sense::click());
+                        crate::widgets::paint_icon_button(ui, pal, rr, &a, Icon::Restore, 15.0);
+                        crate::widgets::paint_icon_button(ui, pal, dr, &b, Icon::Close, 15.0);
+                        if a.on_hover_text("Restore").clicked() {
+                            restore = Some(*id);
+                        }
+                        if b.on_hover_text("Delete forever").clicked() {
+                            delete = Some(*id);
+                        }
                     }
-                    if b.on_hover_text("Delete forever").clicked() {
-                        delete = Some(*id);
-                    }
-                }
-            });
+                });
             ui.add_space(6.0);
         });
         if let Some(id) = restore {
@@ -2258,7 +2821,13 @@ impl LumenApp {
             self.ws.delete_forever(id);
         }
         if empty {
-            let ids: Vec<u64> = self.ws.pages.iter().filter(|p| p.trashed).map(|p| p.id).collect();
+            let ids: Vec<u64> = self
+                .ws
+                .pages
+                .iter()
+                .filter(|p| p.trashed)
+                .map(|p| p.id)
+                .collect();
             for id in ids {
                 self.ws.delete_forever(id);
             }
@@ -2407,43 +2976,76 @@ impl LumenApp {
         let open = {
             let ws = &self.ws;
             let exp = &self.hier_exp;
-            modal(ctx, Id::new("hier"), pal, 460.0, if ctx.screen_rect().width() < 720.0 { 10.0 } else { 70.0 }, |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("Where you are").font(bold(17.0)).color(pal.text));
-                });
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
+            modal(
+                ctx,
+                Id::new("hier"),
+                pal,
+                460.0,
+                if ctx.screen_rect().width() < 720.0 {
+                    10.0
+                } else {
+                    70.0
+                },
+                |ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("Where you are")
+                                .font(bold(17.0))
+                                .color(pal.text),
+                        );
+                    });
                     ui.add_space(6.0);
-                    ui.spacing_mut().item_spacing = vec2(4.0, 6.0);
-                    for (i, id) in path.iter().enumerate() {
-                        let Some(p) = ws.page(*id) else { continue };
-                        let t = if p.title.is_empty() { "Untitled" } else { p.title.as_str() };
-                        if crate::database::pill(ui, pal, t, *id == cur, false).clicked() {
-                            go = Some(*id);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add_space(6.0);
+                        ui.spacing_mut().item_spacing = vec2(4.0, 6.0);
+                        for (i, id) in path.iter().enumerate() {
+                            let Some(p) = ws.page(*id) else { continue };
+                            let t = if p.title.is_empty() {
+                                "Untitled"
+                            } else {
+                                p.title.as_str()
+                            };
+                            if crate::database::pill(ui, pal, t, *id == cur, false).clicked() {
+                                go = Some(*id);
+                            }
+                            if i + 1 < path.len() {
+                                ui.label(
+                                    RichText::new(l::CHEVRON_RIGHT)
+                                        .font(body(13.0))
+                                        .color(pal.muted),
+                                );
+                            }
                         }
-                        if i + 1 < path.len() {
-                            ui.label(RichText::new(l::CHEVRON_RIGHT).font(body(13.0)).color(pal.muted));
-                        }
-                    }
-                });
-                ui.add_space(6.0);
-                ui.painter().hline(ui.max_rect().x_range(), ui.cursor().top(), Stroke::new(1.0_f32, pal.border));
-                ui.add_space(4.0);
-                egui::ScrollArea::vertical().id_salt("hier_scroll").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
-                    hier_rows(ui, pal, ws, exp, cur, None, 0, &mut go, &mut tog);
-                });
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
+                    });
                     ui.add_space(6.0);
-                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-                    if crate::database::pill(ui, pal, "+  New sub-page here", false, true).clicked() {
-                        new_child = true;
-                    }
-                });
-                ui.add_space(4.0);
-            })
+                    ui.painter().hline(
+                        ui.max_rect().x_range(),
+                        ui.cursor().top(),
+                        Stroke::new(1.0_f32, pal.border),
+                    );
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("hier_scroll")
+                        .max_height(max_h)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            hier_rows(ui, pal, ws, exp, cur, None, 0, &mut go, &mut tog);
+                        });
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add_space(6.0);
+                        ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                        if crate::database::pill(ui, pal, "+  New sub-page here", false, true)
+                            .clicked()
+                        {
+                            new_child = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                },
+            )
         };
         if let Some(id) = tog {
             if !self.hier_exp.remove(&id) {
@@ -2492,6 +3094,10 @@ impl LumenApp {
             |ui| {
                 if phone {
                     // the top bar of a phone only has room for undo / redo / this menu: everything else lives here
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("Actions").font(bold(15.5)).color(pal.text));
+                    });
+                    ui.add_space(4.0);
                     section_label(ui, pal, "QUICK ACTIONS");
                     if menu_item(ui, pal, l::SEARCH, "Search & commands", None, false, false)
                         .clicked()
@@ -2840,49 +3446,110 @@ impl LumenApp {
         let phone = screen.width() < 720.0;
         let max_h = (screen.height() - if phone { 130.0 } else { 220.0 }).max(180.0);
         let mut close = false;
-        let open = modal(ctx, Id::new("templates"), pal, 640.0, if phone { 8.0 } else { 90.0 }, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.label(RichText::new("Templates").font(bold(if phone { 18.0 } else { 20.0 })));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if icon_button(ui, pal, Icon::Close, 16.0, "Close").clicked() {
-                        close = true;
-                    }
-                });
-            });
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                ui.add(egui::Label::new(RichText::new("Start from a ready-made page or database. Everything is editable.").font(body(13.0)).color(pal.muted)).wrap());
-            });
-            ui.add_space(8.0);
-            // Phones: one column of full-width, finger-sized cards in a scrolling list (the fixed 296 pt grid used to run off the screen).
-            let avail = ui.available_width();
-            let (cw, ch) = if phone { (avail - 6.0, 78.0) } else { (296.0, 74.0) };
-            egui::ScrollArea::vertical().id_salt("templates_scroll").max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
-                    for (i, (name, icon, desc)) in TEMPLATES.iter().enumerate() {
-                        let (r, resp) = ui.allocate_exact_size(vec2(cw, ch), Sense::click());
-                        let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered() || resp.is_pointer_button_down_on(), 0.12);
-                        ui.painter().rect_filled(r, 10.0, with_alpha(pal.hover, 0.5 + 0.5 * t));
-                        ui.painter().rect_stroke(r, 10.0, Stroke::new(1.2_f32, lerp_color(pal.border, pal.accent, t)), egui::StrokeKind::Inside);
-                        ui.painter().text(pos2(r.left() + 30.0, r.center().y), Align2::CENTER_CENTER, *icon, body(28.0), pal.text);
-                        let tx = r.left() + 62.0;
-                        let tw = (r.right() - 12.0 - tx).max(60.0);
-                        crate::widgets::text_fit(ui.painter(), pos2(tx, r.top() + 22.0), Align2::LEFT_CENTER, name, bold(14.5), pal.text, tw);
-                        let mut job = egui::text::LayoutJob::simple(desc.to_string(), body(12.0), pal.muted, tw);
-                        job.wrap.max_rows = 2;
-                        let g = ui.painter().layout_job(job);
-                        ui.painter().galley(pos2(tx, r.top() + 36.0), g, pal.muted);
-                        if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                            pick = Some(i);
+        let open = modal(
+            ctx,
+            Id::new("templates"),
+            pal,
+            640.0,
+            if phone { 8.0 } else { 90.0 },
+            |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Templates").font(bold(if phone {
+                        18.0
+                    } else {
+                        20.0
+                    })));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button(ui, pal, Icon::Close, 16.0, "Close").clicked() {
+                            close = true;
                         }
-                    }
+                    });
                 });
-            });
-            ui.add_space(6.0);
-        });
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Start from a ready-made page or database. Everything is editable.",
+                            )
+                            .font(body(13.0))
+                            .color(pal.muted),
+                        )
+                        .wrap(),
+                    );
+                });
+                ui.add_space(8.0);
+                // Phones: one column of full-width, finger-sized cards in a scrolling list (the fixed 296 pt grid used to run off the screen).
+                let avail = ui.available_width();
+                let (cw, ch) = if phone {
+                    (avail - 6.0, 78.0)
+                } else {
+                    (296.0, 74.0)
+                };
+                egui::ScrollArea::vertical()
+                    .id_salt("templates_scroll")
+                    .max_height(max_h)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
+                            for (i, (name, icon, desc)) in TEMPLATES.iter().enumerate() {
+                                let (r, resp) =
+                                    ui.allocate_exact_size(vec2(cw, ch), Sense::click());
+                                let t = ui.ctx().animate_bool_with_time(
+                                    resp.id,
+                                    resp.hovered() || resp.is_pointer_button_down_on(),
+                                    0.12,
+                                );
+                                ui.painter().rect_filled(
+                                    r,
+                                    10.0,
+                                    with_alpha(pal.hover, 0.5 + 0.5 * t),
+                                );
+                                ui.painter().rect_stroke(
+                                    r,
+                                    10.0,
+                                    Stroke::new(1.2_f32, lerp_color(pal.border, pal.accent, t)),
+                                    egui::StrokeKind::Inside,
+                                );
+                                ui.painter().text(
+                                    pos2(r.left() + 30.0, r.center().y),
+                                    Align2::CENTER_CENTER,
+                                    *icon,
+                                    body(28.0),
+                                    pal.text,
+                                );
+                                let tx = r.left() + 62.0;
+                                let tw = (r.right() - 12.0 - tx).max(60.0);
+                                crate::widgets::text_fit(
+                                    ui.painter(),
+                                    pos2(tx, r.top() + 22.0),
+                                    Align2::LEFT_CENTER,
+                                    name,
+                                    bold(14.5),
+                                    pal.text,
+                                    tw,
+                                );
+                                let mut job = egui::text::LayoutJob::simple(
+                                    desc.to_string(),
+                                    body(12.0),
+                                    pal.muted,
+                                    tw,
+                                );
+                                job.wrap.max_rows = 2;
+                                let g = ui.painter().layout_job(job);
+                                ui.painter().galley(pos2(tx, r.top() + 36.0), g, pal.muted);
+                                if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                    pick = Some(i);
+                                }
+                            }
+                        });
+                    });
+                ui.add_space(6.0);
+            },
+        );
         if let Some(i) = pick {
             let id = self.ws.add_template(i, None);
             self.focus_title = Some(id);
@@ -3253,7 +3920,9 @@ Launch v2, In progress, High"
     }
 
     fn security_ui(&mut self, ctx: &Context, pal: &Palette) {
-        let Some(mut dlg) = self.security.take() else { return };
+        let Some(mut dlg) = self.security.take() else {
+            return;
+        };
         #[derive(PartialEq)]
         enum A {
             None,
@@ -3267,7 +3936,14 @@ Launch v2, In progress, High"
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.add_space(10.0);
-                ui.label(RichText::new(if has { "Password & security" } else { "Set a password" }).font(bold(18.0)));
+                ui.label(
+                    RichText::new(if has {
+                        "Password & security"
+                    } else {
+                        "Set a password"
+                    })
+                    .font(bold(18.0)),
+                );
             });
             ui.horizontal(|ui| {
                 ui.add_space(10.0);
@@ -3282,33 +3958,93 @@ Launch v2, In progress, High"
             if has {
                 ui.horizontal(|ui| {
                     ui.add_space(8.0);
-                    field(ui, pal, pal.bg, &mut dlg.cur, "Current password", true, w - 16.0, Id::new("sec_cur"));
+                    field(
+                        ui,
+                        pal,
+                        pal.bg,
+                        &mut dlg.cur,
+                        "Current password",
+                        true,
+                        w - 16.0,
+                        Id::new("sec_cur"),
+                    );
                 });
             }
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
-                field(ui, pal, pal.bg, &mut dlg.new, "New password", true, w - 16.0, Id::new("sec_new"));
+                field(
+                    ui,
+                    pal,
+                    pal.bg,
+                    &mut dlg.new,
+                    "New password",
+                    true,
+                    w - 16.0,
+                    Id::new("sec_new"),
+                );
             });
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
-                field(ui, pal, pal.bg, &mut dlg.confirm, "Confirm new password", true, w - 16.0, Id::new("sec_conf"));
+                field(
+                    ui,
+                    pal,
+                    pal.bg,
+                    &mut dlg.confirm,
+                    "Confirm new password",
+                    true,
+                    w - 16.0,
+                    Id::new("sec_conf"),
+                );
             });
             if let Some((m, ok)) = &dlg.msg {
                 ui.horizontal(|ui| {
                     ui.add_space(10.0);
-                    ui.label(RichText::new(m).color(if *ok { Color32::from_rgb(60, 180, 110) } else { pal.danger }).font(body(13.0)));
+                    ui.label(
+                        RichText::new(m)
+                            .color(if *ok {
+                                Color32::from_rgb(60, 180, 110)
+                            } else {
+                                pal.danger
+                            })
+                            .font(body(13.0)),
+                    );
                 });
             }
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
-                if primary_button(ui, pal, if has { "Update password" } else { "Set password" }, if has { 190.0 } else { w - 16.0 }).clicked() {
+                if primary_button(
+                    ui,
+                    pal,
+                    if has {
+                        "Update password"
+                    } else {
+                        "Set password"
+                    },
+                    if has { 190.0 } else { w - 16.0 },
+                )
+                .clicked()
+                {
                     action = A::Save;
                 }
                 if has {
-                    let (r, resp) = ui.allocate_exact_size(vec2(w - 16.0 - 190.0 - 8.0, 38.0), Sense::click());
-                    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
-                    ui.painter().rect_stroke(r, 8.0, Stroke::new(1.0_f32, lerp_color(pal.border, pal.danger, t)), egui::StrokeKind::Inside);
-                    ui.painter().text(r.center(), Align2::CENTER_CENTER, "Remove", body(14.0), lerp_color(pal.muted, pal.danger, t));
+                    let (r, resp) =
+                        ui.allocate_exact_size(vec2(w - 16.0 - 190.0 - 8.0, 38.0), Sense::click());
+                    let t = ui
+                        .ctx()
+                        .animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+                    ui.painter().rect_stroke(
+                        r,
+                        8.0,
+                        Stroke::new(1.0_f32, lerp_color(pal.border, pal.danger, t)),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().text(
+                        r.center(),
+                        Align2::CENTER_CENTER,
+                        "Remove",
+                        body(14.0),
+                        lerp_color(pal.muted, pal.danger, t),
+                    );
                     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                         action = A::Remove;
                     }
@@ -3337,7 +4073,10 @@ Launch v2, In progress, High"
                 }
             }
             A::Remove => {
-                let ok = self.cred.as_ref().map_or(false, |c| auth::verify(c, &dlg.cur));
+                let ok = self
+                    .cred
+                    .as_ref()
+                    .map_or(false, |c| auth::verify(c, &dlg.cur));
                 if ok {
                     self.cred = None;
                     self.skipped_setup = true;
@@ -3366,26 +4105,39 @@ Launch v2, In progress, High"
         let mut undo = None;
         let msg = t.msg.clone();
         let can_undo = t.undo;
-        Area::new(Id::new("toast")).order(Order::Tooltip).anchor(Align2::CENTER_BOTTOM, vec2(0.0, -28.0 + (1.0 - a) * 16.0)).show(ctx, |ui| {
-            ui.set_opacity(a);
-            Frame::new()
-                .fill(Color32::from_rgb(38, 38, 42))
-                .corner_radius(CornerRadius::same(10))
-                .inner_margin(Margin::symmetric(16, 10))
-                .shadow(egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: Color32::from_black_alpha(80) })
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&msg).color(Color32::WHITE).font(body(14.0)));
-                        if let Some(id) = can_undo {
-                            ui.add_space(8.0);
-                            let r = ui.add(egui::Label::new(RichText::new("Undo").color(pal.accent).font(bold(14.0))).sense(Sense::click()));
-                            if r.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                                undo = Some(id);
+        Area::new(Id::new("toast"))
+            .order(Order::Tooltip)
+            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -28.0 + (1.0 - a) * 16.0))
+            .show(ctx, |ui| {
+                ui.set_opacity(a);
+                Frame::new()
+                    .fill(Color32::from_rgb(38, 38, 42))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(Margin::symmetric(16, 10))
+                    .shadow(egui::Shadow {
+                        offset: [0, 8],
+                        blur: 24,
+                        spread: 0,
+                        color: Color32::from_black_alpha(80),
+                    })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&msg).color(Color32::WHITE).font(body(14.0)));
+                            if let Some(id) = can_undo {
+                                ui.add_space(8.0);
+                                let r = ui.add(
+                                    egui::Label::new(
+                                        RichText::new("Undo").color(pal.accent).font(bold(14.0)),
+                                    )
+                                    .sense(Sense::click()),
+                                );
+                                if r.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                    undo = Some(id);
+                                }
                             }
-                        }
+                        });
                     });
-                });
-        });
+            });
         if age < 0.3 || age > 4.1 {
             ctx.request_repaint();
         } else {
@@ -3444,7 +4196,9 @@ fn run_save(job: crate::autosave::SaveJob) -> crate::autosave::SaveDone {
 impl LumenApp {
     /// Stores a serialised state: the data-safety rotation (previous version / previous state slots), then the new text.
     fn write_state(&mut self, storage: &mut dyn eframe::Storage, text: String, fp: Option<u64>) {
-        let old = storage.get_string(STORAGE_KEY).filter(|o| !o.trim().is_empty());
+        let old = storage
+            .get_string(STORAGE_KEY)
+            .filter(|o| !o.trim().is_empty());
         if let Some(old) = old {
             // 2. first save after an app update: keep the previous version's data untouched in its own slot
             let ver = env!("CARGO_PKG_VERSION");
@@ -3457,7 +4211,10 @@ impl LumenApp {
             }
             // 3. rolling "previous state" slot: at most one rotation every 10 minutes, so it is always a state from before the latest edits
             let now = now_ms();
-            let last: f64 = storage.get_string(PREV_AT_KEY).and_then(|t| t.parse().ok()).unwrap_or(0.0);
+            let last: f64 = storage
+                .get_string(PREV_AT_KEY)
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(0.0);
             if now - last > 10.0 * 60.0 * 1000.0 {
                 storage.set_string(PREV_KEY, old);
                 storage.set_string(PREV_AT_KEY, format!("{now}"));
@@ -3471,8 +4228,12 @@ impl LumenApp {
 
     /// Stores the result of the autosave worker (called every frame; a map insert, never serialises anything).
     fn collect_autosave(&mut self, frame: &mut eframe::Frame) {
-        let Some(done) = self.autosave.poll() else { return };
-        let Some(storage) = frame.storage_mut() else { return };
+        let Some(done) = self.autosave.poll() else {
+            return;
+        };
+        let Some(storage) = frame.storage_mut() else {
+            return;
+        };
         match done.text {
             Some(text) => {
                 self.write_state(storage, text, done.fp);
@@ -3566,7 +4327,11 @@ impl eframe::App for LumenApp {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        if self.ws.dark || self.locked { [0.098, 0.098, 0.098, 1.0] } else { [1.0, 1.0, 1.0, 1.0] }
+        if self.ws.dark || self.locked {
+            [0.098, 0.098, 0.098, 1.0]
+        } else {
+            [1.0, 1.0, 1.0, 1.0]
+        }
     }
 
     fn raw_input_hook(&mut self, ctx: &Context, raw_input: &mut egui::RawInput) {
@@ -3587,12 +4352,24 @@ impl eframe::App for LumenApp {
         crate::crisp::set_zoom(1.0);
         self.ed.embed_rects.clear();
         // a person who joined as "View": no typing, pasting, cutting or deleting in this client (the host drops such edits anyway)
-        if (self.collab.mode == crate::collab::Mode::Joined || self.collab.reconnecting()) && self.collab.role == crate::collab::Role::Viewer {
+        if (self.collab.mode == crate::collab::Mode::Joined || self.collab.reconnecting())
+            && self.collab.role == crate::collab::Role::Viewer
+        {
             ctx.input_mut(|i| {
                 i.events.retain(|e| match e {
-                    egui::Event::Text(_) | egui::Event::Paste(_) | egui::Event::Cut | egui::Event::Ime(_) => false,
-                    egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                        !(matches!(key, Key::Backspace | Key::Delete | Key::Enter | Key::Tab) || (modifiers.command && matches!(key, Key::X | Key::V | Key::Z | Key::Y)))
+                    egui::Event::Text(_)
+                    | egui::Event::Paste(_)
+                    | egui::Event::Cut
+                    | egui::Event::Ime(_) => false,
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } => {
+                        !(matches!(key, Key::Backspace | Key::Delete | Key::Enter | Key::Tab)
+                            || (modifiers.command
+                                && matches!(key, Key::X | Key::V | Key::Z | Key::Y)))
                     }
                     _ => true,
                 })
@@ -3605,7 +4382,11 @@ impl eframe::App for LumenApp {
         self.sync_embeds(ctx, frame);
         crate::touch::paint_hold(ctx);
         {
-            let target = if self.locked || self.ws.dark { 1.0 } else { 0.0 };
+            let target = if self.locked || self.ws.dark {
+                1.0
+            } else {
+                0.0
+            };
             let t = ctx.animate_value_with_time(Id::new("theme_t"), target, 0.35);
             let pal = theme::with_accent(Palette::mix(t), self.ws.accent, t);
             crate::widgets::universal_text_menu(ctx, &pal);
@@ -3662,7 +4443,12 @@ impl LumenApp {
             ctx.request_repaint();
             return;
         }
-        if let Some(parent) = self.ws.current.and_then(|c| self.ws.page(c)).and_then(|p| p.parent) {
+        if let Some(parent) = self
+            .ws
+            .current
+            .and_then(|c| self.ws.page(c))
+            .and_then(|p| p.parent)
+        {
             if self.ws.page(parent).is_some_and(|p| !p.trashed) {
                 self.ws.current = Some(parent);
                 ctx.request_repaint();
@@ -4055,16 +4841,23 @@ impl LumenApp {
                     .exact_width(sw * st)
                     .frame(Frame::NONE)
                     .show(ctx, |_| {});
+                // the dimming covers the status bar and the navigation bar too (edge-to-edge window), and the strips under the
+                // drawer take the drawer's colour, so no un-dimmed / differently coloured band is left at the bottom of the phone
+                let (inset_top, inset_bottom) = crate::widgets::system_insets();
+                let full = egui::Rect::from_min_max(
+                    egui::pos2(screen.left(), screen.top() - inset_top),
+                    egui::pos2(screen.right(), screen.bottom() + inset_bottom),
+                );
+                crate::widgets::paint_system_bars(ctx, &pal, sw * st);
                 let bd = Area::new(Id::new("drawer_backdrop"))
                     .order(Order::Middle)
-                    .fixed_pos(screen.min)
+                    .constrain(false)
+                    .fixed_pos(full.min)
                     .show(ctx, |ui| {
-                        let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
-                        ui.painter().rect_filled(
-                            r,
-                            0.0,
-                            Color32::from_black_alpha((110.0 * st) as u8),
-                        );
+                        let (r, resp) = ui.allocate_exact_size(full.size(), Sense::click());
+                        let mut painter = ui.painter().clone();
+                        painter.set_clip_rect(full);
+                        painter.rect_filled(r, 0.0, Color32::from_black_alpha((110.0 * st) as u8));
                         if resp.clicked() {
                             self.ws.sidebar_open = false;
                         }
@@ -4518,6 +5311,8 @@ impl LumenApp {
         crate::pdf::reader_ui(ctx, &mut self.ed.pdf_req, &mut self.ws.pdf_annots, &pal);
         self.toasts_ui(ctx, &pal);
         self.collab_overlays(ctx, &pal);
+        // phone bottom sheets that were just closed slide back down instead of vanishing
+        crate::widgets::play_sheet_ghosts(ctx);
     }
 
     fn history_ui(&mut self, ctx: &Context, pal: &Palette) {
@@ -4566,26 +5361,43 @@ pub(crate) fn ago(ms: f64) -> String {
     }
 }
 
-pub(crate) fn modal(ctx: &Context, id: Id, pal: &Palette, width: f32, top: f32, add: impl FnOnce(&mut Ui)) -> bool {
+pub(crate) fn modal(
+    ctx: &Context,
+    id: Id,
+    pal: &Palette,
+    width: f32,
+    top: f32,
+    add: impl FnOnce(&mut Ui),
+) -> bool {
     let t = appear(ctx, id.with("a"), 0.2);
     let mut open = true;
     let screen = ctx.screen_rect();
-    let bd = Area::new(id.with("backdrop")).order(crate::widgets::HOST_ORDER).fixed_pos(Pos2::ZERO).show(ctx, |ui| {
-        let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
-        ui.painter().rect_filled(r, 0.0, Color32::from_black_alpha((120.0 * t) as u8));
-        if resp.clicked() {
-            open = false;
-        }
-    });
+    let bd = Area::new(id.with("backdrop"))
+        .order(crate::widgets::HOST_ORDER)
+        .fixed_pos(Pos2::ZERO)
+        .show(ctx, |ui| {
+            let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+            ui.painter()
+                .rect_filled(r, 0.0, Color32::from_black_alpha((120.0 * t) as u8));
+            if resp.clicked() {
+                open = false;
+            }
+        });
     // The backdrop must always sit *below* the dialog, otherwise the dialog looks greyed-out/hidden.
     ctx.move_to_top(bd.response.layer_id);
-    let md = Area::new(id).order(crate::widgets::HOST_ORDER).anchor(Align2::CENTER_TOP, vec2(0.0, top + (1.0 - t) * 16.0)).show(ctx, |ui| {
-        ui.set_opacity(t);
-        crate::widgets::popup_frame(pal).corner_radius(CornerRadius::same(14)).inner_margin(Margin::same(8)).show(ui, |ui| {
-            ui.set_width(width.min((screen.width() - 32.0).max(280.0)));
-            add(ui);
+    let md = Area::new(id)
+        .order(crate::widgets::HOST_ORDER)
+        .anchor(Align2::CENTER_TOP, vec2(0.0, top + (1.0 - t) * 16.0))
+        .show(ctx, |ui| {
+            ui.set_opacity(t);
+            crate::widgets::popup_frame(pal)
+                .corner_radius(CornerRadius::same(14))
+                .inner_margin(Margin::same(8))
+                .show(ui, |ui| {
+                    ui.set_width(width.min((screen.width() - 32.0).max(280.0)));
+                    add(ui);
+                });
         });
-    });
     ctx.move_to_top(md.response.layer_id);
     if ctx.input(|i| i.key_pressed(Key::Escape)) {
         open = false;
@@ -4599,7 +5411,17 @@ pub(crate) fn modal(ctx: &Context, id: Id, pal: &Palette, width: f32, top: f32, 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn hier_rows(ui: &mut Ui, pal: &Palette, ws: &Workspace, exp: &std::collections::HashSet<u64>, cur: u64, parent: Option<u64>, depth: usize, go: &mut Option<u64>, tog: &mut Option<u64>) {
+fn hier_rows(
+    ui: &mut Ui,
+    pal: &Palette,
+    ws: &Workspace,
+    exp: &std::collections::HashSet<u64>,
+    cur: u64,
+    parent: Option<u64>,
+    depth: usize,
+    go: &mut Option<u64>,
+    tog: &mut Option<u64>,
+) {
     for id in ws.children(parent) {
         let Some(p) = ws.page(id) else { continue };
         let has = ws.has_children(id);
@@ -4611,21 +5433,56 @@ fn hier_rows(ui: &mut Ui, pal: &Palette, ws: &Workspace, exp: &std::collections:
         let arrow = Rect::from_min_size(pos2(x0, rect.top()), vec2(34.0, rect.height()));
         let ar = ui.interact(arrow, Id::new(("hier_arrow", id)), Sense::click());
         if sel {
-            ui.painter().rect_filled(rect.shrink2(vec2(2.0, 1.0)), 8.0, pal.accent_soft);
+            ui.painter()
+                .rect_filled(rect.shrink2(vec2(2.0, 1.0)), 8.0, pal.accent_soft);
         } else if row.is_pointer_button_down_on() || row.hovered() {
-            ui.painter().rect_filled(rect.shrink2(vec2(2.0, 1.0)), 8.0, pal.hover);
+            ui.painter()
+                .rect_filled(rect.shrink2(vec2(2.0, 1.0)), 8.0, pal.hover);
         }
         if has {
-            ui.painter().text(arrow.center(), Align2::CENTER_CENTER, if open { l::CHEVRON_DOWN } else { l::CHEVRON_RIGHT }, body(15.0), pal.muted);
+            ui.painter().text(
+                arrow.center(),
+                Align2::CENTER_CENTER,
+                if open {
+                    l::CHEVRON_DOWN
+                } else {
+                    l::CHEVRON_RIGHT
+                },
+                body(15.0),
+                pal.muted,
+            );
         }
         let ic = pos2(x0 + 44.0, rect.center().y);
         if p.icon.is_empty() {
-            icons::paint(ui.painter(), ic, 16.0, match p.kind { PageKind::Database => Icon::Board, PageKind::Canvas => Icon::Canvas, PageKind::Flow => Icon::Flow, _ => Icon::Page }, pal.muted);
+            icons::paint(
+                ui.painter(),
+                ic,
+                16.0,
+                match p.kind {
+                    PageKind::Database => Icon::Board,
+                    PageKind::Canvas => Icon::Canvas,
+                    PageKind::Flow => Icon::Flow,
+                    _ => Icon::Page,
+                },
+                pal.muted,
+            );
         } else {
             icons::paint_page_icon(ui, ic, &p.icon, 18.0, pal.text);
         }
-        let title = if p.title.is_empty() { "Untitled" } else { p.title.as_str() };
-        crate::widgets::text_fit(ui.painter(), pos2(x0 + 62.0, rect.center().y), Align2::LEFT_CENTER, title, if sel { bold(14.5) } else { body(14.5) }, if sel { pal.accent } else { pal.text }, (rect.right() - 10.0 - (x0 + 62.0)).max(40.0));
+        let title = if p.title.is_empty() {
+            "Untitled"
+        } else {
+            p.title.as_str()
+        };
+        crate::widgets::text_fit(
+            ui.painter(),
+            pos2(x0 + 62.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            title,
+            if sel { bold(14.5) } else { body(14.5) },
+            if sel { pal.accent } else { pal.text },
+            (rect.right() - 10.0 - (x0 + 62.0)).max(40.0),
+        );
         if ar.clicked() && has {
             *tog = Some(id);
         } else if row.clicked() {
@@ -4637,32 +5494,61 @@ fn hier_rows(ui: &mut Ui, pal: &Palette, ws: &Workspace, exp: &std::collections:
     }
 }
 
-fn crumb(ui: &mut Ui, pal: &Palette, icon: &str, title: &str, last: bool, max_w: f32) -> egui::Response {
+fn crumb(
+    ui: &mut Ui,
+    pal: &Palette,
+    icon: &str,
+    title: &str,
+    last: bool,
+    max_w: f32,
+) -> egui::Response {
     let col = if last { pal.text } else { pal.muted };
-    let galley = ui.painter().layout_no_wrap(title.to_owned(), body(14.0), col);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(title.to_owned(), body(14.0), col);
     let iw = if icon.is_empty() { 0.0 } else { 22.0 };
     let w = (galley.size().x + iw + 16.0).min(max_w.max(48.0));
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, if crate::touch::touchy() { 36.0 } else { 28.0 }), Sense::click());
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.1);
-    ui.painter().rect_filled(rect, 6.0, with_alpha(pal.hover, t));
+    let (rect, resp) = ui.allocate_exact_size(
+        vec2(w, if crate::touch::touchy() { 36.0 } else { 28.0 }),
+        Sense::click(),
+    );
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id, resp.hovered(), 0.1);
+    ui.painter()
+        .rect_filled(rect, 6.0, with_alpha(pal.hover, t));
     let mut x = rect.left() + 8.0;
     if !icon.is_empty() {
         icons::paint_page_icon(ui, pos2(x + 7.0, rect.center().y), icon, 16.0, pal.text);
         x += iw;
     }
-    crate::widgets::text_fit(ui.painter(), pos2(x, rect.center().y), Align2::LEFT_CENTER, title, body(14.0), col, rect.right() - 6.0 - x);
+    crate::widgets::text_fit(
+        ui.painter(),
+        pos2(x, rect.center().y),
+        Align2::LEFT_CENTER,
+        title,
+        body(14.0),
+        col,
+        rect.right() - 6.0 - x,
+    );
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 fn row_bg(ui: &Ui, pal: &Palette, key: Id, rect: Rect, selected: bool) -> (bool, f32) {
     let hovered = ui.rect_contains_pointer(rect);
-    let t = ui.ctx().animate_bool_with_time(key.with("bg"), hovered, 0.1);
-    let s = ui.ctx().animate_bool_with_time(key.with("sel"), selected, 0.15);
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(key.with("bg"), hovered, 0.1);
+    let s = ui
+        .ctx()
+        .animate_bool_with_time(key.with("sel"), selected, 0.15);
     if s > 0.0 {
-        ui.painter().rect_filled(rect, 6.0, with_alpha(pal.active, s));
+        ui.painter()
+            .rect_filled(rect, 6.0, with_alpha(pal.active, s));
     }
     if t > 0.0 {
-        ui.painter().rect_filled(rect, 6.0, with_alpha(pal.hover, t * (1.0 - s)));
+        ui.painter()
+            .rect_filled(rect, 6.0, with_alpha(pal.hover, t * (1.0 - s)));
     }
     (hovered, t)
 }

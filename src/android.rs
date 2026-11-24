@@ -65,7 +65,11 @@ fn wake() {
 
 /// Called first thing in `android_main`.
 pub fn init(app: &android_activity::AndroidApp) {
-    android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("Lumen"));
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("Lumen"),
+    );
     std::panic::set_hook(Box::new(|info| log::error!("panic: {info}")));
     VM.store(app.vm_as_ptr() as usize, Ordering::SeqCst);
     ACT.store(app.activity_as_ptr() as usize, Ordering::SeqCst);
@@ -103,7 +107,12 @@ fn call_void(name: &str, sig: &str, args: &[JValue]) {
 // ───────────────────────────── Java → Rust ─────────────────────────────
 
 #[no_mangle]
-pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeMetrics(_env: JNIEnv, _c: JClass, density: jfloat, tz_min: jint) {
+pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeMetrics(
+    _env: JNIEnv,
+    _c: JClass,
+    density: jfloat,
+    tz_min: jint,
+) {
     DENSITY.store(density.to_bits(), Ordering::SeqCst);
     TZ_MIN.store(tz_min as i64, Ordering::SeqCst);
     wake();
@@ -111,13 +120,31 @@ pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeMetrics(_env: JNIE
 
 /// `Activity.onTrimMemory`: shrink the row caches / dashboard results (see `memgov.rs`).
 #[no_mangle]
-pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeTrim(_env: JNIEnv, _c: JClass, level: jint) {
-    crate::memgov::request_trim(if level >= 60 { 2 } else if level >= 15 { 1 } else { 0 });
+pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeTrim(
+    _env: JNIEnv,
+    _c: JClass,
+    level: jint,
+) {
+    crate::memgov::request_trim(if level >= 60 {
+        2
+    } else if level >= 15 {
+        1
+    } else {
+        0
+    });
     wake();
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeInsets(_env: JNIEnv, _c: JClass, l: jint, t: jint, r: jint, b: jint, ime: jboolean) {
+pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeInsets(
+    _env: JNIEnv,
+    _c: JClass,
+    l: jint,
+    t: jint,
+    r: jint,
+    b: jint,
+    ime: jboolean,
+) {
     for (slot, v) in INSETS.iter().zip([l, t, r, b]) {
         slot.store(v.max(0), Ordering::SeqCst);
     }
@@ -126,7 +153,11 @@ pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeInsets(_env: JNIEn
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeText(mut env: JNIEnv, _c: JClass, text: JString) {
+pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeText(
+    mut env: JNIEnv,
+    _c: JClass,
+    text: JString,
+) {
     if let Ok(s) = env.get_string(&text) {
         let s: String = s.into();
         if !s.is_empty() {
@@ -140,7 +171,12 @@ pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeText(mut env: JNIE
 
 /// An editing key pressed on the soft keyboard (Android key codes).
 #[no_mangle]
-pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeKey(_env: JNIEnv, _c: JClass, code: jint, down: jboolean) {
+pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeKey(
+    _env: JNIEnv,
+    _c: JClass,
+    code: jint,
+    down: jboolean,
+) {
     let key = match code {
         67 => Key::Backspace,
         112 => Key::Delete,
@@ -169,7 +205,9 @@ pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeKey(_env: JNIEnv, 
 static NSD: Mutex<Vec<(crate::collab::Beacon, String)>> = Mutex::new(Vec::new());
 
 pub fn nsd_take() -> Vec<(crate::collab::Beacon, String)> {
-    NSD.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default()
+    NSD.lock()
+        .map(|mut v| std::mem::take(&mut *v))
+        .unwrap_or_default()
 }
 
 /// Opens the camera overlay of the activity; a decoded QR code arrives as a launch link.
@@ -182,7 +220,17 @@ pub fn nsd_register(name: &str, port: u16, info: &str) {
     with_activity(|env, act| {
         let n = env.new_string(name)?;
         let i = env.new_string(info)?;
-        env.call_method(act, "nsdStart", "(Ljava/lang/String;ILjava/lang/String;)V", &[JValue::Object(&n), JValue::Int(port as i32), JValue::Object(&i)]).map(|_| ())
+        env.call_method(
+            act,
+            "nsdStart",
+            "(Ljava/lang/String;ILjava/lang/String;)V",
+            &[
+                JValue::Object(&n),
+                JValue::Int(port as i32),
+                JValue::Object(&i),
+            ],
+        )
+        .map(|_| ())
     });
 }
 
@@ -190,7 +238,13 @@ pub fn nsd_register(name: &str, port: u16, info: &str) {
 pub fn collab_service(on: bool, text: &str) {
     with_activity(|env, act| {
         let t = env.new_string(text)?;
-        env.call_method(act, "collabService", "(ZLjava/lang/String;)V", &[JValue::Bool(on as jboolean), JValue::Object(&t)]).map(|_| ())
+        env.call_method(
+            act,
+            "collabService",
+            "(ZLjava/lang/String;)V",
+            &[JValue::Bool(on as jboolean), JValue::Object(&t)],
+        )
+        .map(|_| ())
     });
 }
 
@@ -206,7 +260,9 @@ pub fn nsd_discover(on: bool) {
 
 fn call_string(name: &str) -> String {
     with_activity(|env, act| {
-        let o = env.call_method(act, name, "()Ljava/lang/String;", &[])?.l()?;
+        let o = env
+            .call_method(act, name, "()Ljava/lang/String;", &[])?
+            .l()?;
         if o.is_null() {
             return Ok(String::new());
         }
@@ -230,7 +286,11 @@ pub fn hotspot_stop() {
 pub fn hotspot_state() -> (String, String, String) {
     let s = call_string("hotspotState");
     let mut it = s.splitn(3, '|');
-    (it.next().unwrap_or("idle").to_owned(), it.next().unwrap_or("").to_owned(), it.next().unwrap_or("").to_owned())
+    (
+        it.next().unwrap_or("idle").to_owned(),
+        it.next().unwrap_or("").to_owned(),
+        it.next().unwrap_or("").to_owned(),
+    )
 }
 
 /// Connects to a hotspot created by another Lumen phone (WifiNetworkSpecifier, Android 10+) and routes this process through it.
@@ -238,7 +298,13 @@ pub fn wifi_join(ssid: &str, pass: &str) {
     with_activity(|env, act| {
         let a = env.new_string(ssid)?;
         let b = env.new_string(pass)?;
-        env.call_method(act, "wifiJoin", "(Ljava/lang/String;Ljava/lang/String;)V", &[JValue::Object(&a), JValue::Object(&b)]).map(|_| ())
+        env.call_method(
+            act,
+            "wifiJoin",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            &[JValue::Object(&a), JValue::Object(&b)],
+        )
+        .map(|_| ())
     });
 }
 
@@ -255,13 +321,19 @@ pub fn wifi_state() -> (String, String) {
 
 /// Every IPv4 address of every up interface (Wi-Fi, hotspot, USB tether).
 pub fn local_ips() -> Vec<String> {
-    call_string("localIps").split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect()
+    call_string("localIps")
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn call_bytes(name: &str, input: &[u8]) -> Option<Vec<u8>> {
     with_activity(|env, act| {
         let arr = env.byte_array_from_slice(input)?;
-        let o = env.call_method(act, name, "([B)[B", &[JValue::Object(&arr)])?.l()?;
+        let o = env
+            .call_method(act, name, "([B)[B", &[JValue::Object(&arr)])?
+            .l()?;
         if o.is_null() {
             return Ok(None);
         }
@@ -315,13 +387,24 @@ pub extern "system" fn Java_com_lumen_app_CollabKit_nativeScanFrame(
 
 /// A host resolved by NsdManager: the beacon it published, plus its address.
 #[no_mangle]
-pub extern "system" fn Java_com_lumen_app_CollabKit_nativeNsdFound(mut env: JNIEnv, _c: JClass, _name: JString, host: JString, port: jint, info: JString) {
-    let (Ok(host), Ok(info)) = (env.get_string(&host), env.get_string(&info)) else { return };
+pub extern "system" fn Java_com_lumen_app_CollabKit_nativeNsdFound(
+    mut env: JNIEnv,
+    _c: JClass,
+    _name: JString,
+    host: JString,
+    port: jint,
+    info: JString,
+) {
+    let (Ok(host), Ok(info)) = (env.get_string(&host), env.get_string(&info)) else {
+        return;
+    };
     let (host, info): (String, String) = (host.into(), info.into());
     if info.len() > 1500 || !(1..=65535).contains(&port) {
         return;
     }
-    let Ok(mut b) = serde_json::from_str::<crate::collab::Beacon>(&info) else { return };
+    let Ok(mut b) = serde_json::from_str::<crate::collab::Beacon>(&info) else {
+        return;
+    };
     if b.v != crate::collab::PROTO {
         return;
     }
@@ -358,19 +441,40 @@ pub extern "system" fn Java_com_lumen_app_LumenActivity_nativeBack(_env: JNIEnv,
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lumen_app_LumenActivity_nativePicked(mut env: JNIEnv, _c: JClass, req: jint, name: JString, _mime: JString, data: JByteArray) {
-    let target = PENDING_PICKS.lock().ok().and_then(|mut m| m.as_mut().and_then(|m| m.remove(&req)));
+pub extern "system" fn Java_com_lumen_app_LumenActivity_nativePicked(
+    mut env: JNIEnv,
+    _c: JClass,
+    req: jint,
+    name: JString,
+    _mime: JString,
+    data: JByteArray,
+) {
+    let target = PENDING_PICKS
+        .lock()
+        .ok()
+        .and_then(|mut m| m.as_mut().and_then(|m| m.remove(&req)));
     let Some(target) = target else { return };
-    let name: String = env.get_string(&name).map(|s| s.into()).unwrap_or_else(|_| "file".into());
+    let name: String = env
+        .get_string(&name)
+        .map(|s| s.into())
+        .unwrap_or_else(|_| "file".into());
     let bytes = env.convert_byte_array(&data).unwrap_or_default();
     if !bytes.is_empty() {
-        crate::platform::push_picked(Picked { target, name, bytes });
+        crate::platform::push_picked(Picked {
+            target,
+            name,
+            bytes,
+        });
     }
     wake();
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_lumen_app_LumenActivity_nativePickCancelled(_env: JNIEnv, _c: JClass, req: jint) {
+pub extern "system" fn Java_com_lumen_app_LumenActivity_nativePickCancelled(
+    _env: JNIEnv,
+    _c: JClass,
+    req: jint,
+) {
     if let Ok(mut m) = PENDING_PICKS.lock() {
         if let Some(m) = m.as_mut() {
             m.remove(&req);
@@ -401,7 +505,13 @@ pub fn go_home() {
 pub fn open_url(url: &str) {
     with_activity(|env, act| {
         let s = env.new_string(url)?;
-        env.call_method(act, "openUrl", "(Ljava/lang/String;)V", &[JValue::Object(&s)]).map(|_| ())
+        env.call_method(
+            act,
+            "openUrl",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&s)],
+        )
+        .map(|_| ())
     });
 }
 
@@ -411,7 +521,9 @@ pub fn haptic(ms: u32) {
 
 pub fn clipboard_get() -> String {
     with_activity(|env, act| {
-        let v = env.call_method(act, "getClipboardText", "()Ljava/lang/String;", &[])?.l()?;
+        let v = env
+            .call_method(act, "getClipboardText", "()Ljava/lang/String;", &[])?
+            .l()?;
         if v.is_null() {
             return Ok(String::new());
         }
@@ -425,7 +537,13 @@ pub fn clipboard_get() -> String {
 pub fn clipboard_set(text: &str) {
     with_activity(|env, act| {
         let s = env.new_string(text)?;
-        env.call_method(act, "setClipboardText", "(Ljava/lang/String;)V", &[JValue::Object(&s)]).map(|_| ())
+        env.call_method(
+            act,
+            "setClipboardText",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&s)],
+        )
+        .map(|_| ())
     });
 }
 
@@ -438,15 +556,30 @@ pub fn notify_request() {
 pub fn schedule(json: &str) {
     with_activity(|env, act| {
         let j = env.new_string(json)?;
-        env.call_method(act, "scheduleReminders", "(Ljava/lang/String;)V", &[JValue::Object(&j)]).map(|_| ())
+        env.call_method(
+            act,
+            "scheduleReminders",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&j)],
+        )
+        .map(|_| ())
     });
 }
 
 pub fn notify(title: &str, body: &str, tag: &str) {
     with_activity(|env, act| {
-        let (t, b, g) = (env.new_string(title)?, env.new_string(body)?, env.new_string(tag)?);
-        env.call_method(act, "notifyUser", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", &[JValue::Object(&t), JValue::Object(&b), JValue::Object(&g)])
-            .map(|_| ())
+        let (t, b, g) = (
+            env.new_string(title)?,
+            env.new_string(body)?,
+            env.new_string(tag)?,
+        );
+        env.call_method(
+            act,
+            "notifyUser",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[JValue::Object(&t), JValue::Object(&b), JValue::Object(&g)],
+        )
+        .map(|_| ())
     });
 }
 
@@ -454,10 +587,20 @@ pub fn notify(title: &str, body: &str, tag: &str) {
 pub fn print_html(name: &str, html: &str) -> String {
     let ok = with_activity(|env, act| {
         let (n, h) = (env.new_string(name)?, env.new_string(html)?);
-        env.call_method(act, "printHtml", "(Ljava/lang/String;Ljava/lang/String;)V", &[JValue::Object(&n), JValue::Object(&h)]).map(|_| ())
+        env.call_method(
+            act,
+            "printHtml",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            &[JValue::Object(&n), JValue::Object(&h)],
+        )
+        .map(|_| ())
     })
     .is_some();
-    if ok { "Opening the Android print dialog (choose “Save as PDF” to export)".to_owned() } else { "Printing is not available".to_owned() }
+    if ok {
+        "Opening the Android print dialog (choose “Save as PDF” to export)".to_owned()
+    } else {
+        "Printing is not available".to_owned()
+    }
 }
 
 /// Opens the system "create document" dialog and writes `data` to the chosen location.
@@ -465,10 +608,20 @@ pub fn save_file(name: &str, data: &[u8], mime: &str) -> String {
     let ok = with_activity(|env, act| {
         let (n, m) = (env.new_string(name)?, env.new_string(mime)?);
         let arr = env.byte_array_from_slice(data)?;
-        env.call_method(act, "saveFile", "(Ljava/lang/String;Ljava/lang/String;[B)V", &[JValue::Object(&n), JValue::Object(&m), JValue::Object(&arr)]).map(|_| ())
+        env.call_method(
+            act,
+            "saveFile",
+            "(Ljava/lang/String;Ljava/lang/String;[B)V",
+            &[JValue::Object(&n), JValue::Object(&m), JValue::Object(&arr)],
+        )
+        .map(|_| ())
     })
     .is_some();
-    if ok { format!("Choose where to save {name}") } else { "Could not open the file dialog".to_owned() }
+    if ok {
+        format!("Choose where to save {name}")
+    } else {
+        "Could not open the file dialog".to_owned()
+    }
 }
 
 /// Opens the system file picker (Storage Access Framework). The result arrives through `platform::take_picked`.
@@ -480,7 +633,13 @@ pub fn pick_file(ctx: &Context, target: PickTarget, images_only: bool) {
     }
     let started = with_activity(|env, act| {
         let mime = env.new_string(if images_only { "image/*" } else { "*/*" })?;
-        env.call_method(act, "pickFile", "(ILjava/lang/String;)V", &[JValue::Int(req), JValue::Object(&mime)]).map(|_| ())
+        env.call_method(
+            act,
+            "pickFile",
+            "(ILjava/lang/String;)V",
+            &[JValue::Int(req), JValue::Object(&mime)],
+        )
+        .map(|_| ())
     });
     if started.is_none() {
         if let Ok(mut m) = PENDING_PICKS.lock() {
@@ -501,6 +660,26 @@ pub fn density() -> f32 {
     f32::from_bits(DENSITY.load(Ordering::SeqCst))
 }
 
+/// Height (points) of the status bar / cutout that the app's `screen_rect` leaves out.
+pub fn top_inset_pts() -> f32 {
+    let d = density();
+    if d > 0.5 {
+        INSETS[1].load(Ordering::SeqCst) as f32 / d
+    } else {
+        0.0
+    }
+}
+
+/// Height (points) of everything below `screen_rect`: navigation bar, plus the keyboard while it is up.
+pub fn bottom_inset_pts() -> f32 {
+    let d = density();
+    if d > 0.5 {
+        INSETS[3].load(Ordering::SeqCst) as f32 / d
+    } else {
+        0.0
+    }
+}
+
 pub fn ime_visible() -> bool {
     IME_VISIBLE.load(Ordering::SeqCst)
 }
@@ -508,7 +687,8 @@ pub fn ime_visible() -> bool {
 /// The Back button / gesture was used since the last call (consumes it).
 pub fn take_back() -> bool {
     // API < 33: winit reports the Back key (see the "Lumen patch" in vendor/egui-winit); API >= 33: the Java back callback.
-    let hit = BACK.swap(false, Ordering::SeqCst) | egui_winit::ANDROID_BACK.swap(false, Ordering::SeqCst);
+    let hit =
+        BACK.swap(false, Ordering::SeqCst) | egui_winit::ANDROID_BACK.swap(false, Ordering::SeqCst);
     if !hit {
         return false;
     }
@@ -550,7 +730,12 @@ pub fn on_raw_input(ctx: &Context, raw: &mut RawInput) {
     // 1. density — the logical size must equal the device's real dp size
     let d = density();
     if d > 0.5 {
-        let native = raw.viewports.get(&raw.viewport_id).and_then(|v| v.native_pixels_per_point).unwrap_or(d).max(0.1);
+        let native = raw
+            .viewports
+            .get(&raw.viewport_id)
+            .and_then(|v| v.native_pixels_per_point)
+            .unwrap_or(d)
+            .max(0.1);
         let zoom = (d / native).clamp(0.25, 8.0);
         if (ctx.zoom_factor() - zoom).abs() > 0.002 {
             ctx.set_zoom_factor(zoom);
@@ -570,7 +755,12 @@ pub fn on_raw_input(ctx: &Context, raw: &mut RawInput) {
     let now = raw.time.unwrap_or(0.0);
     for e in &raw.events {
         match e {
-            Event::PointerButton { pos, pressed: false, button: egui::PointerButton::Primary, .. } => {
+            Event::PointerButton {
+                pos,
+                pressed: false,
+                button: egui::PointerButton::Primary,
+                ..
+            } => {
                 LAST_TAP.with(|t| t.set(Some((now, *pos))));
             }
             _ => {}
@@ -578,7 +768,10 @@ pub fn on_raw_input(ctx: &Context, raw: &mut RawInput) {
     }
 
     // 4. soft keyboard → egui events
-    let drained: Vec<Input> = INPUT.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+    let drained: Vec<Input> = INPUT
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default();
     for i in drained {
         match i {
             Input::Text(s) => {
@@ -589,7 +782,13 @@ pub fn on_raw_input(ctx: &Context, raw: &mut RawInput) {
                             raw.events.push(Event::Text(std::mem::take(&mut buf)));
                         }
                         for pressed in [true, false] {
-                            raw.events.push(Event::Key { key: Key::Enter, physical_key: Some(Key::Enter), pressed, repeat: false, modifiers: Modifiers::NONE });
+                            raw.events.push(Event::Key {
+                                key: Key::Enter,
+                                physical_key: Some(Key::Enter),
+                                pressed,
+                                repeat: false,
+                                modifiers: Modifiers::NONE,
+                            });
                         }
                     } else if !ch.is_control() {
                         buf.push(ch);
@@ -600,7 +799,13 @@ pub fn on_raw_input(ctx: &Context, raw: &mut RawInput) {
                 }
             }
             Input::Key(key, pressed) => {
-                raw.events.push(Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: Modifiers::NONE });
+                raw.events.push(Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                });
             }
         }
     }
@@ -640,7 +845,8 @@ pub fn after_frame(ctx: &Context, dark: bool) {
             let visible = ime_visible();
             let recently_shown = now - LAST_SHOW_T.with(|t| t.get()) < 0.8;
             if !visible && !recently_shown {
-                let tapped_here = tap.is_some_and(|(t, p)| now - t < 0.45 && rect.expand(10.0).contains(p));
+                let tapped_here =
+                    tap.is_some_and(|(t, p)| now - t < 0.45 && rect.expand(10.0).contains(p));
                 let tapped_just_before = tap.is_some_and(|(t, _)| now - t < 0.6);
                 if tapped_here || (!was && tapped_just_before) {
                     LAST_SHOW_T.with(|t| t.set(now));
@@ -650,7 +856,12 @@ pub fn after_frame(ctx: &Context, dark: bool) {
         }
         None => {
             WANTED.with(|w| w.set(false));
-            if ime_visible() {
+            if ime_visible() && crate::widgets::sheet_active(ctx) {
+                // a bottom sheet (⋯ menu, block menu) is open: the field lost focus only because the sheet was tapped. Keep the keyboard so the
+                // page does not collapse and re-flow under the sheet; the usual half-second timer restarts once the sheet is gone.
+                LAST_WANT_T.with(|t| t.set(now));
+                ctx.request_repaint_after(std::time::Duration::from_millis(300));
+            } else if ime_visible() {
                 let since = now - LAST_WANT_T.with(|t| t.get());
                 if since > 0.5 {
                     hide_ime();
@@ -673,7 +884,12 @@ fn frame_stats(now: f64) {
         if t0 == 0.0 {
             w.set((now, 1));
         } else if now - t0 >= 10.0 {
-            log::info!("frames drawn in the last {:.0}s: {} ({:.1} fps average)", now - t0, n, n as f64 / (now - t0));
+            log::info!(
+                "frames drawn in the last {:.0}s: {} ({:.1} fps average)",
+                now - t0,
+                n,
+                n as f64 / (now - t0)
+            );
             w.set((now, 1));
         } else {
             w.set((t0, n + 1));

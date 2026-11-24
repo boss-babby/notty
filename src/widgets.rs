@@ -1,13 +1,16 @@
 //! Small reusable, animated widgets.
 
 use egui::{
-    emath::easing, pos2, text::{CCursor, CCursorRange}, vec2, Align2, Area, Color32, Context, CornerRadius, CursorIcon,
-    Event, Frame, Id, Key, Margin, Modifiers, Order, PointerButton, Pos2, RawInput, Rect, Response, Sense, Shadow,
-    Stroke, TextEdit, Ui, Vec2,
+    emath::easing,
+    pos2,
+    text::{CCursor, CCursorRange},
+    vec2, Align2, Area, Color32, Context, CornerRadius, CursorIcon, Event, Frame, Id, Key, Margin,
+    Modifiers, Order, PointerButton, Pos2, RawInput, Rect, Response, Sense, Shadow, Stroke,
+    TextEdit, Ui, Vec2,
 };
 
 use crate::icons::{self, Icon};
-use crate::theme::{bold, body, lerp_color, Palette};
+use crate::theme::{body, bold, lerp_color, Palette};
 
 pub fn ease(t: f32) -> f32 {
     easing::cubic_out(t.clamp(0.0, 1.0))
@@ -38,7 +41,12 @@ pub fn popup_frame(pal: &Palette) -> Frame {
         .stroke(Stroke::new(1.0_f32, pal.border))
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::same(6))
-        .shadow(Shadow { offset: [0, 10], blur: 30, spread: 0, color: Color32::from_black_alpha(60) })
+        .shadow(Shadow {
+            offset: [0, 10],
+            blur: 30,
+            spread: 0,
+            color: Color32::from_black_alpha(60),
+        })
 }
 
 /// Layer ordering helper shared by every popup, modal, drawer and menu.
@@ -68,6 +76,157 @@ impl LayerRaise for Context {
     }
 }
 
+/// Seconds the phone bottom sheet needs to slide in / out, and the opacity (0‥255) of the dimming scrim behind it.
+const SHEET_IN: f32 = 0.30;
+const SHEET_OUT: f32 = 0.22;
+const SCRIM_ALPHA: f32 = 120.0;
+const GHOSTS: &str = "lumen_sheet_ghosts";
+
+/// `(status bar, navigation bar)` heights in points that the host reserves *outside* `screen_rect` (Android, edge-to-edge window).
+/// The bottom value is 0 while the soft keyboard is up (the sheet then sits on top of the keyboard, no gesture bar below it).
+pub fn system_insets() -> (f32, f32) {
+    #[cfg(target_os = "android")]
+    {
+        let bottom = if crate::android::ime_visible() {
+            0.0
+        } else {
+            crate::android::bottom_inset_pts()
+        };
+        (crate::android::top_inset_pts(), bottom)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        (0.0, 0.0)
+    }
+}
+
+/// Fills the strips the host keeps outside `screen_rect` (status bar, navigation bar) with the page colour, and the part below / above the
+/// open phone drawer (`drawer_w` points wide) with the drawer colour: the window then looks like one unified surface edge to edge.
+pub fn paint_system_bars(ctx: &Context, pal: &Palette, drawer_w: f32) {
+    let (top, bottom) = system_insets();
+    if top <= 0.0 && bottom <= 0.0 {
+        return;
+    }
+    let screen = ctx.screen_rect();
+    let full = Rect::from_min_max(
+        pos2(screen.left(), screen.top() - top),
+        pos2(screen.right(), screen.bottom() + bottom),
+    );
+    let mut p = ctx.layer_painter(egui::LayerId::new(
+        Order::Background,
+        Id::new("system_bars"),
+    ));
+    p.set_clip_rect(full);
+    let strips = [
+        Rect::from_min_max(full.min, pos2(full.right(), screen.top())),
+        Rect::from_min_max(pos2(full.left(), screen.bottom()), full.max),
+    ];
+    for s in strips {
+        p.rect_filled(s, 0.0, pal.bg);
+        if drawer_w > 0.0 {
+            p.rect_filled(
+                Rect::from_min_max(
+                    s.min,
+                    pos2((s.left() + drawer_w).min(s.right()), s.bottom()),
+                ),
+                0.0,
+                pal.sidebar,
+            );
+        }
+    }
+}
+
+/// What a closed bottom sheet looked like on its last frame, so that it can slide back down even though its owner has already
+/// forgotten it (almost every caller closes a menu by just no longer calling [`popup_area`]).
+#[derive(Clone)]
+struct SheetGhost {
+    shapes: Vec<egui::epaint::ClippedShape>,
+    rect: Rect,
+    full: Rect,
+    alpha: f32,
+    pass: u64,
+    t0: Option<f64>,
+}
+
+fn remember_sheet(ctx: &Context, id: Id, resp: &Response, t: f32, full: Rect) {
+    let shapes: Vec<egui::epaint::ClippedShape> = ctx.graphics(|g| {
+        g.get(resp.layer_id)
+            .map(|l| l.all_entries().cloned().collect())
+            .unwrap_or_default()
+    });
+    let ghost = SheetGhost {
+        shapes,
+        rect: resp.rect,
+        full,
+        alpha: SCRIM_ALPHA * t,
+        pass: ctx.cumulative_pass_nr(),
+        t0: None,
+    };
+    let now = ctx.input(|i| i.time);
+    ctx.data_mut(|d| {
+        let list = d.get_temp_mut_or_default::<Vec<(Id, SheetGhost)>>(Id::new(GHOSTS));
+        match list.iter_mut().find(|e| e.0 == id) {
+            Some(e) => e.1 = ghost,
+            None => list.push((id, ghost)),
+        }
+        d.insert_temp(Id::new("lumen_sheet_seen"), now);
+    });
+}
+
+/// True while a phone bottom sheet is on screen (or has been within the last half second): the Android keyboard policy keeps the soft
+/// keyboard up in that time, so opening the ⋯ menu from the editor does not collapse the keyboard and re-flow the page under the sheet.
+pub fn sheet_active(ctx: &Context) -> bool {
+    let now = ctx.input(|i| i.time);
+    ctx.data(|d| d.get_temp::<f64>(Id::new("lumen_sheet_seen")))
+        .is_some_and(|t| now - t < 0.5)
+}
+
+/// Call once per pass after every popup: sheets that were not drawn in this pass slide down (ease-in) while the scrim fades.
+pub fn play_sheet_ghosts(ctx: &Context) {
+    let key = Id::new(GHOSTS);
+    let Some(mut list) = ctx.data(|d| d.get_temp::<Vec<(Id, SheetGhost)>>(key)) else {
+        return;
+    };
+    if list.is_empty() {
+        return;
+    }
+    let (now, pass) = (ctx.input(|i| i.time), ctx.cumulative_pass_nr());
+    list.retain_mut(|(id, g)| {
+        if g.pass == pass {
+            return true;
+        }
+        // closed: the next opening must start its slide from the bottom again (callers never call `reset_appear` themselves)
+        reset_appear(ctx, id.with("appear"));
+        let t0 = *g.t0.get_or_insert(now);
+        let p = ((now - t0) / SHEET_OUT as f64) as f32;
+        if p >= 1.0 {
+            return false;
+        }
+        let dy = easing::cubic_in(p) * (g.full.bottom() - g.rect.top() + 8.0);
+        let alpha = (g.alpha * (1.0 - p)).clamp(0.0, 255.0) as u8;
+        Area::new(Id::new(("sheet_ghost", *id)))
+            .order(Order::Tooltip)
+            .constrain(false)
+            .interactable(false)
+            .fixed_pos(g.full.min)
+            .show(ctx, |ui| {
+                ui.allocate_space(vec2(1.0, 1.0));
+                let mut painter = ui.painter().clone();
+                painter.set_clip_rect(g.full);
+                painter.rect_filled(g.full, 0.0, Color32::from_black_alpha(alpha));
+                for cs in &g.shapes {
+                    let mut s = cs.shape.clone();
+                    s.transform(egui::emath::TSTransform::from_translation(vec2(0.0, dy)));
+                    painter.set_clip_rect(cs.clip_rect.translate(vec2(0.0, dy)));
+                    painter.add(s);
+                }
+            });
+        ctx.request_repaint();
+        true
+    });
+    ctx.data_mut(|d| d.insert_temp(key, list));
+}
+
 /// Floating popup anchored at `pos`. Returns `false` when it should close (click outside / Esc).
 pub fn popup_area(
     ctx: &Context,
@@ -94,65 +253,83 @@ pub fn popup_area_on(
     order: Order,
     add: impl FnOnce(&mut Ui),
 ) -> bool {
-    let t = appear(ctx, id.with("appear"), 0.16);
     let screen = ctx.screen_rect();
     let mobile_sheet = screen.width() < 600.0 && width >= 190.0;
+    let t = appear(
+        ctx,
+        id.with("appear"),
+        if mobile_sheet { SHEET_IN } else { 0.16 },
+    );
     let mut scrim_clicked = false;
     let resp = if mobile_sheet {
-        // Dimmed backdrop scrim behind mobile bottom sheet (absorbs outside taps so they don't hit drawer/page behind)
+        // The sheet is edge-to-edge like Notion's: the scrim dims the status bar and the navigation bar too, and the sheet itself
+        // continues down to the physical bottom of the screen (its last rows keep clear of the gesture bar through the bottom padding).
+        let (inset_top, inset_bottom) = system_insets();
+        let full = Rect::from_min_max(
+            pos2(screen.left(), screen.top() - inset_top),
+            pos2(screen.right(), screen.bottom() + inset_bottom),
+        );
         let scrim = Area::new(id.with("scrim"))
             .order(order)
-            .fixed_pos(screen.min)
+            .constrain(false)
+            .fixed_pos(full.min)
             .show(ctx, |ui| {
-                let (r, sr) = ui.allocate_exact_size(screen.size(), Sense::click());
-                ui.painter()
-                    .rect_filled(r, 0.0, Color32::from_black_alpha((92.0 * t) as u8));
+                let (r, sr) = ui.allocate_exact_size(full.size(), Sense::click());
+                let mut p = ui.painter().clone();
+                p.set_clip_rect(full);
+                p.rect_filled(r, 0.0, Color32::from_black_alpha((SCRIM_ALPHA * t) as u8));
                 if sr.clicked() && !*fresh {
                     scrim_clicked = true;
                 }
             });
         ctx.raise_layer(scrim.response.layer_id);
 
-        let sheet_w = (screen.width() - 12.0).max(200.0);
-        let max_h = (screen.height() * 0.68).max(180.0);
-        let slide = (1.0 - t) * 28.0;
+        let max_h = (screen.height() * 0.82).max(180.0);
+        let h_prev = ctx
+            .data(|d| d.get_temp::<f32>(id.with("h")))
+            .unwrap_or(max_h + 60.0);
+        // `Area` constrains itself to the screen by default, which silently cancelled the slide: `constrain(false)` lets the sheet
+        // start completely below the screen and travel up (eased), instead of fading in place.
+        let slide = (1.0 - t) * (h_prev + inset_bottom + 12.0);
         let frame = Frame::NONE
             .fill(pal.popup)
             .stroke(Stroke::new(1.0_f32, pal.border))
             .corner_radius(CornerRadius {
-                nw: 16,
-                ne: 16,
-                sw: 10,
-                se: 10,
+                nw: 20,
+                ne: 20,
+                sw: 0,
+                se: 0,
             })
             .inner_margin(Margin {
                 left: 12,
                 right: 12,
                 top: 4,
-                bottom: 14,
+                bottom: (12.0 + inset_bottom).round().clamp(0.0, 100.0) as i8,
             })
             .shadow(egui::epaint::Shadow {
-                offset: [0, -6],
+                offset: [0, -4],
                 blur: 24,
                 spread: 0,
                 color: Color32::from_black_alpha(70),
             });
-        Area::new(id)
+        let r = Area::new(id)
             .order(order)
-            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -6.0 + slide))
+            .constrain(false)
+            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, inset_bottom + slide))
             .show(ctx, |ui| {
-                ui.set_opacity(t);
                 frame.show(ui, |ui| {
-                    ui.set_width((sheet_w - 24.0).max(180.0));
-                    // Subtle top drag handle pill
-                    let (hr, _) =
-                        ui.allocate_exact_size(vec2(ui.available_width(), 8.0), Sense::hover());
+                    ui.set_width((screen.width() - 26.0).max(180.0));
+                    // grab handle: a tap on it closes the sheet
+                    let (hr, hresp) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 14.0), Sense::click());
                     ui.painter().rect_filled(
-                        Rect::from_center_size(hr.center(), vec2(36.0, 3.5)),
+                        Rect::from_center_size(hr.center(), vec2(40.0, 4.0)),
                         2.0,
-                        with_alpha(pal.muted, 0.45),
+                        with_alpha(pal.muted, 0.5),
                     );
-                    ui.add_space(2.0);
+                    if hresp.clicked() && !*fresh {
+                        scrim_clicked = true;
+                    }
                     egui::ScrollArea::vertical()
                         .id_salt(id.with("popup_scroll"))
                         .max_height(max_h)
@@ -161,7 +338,9 @@ pub fn popup_area_on(
                             add(ui);
                         });
                 });
-            })
+            });
+        remember_sheet(ctx, id, &r.response, t, full);
+        r
     } else {
         // Desktop / compact popover: anchored cleanly near trigger
         let width = width.min((screen.width() - 16.0).max(180.0));
@@ -218,40 +397,78 @@ pub fn popup_area_on(
 }
 
 pub fn icon_button(ui: &mut Ui, pal: &Palette, icon: Icon, size: f32, tip: &str) -> Response {
-    let side = if crate::touch::touchy() { (size + 12.0).max(38.0) } else { size + 12.0 };
+    let side = if crate::touch::touchy() {
+        (size + 12.0).max(38.0)
+    } else {
+        size + 12.0
+    };
     let (rect, resp) = ui.allocate_exact_size(vec2(side, side), Sense::click());
     paint_icon_button(ui, pal, rect, &resp, icon, size);
-    resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip)
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(tip)
 }
 
-pub fn paint_icon_button(ui: &Ui, pal: &Palette, rect: Rect, resp: &Response, icon: Icon, size: f32) {
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+pub fn paint_icon_button(
+    ui: &Ui,
+    pal: &Palette,
+    rect: Rect,
+    resp: &Response,
+    icon: Icon,
+    size: f32,
+) {
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id, resp.hovered(), 0.12);
     if t > 0.0 {
-        let fill = if resp.is_pointer_button_down_on() { pal.active } else { pal.hover };
+        let fill = if resp.is_pointer_button_down_on() {
+            pal.active
+        } else {
+            pal.hover
+        };
         ui.painter().rect_filled(rect, 6.0, with_alpha(fill, t));
     }
-    icons::paint(ui.painter(), rect.center(), size, icon, lerp_color(pal.muted, pal.text, t));
+    icons::paint(
+        ui.painter(),
+        rect.center(),
+        size,
+        icon,
+        lerp_color(pal.muted, pal.text, t),
+    );
 }
 
 pub fn primary_button(ui: &mut Ui, pal: &Palette, label: &str, width: f32) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 38.0), Sense::click());
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.15);
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id, resp.hovered(), 0.15);
     let down = resp.is_pointer_button_down_on();
     let base = pal.accent;
     let fill = lerp_color(base, Color32::from_rgb(20, 100, 190), t * 0.5);
     let r = if down { rect.shrink(1.0) } else { rect };
     ui.painter().rect_filled(r, 8.0, fill);
-    ui.painter().text(r.center(), Align2::CENTER_CENTER, label, bold(14.5), Color32::WHITE);
+    ui.painter().text(
+        r.center(),
+        Align2::CENTER_CENTER,
+        label,
+        bold(14.5),
+        Color32::WHITE,
+    );
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
 pub fn ghost_button(ui: &mut Ui, pal: &Palette, label: &str) -> Response {
-    let galley = ui.painter().layout_no_wrap(label.to_owned(), body(13.5), pal.muted);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), body(13.5), pal.muted);
     let (rect, resp) = ui.allocate_exact_size(galley.size() + vec2(18.0, 10.0), Sense::click());
-    let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
-    ui.painter().rect_filled(rect, 6.0, with_alpha(pal.hover, t));
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    ui.painter()
+        .rect_filled(rect, 6.0, with_alpha(pal.hover, t));
     let col = lerp_color(pal.muted, pal.text, t);
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, body(13.5), col);
+    ui.painter()
+        .text(rect.center(), Align2::CENTER_CENTER, label, body(13.5), col);
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
@@ -266,7 +483,15 @@ pub fn section_label(ui: &mut Ui, pal: &Palette, text: &str) {
 
 /// Full-width menu row with optional leading glyph and sub-label.
 /// Paints single-line text that is truncated with an ellipsis instead of overflowing its box. Returns the painted width.
-pub fn text_fit(p: &egui::Painter, pos: Pos2, anchor: Align2, text: &str, font: egui::FontId, color: Color32, max_w: f32) -> f32 {
+pub fn text_fit(
+    p: &egui::Painter,
+    pos: Pos2,
+    anchor: Align2,
+    text: &str,
+    font: egui::FontId,
+    color: Color32,
+    max_w: f32,
+) -> f32 {
     let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
     job.wrap = egui::text::TextWrapping::truncate_at_width(max_w.max(1.0));
     let g = p.layout_job(job);
@@ -415,7 +640,10 @@ pub fn radial_glow(p: &egui::Painter, center: Pos2, radius: f32, color: Color32)
     let n = crate::crisp::arc_steps(radius, std::f32::consts::TAU).max(48) as u32;
     for i in 0..=n {
         let a = i as f32 / n as f32 * std::f32::consts::TAU;
-        mesh.colored_vertex(pos2(center.x + a.cos() * radius, center.y + a.sin() * radius), Color32::TRANSPARENT);
+        mesh.colored_vertex(
+            pos2(center.x + a.cos() * radius, center.y + a.sin() * radius),
+            Color32::TRANSPARENT,
+        );
     }
     for i in 1..=n {
         mesh.add_triangle(0, i, i + 1);
@@ -435,8 +663,13 @@ pub fn field(
     id: Id,
 ) -> Response {
     let focused = ui.memory(|m| m.has_focus(id));
-    let t = ui.ctx().animate_bool_with_time(id.with("focus"), focused, 0.15);
-    let stroke = Stroke::new(1.0_f32 + t * 0.7, lerp_color(pal.border.gamma_multiply(1.6), pal.accent, t));
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(id.with("focus"), focused, 0.15);
+    let stroke = Stroke::new(
+        1.0_f32 + t * 0.7,
+        lerp_color(pal.border.gamma_multiply(1.6), pal.accent, t),
+    );
     Frame::new()
         .fill(fill)
         .stroke(stroke)
@@ -456,7 +689,6 @@ pub fn field(
         .inner
 }
 
-
 // ───────────────────────────── right-click support ─────────────────────────────
 
 const RC_KEY: &str = "lumen_rclick";
@@ -466,7 +698,12 @@ const RC_KEY: &str = "lumen_rclick";
 pub fn filter_raw_input(ctx: &Context, raw: &mut RawInput) {
     let mut found = None;
     raw.events.retain(|e| match e {
-        Event::PointerButton { pos, button: PointerButton::Secondary, pressed, .. } => {
+        Event::PointerButton {
+            pos,
+            button: PointerButton::Secondary,
+            pressed,
+            ..
+        } => {
             if *pressed {
                 found = Some(*pos);
             }
@@ -479,7 +716,9 @@ pub fn filter_raw_input(ctx: &Context, raw: &mut RawInput) {
         ctx.request_repaint();
     }
     // events scheduled by the universal text-field menu (Cut / Copy / Paste / Select all / Undo / Redo) for the focused field
-    let pending: Vec<Event> = ctx.data_mut(|d| d.remove_temp::<Vec<Event>>(Id::new("lumen_pending_events"))).unwrap_or_default();
+    let pending: Vec<Event> = ctx
+        .data_mut(|d| d.remove_temp::<Vec<Event>>(Id::new("lumen_pending_events")))
+        .unwrap_or_default();
     if !pending.is_empty() {
         raw.events.extend(pending);
         ctx.request_repaint();
@@ -507,7 +746,8 @@ pub fn end_frame(ctx: &Context) {
 }
 
 fn text_under(ctx: &Context, p: Pos2) -> bool {
-    ctx.data(|d| d.get_temp::<Vec<TxEntry>>(Id::new("lumen_textedits"))).map_or(false, |v| v.iter().any(|e| e.1.contains(p)))
+    ctx.data(|d| d.get_temp::<Vec<TxEntry>>(Id::new("lumen_textedits")))
+        .map_or(false, |v| v.iter().any(|e| e.1.contains(p)))
 }
 
 /// A right-click landed on `rect` (and that part of the screen is not covered by a popup / other layer).
@@ -517,7 +757,8 @@ pub fn right_clicked(ui: &Ui, rect: Rect) -> Option<Pos2> {
     let p = right_clicked_any(ui, rect)?;
     if text_under(ui.ctx(), p) {
         // give the click back to the universal text menu
-        ui.ctx().data_mut(|d| d.remove::<bool>(Id::new("lumen_rc_claimed")));
+        ui.ctx()
+            .data_mut(|d| d.remove::<bool>(Id::new("lumen_rc_claimed")));
         return None;
     }
     Some(p)
@@ -526,7 +767,10 @@ pub fn right_clicked(ui: &Ui, rect: Rect) -> Option<Pos2> {
 /// Like [`right_clicked`] but also for clicks on text fields; the caller owns the click (the universal text menu stays closed).
 pub fn right_clicked_any(ui: &Ui, rect: Rect) -> Option<Pos2> {
     let p = rclick(ui.ctx())?;
-    if rect.contains(p) && ui.clip_rect().contains(p) && ui.ctx().layer_id_at(p).map_or(true, |l| l == ui.layer_id()) {
+    if rect.contains(p)
+        && ui.clip_rect().contains(p)
+        && ui.ctx().layer_id_at(p).map_or(true, |l| l == ui.layer_id())
+    {
         claim_rc(ui.ctx());
         Some(p)
     } else {
@@ -546,7 +790,14 @@ pub struct CtxItem {
 
 impl CtxItem {
     pub fn new(icon: &'static str, label: &'static str) -> Self {
-        Self { icon, label, hint: "", danger: false, enabled: true, sep: false }
+        Self {
+            icon,
+            label,
+            hint: "",
+            danger: false,
+            enabled: true,
+            sep: false,
+        }
     }
     pub fn hint(mut self, h: &'static str) -> Self {
         self.hint = h;
@@ -821,7 +1072,10 @@ pub fn context_menu(
 // ───────────────────────────── text helpers ─────────────────────────────
 
 fn char_to_byte(s: &str, chars: usize) -> usize {
-    s.char_indices().nth(chars).map(|(i, _)| i).unwrap_or(s.len())
+    s.char_indices()
+        .nth(chars)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
 }
 
 /// Text of the char range `a..b`.
@@ -848,7 +1102,8 @@ pub fn selection(ctx: &Context, id: Id) -> Option<(usize, usize)> {
 /// Sets the selection of a text edit and gives it keyboard focus.
 pub fn set_selection(ctx: &Context, id: Id, a: usize, b: usize) {
     let mut st = TextEdit::load_state(ctx, id).unwrap_or_default();
-    st.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(a), CCursor::new(b))));
+    st.cursor
+        .set_char_range(Some(CCursorRange::two(CCursor::new(a), CCursor::new(b))));
     st.store(ctx, id);
     ctx.memory_mut(|m| m.request_focus(id));
 }
@@ -878,14 +1133,25 @@ pub fn field_menu(ui: &Ui, pal: &Palette, resp: &Response, text: &mut String) ->
             d.insert_temp(mkey.with("fresh"), true);
         });
     }
-    let Some((pos, a, b)) = ctx.data(|d| d.get_temp::<(Pos2, usize, usize)>(mkey)) else { return changed };
-    let mut fresh = ctx.data(|d| d.get_temp::<bool>(mkey.with("fresh"))).unwrap_or(false);
+    let Some((pos, a, b)) = ctx.data(|d| d.get_temp::<(Pos2, usize, usize)>(mkey)) else {
+        return changed;
+    };
+    let mut fresh = ctx
+        .data(|d| d.get_temp::<bool>(mkey.with("fresh")))
+        .unwrap_or(false);
     let has_sel = a != b;
     let items = [
-        CtxItem::new(crate::lucide::SCISSORS, "Cut").hint("Ctrl+X").enabled(has_sel),
-        CtxItem::new(crate::lucide::COPY, "Copy").hint("Ctrl+C").enabled(has_sel),
+        CtxItem::new(crate::lucide::SCISSORS, "Cut")
+            .hint("Ctrl+X")
+            .enabled(has_sel),
+        CtxItem::new(crate::lucide::COPY, "Copy")
+            .hint("Ctrl+C")
+            .enabled(has_sel),
         CtxItem::new(crate::lucide::CLIPBOARD_PASTE, "Paste").hint("Ctrl+V"),
-        CtxItem::new(crate::lucide::TEXT_SELECT, "Select all").hint("Ctrl+A").sep().enabled(!text.is_empty()),
+        CtxItem::new(crate::lucide::TEXT_SELECT, "Select all")
+            .hint("Ctrl+A")
+            .sep()
+            .enabled(!text.is_empty()),
     ];
     let (open, pick) = context_menu(&ctx, mkey, pos, pal, &mut fresh, &items);
     ctx.data_mut(|d| d.insert_temp(mkey.with("fresh"), fresh));
@@ -919,7 +1185,14 @@ pub fn field_menu(ui: &Ui, pal: &Palette, resp: &Response, text: &mut String) ->
 /// Next content size when the user presses − / +  (5 % steps, always inside the allowed range).
 pub fn step_zoom(z: f32, dir: i32) -> f32 {
     let pct = (crate::model::clamp_zoom(z) * 100.0).round() as i32;
-    let next = (pct / 5) * 5 + if dir > 0 { 5 } else if pct % 5 == 0 { -5 } else { 0 };
+    let next = (pct / 5) * 5
+        + if dir > 0 {
+            5
+        } else if pct % 5 == 0 {
+            -5
+        } else {
+            0
+        };
     crate::model::clamp_zoom(next as f32 / 100.0)
 }
 
@@ -928,7 +1201,11 @@ pub fn zoom_from_t(t: f32) -> f32 {
     let (lo, hi) = (crate::model::ZOOM_MIN, crate::model::ZOOM_MAX);
     let raw = lo + (hi - lo) * t.clamp(0.0, 1.0);
     let snapped = (raw * 20.0).round() / 20.0;
-    crate::model::clamp_zoom(if (snapped - 1.0).abs() < 0.04 { 1.0 } else { snapped })
+    crate::model::clamp_zoom(if (snapped - 1.0).abs() < 0.04 {
+        1.0
+    } else {
+        snapped
+    })
 }
 
 /// `[−] ──●────── [+] [100 %]` — resizes the *content* of the page only (the caller stores the value in the page).
@@ -941,15 +1218,31 @@ pub fn size_control(ui: &mut Ui, pal: &Palette, zoom: &mut f32) -> bool {
     let h = if touchy { 42.0 } else { 34.0 };
     let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
     let bs = h - 6.0;
-    let minus = Rect::from_center_size(pos2(row.left() + 6.0 + bs / 2.0, row.center().y), vec2(bs, bs));
-    let chip = Rect::from_center_size(pos2(row.right() - 4.0 - 24.0, row.center().y), vec2(48.0, bs));
-    let plus = Rect::from_center_size(pos2(chip.left() - 4.0 - bs / 2.0, row.center().y), vec2(bs, bs));
-    let track = Rect::from_min_max(pos2(minus.right() + 12.0, row.top()), pos2(plus.left() - 12.0, row.bottom()));
+    let minus = Rect::from_center_size(
+        pos2(row.left() + 6.0 + bs / 2.0, row.center().y),
+        vec2(bs, bs),
+    );
+    let chip = Rect::from_center_size(
+        pos2(row.right() - 4.0 - 24.0, row.center().y),
+        vec2(48.0, bs),
+    );
+    let plus = Rect::from_center_size(
+        pos2(chip.left() - 4.0 - bs / 2.0, row.center().y),
+        vec2(bs, bs),
+    );
+    let track = Rect::from_min_max(
+        pos2(minus.right() + 12.0, row.top()),
+        pos2(plus.left() - 12.0, row.bottom()),
+    );
 
     let mr = ui.interact(minus, Id::new("zoom_minus"), Sense::click());
     let pr = ui.interact(plus, Id::new("zoom_plus"), Sense::click());
     let cr = ui.interact(chip, Id::new("zoom_reset"), Sense::click());
-    let tr = ui.interact(track.expand2(vec2(10.0, 0.0)), Id::new("zoom_track"), Sense::click_and_drag());
+    let tr = ui.interact(
+        track.expand2(vec2(10.0, 0.0)),
+        Id::new("zoom_track"),
+        Sense::click_and_drag(),
+    );
     crate::touch::claim(track.expand2(vec2(12.0, 0.0)));
 
     paint_icon_button(ui, pal, minus, &mr, Icon::Minus, 16.0);
@@ -975,17 +1268,41 @@ pub fn size_control(ui: &mut Ui, pal: &Palette, zoom: &mut f32) -> bool {
     let y = track.center().y;
     let rail = Rect::from_min_max(pos2(track.left(), y - 2.0), pos2(track.right(), y + 2.0));
     ui.painter().rect_filled(rail, 2.0, pal.active);
-    ui.painter().rect_filled(Rect::from_min_max(rail.min, pos2(track.left() + track.width() * t, rail.max.y)), 2.0, pal.accent);
+    ui.painter().rect_filled(
+        Rect::from_min_max(rail.min, pos2(track.left() + track.width() * t, rail.max.y)),
+        2.0,
+        pal.accent,
+    );
     let t100 = (1.0 - lo) / (hi - lo);
-    ui.painter().vline(track.left() + track.width() * t100, (y - 6.0)..=(y + 6.0), Stroke::new(1.0_f32, with_alpha(pal.muted, 0.6)));
+    ui.painter().vline(
+        track.left() + track.width() * t100,
+        (y - 6.0)..=(y + 6.0),
+        Stroke::new(1.0_f32, with_alpha(pal.muted, 0.6)),
+    );
     let kn = pos2(track.left() + track.width() * t, y);
     let active = tr.dragged() || tr.hovered();
-    ui.painter().circle_filled(kn, if active { 10.0 } else { 8.5 }, Color32::WHITE);
-    ui.painter().circle_stroke(kn, if active { 10.0 } else { 8.5 }, Stroke::new(2.0_f32, pal.accent));
+    ui.painter()
+        .circle_filled(kn, if active { 10.0 } else { 8.5 }, Color32::WHITE);
+    ui.painter().circle_stroke(
+        kn,
+        if active { 10.0 } else { 8.5 },
+        Stroke::new(2.0_f32, pal.accent),
+    );
 
     let cth = ui.ctx().animate_bool_with_time(cr_id, cr_hov, 0.1);
-    ui.painter().rect_filled(chip, 6.0, with_alpha(pal.hover, cth));
-    ui.painter().text(chip.center(), Align2::CENTER_CENTER, format!("{}%", (out * 100.0).round() as i32), bold(12.5), if (out - 1.0).abs() < 0.001 { pal.muted } else { pal.text });
+    ui.painter()
+        .rect_filled(chip, 6.0, with_alpha(pal.hover, cth));
+    ui.painter().text(
+        chip.center(),
+        Align2::CENTER_CENTER,
+        format!("{}%", (out * 100.0).round() as i32),
+        bold(12.5),
+        if (out - 1.0).abs() < 0.001 {
+            pal.muted
+        } else {
+            pal.text
+        },
+    );
 
     if (out - cur).abs() > 1e-4 {
         *zoom = out;
@@ -995,7 +1312,6 @@ pub fn size_control(ui: &mut Ui, pal: &Palette, zoom: &mut f32) -> bool {
         false
     }
 }
-
 
 // ───────────────────────────── universal text-field menu ─────────────────────────────
 //
@@ -1023,25 +1339,42 @@ pub fn claim_rc(ctx: &Context) {
 }
 
 fn push_event(ctx: &Context, e: Event) {
-    ctx.data_mut(|d| d.get_temp_mut_or_default::<Vec<Event>>(Id::new("lumen_pending_events")).push(e));
+    ctx.data_mut(|d| {
+        d.get_temp_mut_or_default::<Vec<Event>>(Id::new("lumen_pending_events"))
+            .push(e)
+    });
     ctx.request_repaint();
 }
 
 fn key_event(key: Key, modifiers: Modifiers) -> Event {
-    Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    }
 }
 
 /// Call once per frame, after the UI was built (the text fields of this frame have registered themselves).
 pub fn universal_text_menu(ctx: &Context, pal: &Palette) {
-    let entries: Vec<TxEntry> = ctx.data_mut(|d| d.remove_temp::<Vec<TxEntry>>(Id::new("lumen_textedits"))).unwrap_or_default();
-    let claimed = ctx.data(|d| d.get_temp::<bool>(Id::new("lumen_rc_claimed"))).unwrap_or(false);
+    let entries: Vec<TxEntry> = ctx
+        .data_mut(|d| d.remove_temp::<Vec<TxEntry>>(Id::new("lumen_textedits")))
+        .unwrap_or_default();
+    let claimed = ctx
+        .data(|d| d.get_temp::<bool>(Id::new("lumen_rc_claimed")))
+        .unwrap_or(false);
     let mkey = Id::new("lumen_umenu");
     let wkey = Id::new("lumen_umenu_wait");
 
     // a Paste requested from the menu finished (immediately on desktop / Android, a moment later in the browser)
     if let Some(multiline) = ctx.data(|d| d.get_temp::<bool>(wkey)) {
         if let Some(clip) = crate::platform::take_paste() {
-            let clip = if multiline { clip.replace('\r', "") } else { clip.replace(['\r', '\n'], " ") };
+            let clip = if multiline {
+                clip.replace('\r', "")
+            } else {
+                clip.replace(['\r', '\n'], " ")
+            };
             if !clip.is_empty() {
                 push_event(ctx, Event::Paste(clip));
             }
@@ -1052,37 +1385,109 @@ pub fn universal_text_menu(ctx: &Context, pal: &Palette) {
     if !claimed {
         if let Some(p) = rclick(ctx) {
             let top = ctx.layer_id_at(p);
-            let hit = entries.iter().rev().find(|e| e.1.contains(p) && top.map_or(true, |l| l == e.2));
+            let hit = entries
+                .iter()
+                .rev()
+                .find(|e| e.1.contains(p) && top.map_or(true, |l| l == e.2));
             if let Some(&(id, _, _, multiline, password, mutable)) = hit {
                 let (a, b) = selection(ctx, id).unwrap_or((0, 0));
                 ctx.data_mut(|d| {
-                    d.insert_temp(mkey, UMenu { pos: p, id, a, b, multiline, password, mutable });
+                    d.insert_temp(
+                        mkey,
+                        UMenu {
+                            pos: p,
+                            id,
+                            a,
+                            b,
+                            multiline,
+                            password,
+                            mutable,
+                        },
+                    );
                     d.insert_temp(mkey.with("fresh"), true);
                 });
             }
         }
     }
-    let Some(m) = ctx.data(|d| d.get_temp::<UMenu>(mkey)) else { return };
-    let mut fresh = ctx.data(|d| d.get_temp::<bool>(mkey.with("fresh"))).unwrap_or(false);
+    let Some(m) = ctx.data(|d| d.get_temp::<UMenu>(mkey)) else {
+        return;
+    };
+    let mut fresh = ctx
+        .data(|d| d.get_temp::<bool>(mkey.with("fresh")))
+        .unwrap_or(false);
     let has_sel = m.a != m.b;
     let fmt = m.multiline && m.mutable && !m.password;
     let mut list: Vec<(CtxItem, u8)> = vec![
-        (CtxItem::new(crate::lucide::UNDO_2, "Undo").hint("Ctrl+Z").enabled(m.mutable), 0),
-        (CtxItem::new(crate::lucide::REDO_2, "Redo").hint("Ctrl+Y").enabled(m.mutable), 1),
-        (CtxItem::new(crate::lucide::SCISSORS, "Cut").hint("Ctrl+X").sep().enabled(has_sel && m.mutable && !m.password), 2),
-        (CtxItem::new(crate::lucide::COPY, "Copy").hint("Ctrl+C").enabled(has_sel && !m.password), 3),
-        (CtxItem::new(crate::lucide::CLIPBOARD_PASTE, "Paste").hint("Ctrl+V").enabled(m.mutable), 4),
-        (CtxItem::new(crate::lucide::TEXT_SELECT, "Select all").hint("Ctrl+A").sep(), 5),
+        (
+            CtxItem::new(crate::lucide::UNDO_2, "Undo")
+                .hint("Ctrl+Z")
+                .enabled(m.mutable),
+            0,
+        ),
+        (
+            CtxItem::new(crate::lucide::REDO_2, "Redo")
+                .hint("Ctrl+Y")
+                .enabled(m.mutable),
+            1,
+        ),
+        (
+            CtxItem::new(crate::lucide::SCISSORS, "Cut")
+                .hint("Ctrl+X")
+                .sep()
+                .enabled(has_sel && m.mutable && !m.password),
+            2,
+        ),
+        (
+            CtxItem::new(crate::lucide::COPY, "Copy")
+                .hint("Ctrl+C")
+                .enabled(has_sel && !m.password),
+            3,
+        ),
+        (
+            CtxItem::new(crate::lucide::CLIPBOARD_PASTE, "Paste")
+                .hint("Ctrl+V")
+                .enabled(m.mutable),
+            4,
+        ),
+        (
+            CtxItem::new(crate::lucide::TEXT_SELECT, "Select all")
+                .hint("Ctrl+A")
+                .sep(),
+            5,
+        ),
     ];
     if fmt {
         // Markdown formatting for multi-line fields (also reachable by touch: long-press → menu)
-        list.push((CtxItem::new(crate::lucide::BOLD, "Bold").hint("Ctrl+B").sep(), 10));
-        list.push((CtxItem::new(crate::lucide::ITALIC, "Italic").hint("Ctrl+I"), 11));
-        list.push((CtxItem::new(crate::lucide::UNDERLINE, "Underline").hint("Ctrl+U"), 12));
-        list.push((CtxItem::new(crate::lucide::STRIKETHROUGH, "Strikethrough").hint("Ctrl+Shift+S"), 13));
-        list.push((CtxItem::new(crate::lucide::CODE, "Inline code").hint("Ctrl+E"), 14));
-        list.push((CtxItem::new(crate::lucide::HIGHLIGHTER, "Highlight").hint("Ctrl+Shift+H"), 15));
-        list.push((CtxItem::new(crate::lucide::SIGMA, "Math  $…$").hint("Ctrl+Shift+M"), 16));
+        list.push((
+            CtxItem::new(crate::lucide::BOLD, "Bold")
+                .hint("Ctrl+B")
+                .sep(),
+            10,
+        ));
+        list.push((
+            CtxItem::new(crate::lucide::ITALIC, "Italic").hint("Ctrl+I"),
+            11,
+        ));
+        list.push((
+            CtxItem::new(crate::lucide::UNDERLINE, "Underline").hint("Ctrl+U"),
+            12,
+        ));
+        list.push((
+            CtxItem::new(crate::lucide::STRIKETHROUGH, "Strikethrough").hint("Ctrl+Shift+S"),
+            13,
+        ));
+        list.push((
+            CtxItem::new(crate::lucide::CODE, "Inline code").hint("Ctrl+E"),
+            14,
+        ));
+        list.push((
+            CtxItem::new(crate::lucide::HIGHLIGHTER, "Highlight").hint("Ctrl+Shift+H"),
+            15,
+        ));
+        list.push((
+            CtxItem::new(crate::lucide::SIGMA, "Math  $…$").hint("Ctrl+Shift+M"),
+            16,
+        ));
     }
     let items: Vec<CtxItem> = list.iter().map(|x| x.0).collect();
     let (open, pick) = context_menu(ctx, mkey, m.pos, pal, &mut fresh, &items);

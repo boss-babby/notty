@@ -95,12 +95,20 @@ pub fn advertise(beacon: Arc<Mutex<Option<Beacon>>>, stop: Arc<AtomicBool>) {
             };
             let _ = udp.set_broadcast(true);
             let mut last_send = Instant::now() - Duration::from_secs(10);
+            // The target list needs up to four throw-away sockets to learn the local subnet: build it once and refresh it every 20 s
+            // (the phone may roam to another Wi-Fi) instead of on every 2 s beacon.
+            let mut targets = broadcast_targets();
+            let mut targets_at = Instant::now();
             while !stop.load(Ordering::Relaxed) {
                 if last_send.elapsed() >= Duration::from_secs(2) {
                     last_send = Instant::now();
+                    if targets_at.elapsed() >= Duration::from_secs(20) {
+                        targets = broadcast_targets();
+                        targets_at = Instant::now();
+                    }
                     if let Ok(Some(b)) = beacon.lock().map(|g| g.clone()) {
                         if let Some(pkt) = encode_beacon(&b) {
-                            for dst in broadcast_targets() {
+                            for dst in &targets {
                                 let _ = udp.send_to(&pkt, dst);
                             }
                         }
@@ -117,6 +125,7 @@ pub fn browse(inbox: Inbox, stop: Arc<AtomicBool>) {
         .name("lumen-lan-scan".into())
         .spawn(move || {
             let Some(udp) = bind_broadcast_socket(DISCOVERY_PORT) else {
+                log::warn!("LAN discovery: UDP port {DISCOVERY_PORT} is busy or blocked; relying on mDNS / NSD only");
                 return;
             };
             let _ = udp.set_read_timeout(Some(Duration::from_millis(250)));
@@ -136,6 +145,24 @@ pub fn browse(inbox: Inbox, stop: Arc<AtomicBool>) {
 mod tests {
     use super::*;
     use crate::collab::PROTO;
+
+    #[test]
+    fn broadcast_targets_always_include_the_limited_broadcast() {
+        let t = broadcast_targets();
+        assert!(t.contains(&SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::BROADCAST,
+            DISCOVERY_PORT
+        ))));
+        let mut d = t.clone();
+        d.dedup();
+        assert_eq!(d.len(), t.len(), "no duplicate targets");
+    }
+
+    #[test]
+    fn foreign_datagrams_are_ignored() {
+        assert!(decode_beacon(b"GET / HTTP/1.1").is_none());
+        assert!(decode_beacon(b"LMN1{not json").is_none());
+    }
 
     #[test]
     fn lan_beacon_roundtrips_with_iroh_id() {

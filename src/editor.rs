@@ -2000,26 +2000,37 @@ fn sibling_target(bl: &[Block], i: usize, up: bool) -> Option<usize> {
 
 /// Phone / tablet editing toolbar: a strip above the keyboard (add, block type, indent, move, duplicate, undo, delete, hide keyboard)
 /// plus the block-type bottom sheet. It scrolls sideways, so it can never run off a narrow screen.
-/// Checks whether the caret in `text` is sitting right before a closing `mark` (active stateful typing mode).
-fn caret_inside_mark(text: &str, caret_char: usize, mark: &str) -> bool {
-    let mlen = mark.chars().count();
-    let chars: Vec<char> = text.chars().collect();
-    if caret_char + mlen > chars.len() {
-        return false;
+/// Is inline-format `flag` on for the selection `a..b` (every character formatted) or, with a bare caret, for the next typed character
+/// (pending toggle, otherwise the format of the character before the caret)? Drives the highlighted state of the mobile format tools.
+fn fmt_flag_active(rt: &Rich, ed: &EditorState, bid: u64, a: usize, b: usize, flag: u8) -> bool {
+    let (a, b) = (a.min(b), a.max(b));
+    if a != b {
+        return rt.all_have(a, b, flag);
     }
-    let after: String = chars[caret_char..caret_char + mlen].iter().collect();
-    if after != mark {
-        return false;
+    match ed.pending {
+        Some((pb, pc, f)) if pb == bid && pc == a => f.flags & flag != 0,
+        _ => a
+            .checked_sub(1)
+            .and_then(|i| rt.fmts.get(i))
+            .is_some_and(|f| f.flags & flag != 0),
     }
-    // Also ensure there is a matching opening mark before the caret on the same line
-    let before: String = chars[..caret_char].iter().collect();
-    before.contains(mark)
 }
 
-/// Applies inline formatting from the mobile keyboard toolbar:
-/// - With a selection: wraps/unwraps the selected text with `mark`.
-/// - Without a selection (caret only): toggles stateful typing mode by inserting `mark..mark` and placing the
-///   caret inside (when turning ON), or jumping the caret past the closing `mark` (when turning OFF).
+/// The last known selection of a block's text field. Tapping the keyboard toolbar takes the focus (and with it the live cursor) away
+/// from the field for a frame, so the toolbar works on the selection recorded while the field still had it.
+fn last_selection(ctx: &egui::Context, bid: u64) -> Option<(usize, usize)> {
+    ctx.data(|d| d.get_temp::<(u64, usize, usize)>(Id::new("mobile_last_sel")))
+        .filter(|s| s.0 == bid)
+        .map(|s| (s.1, s.2))
+}
+
+/// Inline formatting from the mobile keyboard toolbar. It goes through the same code as Ctrl+B / Ctrl+I on the desktop
+/// ([`toggle_format`] on the per-character [`Rich`] model), so
+/// * with a selection the format is toggled on exactly that text (off again if all of it already has it);
+/// * with only a caret the tool becomes a *typing mode*: nothing is inserted, the next characters are typed in that format until the
+///   tool is toggled off again or the caret moves elsewhere.
+/// (The earlier version spliced `**` markers into the stored Markdown using plain-text caret indices, which drifted as soon as the block
+/// contained any other format, an escape or a link — hence the unpredictable results.)
 fn apply_mobile_format(
     ctx: &egui::Context,
     page: &mut Page,
@@ -2030,51 +2041,22 @@ fn apply_mobile_format(
     let Some(blk) = page.blocks.get_mut(idx) else {
         return;
     };
+    if blk.kind.raw() {
+        return;
+    }
     let bid = blk.id;
     let edit_id = Id::new(("blk", bid));
-    let chars: Vec<char> = blk.text.chars().collect();
-    let (a, b) = egui::TextEdit::load_state(ctx, edit_id)
-        .and_then(|st| st.cursor.char_range())
-        .map(|r| {
-            let i0 = r.primary.index.min(r.secondary.index).min(chars.len());
-            let i1 = r.primary.index.max(r.secondary.index).min(chars.len());
-            (i0, i1)
-        })
-        .unwrap_or((chars.len(), chars.len()));
-
-    let mlen = mark.chars().count();
-    let new_caret = if a < b {
-        // Wrap or unwrap selection
-        let before: String = chars[..a].iter().collect();
-        let mid: String = chars[a..b].iter().collect();
-        let after: String = chars[b..].iter().collect();
-        if before.ends_with(mark) && after.starts_with(mark) {
-            let b_trim = &before[..before.len() - mark.len()];
-            let a_trim = &after[mark.len()..];
-            blk.text = format!("{b_trim}{mid}{a_trim}");
-            b.saturating_sub(mlen)
-        } else {
-            blk.text = format!("{before}{mark}{mid}{mark}{after}");
-            b + mlen
-        }
-    } else if caret_inside_mark(&blk.text, a, mark) {
-        // Turn OFF stateful formatting: step cursor past the closing marker
-        (a + mlen).min(chars.len())
-    } else {
-        // Turn ON stateful formatting: insert opening + closing markers and place caret in between
-        let before: String = chars[..a].iter().collect();
-        let after: String = chars[a..].iter().collect();
-        blk.text = format!("{before}{mark}{mark}{after}");
-        a + mlen
-    };
-    ed.focus = Some((bid, new_caret));
-    ed.restore_sel = Some((bid, new_caret, new_caret));
-    let mut st = egui::TextEdit::load_state(ctx, edit_id).unwrap_or_default();
-    st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
-        egui::text::CCursor::new(new_caret),
-    )));
-    st.store(ctx, edit_id);
+    let mut rt = Rich::parse(&blk.text);
+    let n = rt.len();
+    let (a, b) = last_selection(ctx, bid)
+        .or_else(|| widgets::selection(ctx, edit_id))
+        .unwrap_or((n, n));
+    let (a, b) = (a.min(n), b.min(n));
+    toggle_format(&mut rt, ed, bid, a, b, rich::flag_for(mark));
+    blk.text = rt.markup();
+    ed.restore_sel = Some((bid, a, b));
     ctx.memory_mut(|m| m.request_focus(edit_id));
+    ctx.request_repaint();
 }
 
 fn mobile_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette) -> Option<Act> {
@@ -2146,25 +2128,28 @@ fn mobile_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette)
                                     }
                                     ui.add_space(4.0);
                                     let edit_id = Id::new(("blk", bid));
-                                    let caret = egui::TextEdit::load_state(&ctx, edit_id)
-                                        .and_then(|st| st.cursor.char_range())
-                                        .map(|r| r.primary.index)
-                                        .unwrap_or_else(|| page.blocks[idx].text.chars().count());
+                                    let fmt_rt = Rich::parse(&page.blocks[idx].text);
+                                    let nfmt = fmt_rt.len();
+                                    let (sa, sb) = last_selection(&ctx, bid)
+                                        .or_else(|| widgets::selection(&ctx, edit_id))
+                                        .unwrap_or((nfmt, nfmt));
                                     let mut picked_mark: Option<&'static str> = None;
                                     for (icon, mark, tip) in [
-                                        (Icon::Bold, "**", "Bold (toggle active typing)"),
-                                        (Icon::Italic, "*", "Italic (toggle active typing)"),
-                                        (Icon::Underline, "__", "Underline (toggle active typing)"),
-                                        (
-                                            Icon::Strike,
-                                            "~~",
-                                            "Strikethrough (toggle active typing)",
-                                        ),
-                                        (Icon::Code, "`", "Inline code (toggle active typing)"),
-                                        (Icon::Highlight, "==", "Highlight (toggle active typing)"),
+                                        (Icon::Bold, "**", "Bold"),
+                                        (Icon::Italic, "*", "Italic"),
+                                        (Icon::Underline, "__", "Underline"),
+                                        (Icon::Strike, "~~", "Strikethrough"),
+                                        (Icon::Code, "`", "Inline code"),
+                                        (Icon::Highlight, "==", "Highlight"),
                                     ] {
-                                        let active =
-                                            caret_inside_mark(&page.blocks[idx].text, caret, mark);
+                                        let active = fmt_flag_active(
+                                            &fmt_rt,
+                                            ed,
+                                            bid,
+                                            sa.min(nfmt),
+                                            sb.min(nfmt),
+                                            rich::flag_for(mark),
+                                        );
                                         let r = widgets::icon_button(ui, pal, icon, 18.0, tip);
                                         if active {
                                             ui.painter().rect_filled(
@@ -2337,10 +2322,16 @@ fn mobile_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette)
         let cur_kind = page.blocks[idx].kind;
         let w = (screen.width() - 16.0).min(520.0);
         let max_h = (screen.height() * 0.5).clamp(160.0, 380.0);
+        let sheet_t = widgets::appear(&ctx, Id::new("mobile_sheet_a"), 0.22);
         let sheet = egui::Area::new(Id::new("mobile_sheet"))
             .order(Order::Foreground)
-            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -(bar_h + 6.0)))
+            .constrain(false)
+            .anchor(
+                Align2::CENTER_BOTTOM,
+                vec2(0.0, -(bar_h + 6.0) + (1.0 - sheet_t) * 36.0),
+            )
             .show(&ctx, |ui| {
+                ui.set_opacity(sheet_t);
                 widgets::popup_frame(pal).show(ui, |ui| {
                     ui.set_width(w - 12.0);
                     ui.horizontal(|ui| {
@@ -2424,6 +2415,19 @@ fn mobile_bar(ui: &mut Ui, page: &mut Page, ed: &mut EditorState, pal: &Palette)
                 }
             }
         }
+    }
+    // Tapping the toolbar or its sheet must not take the caret from the text field: when the field loses focus Android collapses the
+    // keyboard, the toolbar drops to the bottom edge and the whole page re-flows under the finger.
+    if !dismiss
+        && ctx.input(|i| i.pointer.any_pressed() || i.pointer.any_released())
+        && ctx
+            .pointer_interact_pos()
+            .is_some_and(|p| covered.contains(p))
+    {
+        ctx.memory_mut(|m| m.request_focus(Id::new(("blk", bid))));
+    }
+    if menu == 0 {
+        widgets::reset_appear(&ctx, Id::new("mobile_sheet_a"));
     }
     ed.tool_menu = menu;
     if dismiss {
@@ -4436,6 +4440,21 @@ fn text_edit(
                 {
                     *act = Some(Act::FocusNext(idx));
                 }
+                // ← at the very start / → at the very end of a block continue in the previous / next block
+                if collapsed
+                    && cursor == 0
+                    && idx > 0
+                    && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowLeft))
+                {
+                    *act = Some(Act::FocusPrev(idx));
+                }
+                if collapsed
+                    && cursor >= nchars
+                    && idx + 1 < n
+                    && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowRight))
+                {
+                    *act = Some(Act::FocusNext(idx));
+                }
             }
         }
     }
@@ -4495,6 +4514,8 @@ fn text_edit(
     // collaboration: report my caret, draw the other people's (thin coloured bar + name flag + selection tint)
     if focused {
         if let Some(cr) = out.cursor_range {
+            let (p, q) = (cr.primary.ccursor.index, cr.secondary.ccursor.index);
+            ctx.data_mut(|d| d.insert_temp(Id::new("mobile_last_sel"), (b.id, p.min(q), p.max(q))));
             crate::collab::set_caret(
                 b.id,
                 cr.secondary.ccursor.index as u32,
@@ -4522,6 +4543,16 @@ fn text_edit(
                 })
             });
             rt.adjust(&buf, pending_fmt, paste.as_ref());
+            // smart typography: typing `->` / `<-` turns into → / ← (not in code blocks, only when a character was typed)
+            if !b.kind.raw() && rt.len() == rt_old.len() + 1 {
+                if let Some(cr) = out.cursor_range.filter(|c| c.is_empty()) {
+                    let c = cr.primary.ccursor.index;
+                    if let Some(arrow) = smart_arrow(&rt.plain, c) {
+                        rt.replace(c - 2, c, &Rich::plain(arrow));
+                        ed.restore_sel = Some((b.id, c - 1, c - 1));
+                    }
+                }
+            }
             b.text = rt.markup();
             ed.pending = None;
         }
@@ -4883,6 +4914,19 @@ fn insert_wiki(rt: &mut Rich, start: usize, cursor: usize, title: &str) -> usize
 }
 
 /// Bold / italic / … on the selection, or — with an empty selection — on the text typed next.
+/// `->` / `<-` right before the caret (`c` chars into `plain`) → the arrow that replaces those two characters.
+fn smart_arrow(plain: &str, c: usize) -> Option<&'static str> {
+    if c < 2 {
+        return None;
+    }
+    let mut it = plain.chars().skip(c - 2);
+    match (it.next()?, it.next()?) {
+        ('-', '>') => Some("→"),
+        ('<', '-') => Some("←"),
+        _ => None,
+    }
+}
+
 fn toggle_format(rt: &mut Rich, ed: &mut EditorState, bid: u64, a: usize, b: usize, flag: u8) {
     let (a, b) = (a.min(b), a.max(b));
     if a != b {
@@ -6071,5 +6115,53 @@ mod tests {
             2,
             "a trailing text block is kept so the user can keep typing"
         );
+    }
+}
+
+#[cfg(test)]
+mod mobile_format_tests {
+    use super::*;
+
+    #[test]
+    fn arrows_are_typed_as_symbols() {
+        assert_eq!(smart_arrow("a ->", 4), Some("→"));
+        assert_eq!(smart_arrow("<-", 2), Some("←"));
+        assert_eq!(smart_arrow("a - >", 5), None);
+        assert_eq!(smart_arrow("->", 1), None);
+        assert_eq!(smart_arrow("x-", 2), None);
+    }
+
+    #[test]
+    fn caret_toggle_is_a_typing_mode_without_visible_markers() {
+        let mut rt = Rich::parse("ab");
+        let mut ed = EditorState::default();
+        toggle_format(&mut rt, &mut ed, 1, 2, 2, rich::BOLD);
+        assert_eq!(rt.markup(), "ab", "nothing may be inserted into the text");
+        assert!(fmt_flag_active(&rt, &ed, 1, 2, 2, rich::BOLD));
+        assert!(!fmt_flag_active(&rt, &ed, 1, 2, 2, rich::ITALIC));
+        rt.adjust("abc", ed.pending.map(|p| p.2), None);
+        ed.pending = None;
+        assert_eq!(rt.markup(), "ab**c**");
+        // the next character inherits the format of the previous one: the mode stays on until it is switched off
+        rt.adjust("abcd", None, None);
+        assert_eq!(rt.markup(), "ab**cd**");
+        assert!(fmt_flag_active(&rt, &ed, 1, 4, 4, rich::BOLD));
+        toggle_format(&mut rt, &mut ed, 1, 4, 4, rich::BOLD);
+        assert!(!fmt_flag_active(&rt, &ed, 1, 4, 4, rich::BOLD));
+        rt.adjust("abcde", ed.pending.map(|p| p.2), None);
+        assert_eq!(rt.markup(), "ab**cd**e");
+    }
+
+    #[test]
+    fn selection_toggle_formats_exactly_the_selection() {
+        let mut rt = Rich::parse("hello **big** world");
+        let mut ed = EditorState::default();
+        // "hello big world": select "lo b" (3..7) and make it italic; the existing bold must survive
+        toggle_format(&mut rt, &mut ed, 1, 3, 7, rich::ITALIC);
+        assert!(fmt_flag_active(&rt, &ed, 1, 3, 7, rich::ITALIC));
+        assert!(fmt_flag_active(&rt, &ed, 1, 6, 9, rich::BOLD));
+        toggle_format(&mut rt, &mut ed, 1, 3, 7, rich::ITALIC);
+        assert!(!fmt_flag_active(&rt, &ed, 1, 3, 7, rich::ITALIC));
+        assert_eq!(rt.markup(), "hello **big** world");
     }
 }
