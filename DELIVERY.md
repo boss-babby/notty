@@ -1,23 +1,32 @@
-# Delivery — Lumen 14.8 · pass 11 (carets, follow-the-cursor, universal Nearby, one link anywhere — `COLLAB.md` §17)
+# Delivery — Lumen 16.0 · pass 12 (tabs, unified search, history diff, hourly backups, synced blocks, device unlock)
 
-Everything is built from this repository, headless, on Linux x86-64: no Android Studio, no GUI. The website in `../` serves all three
-artefacts; the WebAssembly build is linked into the page at `/app` (and `/webapp`).
+Everything is built from this repository, headless, on Linux x86-64: no Android Studio, no GUI. The website in `../` serves all
+artefacts; the WebAssembly build is linked into the page at `/app` (and `/webapp`), and the download buttons stream the files through
+`/api/download/<file>` while counting them in PostgreSQL.
 
-## Artefacts (`../public/downloads`)
+## Artefacts (`../public/downloads`) — release 16.0
 
 | File | Size | SHA-256 |
 |---|---|---|
-| `Lumen-android-arm64.apk` | 17.3 MB | `bd4c2de820f1d166dc5e8afba984adaf8d7733be2cdec1be71dd5d7108399cfd` |
-| `Lumen-windows-x64.exe` | 39.2 MB | `237cb79b9b5ccea2aa8ee5e90b479f5d86b3b3b42c6910fc86556c1230c3fcdd` |
-| `Lumen-windows-x64.zip` | 19.7 MB | `4749dd72e32b35af75b33139f312ce7c01767c7447e16640973687b8b29c032c` |
+| `Lumen-android-arm64.apk` | 21.8 MB | `23529a065aa83242cbee79173cb095fd2dd9d524e5552a9d7b01990ec92aa8be` |
+| `Lumen-windows-x64.exe` | 49.9 MB | `346e6c7caaa8bc055ca41cc8bdc3d6122209b27bf867bc35fadbea98650dc21b` |
+| `Lumen-windows-x64.zip` | 24.2 MB | `fad04b32108212680f3a3d90a7d5a8191e767f4bf4637731a7892046e54517c0` |
+| `Lumen-source.zip` | 8.9 MB | `d5d50c3e789740936b9e98c46146619b6541ff264bccf1b1bbb22cd59f478896` |
 
-* **Android**: arm64-v8a, `minSdk 26`, `targetSdk 34`, release, signed with `android/lumen-release.jks` (v1 + v2 + v3; the `.so` is linked
-  with 16 KB page alignment for Android 15). Java shell: `LumenActivity`, `CollabService` (foreground service while sharing), `NearbyKit`
-  (NSD + MulticastLock), `CollabKit`, `BlePair` (BLE pairing transport), `FcmKit` (push token, by reflection).
-  Install: allow "install unknown apps" once, then open the APK. Updates must be signed with the same key.
-* **Windows**: portable x64 `.exe` (mingw-w64 cross build, mimalloc, WebView2 preview). No installer, no runtime to install.
-* **WebAssembly**: `../public/webapp` — `lumen_bg.wasm` 26.3 MB, `lumen.js` 93 KB, `index.html` with `<base href="/webapp/">`,
-  `manifest.webmanifest`, service worker, icons, `version.json`. Served at `/app` (rewrite) and `/webapp`.
+* **Android**: arm64-v8a, `minSdk 26`, `targetSdk 34`, `android` profile (release + thin LTO + strip), 16 KB page aligned
+  (`zipalign -c -p 4` passes), signed with `android/lumen-release.jks` (v2 + v3; v1 is not needed at minSdk 26). Contains
+  `lib/arm64-v8a/liblumen.so` (43.8 MB), `classes.dex` (Java shell: `LumenActivity`, `NearbyKit`, `CollabKit`, `BlePair`, `KeyKit`,
+  `Reminders`, `CollabService`, `ScanActivity`) and the manifest with every permission the features need.
+* **Windows**: portable x64 `.exe` (mingw-w64 cross build, mimalloc, WebView2 preview), plus the same file zipped.
+* **WebAssembly**: `../public/webapp` — `lumen_bg.wasm` 30.2 MB, `lumen.js`, `index.html` with `<base href="/webapp/">`,
+  `manifest.webmanifest`, service worker, icons, `version.json`. Served at `/app` (rewrite in `next.config.ts`) and `/webapp`.
+* **Source**: `Lumen-source.zip` — the Rust tree that produced the three builds **plus the Next.js site sources** (`src/`, the Next.js + PostgreSQL layer), without `.git`, build output or keystores.
+
+Rebuild everything with one command:
+
+```bash
+./build-deliver.sh     # web -> android -> windows -> source zip -> SHA256SUMS
+```
 
 ## How it was built
 

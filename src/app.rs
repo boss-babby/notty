@@ -113,6 +113,14 @@ enum PalAct {
     Lock,
     Sidebar,
     Trash,
+    SaveTemplate,
+    DailyTemplate,
+    Yesterday,
+    Tomorrow,
+    NewTab,
+    CloseTab,
+    RememberDevice,
+    ForgetDevice,
     Print,
     History,
     Undo,
@@ -206,6 +214,8 @@ pub struct LumenApp {
     hier_exp: std::collections::HashSet<u64>,
     hier_init: bool,
     focus_mode: bool,
+    /// Workspace tabs (persisted next to, not inside, the workspace).
+    tabs: crate::tabs::Tabs,
     /// Side peek of database rows (`peek.rs`).
     peek: crate::peek::Peek,
     /// Storage manager dialog (`vault.rs`).
@@ -347,6 +357,7 @@ impl LumenApp {
             hier_exp: Default::default(),
             hier_init: false,
             focus_mode: false,
+            tabs: cc.storage.and_then(|s| s.get_string(crate::tabs::STORAGE_KEY)).map(|t| crate::tabs::Tabs::from_json(&t)).unwrap_or_default(),
             peek: Default::default(),
             storage: None,
             ctx_for_media: None,
@@ -639,6 +650,80 @@ impl LumenApp {
         }
     }
 
+    fn tabs_sync(&mut self) {
+        let ws = &self.ws;
+        self.tabs.prune(|p| ws.page(p).is_some_and(|x| !x.trashed));
+        if let Some(cur) = self.ws.current.filter(|c| self.ws.page(*c).is_some_and(|p| !p.row)) {
+            self.tabs.follow(cur);
+        }
+    }
+
+    fn close_tab(&mut self, i: usize) {
+        if self.tabs.list.len() < 2 {
+            return;
+        }
+        if let Some(p) = self.tabs.close(i) {
+            self.ws.current = Some(p);
+        }
+    }
+
+    fn tab_bar(&mut self, ctx: &Context, pal: &Palette) {
+        let (mut select, mut close, mut mv): (Option<usize>, Option<usize>, Option<(usize, usize)>) = (None, None, None);
+        egui::TopBottomPanel::top("tabbar")
+            .exact_height(34.0)
+            .show_separator_line(false)
+            .frame(Frame::new().fill(pal.sidebar).inner_margin(Margin::symmetric(6, 4)))
+            .show(ctx, |ui| {
+                let n = self.tabs.list.len();
+                let left = ui.min_rect().left();
+                let w = ((ui.available_width() - 8.0) / n as f32 - 4.0).clamp(96.0, 220.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (i, pid) in self.tabs.list.iter().copied().enumerate() {
+                        let (r, resp) = ui.allocate_exact_size(vec2(w, 26.0), Sense::click_and_drag());
+                        let active = i == self.tabs.active;
+                        let fill = if active { pal.bg } else if resp.hovered() { pal.hover } else { Color32::TRANSPARENT };
+                        ui.painter().rect_filled(r, 6.0, fill);
+                        if active {
+                            ui.painter().rect_stroke(r, 6.0, Stroke::new(1.0_f32, pal.border), egui::StrokeKind::Inside);
+                        }
+                        let title = self.ws.display_title(pid);
+                        crate::widgets::text_fit(ui.painter(), pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, &title, body(13.0), if active { pal.text } else { pal.muted }, w - 38.0);
+                        let cr = Rect::from_center_size(pos2(r.right() - 13.0, r.center().y), vec2(20.0, 20.0));
+                        let x = ui.interact(cr, resp.id.with("close"), Sense::click());
+                        if active || resp.hovered() {
+                            ui.painter().text(cr.center(), Align2::CENTER_CENTER, "×", body(16.0), if x.hovered() { pal.danger } else { pal.muted });
+                        }
+                        if x.clicked() || resp.middle_clicked() {
+                            close = Some(i);
+                        } else if resp.clicked() {
+                            select = Some(i);
+                        }
+                        if resp.dragged() {
+                            if let Some(p) = ctx.pointer_latest_pos() {
+                                let target = (((p.x - left) / (w + 4.0)) as isize).clamp(0, n as isize - 1) as usize;
+                                if target != i {
+                                    mv = Some((i, target));
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        if let Some((a, b)) = mv {
+            self.tabs.move_tab(a, b);
+        }
+        if let Some(i) = select {
+            self.tabs.active = i.min(self.tabs.list.len().saturating_sub(1));
+            if let Some(p) = self.tabs.active_page() {
+                self.ws.current = Some(p);
+            }
+        }
+        if let Some(i) = close {
+            self.close_tab(i);
+        }
+    }
+
     fn handle_req(&mut self, req: Req, cur: u64) {
         match req {
             Req::NewPage(bid) => {
@@ -762,6 +847,8 @@ impl LumenApp {
                     ui.add_space(8.0);
                 }
                 ui.label(RichText::new(format!("{} saved versions · {} files · {} PDF annotations", rep.history_versions, rep.media_items, rep.annotations)).font(body(12.5)).color(pal.muted));
+                let (bn, bb) = crate::backups::totals();
+                ui.label(RichText::new(if bn == 0 { "No hourly backups yet — the first one is written within the hour".to_owned() } else { format!("{bn} hourly backups · {} (newest: {})", crate::vault::fmt_bytes(bb), crate::backups::list().first().map(|e| crate::backups::label(&e.name)).unwrap_or_default()) }).font(body(12.5)).color(pal.muted));
                 if !rep.largest.is_empty() {
                     ui.add_space(8.0);
                     ui.label(RichText::new("Largest attachments").font(bold(13.0)).color(pal.text));
@@ -1069,6 +1156,55 @@ impl LumenApp {
             PalAct::History => {
                 if self.ws.current.is_some() {
                     self.history = Some(crate::history::HistState::default());
+                }
+            }
+            PalAct::SaveTemplate => match self.ws.current.and_then(|c| self.ws.save_as_template(c)) {
+                Some(_) => self.toast("Saved as template — find it under Templates or with /template", None),
+                None => self.toast("Open a page first", None),
+            },
+            PalAct::DailyTemplate => {
+                let ids: Vec<u64> = self.ws.user_templates.iter().map(|t| t.id).collect();
+                let next = match self.ws.daily_template.and_then(|t| ids.iter().position(|i| *i == t)) {
+                    None => ids.first().copied(),
+                    Some(p) => ids.get(p + 1).copied(),
+                };
+                self.ws.daily_template = next;
+                let name = next.and_then(|n| self.ws.user_templates.iter().find(|t| t.id == n)).map(|t| t.name.clone());
+                self.toast(
+                    match (name, ids.is_empty()) {
+                        (Some(n), _) => format!("New daily notes start from “{n}”"),
+                        (None, true) => "Save a page as template first".to_owned(),
+                        (None, false) => "New daily notes use the built-in journal layout".to_owned(),
+                    },
+                    None,
+                );
+            }
+            PalAct::Yesterday | PalAct::Tomorrow => {
+                let d = if matches!(a, PalAct::Yesterday) { -1 } else { 1 };
+                match self.ws.current.filter(|c| self.ws.journal_day(*c).is_some()) {
+                    Some(c) => self.ws.open_journal_neighbour(c, d),
+                    None => self.ws.open_day(d),
+                }
+            }
+            PalAct::NewTab => {
+                self.tabs.duplicate_active();
+                self.new_page(None, PageKind::Doc);
+            }
+            PalAct::CloseTab => self.close_tab(self.tabs.active),
+            PalAct::RememberDevice => match self.cred.as_ref().and_then(auth::remember_device) {
+                Some(c) => {
+                    self.cred = Some(c);
+                    self.toast("This device now opens the workspace without a password", None);
+                }
+                None => {
+                    let m = if self.cred.is_none() { "Set a password first (Lock workspace)" } else { "This platform has no OS key store" };
+                    self.toast(m, None);
+                }
+            },
+            PalAct::ForgetDevice => {
+                if let Some(c) = self.cred.as_ref().map(auth::forget_device) {
+                    self.cred = Some(c);
+                    self.toast("This device will ask for the password again", None);
                 }
             }
             PalAct::Undo => self.undo_redo(false),
@@ -2058,8 +2194,16 @@ impl LumenApp {
                     .take(8)
                     .map(|(_, a, i, t, s)| (a, i, t, s)),
             );
+            // unified index: whiteboard text, database rows, ranked body matches the substring scan above did not list
+            for h in crate::search::cached(&self.ws, &q, now_ms(), 10) {
+                if h.kind == crate::search::Kind::Pdf || out.iter().any(|o| matches!(o.0, PalAct::Open(id) if id == h.page)) {
+                    continue;
+                }
+                let icon = self.ws.page(h.page).map(|p| if p.icon.is_empty() { l::FILE_TEXT.to_owned() } else { icons::icon_text(&p.icon).to_owned() }).unwrap_or_else(|| l::FILE_TEXT.to_owned());
+                out.push((PalAct::Open(h.page), icon, h.title, Some(format!("{} · {}", h.kind.label(), h.snippet))));
+            }
         }
-        let actions: [(PalAct, &str, &str, &str); 31] = [
+        let actions: [(PalAct, &str, &str, &str); 39] = [
             (PalAct::Ai, l::SPARKLES, "Ask Lumen AI", "Chat with the agent that can build pages, databases, dashboards and automations  (Ctrl+Shift+J)"),
             (PalAct::AiSettings, l::KEY_ROUND, "AI settings & agent connections", "API keys (Gemini, OpenAI, Claude, OpenRouter …), access level, MCP server"),
             (PalAct::Automations, l::ZAP, "Automations", "Rules, buttons, recurring tasks, reminders  (Ctrl+Shift+A)"),
@@ -2076,7 +2220,7 @@ impl LumenApp {
             (PalAct::NewCanvas, l::NETWORK, "New canvas", "Infinite whiteboard of cards, pages, images and connectors"),
             (PalAct::NewFlow, l::ZAP, "New flow", "Node-based automation: APIs, data, logic and your workspace, wired together"),
             (PalAct::LiveDemo, l::ZAP, "Live data demo", "A mock API stream → flow → database → dashboard that updates every second"),
-            (PalAct::Journal, l::BOOK_OPEN, "Today's journal", "Open or create today's entry  (Ctrl+J)"),
+            (PalAct::Journal, l::BOOK_OPEN, "Today's journal", "Open or create today's entry  (Ctrl+J or Alt+D)"),
             (PalAct::Templates, l::LAYOUT_TEMPLATE, "Browse templates", "Meeting notes, trackers, wiki…"),
             (PalAct::Import, l::FILE_DOWN, "Import…", "Markdown, CSV or a workspace backup"),
             (PalAct::ExportMd, l::FILE_UP, "Export page as Markdown", "Download the current page"),
@@ -2090,6 +2234,14 @@ impl LumenApp {
             (PalAct::Lock, l::LOCK, "Lock workspace", "Require your password again"),
             (PalAct::Sidebar, l::PANEL_LEFT, "Toggle sidebar", "Show or hide the sidebar"),
             (PalAct::Trash, l::TRASH_2, "Open trash", "Restore deleted pages"),
+            (PalAct::SaveTemplate, l::LAYOUT_DASHBOARD, "Save page as template", "Keep this page's blocks in the template gallery (and /template)"),
+            (PalAct::DailyTemplate, l::BOOK_OPEN, "Daily note template: next", "Cycle the template new daily notes start from"),
+            (PalAct::Yesterday, l::ARROW_LEFT, "Journal: yesterday", "Open (or create) yesterday's entry"),
+            (PalAct::Tomorrow, l::ARROW_RIGHT, "Journal: tomorrow", "Open (or create) tomorrow's entry"),
+            (PalAct::NewTab, l::PLUS, "New tab", "Open a blank page in a new tab  (Ctrl+W closes, Ctrl+Tab cycles)"),
+            (PalAct::CloseTab, l::X, "Close tab", "Close the active tab  (Ctrl+W)"),
+            (PalAct::RememberDevice, l::KEY_ROUND, "Remember this device", "Unlock without typing the password here (OS key store: Windows Credential Manager / Android Keystore)"),
+            (PalAct::ForgetDevice, l::LOCK, "Forget this device", "Ask for the password again on this device"),
             (PalAct::Help, l::KEYBOARD, "Keyboard shortcuts", "Everything you can do without the mouse  (Ctrl+/)"),
         ];
         for (a, i, t, s) in actions {
@@ -3558,6 +3710,7 @@ impl LumenApp {
             return;
         }
         let mut pick: Option<usize> = None;
+        let (mut pick_user, mut del_user, mut daily_user): (Option<u64>, Option<u64>, Option<u64>) = (None, None, None);
         let screen = ctx.screen_rect();
         let phone = screen.width() < 720.0;
         let max_h = (screen.height() - if phone { 130.0 } else { 220.0 }).max(180.0);
@@ -3663,9 +3816,46 @@ impl LumenApp {
                             }
                         });
                     });
+                if !self.ws.user_templates.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Your templates").font(bold(13.5)).color(pal.muted));
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().id_salt("user_templates_scroll").max_height(if phone { 150.0 } else { 170.0 }).auto_shrink([false, true]).show(ui, |ui| {
+                        for t in self.ws.user_templates.iter() {
+                            ui.horizontal(|ui| {
+                                let h = if phone { 44.0 } else { 34.0 };
+                                let bw = (ui.available_width() - if phone { 150.0 } else { 190.0 }).max(80.0);
+                                if ui.add_sized([bw, h], egui::Button::new(RichText::new(format!("{}  {}", t.icon, t.name)).font(body(14.0)).color(pal.text))).clicked() {
+                                    pick_user = Some(t.id);
+                                }
+                                let daily = self.ws.daily_template == Some(t.id);
+                                if ui.add_sized([if phone { 76.0 } else { 120.0 }, h], egui::Button::new(RichText::new(if daily { "✓ Daily" } else if phone { "Daily" } else { "Use for daily" }).font(body(12.5)).color(if daily { pal.accent } else { pal.muted }))).clicked() {
+                                    daily_user = Some(t.id);
+                                }
+                                if ui.add_sized([if phone { 56.0 } else { 56.0 }, h], egui::Button::new(RichText::new("Delete").font(body(12.5)).color(pal.danger))).clicked() {
+                                    del_user = Some(t.id);
+                                }
+                            });
+                        }
+                    });
+                }
                 ui.add_space(6.0);
             },
         );
+        if let Some(t) = daily_user {
+            self.ws.daily_template = if self.ws.daily_template == Some(t) { None } else { Some(t) };
+        }
+        if let Some(t) = del_user {
+            self.ws.delete_user_template(t);
+        }
+        if let Some(t) = pick_user {
+            if let Some(id) = self.ws.add_from_user_template(t, None) {
+                self.ws.current = Some(id);
+                self.focus_title = Some(id);
+            }
+            self.templates_open = false;
+            reset_appear(ctx, Id::new("templates").with("a"));
+        }
         if let Some(i) = pick {
             let id = self.ws.add_template(i, None);
             self.focus_title = Some(id);
@@ -3966,7 +4156,9 @@ Launch v2, In progress, High"
                 &[
                     ("Ctrl K  /  Ctrl P", "Search & command palette"),
                     ("Ctrl N", "New page"),
-                    ("Ctrl J", "Today's journal"),
+                    ("Ctrl J  /  Alt D", "Today's journal"),
+                    ("Ctrl W", "Close tab"),
+                    ("Ctrl Tab  /  Ctrl Shift Tab", "Next / previous tab"),
                     ("Ctrl \\", "Toggle sidebar"),
                     ("Ctrl .", "Focus mode"),
                     ("Ctrl L", "Lock workspace"),
@@ -4314,6 +4506,8 @@ fn run_save(job: crate::autosave::SaveJob) -> crate::autosave::SaveDone {
 impl LumenApp {
     /// Stores a serialised state: the data-safety rotation (previous version / previous state slots), then the new text.
     fn write_state(&mut self, storage: &mut dyn eframe::Storage, text: String, fp: Option<u64>) {
+        // hourly rotating backup (cheap unless the hour changed)
+        crate::backups::on_state(&text, now_ms());
         let old = storage
             .get_string(STORAGE_KEY)
             .filter(|o| !o.trim().is_empty());
@@ -4436,6 +4630,7 @@ impl eframe::App for LumenApp {
         eframe::set_value(storage, crate::workspaces::REG_KEY, &self.wsreg);
         self.media.save(storage);
         eframe::set_value(storage, crate::ai::STORAGE_KEY, &self.ai.st.for_save());
+        storage.set_string(crate::tabs::STORAGE_KEY, self.tabs.to_json());
     }
 
     fn auto_save_interval(&self) -> Duration {
@@ -4467,6 +4662,10 @@ impl eframe::App for LumenApp {
             self.ctx_for_media = Some(ctx.clone());
         }
         self.last_frame_ms = now_ms();
+        if std::mem::take(&mut self.ed.want_templates) {
+            self.templates_open = true;
+        }
+        self.tabs_sync();
         self.closing = ctx.input(|i| i.viewport().close_requested() || !i.focused);
         self.collect_autosave(frame);
         crate::crisp::set_ppp(ctx.pixels_per_point());
@@ -4810,6 +5009,24 @@ impl LumenApp {
             if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::J)) {
                 self.run(PalAct::Journal);
             }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::ALT, Key::D)) {
+                self.run(PalAct::Journal);
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::W)) && self.tabs.list.len() > 1 {
+                self.run(PalAct::CloseTab);
+            }
+            let cycle = if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Tab)) {
+                -1
+            } else if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Tab)) {
+                1
+            } else {
+                0
+            };
+            if cycle != 0 {
+                if let Some(p) = self.tabs.cycle(cycle) {
+                    self.ws.current = Some(p);
+                }
+            }
             if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Slash)) {
                 self.help_open = !self.help_open;
             }
@@ -5077,6 +5294,10 @@ impl LumenApp {
                 });
         }
 
+        if !self.focus_mode && self.tabs.list.len() > 1 && ctx.screen_rect().width() >= 720.0 {
+            self.tab_bar(ctx, &pal);
+        }
+
         // AI panel: slides in / out (the content keeps its width and is revealed from the right edge, so nothing re-wraps while it moves)
         if ai_t > 0.003 {
             let animating = ai_t < 0.997;
@@ -5314,6 +5535,21 @@ impl LumenApp {
                         && !self.collab.ui.dialog
                         && !self.collab.ui.comments
                         && self.ai.rt.settings.is_none();
+                    if ws.journal_day(cur).is_some() {
+                        let h = if crate::touch::touchy() { 40.0 } else { 26.0 };
+                        ui.horizontal(|ui| {
+                            ui.add_space(14.0);
+                            for (label, delta) in [("‹ Yesterday", Some(-1)), ("Today", None), ("Tomorrow ›", Some(1))] {
+                                let b = egui::Button::new(RichText::new(label).font(body(13.0)).color(pal.muted)).frame(false);
+                                if ui.add_sized([if delta.is_none() { 70.0 } else { 104.0 }, h], b).clicked() {
+                                    match delta {
+                                        Some(d) => ws.open_journal_neighbour(cur, d),
+                                        None => ws.open_day(0),
+                                    }
+                                }
+                            }
+                        });
+                    }
                     let sa = ScrollArea::vertical()
                         .id_salt(("page_scroll", cur))
                         .drag_to_scroll(false)
@@ -5873,4 +6109,28 @@ fn page_row(
     out.click = resp.on_hover_cursor(CursorIcon::PointingHand).clicked();
     out.arrow = aresp.clicked() && has_children;
     out
+}
+
+
+/// A one-key storage so a backup's text can go through the same decoder as the live state.
+struct OneKey(String);
+
+impl eframe::Storage for OneKey {
+    fn get_string(&self, _key: &str) -> Option<String> {
+        Some(self.0.clone())
+    }
+    fn set_string(&mut self, _key: &str, value: String) {
+        self.0 = value;
+    }
+    fn flush(&mut self) {}
+}
+
+/// The page `page` as it was in the hourly backup `name`, as a history version (for the page-history comparison).
+pub(crate) fn backup_version(name: &str, page: u64) -> Option<crate::model::Version> {
+    let text = crate::backups::read(name)?;
+    let saved: Saved = eframe::get_value(&OneKey(text), STORAGE_KEY)?;
+    let p = saved.ws.pages.into_iter().find(|p| p.id == page)?;
+    let (y, m, d, h) = crate::backups::parse_name(name)?;
+    let ts = crate::dates::days_from_civil(y, m, d) as f64 * 86_400_000.0 + h as f64 * 3_600_000.0;
+    Some(crate::model::Version { ts, title: p.title, blocks: p.blocks, manual: false, note: format!("Backup {}", crate::backups::label(name)) })
 }

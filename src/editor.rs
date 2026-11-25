@@ -57,6 +57,10 @@ pub struct EditorState {
     pub edit_button: Option<u64>,
     /// Set by the `/widget` command: open the widget gallery for this (new) widget block.
     pub want_widget: Option<u64>,
+    /// Set by `/template`: open the template gallery.
+    pub want_templates: bool,
+    /// "Copy as synced block": (page, block) that `/synced` pastes as a live copy.
+    pub synced_clip: Option<(u64, u64)>,
     /// Set when a whiteboard block is created: the block that needs a new board (a canvas page under this page).
     pub want_board: Option<u64>,
     pub focus: Option<(u64, usize)>,
@@ -195,6 +199,10 @@ enum Slash {
     DbView,
     /// A dashboard widget (chart, number, task list …) placed anywhere in the page.
     Widget,
+    /// The template gallery.
+    Template,
+    /// A synced block (copy of the last "Copy as synced block", or a page picker).
+    Synced,
 }
 
 #[derive(Clone, Copy)]
@@ -384,6 +392,22 @@ fn slash_all() -> Vec<SlashItem> {
         sec: adv,
     });
     v.push(SlashItem {
+        act: Slash::Template,
+        label: "Template",
+        hint: "Start a new page from a built-in or your own template.",
+        glyph: l::LAYOUT_DASHBOARD,
+        kw: "template templates gallery new page from template meeting project journal",
+        sec: adv,
+    });
+    v.push(SlashItem {
+        act: Slash::Synced,
+        label: "Synced block",
+        hint: "Mirror a block, section or page: edit the original, every copy follows. Also ![[Page#Heading]].",
+        glyph: l::LINK_2,
+        kw: "synced sync transclusion embed mirror reference live copy block",
+        sec: adv,
+    });
+    v.push(SlashItem {
         act: Slash::DbView,
         label: "Linked view of database",
         hint: "Show a filtered view of any database on this page.",
@@ -462,6 +486,12 @@ enum Act {
     ColDelete(usize),
     /// Insert an empty block after this one and turn *that* into a slash-menu item (phone toolbar "insert").
     InsertSlash(usize, SlashItem),
+    /// `![[Page#Heading]]` was typed: turn the block into a transclusion.
+    ToSynced(usize),
+    /// Remember this block (and its children) as the source of a synced block.
+    SyncCopy(usize),
+    /// Replace one block by these blocks ("Unsync").
+    ReplaceWith(usize, Vec<Block>),
 }
 
 fn slash_act(idx: usize, s: SlashItem) -> Act {
@@ -1808,6 +1838,12 @@ fn draw_range(
                     if let Some(op) = o.open {
                         cx.ed.nav = Some(op);
                     }
+                } else if kind == BlockKind::Synced {
+                    let o = crate::syncedui::draw(ui, cx.ws, &mut page.blocks[cur], cx.ed, pal, w - ind_px, cx.ed.cur_page);
+                    cx.changed |= o.changed;
+                    if let Some(v) = o.unsync {
+                        cx.act = Some(Act::ReplaceWith(cur, v));
+                    }
                 } else if kind == BlockKind::Widget {
                     let o = crate::inlinew::draw(ui, cx.ws, pal, &mut page.blocks[cur], w - ind_px);
                     cx.changed |= o.changed;
@@ -3081,6 +3117,30 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
             }
         }
         Act::ColUnwrap(i) => dissolve(bl, i),
+        Act::ToSynced(i) => {
+            if let Some(inner) = crate::synced::parse_embed(&bl[i].text).map(str::to_owned) {
+                bl[i].kind = BlockKind::Synced;
+                bl[i].text = inner;
+                bl[i].link = None;
+                bl[i].media = 0;
+                if i + 1 >= bl.len() {
+                    let ind = bl[i].indent;
+                    let nb = new_block(next_id, BlockKind::Text, String::new(), ind);
+                    ed.focus = Some((nb.id, 0));
+                    bl.push(nb);
+                }
+            }
+        }
+        Act::SyncCopy(i) => {
+            ed.synced_clip = Some((ed.cur_page, bl[i].id));
+            crate::dashcfg::set_toast("Copied as synced block — type /synced on another page to paste a live copy");
+        }
+        Act::ReplaceWith(i, v) => {
+            if !v.is_empty() && i < bl.len() {
+                ed.focus = Some((v[0].id, usize::MAX));
+                bl.splice(i..i + 1, v);
+            }
+        }
         Act::Dup(i) => {
             let end = subtree_end(bl, i);
             let mut copies: Vec<Block> = bl[i..end].to_vec();
@@ -3304,6 +3364,30 @@ fn apply(page: &mut Page, act: Act, next_id: &mut u64, ed: &mut EditorState) {
                 }
                 ed.focus = Some((first, 0));
                 bl.splice(i + 1..i + 1, ins);
+            }
+            Slash::Template => {
+                bl[i].kind = BlockKind::Text;
+                bl[i].text.clear();
+                ed.want_templates = true;
+            }
+            Slash::Synced => {
+                let bid = bl[i].id;
+                bl[i].kind = BlockKind::Synced;
+                bl[i].text.clear();
+                bl[i].link = None;
+                bl[i].media = 0;
+                match ed.synced_clip.filter(|(p, _)| *p != ed.cur_page) {
+                    Some((p, b)) => {
+                        bl[i].link = Some(p);
+                        bl[i].media = b;
+                    }
+                    None => ed.req = Some(Req::PickLink(bid)),
+                }
+                if i + 1 >= bl.len() {
+                    let ind = bl[i].indent;
+                    let nb = new_block(next_id, BlockKind::Text, String::new(), ind);
+                    bl.push(nb);
+                }
             }
             Slash::DbView => {
                 bl[i].kind = BlockKind::DbView;
@@ -3994,6 +4078,7 @@ fn draw_block(
         | BlockKind::Column
         | BlockKind::DbView
         | BlockKind::Widget
+        | BlockKind::Synced
         | BlockKind::Whiteboard => {}
         BlockKind::PageLink => {
             let info = b.link.and_then(|l| links.get(&l));
@@ -4683,6 +4768,8 @@ fn text_edit(
     if out.response.changed() && b.kind == BlockKind::Text && act.is_none() {
         if let Some((kind, n)) = md_shortcut(&rt.plain, cursor_idx) {
             *act = Some(Act::Strip(idx, kind, n));
+        } else if crate::synced::parse_embed(&rt.plain).is_some() {
+            *act = Some(Act::ToSynced(idx));
         }
     }
 
@@ -5752,6 +5839,11 @@ fn popups(
                                 .clicked()
                             {
                                 action = Some(Act::Dup(idx));
+                            }
+                            if menu_item(ui, pal, l::LINK_2, "Copy as synced block", None, false, false)
+                                .clicked()
+                            {
+                                action = Some(Act::SyncCopy(idx));
                             }
                             if menu_item(ui, pal, l::TRASH_2, "Delete", None, false, true).clicked()
                             {

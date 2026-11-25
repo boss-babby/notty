@@ -885,4 +885,5 @@ public class LumenActivity extends NativeActivity {
             return true;
         }
     }
+
 }

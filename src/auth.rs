@@ -22,6 +22,9 @@ pub struct Credential {
     /// Key-derivation function (see `KDF_*`); files written before 15.x have none = 0.
     #[serde(default)]
     pub kdf: u8,
+    /// "Remember on this device": `hex(seal(device token, hash))`, see `keychain.rs`. Empty = not remembered.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub device: String,
 }
 
 pub fn now_ms() -> f64 {
@@ -83,7 +86,7 @@ fn derive_argon2id(password: &str, salt: &str) -> String {
 pub fn create(password: &str) -> Credential {
     let salt = random_hex(16);
     let hash = derive_argon2id(password, &salt);
-    Credential { salt, hash, kdf: KDF_ARGON2ID }
+    Credential { salt, hash, kdf: KDF_ARGON2ID, device: String::new() }
 }
 
 /// True when the credential still uses the old SHA-256 chain (re-create it with [`create`] after a successful [`verify`]).
@@ -98,6 +101,30 @@ pub fn verify(cred: &Credential, password: &str) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Stores a device token in the OS key store and returns the credential that remembers this device (`None` where there is no key store).
+pub fn remember_device(cred: &Credential) -> Option<Credential> {
+    let store = crate::keychain::os()?;
+    let device = crate::keychain::enroll(store.as_ref(), crate::keychain::VAULT, cred.hash.as_bytes())?;
+    Some(Credential { device, ..cred.clone() })
+}
+
+/// The credential without the device seal; the token leaves the OS store.
+pub fn forget_device(cred: &Credential) -> Credential {
+    if let Some(store) = crate::keychain::os() {
+        store.forget(crate::keychain::VAULT);
+    }
+    Credential { device: String::new(), ..cred.clone() }
+}
+
+/// True when this device holds the token that opens the credential (no password needed).
+pub fn device_unlock(cred: &Credential) -> bool {
+    if cred.device.is_empty() {
+        return false;
+    }
+    let Some(store) = crate::keychain::os() else { return false };
+    crate::keychain::unlock(store.as_ref(), crate::keychain::VAULT, &cred.device).is_some_and(|h| h == cred.hash.as_bytes())
 }
 
 /// Returns a 0..=1 score and a label.
@@ -145,7 +172,7 @@ mod tests {
     #[test]
     fn legacy_credentials_still_unlock_and_are_flagged() {
         let salt = random_hex(16);
-        let old = Credential { hash: derive("hunter22", &salt), salt, kdf: KDF_SHA256 };
+        let old = Credential { hash: derive("hunter22", &salt), salt, kdf: KDF_SHA256, device: String::new() };
         assert!(is_legacy(&old));
         assert!(verify(&old, "hunter22"));
         assert!(!verify(&old, "hunter23"));

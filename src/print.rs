@@ -442,6 +442,11 @@ pub fn page_html(ws: &Workspace, media: &MediaStore, id: u64, auto_print: bool) 
                 let name = ws.dash.widget(b.media as u64).and_then(crate::dashwidgets::def_for).map_or_else(|| "Dashboard widget".to_owned(), |d| d.name.to_string());
                 o.push_str(&format!("<div class=\"card\" style=\"{pad}\"><b>{}</b><small>Interactive dashboard widget — open the page in Lumen to see it live.</small></div>", esc(&name)));
             }
+            BlockKind::Synced => {
+                for line in crate::synced::plain_lines(ws, b) {
+                    o.push_str(&format!("<p style=\"{pad}{st}\">{}</p>", line.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")));
+                }
+            }
             BlockKind::Whiteboard => match b.link.and_then(|l| ws.page(l)).and_then(|p| p.canvas.as_ref()) {
                 Some(c) => {
                     let svg = crate::canvasexport::to_svg(c, false, &|id| ws.display_title(id)).replacen("<svg", "<svg style=\"max-width:100%;height:auto;border:1px solid #ddd;border-radius:8px\"", 1);

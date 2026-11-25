@@ -53,6 +53,8 @@ pub enum BlockKind {
     Equation,
     /// An embedded whiteboard: `link` = the canvas page it shows (live thumbnail in the page, full editor in a peek view), see `whiteboard.rs`.
     Whiteboard,
+    /// Live content of another page / section / block, see `synced.rs`.
+    Synced,
 }
 
 impl BlockKind {
@@ -77,7 +79,7 @@ impl BlockKind {
     ];
 
     pub fn has_text(self) -> bool {
-        !matches!(self, BlockKind::Divider | BlockKind::Toc | BlockKind::PageLink | BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File | BlockKind::Columns | BlockKind::Column | BlockKind::DbView | BlockKind::Widget | BlockKind::Button | BlockKind::Table | BlockKind::Whiteboard)
+        !matches!(self, BlockKind::Divider | BlockKind::Toc | BlockKind::PageLink | BlockKind::Image | BlockKind::Embed | BlockKind::Bookmark | BlockKind::File | BlockKind::Columns | BlockKind::Column | BlockKind::DbView | BlockKind::Widget | BlockKind::Button | BlockKind::Table | BlockKind::Whiteboard | BlockKind::Synced)
     }
 
     pub fn label(self) -> &'static str {
@@ -108,6 +110,7 @@ impl BlockKind {
             BlockKind::Table => "Table",
             BlockKind::Equation => "Equation",
             BlockKind::Whiteboard => "Whiteboard",
+            BlockKind::Synced => "Synced block",
         }
     }
 
@@ -139,6 +142,7 @@ impl BlockKind {
             BlockKind::Table => "A simple table. Paste Markdown tables here, or turn one into a database.",
             BlockKind::Equation => "Write a LaTeX / math formula ($$ … $$).",
             BlockKind::Whiteboard => "An infinite board inside the page: shapes, sticky notes, ink, frames, connectors.",
+            BlockKind::Synced => "Show live content of another page, section or block (![[Page#Heading]]).",
         }
     }
 
@@ -169,6 +173,7 @@ impl BlockKind {
             BlockKind::Table => l::TABLE,
             BlockKind::Equation => l::SIGMA,
             BlockKind::Whiteboard => l::NETWORK,
+            BlockKind::Synced => l::LINK_2,
         }
     }
 
@@ -199,6 +204,7 @@ impl BlockKind {
             BlockKind::Table => "table grid rows columns markdown spreadsheet cells",
             BlockKind::Equation => "equation math latex formula tex katex sigma integral fraction",
             BlockKind::Whiteboard => "whiteboard canvas edgeless draw sketch diagram miro board affine shapes frame",
+            BlockKind::Synced => "synced block transclusion embed mirror live reference page heading section",
         }
     }
 }
@@ -861,6 +867,12 @@ pub struct Workspace {
     /// Automations: rules, reminders, notification inbox and run log (see `automation.rs`).
     #[serde(default)]
     pub auto: crate::automation::AutoState,
+    /// Pages saved as templates by the user (gallery, `/template`, daily notes) — see `usertpl.rs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_templates: Vec<crate::usertpl::UserTemplate>,
+    /// User template (id) used for new daily notes; `None` = the built-in journal layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_template: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
@@ -1507,30 +1519,7 @@ impl Workspace {
 
     /// Opens (creating when needed) today's entry inside the "Journal" page.
     pub fn open_today(&mut self) {
-        let root = match self.pages.iter().find(|p| p.title == "Journal" && p.parent.is_none() && !p.trashed && !p.row) {
-            Some(p) => p.id,
-            None => {
-                let r = self.add_page(None, PageKind::Doc);
-                let intro = self.blk(BlockKind::Callout, "Your daily journal. Press Ctrl+J any time to open today's entry.", 0);
-                if let Some(p) = self.page_mut(r) {
-                    p.title = "Journal".into();
-                    p.icon = "📖".into();
-                    p.blocks.insert(0, intro);
-                }
-                r
-            }
-        };
-        let today = dates::long_today();
-        if let Some(e) = self.pages.iter().find(|p| p.parent == Some(root) && p.title == today && !p.trashed) {
-            self.current = Some(e.id);
-            return;
-        }
-        let e = self.add_page(Some(root), PageKind::Doc);
-        self.fill_template_doc(e, 5);
-        if let Some(p) = self.page_mut(e) {
-            p.title = today;
-            p.icon = "📖".into();
-        }
+        self.open_day(0);
     }
 
     // ───────── migration of the old kanban pages ─────────
@@ -1941,7 +1930,7 @@ impl Workspace {
 
     /// An empty workspace for the workspace switcher: one welcome page, no sample data. Look (dark mode, accent) is inherited.
     pub fn blank(name: &str, dark: bool, accent: usize) -> Self {
-        let mut ws = Workspace { name: name.into(), pages: vec![], next_id: 0, bigs: BTreeMap::new(), current: None, dark, sidebar_open: true, accent, icons_v2: false, pdf_annots: BTreeMap::new(), comments: BTreeMap::new(), dash: Default::default(), auto: Default::default() };
+        let mut ws = Workspace { name: name.into(), pages: vec![], next_id: 0, bigs: BTreeMap::new(), current: None, dark, sidebar_open: true, accent, icons_v2: false, pdf_annots: BTreeMap::new(), comments: BTreeMap::new(), dash: Default::default(), auto: Default::default(), user_templates: vec![], daily_template: None };
         let start = ws.add_page(None, PageKind::Doc);
         let bl = vec![
             ws.blk(BlockKind::Text, "This is a fresh workspace — pages, databases, canvases and dashboards you create here stay separate from your other workspaces.", 0),
@@ -1958,7 +1947,7 @@ impl Workspace {
     }
 
     pub fn seed() -> Self {
-        let mut ws = Workspace { name: "My Workspace".into(), pages: vec![], next_id: 0, bigs: BTreeMap::new(), current: None, dark: false, sidebar_open: true, accent: 0, icons_v2: false, pdf_annots: BTreeMap::new(), comments: BTreeMap::new(), dash: Default::default(), auto: Default::default() };
+        let mut ws = Workspace { name: "My Workspace".into(), pages: vec![], next_id: 0, bigs: BTreeMap::new(), current: None, dark: false, sidebar_open: true, accent: 0, icons_v2: false, pdf_annots: BTreeMap::new(), comments: BTreeMap::new(), dash: Default::default(), auto: Default::default(), user_templates: vec![], daily_template: None };
         use BlockKind::*;
 
         let start = ws.add_page(None, PageKind::Doc);

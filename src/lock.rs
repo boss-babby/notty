@@ -31,6 +31,8 @@ pub struct LockScreen {
     working: bool,
     fails: u32,
     locked_until: f64,
+    /// The device token is tried once per session (a later manual lock asks for the password).
+    device_tried: bool,
 }
 
 impl LockScreen {
@@ -58,6 +60,12 @@ impl LockScreen {
         let pal = Palette::dark();
         let time = ctx.input(|i| i.time) as f32;
         let mut event = LockEvent::None;
+        if !self.device_tried {
+            self.device_tried = true;
+            if cred.is_some_and(auth::device_unlock) {
+                return LockEvent::Unlocked;
+            }
+        }
         let setup = cred.is_none();
 
         egui::CentralPanel::default()

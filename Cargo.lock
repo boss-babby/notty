@@ -3787,7 +3787,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "lumen"
-version = "15.0.0"
+version = "16.0.0"
 dependencies = [
  "android-activity",
  "android_logger",
@@ -3827,6 +3827,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "webbrowser",
+ "windows-sys 0.61.2",
  "wry",
  "x25519-dalek",
 ]

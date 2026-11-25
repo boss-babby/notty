@@ -105,6 +105,7 @@ pub fn page_markdown_with(ws: &Workspace, id: u64, asset: &dyn Fn(u64) -> Option
             },
             BlockKind::PageLink => format!("{pad}[{}]", b.link.map(|l| ws.display_title(l)).unwrap_or_else(|| "Missing page".into())),
             BlockKind::Columns | BlockKind::Column => String::new(),
+            BlockKind::Synced => crate::synced::plain_lines(ws, b).iter().map(|x| format!("{pad}{x}")).collect::<Vec<_>>().join("\n\n"),
             BlockKind::Widget => format!("{pad}[Dashboard widget]"),
             BlockKind::Whiteboard => format!("{pad}[Whiteboard: {}]", b.link.map(|l| ws.display_title(l)).unwrap_or_else(|| "empty".into())),
             BlockKind::Button => format!("{pad}[Button: {}]", if b.text.is_empty() { "Button" } else { &b.text }),

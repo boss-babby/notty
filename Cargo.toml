@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "15.0.0"
+version = "16.0.0"
 edition = "2021"
 description = "Lumen — a Notion + Obsidian + Miro-lite alternative (infinite canvas) written entirely in Rust with egui (Windows, Android + WebAssembly): Markdown tables, two-way relations, automations, reminders, LumenScript, AI + MCP"
 license = "MIT"
@@ -71,6 +71,8 @@ android_logger = "0.14"
 rqrr = { version = "0.8", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
+# Windows Credential Manager for "Remember on this device" (src/keychain.rs)
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 # lower fragmentation and RSS that is returned to the OS (large workspaces); Windows only — Android's scudo and wasm's dlmalloc stay
 mimalloc = { version = "0.1", default-features = false }
 # Native web preview: WebView2 (Chromium-based, ships with Windows 10/11) in a child window that only exists while a preview is open.

@@ -194,6 +194,10 @@ pub fn track(ws: &mut Workspace, cur: u64, ed: &mut EditorState, now: f64) {
 pub struct HistState {
     pub sel: Option<usize>,
     pub note: String,
+    /// Hourly backups on disk (loaded when the dialog first draws).
+    pub backups: Option<Vec<crate::backups::Entry>>,
+    /// The page as it was in a chosen backup: shown instead of the selected version.
+    pub cmp: Option<Version>,
 }
 
 #[derive(Default)]
@@ -226,7 +230,7 @@ pub fn stamp(ts_ms: f64) -> String {
     )
 }
 
-fn plain_line(b: &Block) -> String {
+pub(crate) fn plain_line(b: &Block) -> String {
     let pad = "    ".repeat(b.indent as usize);
     let t = crate::rich::strip(&b.text);
     match b.kind {
@@ -292,6 +296,29 @@ pub fn dialog(ctx: &Context, pal: &Palette, ws: &mut Workspace, cur: u64, st: &m
                 act = Some((0, 0));
             }
         });
+        {
+            let backups = st.backups.get_or_insert_with(crate::backups::list).clone();
+            if !backups.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Compare with backup:").font(body(12.5)).color(pal.muted));
+                    for e in backups.iter().take(6) {
+                        let on = st.cmp.as_ref().is_some_and(|c| c.note.ends_with(&crate::backups::label(&e.name)));
+                        let b = egui::Button::new(RichText::new(crate::backups::label(&e.name)).font(body(12.0)).color(if on { pal.accent } else { pal.text })).fill(if on { pal.active } else { pal.hover });
+                        if ui.add_sized([0.0, if narrow { 32.0 } else { 24.0 }], b).clicked() {
+                            if on {
+                                st.cmp = None;
+                            } else {
+                                match crate::app::backup_version(&e.name, cur) {
+                                    Some(v) => st.cmp = Some(v),
+                                    None => out.toast = Some("That page does not exist in this backup".into()),
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
         ui.add_space(8.0);
         let list_w = if narrow { ui.available_width() - 8.0 } else { 262.0 };
         let body_fn = |ui: &mut Ui, act: &mut Option<(u8, usize)>, st: &mut HistState| {
@@ -314,6 +341,7 @@ pub fn dialog(ctx: &Context, pal: &Palette, ws: &mut Workspace, cur: u64, st: &m
                         crate::widgets::text_fit(ui.painter(), pos2(r.left() + 12.0, r.top() + 35.0), Align2::LEFT_CENTER, &sub, body(12.0), pal.muted, r.width() - 24.0);
                         if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                             st.sel = Some(i);
+                            st.cmp = None;
                         }
                     }
                 });
@@ -327,8 +355,13 @@ pub fn dialog(ctx: &Context, pal: &Palette, ws: &mut Workspace, cur: u64, st: &m
                 ui.add_space(8.0);
             }
             ui.vertical(|ui| {
-                let Some(i) = sel else { return };
-                let v = &versions[i];
+                let cmp_v = st.cmp.clone();
+                let v: &Version = match (&cmp_v, sel) {
+                    (Some(c), _) => c,
+                    (None, Some(i)) => &versions[i],
+                    _ => return,
+                };
+                let i = sel.unwrap_or(0);
                 let (added, removed) = diff_counts(&v.blocks, &now_blocks);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(stamp(v.ts)).font(bold(14.0)));
@@ -337,37 +370,17 @@ pub fn dialog(ctx: &Context, pal: &Palette, ws: &mut Workspace, cur: u64, st: &m
                 });
                 ui.horizontal(|ui| {
                     if primary_button(ui, pal, "Restore this version", 170.0).clicked() {
-                        *act = Some((1, i));
+                        *act = Some((if cmp_v.is_some() { 3 } else { 1 }, i));
                     }
-                    if ghost_button(ui, pal, "Delete").clicked() {
+                    if cmp_v.is_none() && ghost_button(ui, pal, "Delete").clicked() {
                         *act = Some((2, i));
                     }
                 });
                 ui.add_space(6.0);
                 ScrollArea::vertical().id_salt("hist_prev").max_height(if narrow { 180.0 } else { 330.0 }).auto_shrink([false, false]).show(ui, |ui| {
-                    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 0.0), Sense::hover());
-                    let _ = r;
                     ui.label(RichText::new(if v.title.is_empty() { "Untitled".to_owned() } else { v.title.clone() }).font(bold(18.0)));
                     ui.add_space(4.0);
-                    let mut pool: Vec<String> = now_blocks.iter().map(plain_line).collect();
-                    for b in v.blocks.iter().take(300) {
-                        let line = plain_line(b);
-                        let in_now = if let Some(k) = pool.iter().position(|x| *x == line) {
-                            pool.remove(k);
-                            true
-                        } else {
-                            false
-                        };
-                        let mut rt = RichText::new(if line.trim().is_empty() { " ".to_owned() } else { line }).font(match b.kind {
-                            BlockKind::H1 | BlockKind::H2 | BlockKind::H3 => bold(15.0),
-                            BlockKind::Code => egui::FontId::monospace(12.5),
-                            _ => body(13.5),
-                        });
-                        if !in_now {
-                            rt = rt.background_color(with_alpha(lerp_color(pal.accent, pal.bg, 0.3), 0.28));
-                        }
-                        ui.add(egui::Label::new(rt).wrap());
-                    }
+                    crate::diff::view(ui, pal, &v.blocks, &now_blocks, narrow);
                 });
             });
         };
@@ -394,6 +407,16 @@ pub fn dialog(ctx: &Context, pal: &Palette, ws: &mut Workspace, cur: u64, st: &m
                 1 => {
                     if restore(p, i) {
                         out.toast = Some("Version restored — Ctrl+Z undoes it".into());
+                        out.close = true;
+                    }
+                }
+                3 => {
+                    if let Some(v) = st.cmp.take() {
+                        snapshot(p, false, "Before restore");
+                        p.blocks = v.blocks;
+                        p.title = v.title;
+                        p.updated = now_ms();
+                        out.toast = Some("Backup restored — Ctrl+Z undoes it".into());
                         out.close = true;
                     }
                 }

@@ -547,6 +547,28 @@ pub fn clipboard_set(text: &str) {
     });
 }
 
+/// Wraps `data` with the Android Keystore key (`None` when the keystore refuses).
+pub fn key_wrap(data: &[u8]) -> Option<Vec<u8>> {
+    key_call("keyWrap", data)
+}
+
+pub fn key_unwrap(data: &[u8]) -> Option<Vec<u8>> {
+    key_call("keyUnwrap", data)
+}
+
+fn key_call(method: &str, data: &[u8]) -> Option<Vec<u8>> {
+    with_activity(|env, act| {
+        let arr = env.byte_array_from_slice(data)?;
+        let out = env.call_method(act, method, "([B)[B", &[JValue::Object(&arr)])?.l()?;
+        if out.is_null() {
+            return Ok(None);
+        }
+        let v = env.convert_byte_array(jni::objects::JByteArray::from(out))?;
+        Ok(Some(v))
+    })
+    .flatten()
+}
+
 pub fn notify_request() {
     call_void("requestNotificationPermission", "()V", &[]);
     call_void("requestExactAlarms", "()V", &[]);
